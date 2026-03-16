@@ -158,7 +158,7 @@ async def run(config: RunConfig) -> int:
         output_file=config.output_file,
     )
     permission = PermissionLevel(config.permission_level)
-    client = AcpcClient(output=output, permission_level=permission)
+    client = AcpcClient(output=output, permission_level=permission, is_tty=config.is_tty)
 
     # 3. Determine command
     parts = shlex.split(agent.run_command)
