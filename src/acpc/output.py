@@ -90,9 +90,9 @@ class OutputHandler:
         if self.mode is OutputMode.TEXT:
             sys.stdout.write(text)
             sys.stdout.flush()
-        elif self.mode is OutputMode.QUIET:
+        # Always collect chunks for output file and quiet mode
+        if self.mode in (OutputMode.TEXT, OutputMode.QUIET):
             self._chunks.append(text)
-        # JSON mode: text is part of the full event, handled by on_event
 
     # -- raw ACP events (JSON mode) ----------------------------------------
 

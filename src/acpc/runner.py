@@ -38,7 +38,7 @@ _STOP_REASON_EXIT: dict[str, int] = {
     "end_turn": 0,
     "max_tokens": EXIT_AGENT_ERROR,
     "max_turn_requests": EXIT_AGENT_ERROR,
-    "refusal": EXIT_PERMISSION_DENIED,
+    "refusal": EXIT_AGENT_ERROR,
     "cancelled": EXIT_SIGINT,
 }
 
@@ -156,7 +156,14 @@ async def run(config: RunConfig) -> int:
     # Import at runtime (these sibling modules don't exist in this worktree yet)
     from acpc.agents import load_agent  # type: ignore[import-not-found]
     from acpc.client import AcpcClient, PermissionLevel  # type: ignore[import-not-found]
-    from acpc.output import OutputHandler, OutputMode, stderr, stderr_error  # type: ignore[import-not-found]
+    from acpc.output import (
+        OutputHandler,
+        OutputMode,
+        stderr,
+        stderr_error,
+        stderr_resume,
+        stderr_session,
+    )  # type: ignore[import-not-found]
 
     # 1. Load agent
     agent = load_agent(config.agent_identity)
@@ -237,6 +244,11 @@ async def run(config: RunConfig) -> int:
                 new_session = await conn.new_session(cwd=cwd)
                 session_id = new_session.session_id
 
+            # Emit session info
+            stderr_session(session_id)
+            stderr_resume(config.agent_identity, session_id)
+            output.on_session_started(session_id)
+
             # Register running session
             rs = make_running_session(
                 session_id=session_id,
@@ -292,12 +304,15 @@ async def run(config: RunConfig) -> int:
                 except asyncio.CancelledError:
                     pass
 
-            # 9. Save state
+            # 9. Finalize output
+            exit_code = _STOP_REASON_EXIT.get(result.stop_reason, EXIT_AGENT_ERROR)
+            output.on_session_ended(session_id, result.stop_reason, exit_code)
+            output.finalize()
+
+            # 10. Save state and return
             save_last_session(config.agent_identity, session_id)
             remove_running(session_id)
-
-            # 10. Return exit code based on stop reason
-            return _STOP_REASON_EXIT.get(result.stop_reason, EXIT_AGENT_ERROR)
+            return exit_code
 
     except asyncio.TimeoutError:
         stderr_error("timeout reached")
