@@ -1,0 +1,5 @@
+identity = "codex"
+name = "Codex CLI"
+author = "OpenAI"
+run_command = "npx @zed-industries/codex-acp"
+install_command = "npm install -g @zed-industries/codex-acp"

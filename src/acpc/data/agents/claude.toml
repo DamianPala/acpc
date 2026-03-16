@@ -1,0 +1,5 @@
+identity = "claude"
+name = "Claude Code"
+author = "Anthropic"
+run_command = "npx @zed-industries/claude-agent-acp"
+install_command = "npm install -g @zed-industries/claude-agent-acp"
