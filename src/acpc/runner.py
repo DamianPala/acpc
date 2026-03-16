@@ -123,6 +123,22 @@ def _get_pgid(pid: int) -> int | None:
         return None
 
 
+async def _heartbeat(quiet: bool) -> None:
+    """Print periodic status to stderr during long-running prompts.
+
+    Prints every 60 seconds. Suppressed in quiet mode.
+    """
+    if quiet:
+        return
+    start = asyncio.get_event_loop().time()
+    while True:
+        await asyncio.sleep(60)
+        elapsed = asyncio.get_event_loop().time() - start
+        minutes = int(elapsed) // 60
+        seconds = int(elapsed) % 60
+        print(f"[acpc] still running... ({minutes}m {seconds}s)", file=sys.stderr, flush=True)
+
+
 async def run(config: RunConfig) -> int:
     """Execute a prompt against an ACP agent. Returns exit code.
 
@@ -140,15 +156,14 @@ async def run(config: RunConfig) -> int:
     # Import at runtime (these sibling modules don't exist in this worktree yet)
     from acpc.agents import load_agent  # type: ignore[import-not-found]
     from acpc.client import AcpcClient, PermissionLevel  # type: ignore[import-not-found]
-    from acpc.output import OutputHandler, OutputMode  # type: ignore[import-not-found]
+    from acpc.output import OutputHandler, OutputMode, stderr, stderr_error  # type: ignore[import-not-found]
 
     # 1. Load agent
     agent = load_agent(config.agent_identity)
     if agent is None:
-        print(
-            f"Agent '{config.agent_identity}' not found. "
-            f"Run 'acpc agents' to list available agents.",
-            file=sys.stderr,
+        stderr_error(
+            f"agent '{config.agent_identity}' not found. "
+            f"Run 'acpc agents' to list available agents."
         )
         return EXIT_USAGE_ERROR
 
@@ -189,28 +204,32 @@ async def run(config: RunConfig) -> int:
 
             # 6. Create or load session
             session_id = config.session_id
+            explicitly_requested = config.use_last or config.session_id is not None
+
             if config.use_last and session_id is None:
                 session_id = load_last_session(config.agent_identity)
                 if session_id is None:
-                    print(
-                        "No previous session found. Starting new session.",
-                        file=sys.stderr,
-                    )
+                    stderr_error("no previous session found")
+                    return EXIT_USAGE_ERROR
 
             if session_id and supports_load:
                 try:
                     await conn.load_session(cwd=cwd, session_id=session_id)
                 except RequestError as e:
-                    print(
-                        f"Failed to load session {session_id}: {e}. Starting new session.",
-                        file=sys.stderr,
-                    )
+                    if explicitly_requested:
+                        stderr_error(f"failed to load session {session_id}: {e}")
+                        return EXIT_AGENT_ERROR
+                    stderr(f"warning: failed to load session {session_id}: {e}, starting new")
                     session_id = None
             elif session_id and not supports_load:
-                print(
-                    f"Agent '{config.agent_identity}' does not support "
-                    f"session loading. Starting new session.",
-                    file=sys.stderr,
+                if explicitly_requested:
+                    stderr_error(
+                        f"agent '{config.agent_identity}' does not support session loading"
+                    )
+                    return EXIT_AGENT_ERROR
+                stderr(
+                    f"warning: agent '{config.agent_identity}' does not support "
+                    f"session loading, starting new"
                 )
                 session_id = None
 
@@ -238,10 +257,7 @@ async def run(config: RunConfig) -> int:
                         session_id=session_id,
                     )
                 except RequestError as e:
-                    print(
-                        f"Warning: failed to set model '{config.model}': {e}",
-                        file=sys.stderr,
-                    )
+                    stderr(f"warning: failed to set model '{config.model}': {e}")
 
             if config.mode:
                 try:
@@ -250,25 +266,31 @@ async def run(config: RunConfig) -> int:
                         session_id=session_id,
                     )
                 except RequestError as e:
-                    print(
-                        f"Warning: failed to set mode '{config.mode}': {e}",
-                        file=sys.stderr,
-                    )
+                    stderr(f"warning: failed to set mode '{config.mode}': {e}")
 
-            # 8. Send prompt
-            if config.timeout:
-                result = await asyncio.wait_for(
-                    conn.prompt(
+            # 8. Send prompt (with heartbeat)
+            is_quiet = config.output_mode == "quiet"
+            heartbeat_task = asyncio.create_task(_heartbeat(is_quiet))
+            try:
+                if config.timeout:
+                    result = await asyncio.wait_for(
+                        conn.prompt(
+                            [acp.text_block(config.prompt_text)],
+                            session_id=session_id,
+                        ),
+                        timeout=config.timeout,
+                    )
+                else:
+                    result = await conn.prompt(
                         [acp.text_block(config.prompt_text)],
                         session_id=session_id,
-                    ),
-                    timeout=config.timeout,
-                )
-            else:
-                result = await conn.prompt(
-                    [acp.text_block(config.prompt_text)],
-                    session_id=session_id,
-                )
+                    )
+            finally:
+                heartbeat_task.cancel()
+                try:
+                    await heartbeat_task
+                except asyncio.CancelledError:
+                    pass
 
             # 9. Save state
             save_last_session(config.agent_identity, session_id)
@@ -278,19 +300,18 @@ async def run(config: RunConfig) -> int:
             return _STOP_REASON_EXIT.get(result.stop_reason, EXIT_AGENT_ERROR)
 
     except asyncio.TimeoutError:
-        print("Timeout reached.", file=sys.stderr)
+        stderr_error("timeout reached")
         return EXIT_TIMEOUT
     except KeyboardInterrupt:
         return EXIT_SIGINT
     except FileNotFoundError as e:
-        print(
-            f"Agent command not found: {e}. Run 'acpc install {config.agent_identity}' first.",
-            file=sys.stderr,
+        stderr_error(
+            f"agent command not found: {e}. Run 'acpc install {config.agent_identity}' first."
         )
         return EXIT_USAGE_ERROR
     except RequestError as e:
-        print(f"ACP error: {e}", file=sys.stderr)
+        stderr_error(f"ACP error: {e}")
         return EXIT_AGENT_ERROR
     except OSError as e:
-        print(f"OS error: {e}", file=sys.stderr)
+        stderr_error(f"OS error: {e}")
         return EXIT_AGENT_ERROR
