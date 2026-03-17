@@ -19,6 +19,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -349,3 +350,78 @@ class TestTimeout:
         assert result.returncode == 124, (
             f"Expected exit 124 (timeout), got {result.returncode}. stderr: {result.stderr}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Tier 3: Process lifecycle and session management
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("agent", ["codex", "claude"])
+class TestResumeWithLast:
+    """--last flag resumes the most recent session."""
+
+    def test_last_resumes_session(self, agent: str) -> None:
+        """--last picks up context from the previous session."""
+        model = TEST_MODELS.get(agent)
+        model_args = ("--model", model) if model else ()
+
+        # Turn 1: establish a fact
+        r1 = _run_acpc(
+            "prompt",
+            agent,
+            "For this test, the color is 'Magenta'. Confirm by saying just the color.",
+            *model_args,
+            "--permissions",
+            "none",
+            "--quiet",
+        )
+        assert r1.returncode == 0, f"Turn 1 failed: {r1.stderr}"
+
+        # Turn 2: resume with --last
+        r2 = _run_acpc(
+            "prompt",
+            agent,
+            "--last",
+            "What color did I mention? Reply with just the color.",
+            *model_args,
+            "--permissions",
+            "none",
+            "--quiet",
+        )
+        assert r2.returncode == 0, f"Turn 2 failed: {r2.stderr}"
+        assert "magenta" in r2.stdout.lower(), f"Agent forgot context. Got: {r2.stdout!r}"
+
+
+@pytest.mark.parametrize("agent", ["codex", "claude"])
+class TestProcessCleanup:
+    """Adapter processes are cleaned up after exit (no orphans)."""
+
+    def test_no_orphans_after_normal_exit(self, agent: str) -> None:
+        """No adapter processes remain after a normal prompt completes."""
+        result = _run_acpc_cheap(
+            agent, "Respond with exactly one word: cleanup", "--permissions", "none", "--quiet"
+        )
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        time.sleep(2)
+
+        # Check for orphaned adapter processes
+        ps = subprocess.run(
+            ["pgrep", "-f", f"{agent}-acp|{agent}-agent-acp"],
+            capture_output=True,
+            text=True,
+        )
+        # pgrep exit 1 = no matches (good), exit 0 = matches found (bad)
+        orphan_pids = ps.stdout.strip().split("\n") if ps.stdout.strip() else []
+        assert len(orphan_pids) == 0, (
+            f"Orphan {agent} adapter processes found: {orphan_pids}"
+        )
+
+
+class TestStatus:
+    """acpc status command."""
+
+    def test_status_no_sessions(self) -> None:
+        """Status with no running sessions exits cleanly."""
+        result = _run_acpc("status")
+        assert result.returncode == 0, f"stderr: {result.stderr}"
