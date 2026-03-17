@@ -9,7 +9,9 @@ import os
 import shlex
 import signal
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Any
 
 import acp
 from acp import RequestError
@@ -139,6 +141,79 @@ async def _heartbeat(quiet: bool) -> None:
         print(f"[acpc] still running... ({minutes}m {seconds}s)", file=sys.stderr, flush=True)
 
 
+async def _try_set_model(
+    conn: ClientSideConnection,
+    session_id: str,
+    model: str,
+    new_session_response: Any | None,
+    log: Callable[[str], None],
+) -> bool:
+    """Try to set the model, pre-validating against available models if possible.
+
+    Returns True if set_session_model was called (even if adapter accepted silently).
+    """
+    # Pre-validate: check if new_session response lists available models (ACP unstable field)
+    if new_session_response is not None and hasattr(new_session_response, "models"):
+        models_state = new_session_response.models
+        if models_state is not None and hasattr(models_state, "available_models"):
+            available = models_state.available_models
+            if available:
+                valid_ids = [m.model_id for m in available if hasattr(m, "model_id")]
+                if valid_ids and model not in valid_ids:
+                    log(  # type: ignore[operator]
+                        f"warning: model '{model}' not in available models "
+                        f"({', '.join(valid_ids[:5])}), skipping --model"
+                    )
+                    return False
+
+    try:
+        await conn.set_session_model(model_id=model, session_id=session_id)
+        return True
+    except RequestError as e:
+        log(f"warning: failed to set model '{model}': {e}")  # type: ignore[operator]
+        return False
+
+
+async def _send_prompt(
+    conn: ClientSideConnection,
+    session_id: str,
+    config: "RunConfig",
+    model_was_set: bool,
+    log: Callable[[str], None],
+) -> Any:
+    """Send prompt with heartbeat. Retry without model if prompt fails after set_model.
+
+    Some adapters (codex-acp) accept set_session_model but then fail on prompt()
+    with Internal error. This retries once without the model override.
+    """
+    is_quiet = config.output_mode == "quiet"
+    heartbeat_task = asyncio.create_task(_heartbeat(is_quiet))
+    try:
+        prompt_coro = conn.prompt([acp.text_block(config.prompt_text)], session_id=session_id)
+        if config.timeout:
+            result = await asyncio.wait_for(prompt_coro, timeout=config.timeout)
+        else:
+            result = await prompt_coro
+        return result
+    except RequestError as e:
+        if not model_was_set:
+            raise
+        # Model was set and prompt failed. Retry without model override
+        log(  # type: ignore[operator]
+            f"warning: prompt failed after --model ('{e}'), retrying without model override"
+        )
+        prompt_coro = conn.prompt([acp.text_block(config.prompt_text)], session_id=session_id)
+        if config.timeout:
+            return await asyncio.wait_for(prompt_coro, timeout=config.timeout)
+        return await prompt_coro
+    finally:
+        heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
+
+
 async def run(config: RunConfig) -> int:
     """Execute a prompt against an ACP agent. Returns exit code.
 
@@ -234,9 +309,10 @@ async def run(config: RunConfig) -> int:
                 )
                 session_id = None
 
+            new_session_resp = None
             if session_id is None:
-                new_session = await conn.new_session(cwd=cwd)
-                session_id = new_session.session_id
+                new_session_resp = await conn.new_session(cwd=cwd)
+                session_id = new_session_resp.session_id
 
             # Emit session info
             stderr_session(session_id)
@@ -256,14 +332,11 @@ async def run(config: RunConfig) -> int:
             _setup_signals(conn, session_id, process.pid)
 
             # 7. Set model/mode if requested
+            model_was_set = False
             if config.model:
-                try:
-                    await conn.set_session_model(
-                        model_id=config.model,
-                        session_id=session_id,
-                    )
-                except RequestError as e:
-                    stderr(f"warning: failed to set model '{config.model}': {e}")
+                model_was_set = await _try_set_model(
+                    conn, session_id, config.model, new_session_resp, stderr
+                )
 
             if config.mode:
                 try:
@@ -274,29 +347,8 @@ async def run(config: RunConfig) -> int:
                 except RequestError as e:
                     stderr(f"warning: failed to set mode '{config.mode}': {e}")
 
-            # 8. Send prompt (with heartbeat)
-            is_quiet = config.output_mode == "quiet"
-            heartbeat_task = asyncio.create_task(_heartbeat(is_quiet))
-            try:
-                if config.timeout:
-                    result = await asyncio.wait_for(
-                        conn.prompt(
-                            [acp.text_block(config.prompt_text)],
-                            session_id=session_id,
-                        ),
-                        timeout=config.timeout,
-                    )
-                else:
-                    result = await conn.prompt(
-                        [acp.text_block(config.prompt_text)],
-                        session_id=session_id,
-                    )
-            finally:
-                heartbeat_task.cancel()
-                try:
-                    await heartbeat_task
-                except asyncio.CancelledError:
-                    pass
+            # 8. Send prompt (with heartbeat, retry on model error)
+            result = await _send_prompt(conn, session_id, config, model_was_set, stderr)
 
             # 9. Finalize output
             exit_code = _STOP_REASON_EXIT.get(result.stop_reason, EXIT_AGENT_ERROR)
