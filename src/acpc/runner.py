@@ -165,14 +165,8 @@ async def run(config: RunConfig) -> int:
         stderr_session,
     )  # type: ignore[import-not-found]
 
-    # 1. Load agent
+    # 1. Load agent (raises AgentNotFoundError if not found, caught by cli.py)
     agent = load_agent(config.agent_identity)
-    if agent is None:
-        stderr_error(
-            f"agent '{config.agent_identity}' not found. "
-            f"Run 'acpc agents' to list available agents."
-        )
-        return EXIT_USAGE_ERROR
 
     # 2. Create output handler and client
     output = OutputHandler(
