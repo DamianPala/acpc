@@ -153,7 +153,7 @@ async def _try_set_model(
 
     Returns True if set_session_model was called (even if adapter accepted silently).
     """
-    # Pre-validate: check if new_session response lists available models (ACP unstable field)
+    # Warn if model not in available_models, but still try (list may be incomplete)
     if new_session_response is not None and hasattr(new_session_response, "models"):
         models_state = new_session_response.models
         if models_state is not None and hasattr(models_state, "available_models"):
@@ -162,10 +162,9 @@ async def _try_set_model(
                 valid_ids = [m.model_id for m in available if hasattr(m, "model_id")]
                 if valid_ids and model not in valid_ids:
                     log(  # type: ignore[operator]
-                        f"warning: model '{model}' not in available models "
-                        f"({', '.join(valid_ids[:5])}), skipping --model"
+                        f"note: model '{model}' not in advertised models "
+                        f"({', '.join(valid_ids[:5])}), trying anyway"
                     )
-                    return False
 
     try:
         await conn.set_session_model(model_id=model, session_id=session_id)
