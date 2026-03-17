@@ -1,7 +1,5 @@
 """CLI entry point for acpc."""
 
-import os
-import signal
 import subprocess
 import sys
 
@@ -88,7 +86,7 @@ def cli() -> None:
 @click.argument("prompt_text", required=False)
 @click.option("--last", is_flag=True, help="Resume last session")
 @click.option("-s", "--session", "session_id", help="Resume session by ID")
-@click.option("--model", help="Set model (ACP: session/set_model)")
+@click.option("--model", help="Model ID or preset (fast/standard/max)")
 @click.option("--mode", help="Set mode (ACP: session/set_mode)")
 @click.option(
     "--permissions",
@@ -161,10 +159,17 @@ def prompt(
         if permissions is None:
             permissions = "prompt" if is_tty else "read"
 
+        # Resolve model presets (fast/standard/max → vendor-specific model ID)
+        resolved_model = model
+        if model:
+            from acpc.presets import resolve_model
+
+            resolved_model = resolve_model(agent, model)
+
         config = RunConfig(
             agent_identity=agent,
             prompt_text=final_prompt,
-            model=model,
+            model=resolved_model,
             mode=mode,
             permission_level=permissions,
             cwd=cwd,
@@ -303,7 +308,20 @@ def install(agent: str) -> None:
 def stop(agent: str | None, session_id: str | None) -> None:
     """Stop running agent sessions."""
     from acpc.output import stderr
+    from acpc.runner import kill_process_tree
     from acpc.sessions import get_running_by_agent, list_running, remove_running
+
+    def _stop_session(rs, sid: str) -> None:  # noqa: ANN001
+        """Stop a single session by killing its process tree."""
+        try:
+            kill_process_tree(rs.pid)
+            stderr(f"stopped session {sid} (pid {rs.pid})")
+        except ProcessLookupError:
+            stderr(f"process {rs.pid} already exited")
+        except PermissionError:
+            stderr_error(f"permission denied sending signal to pid {rs.pid}")
+            sys.exit(1)
+        remove_running(sid)
 
     try:
         if session_id:
@@ -311,16 +329,7 @@ def stop(agent: str | None, session_id: str | None) -> None:
             if session_id not in running:
                 stderr_error(f"session {session_id} not found in running sessions")
                 sys.exit(1)
-            rs = running[session_id]
-            try:
-                os.kill(rs.pid, signal.SIGTERM)
-                stderr(f"sent SIGTERM to session {session_id} (pid {rs.pid})")
-            except ProcessLookupError:
-                stderr(f"process {rs.pid} already exited")
-            except PermissionError:
-                stderr_error(f"permission denied sending signal to pid {rs.pid}")
-                sys.exit(1)
-            remove_running(session_id)
+            _stop_session(running[session_id], session_id)
             return
 
         if agent:
@@ -329,14 +338,7 @@ def stop(agent: str | None, session_id: str | None) -> None:
                 stderr_error(f"no running sessions for agent '{agent}'")
                 sys.exit(1)
             for rs in sessions:
-                try:
-                    os.kill(rs.pid, signal.SIGTERM)
-                    stderr(f"sent SIGTERM to session {rs.session_id} (pid {rs.pid})")
-                except ProcessLookupError:
-                    stderr(f"process {rs.pid} already exited")
-                except PermissionError:
-                    stderr_error(f"permission denied sending signal to pid {rs.pid}")
-                remove_running(rs.session_id)
+                _stop_session(rs, rs.session_id)
             return
 
         stderr_error("specify an agent name or --session ID")

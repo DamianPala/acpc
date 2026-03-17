@@ -5,17 +5,22 @@ creates/loads session, runs prompt, handles signals.
 """
 
 import asyncio
+import asyncio.subprocess as aio_subprocess
+import contextlib
 import os
 import shlex
 import signal
+import subprocess as _subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
 import acp
 from acp import RequestError
 from acp.client import ClientSideConnection
+from acp.transports import default_environment
 
 from acpc.sessions import (
     add_running,
@@ -44,6 +49,9 @@ _STOP_REASON_EXIT: dict[str, int] = {
     "cancelled": EXIT_SIGINT,
 }
 
+# Graceful shutdown timeout (seconds)
+_SHUTDOWN_TIMEOUT = 2.0
+
 
 @dataclass
 class RunConfig:
@@ -64,14 +72,103 @@ class RunConfig:
     env: dict[str, str] = field(default_factory=dict)
 
 
-def _get_preexec_fn():  # type: ignore[no-untyped-def]
-    """Return os.setpgrp for Unix, None for Windows.
+# --- Process group management (Zed pattern) ---
 
-    CREATE_NEW_PROCESS_GROUP is handled via subprocess flags on Windows.
+
+def _process_group_kwargs() -> dict[str, Any]:
+    """Platform-specific kwargs to spawn adapter in its own process group.
+
+    Linux/macOS: start_new_session=True (calls setsid, adapter becomes PGID leader).
+    Windows: CREATE_NEW_PROCESS_GROUP flag.
     """
-    if sys.platform != "win32":
-        return os.setpgrp
-    return None
+    if sys.platform == "win32":
+        return {"creationflags": _subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
+
+
+def kill_process_tree(pid: int) -> None:
+    """Kill adapter and all its children (cross-platform).
+
+    Linux/macOS: killpg sends SIGKILL to the entire process group.
+    Windows: taskkill /T recursively kills the process tree.
+    """
+    if sys.platform == "win32":
+        _subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(pid)],
+            capture_output=True,
+        )
+    else:
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+
+@asynccontextmanager
+async def _spawn_agent(
+    client: Any,
+    command: str,
+    *args: str,
+    env: dict[str, str] | None = None,
+    cwd: str | None = None,
+) -> AsyncIterator[tuple[ClientSideConnection, aio_subprocess.Process]]:
+    """Spawn ACP agent in its own process group for reliable cleanup.
+
+    Like acp.spawn_agent_process but with process group isolation
+    (start_new_session on Unix, CREATE_NEW_PROCESS_GROUP on Windows).
+    On exit, kills the entire process tree via killpg/taskkill.
+    """
+    merged_env = dict(default_environment())
+    if env:
+        merged_env.update(env)
+
+    process = await asyncio.create_subprocess_exec(
+        command,
+        *args,
+        stdin=aio_subprocess.PIPE,
+        stdout=aio_subprocess.PIPE,
+        stderr=aio_subprocess.PIPE,
+        env=merged_env,
+        cwd=str(cwd) if cwd is not None else None,
+        **_process_group_kwargs(),
+    )
+
+    if process.stdout is None or process.stdin is None:
+        process.kill()
+        await process.wait()
+        raise RuntimeError("failed to create stdio pipes for agent process")
+
+    conn = ClientSideConnection(client, process.stdin, process.stdout)
+    pid = process.pid
+
+    try:
+        yield conn, process
+    finally:
+        # 1. Close ACP connection (protocol-level shutdown)
+        with contextlib.suppress(Exception):
+            await conn.close()
+
+        # 2. Graceful: close stdin to signal adapter
+        if process.stdin is not None:
+            try:
+                process.stdin.write_eof()
+            except (AttributeError, OSError, RuntimeError):
+                with contextlib.suppress(Exception):
+                    process.stdin.close()
+            with contextlib.suppress(Exception):
+                await process.stdin.drain()
+            with contextlib.suppress(Exception):
+                process.stdin.close()
+
+        # 3. Wait briefly for graceful exit
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(process.wait(), timeout=_SHUTDOWN_TIMEOUT)
+
+        # 4. Kill entire process tree (adapter + all children)
+        if process.returncode is None and pid is not None:
+            kill_process_tree(pid)
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(process.wait(), timeout=_SHUTDOWN_TIMEOUT)
 
 
 def _setup_signals(
@@ -81,31 +178,20 @@ def _setup_signals(
 ) -> None:
     """Set up SIGINT/SIGTERM handlers.
 
-    On signal: cancel session, wait 5s, SIGTERM process group, wait 2s, SIGKILL.
+    On signal: cancel ACP session, wait for graceful shutdown, kill process tree.
     """
     loop = asyncio.get_running_loop()
 
     async def _shutdown(sig_num: int) -> None:
-        try:
+        # 1. Cancel session via ACP protocol
+        with contextlib.suppress(RequestError, OSError):
             await conn.cancel(session_id=session_id)
-        except (RequestError, OSError):
-            pass
 
-        # Give agent 5s to shut down gracefully
-        await asyncio.sleep(5)
+        # 2. Give agent time to shut down gracefully
+        await asyncio.sleep(_SHUTDOWN_TIMEOUT)
 
-        pgid = _get_pgid(pid)
-        if pgid is not None:
-            try:
-                os.killpg(pgid, signal.SIGTERM)
-            except (ProcessLookupError, PermissionError):
-                return
-
-            await asyncio.sleep(2)
-            try:
-                os.killpg(pgid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
+        # 3. Kill entire process tree
+        kill_process_tree(pid)
 
     def _handler(sig_num: int) -> None:
         loop.create_task(_shutdown(sig_num))
@@ -113,16 +199,6 @@ def _setup_signals(
     if sys.platform != "win32":
         loop.add_signal_handler(signal.SIGINT, _handler, signal.SIGINT)
         loop.add_signal_handler(signal.SIGTERM, _handler, signal.SIGTERM)
-
-
-def _get_pgid(pid: int) -> int | None:
-    """Get process group ID, or None if process is gone."""
-    if sys.platform == "win32":
-        return None
-    try:
-        return os.getpgid(pid)
-    except (ProcessLookupError, PermissionError):
-        return None
 
 
 async def _heartbeat(quiet: bool) -> None:
@@ -208,10 +284,8 @@ async def _send_prompt(
         return await prompt_coro
     finally:
         heartbeat_task.cancel()
-        try:
+        with contextlib.suppress(asyncio.CancelledError):
             await heartbeat_task
-        except asyncio.CancelledError:
-            pass
 
 
 async def run(config: RunConfig) -> int:
@@ -220,7 +294,7 @@ async def run(config: RunConfig) -> int:
     Steps:
     1. Load agent from registry
     2. Create OutputHandler + AcpcClient
-    3. Spawn agent process via ACP SDK
+    3. Spawn agent process in its own process group
     4. Initialize connection
     5. Create or load session
     6. Set model/mode if requested
@@ -257,9 +331,9 @@ async def run(config: RunConfig) -> int:
 
     cwd = config.cwd or os.getcwd()
 
-    # 4. Spawn and run
+    # 4. Spawn in own process group and run
     try:
-        async with acp.spawn_agent_process(
+        async with _spawn_agent(
             client,
             command,
             *args,
