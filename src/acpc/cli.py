@@ -262,6 +262,8 @@ def sessions(agent: str) -> None:
 @click.argument("agent")
 def install(agent: str) -> None:
     """Install an ACP agent adapter."""
+    import shlex
+
     from acpc.agents import AgentNotFoundError, load_agent
     from acpc.output import stderr
 
@@ -274,8 +276,7 @@ def install(agent: str) -> None:
 
         stderr(f"installing {agent_def.identity} via: {agent_def.install_command}")
         result = subprocess.run(
-            agent_def.install_command,
-            shell=True,
+            shlex.split(agent_def.install_command),
             check=False,
         )
         if result.returncode != 0:

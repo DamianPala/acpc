@@ -229,9 +229,8 @@ async def run(config: RunConfig) -> int:
     8. Handle result
     9. Save state and return exit code
     """
-    # Import at runtime (these sibling modules don't exist in this worktree yet)
-    from acpc.agents import load_agent  # type: ignore[import-not-found]
-    from acpc.client import AcpcClient, PermissionLevel  # type: ignore[import-not-found]
+    from acpc.agents import load_agent
+    from acpc.client import AcpcClient, PermissionLevel
     from acpc.output import (
         OutputHandler,
         OutputMode,
@@ -239,7 +238,7 @@ async def run(config: RunConfig) -> int:
         stderr_error,
         stderr_resume,
         stderr_session,
-    )  # type: ignore[import-not-found]
+    )
 
     # 1. Load agent (raises AgentNotFoundError if not found, caught by cli.py)
     agent = load_agent(config.agent_identity)
@@ -268,7 +267,9 @@ async def run(config: RunConfig) -> int:
             cwd=cwd,
             env=config.env or None,
         ) as (conn, process):
-            assert process.pid is not None
+            if process.pid is None:
+                stderr_error("agent process failed to start")
+                return EXIT_AGENT_ERROR
 
             # 5. Initialize
             init_response = await conn.initialize(

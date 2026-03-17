@@ -56,15 +56,12 @@ def _atomic_write(path: Path, data: dict[str, Any]) -> None:
 
 def _load_sessions() -> dict[str, dict[str, object]]:
     """Load sessions map from disk. Returns empty dict if file missing or corrupt."""
-    path = _sessions_file()
-    if not path.exists():
-        return {}
     try:
-        with open(path) as f:
+        with open(_sessions_file()) as f:
             data = json.load(f)
         if isinstance(data, dict):
             return data  # type: ignore[return-value]
-    except (json.JSONDecodeError, OSError):
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
         pass
     return {}
 
