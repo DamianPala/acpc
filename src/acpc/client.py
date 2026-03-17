@@ -166,11 +166,12 @@ class AcpcClient:
         category = _classify_kind(kind_str)
         decision = _should_allow(self.permission_level, category)
 
+        title = getattr(tool_call, "title", None) or ""
+
         if decision is None:
-            decision = self._prompt_user(tool_call)
+            decision = self._prompt_user(kind_str or "unknown", title)
 
         outcome_label = "allow" if decision else "deny"
-        title = tool_call.title if hasattr(tool_call, "title") and tool_call.title else ""
         stderr_permission(kind_str or "unknown", title, outcome_label)
 
         option_id = _find_option(options, decision)
@@ -186,14 +187,12 @@ class AcpcClient:
             outcome=DeniedOutcome(outcome="cancelled"),
         )
 
-    def _prompt_user(self, tool_call: ToolCallUpdate) -> bool:
+    def _prompt_user(self, kind_str: str, title: str) -> bool:
         """Ask the user on stderr/stdin. Returns False if not a TTY."""
         if not self.is_tty:
             stderr_error("permission prompt requires a TTY (use --permissions all/write/read/none)")
             return False
 
-        title = tool_call.title if hasattr(tool_call, "title") and tool_call.title else ""
-        kind_str = tool_call.kind or "unknown"
         print(
             f"[acpc] approve {kind_str}: {title}? [y/N] ",
             file=sys.stderr,

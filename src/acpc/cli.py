@@ -119,16 +119,11 @@ def prompt(
     """Send a prompt to an ACP agent."""
     import asyncio
 
-    from acpc.agents import AgentNotFoundError, load_agent
+    from acpc.agents import AgentNotFoundError
     from acpc.runner import RunConfig, run
 
     try:
-        # Validate agent exists
-        try:
-            load_agent(agent)
-        except AgentNotFoundError as e:
-            stderr_error(str(e))
-            sys.exit(2)
+        is_tty = sys.stdin.isatty()
 
         # Determine prompt text
         final_prompt: str | None = None
@@ -142,18 +137,13 @@ def prompt(
             except OSError as e:
                 stderr_error(f"cannot read input file: {e}")
                 sys.exit(1)
-        elif prompt_text == "-":
+        elif prompt_text == "-" or (not prompt_text and not is_tty):
             try:
                 final_prompt = sys.stdin.read()
             except KeyboardInterrupt:
                 sys.exit(130)
         elif prompt_text:
             final_prompt = prompt_text
-        elif not sys.stdin.isatty():
-            try:
-                final_prompt = sys.stdin.read()
-            except KeyboardInterrupt:
-                sys.exit(130)
 
         if not final_prompt or not final_prompt.strip():
             stderr_error("no prompt provided (use argument, --input-file, or pipe to stdin)")
@@ -169,7 +159,7 @@ def prompt(
 
         # Determine permissions
         if permissions is None:
-            permissions = "prompt" if sys.stdin.isatty() else "read"
+            permissions = "prompt" if is_tty else "read"
 
         config = RunConfig(
             agent_identity=agent,
@@ -183,12 +173,15 @@ def prompt(
             output_mode=output_mode,
             output_file=output_file,
             timeout=timeout,
-            is_tty=sys.stdin.isatty(),
+            is_tty=is_tty,
         )
 
         exit_code = asyncio.run(run(config))
         sys.exit(exit_code)
 
+    except AgentNotFoundError as e:
+        stderr_error(str(e))
+        sys.exit(2)
     except KeyboardInterrupt:
         sys.exit(130)
     except Exception as e:

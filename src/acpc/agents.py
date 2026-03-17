@@ -75,17 +75,16 @@ def load_agent(identity: str) -> Agent:
     Raises:
         AgentNotFoundError: If no agent with the given identity exists.
     """
+    builtin_agents = _load_builtin_agents()
     user_agents = _load_user_agents()
     if identity in user_agents:
         return user_agents[identity]
-
-    builtin_agents = _load_builtin_agents()
     if identity in builtin_agents:
         return builtin_agents[identity]
 
+    all_ids = sorted({*builtin_agents, *user_agents})
     raise AgentNotFoundError(
-        f"Agent '{identity}' not found in registry. "
-        f"Available: {', '.join(sorted({*_load_builtin_agents(), *_load_user_agents()}))}"
+        f"Agent '{identity}' not found in registry. Available: {', '.join(all_ids)}"
     )
 
 

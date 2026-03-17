@@ -132,10 +132,11 @@ async def _heartbeat(quiet: bool) -> None:
     """
     if quiet:
         return
-    start = asyncio.get_event_loop().time()
+    loop = asyncio.get_running_loop()
+    start = loop.time()
     while True:
         await asyncio.sleep(60)
-        elapsed = asyncio.get_event_loop().time() - start
+        elapsed = loop.time() - start
         minutes = int(elapsed) // 60
         seconds = int(elapsed) % 60
         print(f"[acpc] still running... ({minutes}m {seconds}s)", file=sys.stderr, flush=True)
