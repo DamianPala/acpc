@@ -154,17 +154,13 @@ def load_last_session(agent: str) -> str | None:
     last = _last_dir()
     ppid = os.getppid()
 
-    ppid_file = last / f"{agent}.{ppid}"
-    if ppid_file.exists():
-        text = ppid_file.read_text().strip()
-        if text:
-            return text
-
-    default_file = last / f"{agent}.default"
-    if default_file.exists():
-        text = default_file.read_text().strip()
-        if text:
-            return text
+    for name in (f"{agent}.{ppid}", f"{agent}.default"):
+        try:
+            text = (last / name).read_text().strip()
+            if text:
+                return text
+        except (FileNotFoundError, OSError):
+            continue
 
     return None
 

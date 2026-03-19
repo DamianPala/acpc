@@ -49,6 +49,18 @@ def _load_config() -> dict[str, dict[str, str]]:
         return {}
 
 
+def get_presets(agent: str, config: dict[str, dict[str, str]] | None = None) -> dict[str, str]:
+    """Get preset mappings for agent (config.toml + builtin fallback).
+
+    Pass config to avoid repeated file reads in loops.
+    """
+    if config is None:
+        config = _load_config()
+    builtin = _BUILTIN_PRESETS.get(agent, {})
+    merged = {**builtin, **config.get(agent, {})}
+    return {k: v for k, v in merged.items() if k in PRESET_NAMES}
+
+
 def resolve_model(agent: str, model: str) -> str:
     """Resolve a model string, checking presets first.
 
@@ -58,15 +70,4 @@ def resolve_model(agent: str, model: str) -> str:
     """
     if model not in PRESET_NAMES:
         return model
-
-    # Try global config first, then built-in defaults
-    config = _load_config()
-    agent_presets = config.get(agent, _BUILTIN_PRESETS.get(agent, {}))
-    resolved = agent_presets.get(model)
-
-    if resolved:
-        return resolved
-
-    # Fallback to built-in if config exists but lacks this preset
-    builtin = _BUILTIN_PRESETS.get(agent, {})
-    return builtin.get(model, model)
+    return get_presets(agent).get(model, model)

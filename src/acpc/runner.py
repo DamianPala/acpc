@@ -167,7 +167,7 @@ async def _spawn_agent(
             await asyncio.wait_for(process.wait(), timeout=_SHUTDOWN_TIMEOUT)
 
         # 4. Kill entire process tree (adapter + all children)
-        if process.returncode is None and pid is not None:
+        if process.returncode is None:
             kill_process_tree(pid)
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(process.wait(), timeout=_SHUTDOWN_TIMEOUT)

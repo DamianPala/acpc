@@ -21,6 +21,17 @@ class RawEpilogGroup(click.Group):
                 formatter.write(f"{line}\n")
 
 
+def _require_agent(identity: str) -> "Agent":  # noqa: F821
+    """Load agent or exit with error. Shared by all commands that need an agent."""
+    from acpc.agents import AgentNotFoundError, load_agent
+
+    try:
+        return load_agent(identity)
+    except AgentNotFoundError as e:
+        stderr_error(str(e))
+        sys.exit(2)
+
+
 CHEAT_SHEET = """\
 
 # acpc cheat sheet
@@ -259,14 +270,7 @@ def agents() -> None:
 def sessions(agent: str) -> None:
     """List sessions for an agent (via ACP)."""
     try:
-        from acpc.agents import AgentNotFoundError, load_agent
-
-        try:
-            load_agent(agent)
-        except AgentNotFoundError as e:
-            stderr_error(str(e))
-            sys.exit(2)
-
+        _require_agent(agent)
         stderr_error("sessions listing requires ACP connection (not yet implemented)")
         sys.exit(1)
     except SystemExit:
@@ -289,16 +293,10 @@ def install(agent: str) -> None:
     """Install an ACP agent adapter."""
     import shlex
 
-    from acpc.agents import AgentNotFoundError, load_agent
     from acpc.output import stderr
 
     try:
-        try:
-            agent_def = load_agent(agent)
-        except AgentNotFoundError as e:
-            stderr_error(str(e))
-            sys.exit(2)
-
+        agent_def = _require_agent(agent)
         stderr(f"installing {agent_def.identity} via: {agent_def.install_command}")
         result = subprocess.run(
             shlex.split(agent_def.install_command),
@@ -417,8 +415,9 @@ def models(agent: str | None) -> None:
     """
     import asyncio
 
-    from acpc.agents import list_agents, load_agent
-    from acpc.models_cache import get_presets, is_cache_fresh, load_cached_models
+    from acpc.agents import list_agents
+    from acpc.models_cache import is_cache_fresh, load_cached_models
+    from acpc.presets import get_presets
     from acpc.output import stderr
 
     def _show_agent_models(agent_id: str) -> None:
@@ -446,12 +445,7 @@ def models(agent: str | None) -> None:
 
     try:
         if agent:
-            # Verify agent exists
-            try:
-                load_agent(agent)
-            except Exception as e:
-                stderr_error(str(e))
-                sys.exit(2)
+            _require_agent(agent)
 
             # If cache is stale or missing, fetch live
             if not is_cache_fresh(agent):
@@ -496,14 +490,7 @@ def models_refresh(agent: str) -> None:
     from acpc.output import stderr
 
     try:
-        from acpc.agents import load_agent
-
-        try:
-            load_agent(agent)
-        except Exception as e:
-            stderr_error(str(e))
-            sys.exit(2)
-
+        _require_agent(agent)
         stderr(f"fetching models for {agent}...")
         exit_code = asyncio.run(_fetch_models_live(agent))
         if exit_code != 0:

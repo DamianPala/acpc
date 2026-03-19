@@ -12,7 +12,7 @@ from typing import Any
 
 from platformdirs import user_state_dir
 
-from acpc.presets import PRESET_NAMES, _BUILTIN_PRESETS, _load_config
+from acpc.presets import _BUILTIN_PRESETS, _load_config, get_presets
 
 _CACHE_DIR = Path(user_state_dir("acpc")) / "models"
 _TTL_SECONDS = 7 * 24 * 3600  # 7 days
@@ -60,17 +60,6 @@ def is_cache_fresh(agent: str) -> bool:
     return (time.time() - updated) < _TTL_SECONDS
 
 
-def get_presets(agent: str) -> dict[str, str]:
-    """Get preset mappings for agent (config.toml + builtin fallback)."""
-    config = _load_config()
-    presets = config.get(agent, {})
-    builtin = _BUILTIN_PRESETS.get(agent, {})
-    # Merge: config overrides builtin
-    merged = {**builtin, **presets}
-    # Only return known preset names
-    return {k: v for k, v in merged.items() if k in PRESET_NAMES}
-
-
 def reverse_model_to_agent() -> dict[str, tuple[str, str]]:
     """Build reverse mapping: model_name → (agent, model_or_preset).
 
@@ -80,25 +69,22 @@ def reverse_model_to_agent() -> dict[str, tuple[str, str]]:
     2. Cached available_models: e.g. "gpt-5.4/high" → ("codex", "gpt-5.4/high")
     """
     result: dict[str, tuple[str, str]] = {}
-    config = _load_config()
 
     # 1. Cached models (lower priority, added first so presets override)
-    for cache_file in _CACHE_DIR.glob("*.json"):
-        agent = cache_file.stem
-        cached = load_cached_models(agent)
-        if cached:
-            for m in cached.get("available_models", []):
-                model_id = m.get("model_id", "")
-                if model_id:
-                    lower = model_id.lower()
-                    if lower not in result:
-                        result[lower] = (agent, model_id)
+    if _CACHE_DIR.is_dir():
+        for cache_file in _CACHE_DIR.glob("*.json"):
+            agent = cache_file.stem
+            cached = load_cached_models(agent)
+            if cached:
+                for m in cached.get("available_models", []):
+                    model_id = m.get("model_id", "")
+                    if model_id:
+                        result.setdefault(model_id.lower(), (agent, model_id))
 
     # 2. Presets (higher priority, override cached entries)
+    config = _load_config()
     for agent in {*_BUILTIN_PRESETS, *config}:
-        presets = get_presets(agent)
-        for preset_name, model_id in presets.items():
-            lower = model_id.lower()
-            result[lower] = (agent, preset_name)
+        for preset_name, model_id in get_presets(agent, config).items():
+            result[model_id.lower()] = (agent, preset_name)
 
     return result
