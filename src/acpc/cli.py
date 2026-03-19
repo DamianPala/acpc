@@ -1,5 +1,6 @@
 """CLI entry point for acpc."""
 
+import os
 import subprocess
 import sys
 
@@ -99,6 +100,7 @@ def cli() -> None:
 @click.option("-o", "--output", "output_file", type=click.Path(), help="Write output to file")
 @click.option("--input-file", type=click.Path(exists=True), help="Read prompt from file")
 @click.option("--timeout", type=int, help="Timeout in seconds")
+@click.option("--dry-run", is_flag=True, help="Resolve config and exit without running")
 def prompt(
     agent: str,
     prompt_text: str | None,
@@ -113,6 +115,7 @@ def prompt(
     output_file: str | None,
     input_file: str | None,
     timeout: int | None,
+    dry_run: bool,
 ) -> None:
     """Send a prompt to an ACP agent."""
     import asyncio
@@ -161,15 +164,32 @@ def prompt(
 
         # Resolve model presets (fast/standard/max → vendor-specific model ID)
         resolved_model = model
+        model_preset = None
         if model:
-            from acpc.presets import resolve_model
+            from acpc.presets import PRESET_NAMES, resolve_model
 
             resolved_model = resolve_model(agent, model)
+            if model in PRESET_NAMES and resolved_model != model:
+                model_preset = model
+
+        if dry_run:
+            click.echo(f"agent: {agent}")
+            if resolved_model:
+                model_info = resolved_model
+                if model_preset:
+                    model_info += f" (preset: {model_preset})"
+                click.echo(f"model: {model_info}")
+            if mode:
+                click.echo(f"mode: {mode}")
+            click.echo(f"permissions: {permissions}")
+            click.echo(f"cwd: {cwd or os.getcwd()}")
+            sys.exit(0)
 
         config = RunConfig(
             agent_identity=agent,
             prompt_text=final_prompt,
             model=resolved_model,
+            model_preset=model_preset,
             mode=mode,
             permission_level=permissions,
             cwd=cwd,
@@ -380,6 +400,170 @@ def status() -> None:
     except Exception as e:
         stderr_error(f"unexpected error: {e}")
         sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# models
+# ---------------------------------------------------------------------------
+
+
+@cli.command()
+@click.argument("agent", required=False)
+def models(agent: str | None) -> None:
+    """Show available models and presets for agents.
+
+    Reads from cache (refreshed on every acpc prompt call).
+    If cache is stale or missing, fetches live from the adapter.
+    """
+    import asyncio
+
+    from acpc.agents import list_agents, load_agent
+    from acpc.models_cache import get_presets, is_cache_fresh, load_cached_models
+    from acpc.output import stderr
+
+    def _show_agent_models(agent_id: str) -> None:
+        presets = get_presets(agent_id)
+        cached = load_cached_models(agent_id)
+
+        click.echo(f"{agent_id}:")
+
+        if presets:
+            tier_order = ["fast", "standard", "max"]
+            ordered = [(k, presets[k]) for k in tier_order if k in presets]
+            click.echo("  presets:")
+            for tier, model_id in ordered:
+                click.echo(f"    {tier:<12} {model_id}")
+        else:
+            click.echo("  presets: (none)")
+
+        if cached:
+            models_list = cached.get("available_models", [])
+            click.echo("  models:")
+            for m in models_list:
+                click.echo(f"    {m.get('model_id', '?')}")
+        else:
+            click.echo("  models: (not installed)")
+
+    try:
+        if agent:
+            # Verify agent exists
+            try:
+                load_agent(agent)
+            except Exception as e:
+                stderr_error(str(e))
+                sys.exit(2)
+
+            # If cache is stale or missing, fetch live
+            if not is_cache_fresh(agent):
+                stderr(f"fetching models for {agent}...")
+                exit_code = asyncio.run(_fetch_models_live(agent))
+                if exit_code != 0:
+                    stderr(f"warning: live fetch failed (exit {exit_code}), showing cached data")
+
+            _show_agent_models(agent)
+        else:
+            # Show all agents, fetch stale/missing for installed ones
+            from acpc.agents import is_installed
+
+            all_agents = list_agents()
+            stale = [
+                a for a in all_agents
+                if is_installed(a) and not is_cache_fresh(a.identity)
+            ]
+            if stale:
+                names = ", ".join(a.identity for a in stale)
+                stderr(f"fetching models for {names}...")
+                for a in stale:
+                    asyncio.run(_fetch_models_live(a.identity))
+
+            for a in all_agents:
+                _show_agent_models(a.identity)
+                click.echo()
+
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as e:
+        stderr_error(f"unexpected error: {e}")
+        sys.exit(1)
+
+
+@cli.command(name="models-refresh", hidden=True)
+@click.argument("agent")
+def models_refresh(agent: str) -> None:
+    """Force refresh model cache for an agent (hidden command)."""
+    import asyncio
+
+    from acpc.output import stderr
+
+    try:
+        from acpc.agents import load_agent
+
+        try:
+            load_agent(agent)
+        except Exception as e:
+            stderr_error(str(e))
+            sys.exit(2)
+
+        stderr(f"fetching models for {agent}...")
+        exit_code = asyncio.run(_fetch_models_live(agent))
+        if exit_code != 0:
+            stderr_error(f"live fetch failed (exit {exit_code})")
+            sys.exit(1)
+        stderr("done")
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as e:
+        stderr_error(f"unexpected error: {e}")
+        sys.exit(1)
+
+
+async def _fetch_models_live(agent_identity: str) -> int:
+    """Spawn adapter, initialize, new_session, cache models, exit.
+
+    Returns 0 on success, non-zero on failure.
+    """
+    import os
+    import shlex
+
+    import acp
+    from acp import RequestError
+
+    from acpc.agents import load_agent
+    from acpc.runner import _cache_available_models, _spawn_agent
+
+    agent = load_agent(agent_identity)
+    parts = shlex.split(agent.run_command)
+    command, args = parts[0], parts[1:]
+
+    class _NoopClient:
+        """Minimal client that ignores all callbacks."""
+
+        async def session_update(self, **kwargs):  # type: ignore[no-untyped-def] # noqa: ANN003, ARG002
+            pass
+
+        async def request_permission(self, **kwargs):  # type: ignore[no-untyped-def] # noqa: ANN003, ARG002
+            return {"allowed": False}
+
+        async def log(self, **kwargs):  # type: ignore[no-untyped-def] # noqa: ANN003, ARG002
+            pass
+
+    cwd = os.getcwd()
+
+    import logging
+
+    # Suppress SDK "Receive loop failed" noise during fast shutdown
+    logging.getLogger().setLevel(logging.CRITICAL)
+
+    try:
+        async with _spawn_agent(_NoopClient(), command, *args, cwd=cwd) as (conn, _process):
+            await conn.initialize(protocol_version=acp.PROTOCOL_VERSION)
+            resp = await conn.new_session(cwd=cwd)
+            _cache_available_models(agent_identity, resp)
+            return 0
+    except (RequestError, OSError, RuntimeError):
+        return 1
 
 
 # ---------------------------------------------------------------------------
