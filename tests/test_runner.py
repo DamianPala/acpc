@@ -1,6 +1,6 @@
 """Tests for acpc.runner module."""
 
-import os
+import subprocess
 import sys
 from unittest.mock import patch
 
@@ -13,7 +13,7 @@ from acpc.runner import (
     EXIT_TIMEOUT,
     EXIT_USAGE_ERROR,
     RunConfig,
-    _get_preexec_fn,
+    _process_group_kwargs,
 )
 
 
@@ -77,18 +77,21 @@ class TestExitCodes:
         assert EXIT_SIGTERM == 143
 
 
-class TestGetPreexecFn:
-    def test_returns_setpgrp_on_unix(self) -> None:
+class TestProcessGroupKwargs:
+    def test_unix_uses_start_new_session(self) -> None:
         with patch.object(sys, "platform", "linux"):
-            fn = _get_preexec_fn()
-            assert fn is os.setpgrp
+            kwargs = _process_group_kwargs()
+            assert kwargs == {"start_new_session": True}
 
-    def test_returns_none_on_windows(self) -> None:
-        with patch.object(sys, "platform", "win32"):
-            fn = _get_preexec_fn()
-            assert fn is None
+    def test_windows_uses_create_new_process_group(self) -> None:
+        with (
+            patch.object(sys, "platform", "win32"),
+            patch.object(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200, create=True),
+        ):
+            kwargs = _process_group_kwargs()
+            assert kwargs == {"creationflags": 0x00000200}
 
-    def test_returns_setpgrp_on_darwin(self) -> None:
+    def test_darwin_uses_start_new_session(self) -> None:
         with patch.object(sys, "platform", "darwin"):
-            fn = _get_preexec_fn()
-            assert fn is os.setpgrp
+            kwargs = _process_group_kwargs()
+            assert kwargs == {"start_new_session": True}

@@ -9,6 +9,7 @@ Behavior controlled by prompt text:
 - "slow:N": waits N seconds before responding (for timeout tests)
 - "error": returns stop_reason=refusal
 - "multi:TEXT": echoes text, supports load_session for multi-turn
+- "large:N": returns N kilobytes of text (for buffer tests)
 """
 
 import asyncio
@@ -147,6 +148,12 @@ class MockAgent(Agent):
             done = update_tool_call(tool_call_id=tool_id, status="completed")
             await self._conn.session_update(session_id=session_id, update=done)
             await self._send_text(session_id, f"edit {title} done")
+            return PromptResponse(stop_reason="end_turn")
+
+        if prompt_text.startswith("large:"):
+            kb = int(prompt_text.split(":")[1])
+            payload = "X" * (kb * 1024)
+            await self._send_text(session_id, payload)
             return PromptResponse(stop_reason="end_turn")
 
         if prompt_text.startswith("multi:"):
