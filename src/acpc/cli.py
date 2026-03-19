@@ -83,7 +83,7 @@ acpc install codex                            # install adapter
 
 
 @click.group(cls=RawEpilogGroup, epilog=CHEAT_SHEET)
-@click.version_option(__version__, prog_name="acpc")
+@click.version_option(__version__, "-V", "--version", prog_name="acpc")
 def cli() -> None:
     """acpc - Thin CLI client for the Agent Client Protocol (ACP)."""
 
