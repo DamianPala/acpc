@@ -27,8 +27,8 @@ Requires Python 3.12+.
 # Send a prompt to Codex
 acpc prompt codex "fix the tests"
 
-# Use a specific model
-acpc prompt claude "analyze this repo" --model sonnet
+# Use a model preset
+acpc prompt claude "analyze this repo" --model fast
 
 # Pipe a prompt from stdin
 echo "explain the architecture" | acpc prompt codex -
@@ -43,6 +43,7 @@ acpc prompt codex --input-file task.md -o result.md
 |---------|-------------|
 | `prompt <agent> [text]` | Send a prompt to an ACP agent |
 | `run <agent> [text]` | Alias for `prompt` |
+| `models [agent]` | Show available models and presets |
 | `agents` | List registered agents and install status |
 | `sessions <agent>` | List agent sessions (via ACP) |
 | `install <agent>` | Run the agent's install command |
@@ -59,7 +60,7 @@ All options for the `prompt` command:
 |------|-------------|-------------|
 | `--last` | Resume the last session | `session/load` |
 | `-s, --session ID` | Resume session by ID | `session/load` |
-| `--model MODEL` | Set model for the session | `session/set_model` |
+| `--model MODEL` | Model ID or preset (fast/standard/max) | `session/set_model` |
 | `--mode MODE` | Set mode for the session | `session/set_mode` |
 | `--permissions LEVEL` | Permission policy (see below) | `request_permission` |
 | `--cwd DIR` | Working directory for the agent | `session/new` (cwd) |
@@ -68,6 +69,51 @@ All options for the `prompt` command:
 | `-o, --output FILE` | Write output to file | local |
 | `--input-file FILE` | Read prompt from file | local |
 | `--timeout SECS` | Timeout in seconds | local |
+| `--dry-run` | Resolve config and exit without running | local |
+
+## Model presets
+
+Instead of memorizing vendor-specific model IDs, use three tier presets:
+
+```bash
+acpc prompt claude --model fast       # cheapest/fastest model
+acpc prompt claude --model standard   # balanced (default tier)
+acpc prompt codex --model max         # most capable model
+```
+
+Run `acpc models` to see what each preset resolves to for each agent.
+
+Presets are configured in `~/.agents/config.toml` (built-in defaults
+are used when the file doesn't exist):
+
+```toml
+[models.claude]
+fast = "haiku"
+standard = "sonnet"
+max = "opus"
+
+[models.codex]
+fast = "..."
+standard = "..."
+max = "..."
+```
+
+Use `--dry-run` to verify what model will be used without running:
+
+```bash
+acpc prompt codex --model standard "task" --dry-run
+```
+
+### Discovering models
+
+```bash
+acpc models           # show presets and available models for all agents
+acpc models claude    # show for a specific agent
+```
+
+Available models are cached from ACP responses (TTL: 7 days). The cache
+refreshes automatically on every `acpc prompt` call at zero extra cost.
+If the cache is stale, `acpc models <agent>` fetches live from the adapter.
 
 ## Permissions
 
@@ -137,22 +183,17 @@ Last-session tracking is scoped per PPID to avoid race conditions in concurrent 
 
 ## Agent registry
 
-Agents are defined in TOML files. Three agents ship built-in:
-
-| Identity | Name | Author | run_command |
-|----------|------|--------|-------------|
-| `codex` | Codex CLI | OpenAI | `npx @zed-industries/codex-acp` |
-| `claude` | Claude Code | Anthropic | `npx @zed-industries/claude-agent-acp` |
-| `gemini` | Gemini CLI | Google | `gemini --experimental-acp` |
+Agents are defined in TOML files. Three agents ship built-in (codex, claude,
+gemini). Run `acpc agents` to see the current list and install status.
 
 ### TOML format
 
 ```toml
-identity = "codex"
-name = "Codex CLI"
-author = "OpenAI"
-run_command = "npx @zed-industries/codex-acp"
-install_command = "npm install -g @zed-industries/codex-acp"
+identity = "my-agent"
+name = "My Agent"
+author = "Me"
+run_command = "my-agent-acp"
+install_command = "npm install -g my-agent-acp"
 ```
 
 ### User overrides
