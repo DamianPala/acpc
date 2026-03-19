@@ -60,6 +60,7 @@ class RunConfig:
     agent_identity: str
     prompt_text: str
     model: str | None = None
+    model_preset: str | None = None  # original preset name before resolution (fast/standard/max)
     mode: str | None = None
     permission_level: str = "prompt"
     cwd: str | None = None
@@ -130,6 +131,7 @@ async def _spawn_agent(
         stderr=aio_subprocess.PIPE,
         env=merged_env,
         cwd=str(cwd) if cwd is not None else None,
+        limit=10_485_760,  # 10 MB; asyncio default (64 KB) too small for large NDJSON frames
         **_process_group_kwargs(),
     )
 
@@ -288,6 +290,32 @@ async def _send_prompt(
             await heartbeat_task
 
 
+def _cache_available_models(agent: str, new_session_resp: Any) -> None:
+    """Cache available_models from new_session response (best-effort)."""
+    try:
+        models_state = getattr(new_session_resp, "models", None)
+        if models_state is None:
+            return
+        available = getattr(models_state, "available_models", None)
+        if not available:
+            return
+        model_list = []
+        for m in available:
+            entry: dict[str, Any] = {}
+            if hasattr(m, "model_id"):
+                entry["model_id"] = m.model_id
+            if hasattr(m, "display_name"):
+                entry["display_name"] = m.display_name
+            if entry:
+                model_list.append(entry)
+        if model_list:
+            from acpc.models_cache import save_models
+
+            save_models(agent, model_list)
+    except Exception:
+        pass  # Best-effort, never fail the prompt
+
+
 async def run(config: RunConfig) -> int:
     """Execute a prompt against an ACP agent. Returns exit code.
 
@@ -389,7 +417,17 @@ async def run(config: RunConfig) -> int:
                 new_session_resp = await conn.new_session(cwd=cwd)
                 session_id = new_session_resp.session_id
 
-            # Emit session info
+                # Cache available_models as side effect (zero extra cost)
+                _cache_available_models(config.agent_identity, new_session_resp)
+
+            # Emit run info
+            if config.model:
+                if config.model_preset:
+                    stderr(f"agent: {config.agent_identity}, model: {config.model} (preset: {config.model_preset})")
+                else:
+                    stderr(f"agent: {config.agent_identity}, model: {config.model}")
+            else:
+                stderr(f"agent: {config.agent_identity}")
             stderr_session(session_id)
             stderr_resume(config.agent_identity, session_id)
             output.on_session_started(session_id)
