@@ -67,6 +67,23 @@ def _load_user_agents() -> dict[str, Agent]:
     return agents
 
 
+def _model_name_hint(identity: str, available_agents: list[str]) -> str | None:
+    """If identity looks like a model name, return a hint with correct syntax.
+
+    Derives the mapping dynamically from presets (config.toml + builtins),
+    so it stays in sync without hardcoded model names.
+    """
+    from acpc.models_cache import reverse_model_to_agent
+
+    mapping = reverse_model_to_agent()
+    lower = identity.lower()
+    if lower in mapping:
+        agent, preset = mapping[lower]
+        if agent in available_agents:
+            return f"Hint: '{identity}' is a model name. Try: acpc prompt {agent} --model {preset}"
+    return None
+
+
 def load_agent(identity: str) -> Agent:
     """Load a single agent by identity.
 
@@ -83,9 +100,14 @@ def load_agent(identity: str) -> Agent:
         return builtin_agents[identity]
 
     all_ids = sorted({*builtin_agents, *user_agents})
-    raise AgentNotFoundError(
-        f"Agent '{identity}' not found in registry. Available: {', '.join(all_ids)}"
-    )
+    msg = f"Agent '{identity}' not found in registry. Available: {', '.join(all_ids)}"
+
+    # Detect model-name-as-agent mistakes and suggest correct command
+    hint = _model_name_hint(identity, all_ids)
+    if hint:
+        msg += f"\n{hint}"
+
+    raise AgentNotFoundError(msg)
 
 
 def list_agents() -> list[Agent]:

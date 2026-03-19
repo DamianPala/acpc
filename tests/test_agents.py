@@ -57,6 +57,33 @@ class TestAgentNotFound:
         with pytest.raises(AgentNotFoundError, match="nonexistent"):
             load_agent("nonexistent")
 
+    def test_no_hint_for_unknown_name(self) -> None:
+        with pytest.raises(AgentNotFoundError, match="nonexistent") as exc_info:
+            load_agent("nonexistent")
+        assert "Hint" not in str(exc_info.value)
+
+    @pytest.mark.parametrize(
+        ("model_name", "expected_agent", "expected_model"),
+        [
+            ("sonnet", "claude", "standard"),
+            ("haiku", "claude", "fast"),
+            ("opus", "claude", "max"),
+        ],
+    )
+    def test_model_name_hint(
+        self, model_name: str, expected_agent: str, expected_model: str
+    ) -> None:
+        with pytest.raises(AgentNotFoundError, match="Hint") as exc_info:
+            load_agent(model_name)
+        msg = str(exc_info.value)
+        assert f"acpc prompt {expected_agent} --model {expected_model}" in msg
+
+    def test_no_hint_for_raw_model_id(self) -> None:
+        """Raw model IDs like 'o3' are not in presets, so no hint."""
+        with pytest.raises(AgentNotFoundError) as exc_info:
+            load_agent("o3")
+        assert "Hint" not in str(exc_info.value)
+
 
 class TestUserOverride:
     """Verify user overrides replace built-in agents."""
