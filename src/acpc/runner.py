@@ -119,7 +119,8 @@ async def _spawn_agent(
     (start_new_session on Unix, CREATE_NEW_PROCESS_GROUP on Windows).
     On exit, kills the entire process tree via killpg/taskkill.
     """
-    merged_env = dict(default_environment())
+    merged_env = dict(os.environ)
+    merged_env.update(default_environment())
     if env:
         merged_env.update(env)
 
@@ -390,6 +391,10 @@ async def run(config: RunConfig) -> int:
                 if session_id is None:
                     stderr_error("no previous session found")
                     return EXIT_USAGE_ERROR
+                stderr(
+                    f"warning: --last resolved to session {session_id}. "
+                    "For reliable multi-agent orchestration, use -s SESSION_ID instead."
+                )
 
             if session_id and supports_load:
                 try:
