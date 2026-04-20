@@ -4,15 +4,35 @@ version = "0.1.0"
 description = "Thin Python CLI client for the Agent Client Protocol (ACP)"
 readme = "README.md"
 license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     { name = "Damian Pala", email = "noreply@damianpala.com" },
 ]
 requires-python = ">=3.12"
+keywords = ["acp", "agent-client-protocol", "ai-agents", "claude", "codex", "gemini", "cli", "llm"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development",
+    "Topic :: Utilities",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+]
 dependencies = [
     "agent-client-protocol>=0.8.1",
     "click>=8.1",
     "platformdirs>=4.0",
 ]
+
+[project.urls]
+Repository = "https://github.com/DamianPala/acpc"
+Issues = "https://github.com/DamianPala/acpc/issues"
 
 [project.scripts]
 acpc = "acpc.cli:cli"
@@ -68,6 +88,8 @@ current_version = "0.1.0"
 commit = true
 tag = true
 tag_name = "v{new_version}"
+commit_args = ""
+message = "chore(release): bump version {current_version} → {new_version}"
 
 [[tool.bumpversion.files]]
 filename = "pyproject.toml"
