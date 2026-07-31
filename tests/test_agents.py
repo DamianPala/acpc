@@ -18,23 +18,23 @@ class TestLoadBuiltinAgents:
         assert agent.identity == "codex"
         assert agent.name == "Codex CLI"
         assert agent.author == "OpenAI"
-        assert agent.run_command == "npx @zed-industries/codex-acp"
-        assert agent.install_command == "npm install -g @zed-industries/codex-acp"
+        assert agent.run_command == "npx -y @agentclientprotocol/codex-acp"
+        assert agent.install_command == "npm install -g @agentclientprotocol/codex-acp"
 
     def test_load_claude(self) -> None:
         agent = load_agent("claude")
         assert agent.identity == "claude"
         assert agent.name == "Claude Code"
         assert agent.author == "Anthropic"
-        assert agent.run_command == "npx @zed-industries/claude-agent-acp"
-        assert agent.install_command == "npm install -g @zed-industries/claude-agent-acp"
+        assert agent.run_command == "npx -y @agentclientprotocol/claude-agent-acp"
+        assert agent.install_command == "npm install -g @agentclientprotocol/claude-agent-acp"
 
     def test_load_gemini(self) -> None:
         agent = load_agent("gemini")
         assert agent.identity == "gemini"
         assert agent.name == "Gemini CLI"
         assert agent.author == "Google"
-        assert agent.run_command == "gemini --experimental-acp"
+        assert agent.run_command == "gemini --acp"
         assert agent.install_command == "npm install -g @google/gemini-cli"
 
 

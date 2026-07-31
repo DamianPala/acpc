@@ -31,10 +31,12 @@ ACPC = [_acpc_bin]
 
 pytestmark = pytest.mark.live
 
-# Models used in live tests
+# Models used in live tests. Presets, not raw model ids: the advertised
+# model list changes with adapter releases and account tier, so a hardcoded
+# id silently rots into "Invalid params".
 TEST_MODELS: dict[str, str] = {
-    "codex": "gpt-5.1-codex-mini",
-    "claude": "default",
+    "codex": "fast",
+    "claude": "fast",
 }
 
 # Isolated env: no skills, no user config, just auth.

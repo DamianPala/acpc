@@ -1,5 +1,5 @@
 identity = "gemini"
 name = "Gemini CLI"
 author = "Google"
-run_command = "gemini --experimental-acp"
+run_command = "gemini --acp"
 install_command = "npm install -g @google/gemini-cli"
