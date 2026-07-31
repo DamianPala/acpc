@@ -7,6 +7,8 @@ policy based on tool_call.kind.
 from __future__ import annotations
 
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -113,11 +115,29 @@ class AcpcClient:
         self.permission_level = permission_level
         self.is_tty = is_tty
         self.session_id: str | None = None
+        self.replaying = False
 
     # -- connection callback ------------------------------------------------
 
     def on_connect(self, conn: Agent) -> None:  # noqa: ARG002
         pass
+
+    # -- history replay -----------------------------------------------------
+
+    @contextmanager
+    def replaying_history(self) -> Iterator[None]:
+        """Suppress event output while the agent replays past conversation.
+
+        ACP requires an agent to emit session/update notifications for the
+        entire prior conversation before it responds to session/load. Those
+        events are indistinguishable from live ones, so without this guard
+        every resume reprints the whole transcript ahead of the new answer.
+        """
+        self.replaying = True
+        try:
+            yield
+        finally:
+            self.replaying = False
 
     # -- session_update -----------------------------------------------------
 
@@ -129,6 +149,8 @@ class AcpcClient:
     ) -> None:
         """Dispatch session_update to the output handler."""
         self.session_id = session_id
+        if self.replaying:
+            return
         discriminator: str = getattr(update, "session_update", "")
 
         if discriminator == "agent_message_chunk":

@@ -467,7 +467,8 @@ async def run(config: RunConfig) -> int:
             session_resp = None
             if session_id and supports_load:
                 try:
-                    session_resp = await conn.load_session(cwd=cwd, session_id=session_id)
+                    with client.replaying_history():
+                        session_resp = await conn.load_session(cwd=cwd, session_id=session_id)
                 except RequestError as e:
                     if explicitly_requested:
                         stderr_error(f"failed to load session {session_id}: {e}")

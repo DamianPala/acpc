@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 
 import pytest
 
@@ -107,6 +108,76 @@ class TestSessionUpdate:
         captured = capsys.readouterr()
         assert "tool:" in captured.err
         assert "Read file.py" in captured.err
+
+
+class TestHistoryReplay:
+    """session/load replays the whole transcript; none of it belongs on stdout."""
+
+    def test_replayed_messages_are_suppressed(
+        self,
+        output: OutputHandler,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        client = AcpcClient(output, PermissionLevel.ALL, is_tty=False)
+
+        with client.replaying_history():
+            asyncio.run(client.session_update("sess-1", _make_agent_message_chunk("old turn")))
+
+        captured = capsys.readouterr()
+        assert captured.out == ""
+
+    def test_replayed_tool_calls_are_suppressed(
+        self,
+        output: OutputHandler,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        client = AcpcClient(output, PermissionLevel.ALL, is_tty=False)
+
+        with client.replaying_history():
+            asyncio.run(client.session_update("sess-1", _make_tool_call_start("Read old.py")))
+
+        captured = capsys.readouterr()
+        assert "Read old.py" not in captured.err
+
+    def test_live_output_resumes_after_replay(
+        self,
+        output: OutputHandler,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        client = AcpcClient(output, PermissionLevel.ALL, is_tty=False)
+
+        with client.replaying_history():
+            asyncio.run(client.session_update("sess-1", _make_agent_message_chunk("old turn")))
+        asyncio.run(client.session_update("sess-1", _make_agent_message_chunk("new answer")))
+
+        captured = capsys.readouterr()
+        assert captured.out == "new answer"
+
+    def test_flag_is_cleared_when_load_fails(
+        self,
+        output: OutputHandler,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """A failed session/load must not leave the client permanently muted."""
+        client = AcpcClient(output, PermissionLevel.ALL, is_tty=False)
+
+        with contextlib.suppress(RuntimeError), client.replaying_history():
+            raise RuntimeError("load_session failed")
+
+        assert client.replaying is False
+        asyncio.run(client.session_update("sess-1", _make_agent_message_chunk("live")))
+        assert capsys.readouterr().out == "live"
+
+    def test_session_id_still_recorded_during_replay(
+        self,
+        output: OutputHandler,
+    ) -> None:
+        client = AcpcClient(output, PermissionLevel.ALL, is_tty=False)
+
+        with client.replaying_history():
+            asyncio.run(client.session_update("sess-42", _make_agent_message_chunk("old")))
+
+        assert client.session_id == "sess-42"
 
 
 # ---------------------------------------------------------------------------
