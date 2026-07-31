@@ -92,7 +92,9 @@ def _run_acpc_cheap(
     """Run acpc prompt with the cheapest model for the given agent."""
     model = TEST_MODELS.get(agent)
     model_args = ("--model", model) if model else ()
-    return _run_acpc("prompt", agent, *args, *model_args, input_text=input_text, timeout=timeout, env=env)
+    return _run_acpc(
+        "prompt", agent, *args, *model_args, input_text=input_text, timeout=timeout, env=env
+    )
 
 
 def _extract_session_id(stderr: str) -> str | None:
@@ -415,9 +417,7 @@ class TestProcessCleanup:
         )
         # pgrep exit 1 = no matches (good), exit 0 = matches found (bad)
         orphan_pids = ps.stdout.strip().split("\n") if ps.stdout.strip() else []
-        assert len(orphan_pids) == 0, (
-            f"Orphan {agent} adapter processes found: {orphan_pids}"
-        )
+        assert len(orphan_pids) == 0, f"Orphan {agent} adapter processes found: {orphan_pids}"
 
 
 class TestStatus:

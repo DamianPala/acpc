@@ -221,32 +221,84 @@ async def _heartbeat(quiet: bool) -> None:
         print(f"[acpc] still running... ({minutes}m {seconds}s)", file=sys.stderr, flush=True)
 
 
+def _find_model_config_option(session_response: Any | None) -> Any | None:
+    """Return the unwrapped ACP model config option, if advertised."""
+    if session_response is None:
+        return None
+    for config_option in getattr(session_response, "config_options", None) or []:
+        config_option = getattr(config_option, "root", config_option)
+        if (
+            getattr(config_option, "category", None) == "model"
+            or getattr(config_option, "id", None) == "model"
+        ):
+            return config_option
+    return None
+
+
 async def _try_set_model(
     conn: ClientSideConnection,
     session_id: str,
     model: str,
-    new_session_response: Any | None,
+    session_response: Any | None,
     log: Callable[[str], None],
 ) -> bool:
-    """Try to set the model, pre-validating against available models if possible.
+    """Set the model through the current ACP API, with legacy fallback.
 
-    Returns True if set_session_model was called (even if adapter accepted silently).
+    Returns True if the adapter accepted the model selection call.
     """
-    # Warn if model not in available_models, but still try (list may be incomplete)
-    if new_session_response is not None and hasattr(new_session_response, "models"):
-        models_state = new_session_response.models
+    model_config = _find_model_config_option(session_response)
+    model_id = model
+    reasoning_effort = None
+    base_model, separator, suffix = model.rpartition("/")
+    if separator and suffix in {
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra",
+    }:
+        model_id = base_model
+        reasoning_effort = suffix
+
+    valid_ids: list[str] = []
+    if model_config is not None:
+        valid_ids = [
+            option.value
+            for option in getattr(model_config, "options", None) or []
+            if isinstance(getattr(option, "value", None), str)
+        ]
+    elif session_response is not None and hasattr(session_response, "models"):
+        models_state = session_response.models
         if models_state is not None and hasattr(models_state, "available_models"):
             available = models_state.available_models
             if available:
                 valid_ids = [m.model_id for m in available if hasattr(m, "model_id")]
-                if valid_ids and model not in valid_ids:
-                    log(  # type: ignore[operator]
-                        f"note: model '{model}' not in advertised models "
-                        f"({', '.join(valid_ids[:5])}), trying anyway"
-                    )
+
+    # Lists can be incomplete, so warn but still pass the model through.
+    if valid_ids and model_id not in valid_ids:
+        log(  # type: ignore[operator]
+            f"note: model '{model_id}' not in advertised models "
+            f"({', '.join(valid_ids[:5])}), trying anyway"
+        )
 
     try:
-        await conn.set_session_model(model_id=model, session_id=session_id)
+        if model_config is not None:
+            await conn.set_config_option(
+                config_id=getattr(model_config, "id", "model"),
+                session_id=session_id,
+                value=model_id,
+            )
+            if reasoning_effort is not None:
+                await conn.set_config_option(
+                    config_id="reasoning_effort",
+                    session_id=session_id,
+                    value=reasoning_effort,
+                )
+        else:
+            await conn.set_session_model(model_id=model, session_id=session_id)
         return True
     except RequestError as e:
         log(f"warning: failed to set model '{model}': {e}")  # type: ignore[operator]
@@ -291,30 +343,46 @@ async def _send_prompt(
             await heartbeat_task
 
 
-def _cache_available_models(agent: str, new_session_resp: Any) -> None:
-    """Cache available_models from new_session response (best-effort)."""
+def _cache_available_models(agent: str, new_session_resp: Any) -> bool:
+    """Cache models advertised by either the legacy or current ACP schema."""
     try:
-        models_state = getattr(new_session_resp, "models", None)
-        if models_state is None:
-            return
-        available = getattr(models_state, "available_models", None)
-        if not available:
-            return
-        model_list = []
-        for m in available:
-            entry: dict[str, Any] = {}
-            if hasattr(m, "model_id"):
-                entry["model_id"] = m.model_id
-            if hasattr(m, "display_name"):
-                entry["display_name"] = m.display_name
-            if entry:
-                model_list.append(entry)
-        if model_list:
-            from acpc.models_cache import save_models
+        model_list: list[dict[str, Any]] = []
 
-            save_models(agent, model_list)
+        # ACP originally exposed models through models.available_models.
+        models_state = getattr(new_session_resp, "models", None)
+        available = getattr(models_state, "available_models", None)
+        for model in available or []:
+            model_id = getattr(model, "model_id", None)
+            if not isinstance(model_id, str):
+                continue
+            entry = {"model_id": model_id}
+            display_name = getattr(model, "display_name", None)
+            if isinstance(display_name, str):
+                entry["display_name"] = display_name
+            model_list.append(entry)
+
+        # Current ACP exposes model selection as a session config option.
+        if not model_list:
+            config_option = _find_model_config_option(new_session_resp)
+            for option in getattr(config_option, "options", None) or []:
+                model_id = getattr(option, "value", None)
+                if not isinstance(model_id, str):
+                    continue
+                entry = {"model_id": model_id}
+                display_name = getattr(option, "name", None)
+                if isinstance(display_name, str):
+                    entry["display_name"] = display_name
+                model_list.append(entry)
+
+        if not model_list:
+            return False
+
+        from acpc.models_cache import save_models
+
+        save_models(agent, model_list)
+        return True
     except Exception:
-        pass  # Best-effort, never fail the prompt
+        return False  # Best-effort, never fail the prompt
 
 
 async def run(config: RunConfig) -> int:
@@ -396,9 +464,10 @@ async def run(config: RunConfig) -> int:
                     "For reliable multi-agent orchestration, use -s SESSION_ID instead."
                 )
 
+            session_resp = None
             if session_id and supports_load:
                 try:
-                    await conn.load_session(cwd=cwd, session_id=session_id)
+                    session_resp = await conn.load_session(cwd=cwd, session_id=session_id)
                 except RequestError as e:
                     if explicitly_requested:
                         stderr_error(f"failed to load session {session_id}: {e}")
@@ -417,18 +486,20 @@ async def run(config: RunConfig) -> int:
                 )
                 session_id = None
 
-            new_session_resp = None
             if session_id is None:
-                new_session_resp = await conn.new_session(cwd=cwd)
-                session_id = new_session_resp.session_id
+                session_resp = await conn.new_session(cwd=cwd)
+                session_id = session_resp.session_id
 
-                # Cache available_models as side effect (zero extra cost)
-                _cache_available_models(config.agent_identity, new_session_resp)
+            if session_resp is not None:
+                # Cache advertised models as a side effect (zero extra cost).
+                _cache_available_models(config.agent_identity, session_resp)
 
             # Emit run info
             if config.model:
                 if config.model_preset:
-                    stderr(f"agent: {config.agent_identity}, model: {config.model} (preset: {config.model_preset})")
+                    stderr(
+                        f"agent: {config.agent_identity}, model: {config.model} (preset: {config.model_preset})"
+                    )
                 else:
                     stderr(f"agent: {config.agent_identity}, model: {config.model}")
             else:
@@ -453,7 +524,7 @@ async def run(config: RunConfig) -> int:
             model_was_set = False
             if config.model:
                 model_was_set = await _try_set_model(
-                    conn, session_id, config.model, new_session_resp, stderr
+                    conn, session_id, config.model, session_resp, stderr
                 )
 
             if config.mode:

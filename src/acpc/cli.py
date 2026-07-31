@@ -7,6 +7,7 @@ import sys
 import click
 
 from acpc import __version__
+from acpc.agents import Agent
 from acpc.output import stderr_error
 
 
@@ -21,7 +22,7 @@ class RawEpilogGroup(click.Group):
                 formatter.write(f"{line}\n")
 
 
-def _require_agent(identity: str) -> "Agent":  # noqa: F821
+def _require_agent(identity: str) -> Agent:
     """Load agent or exit with error. Shared by all commands that need an agent."""
     from acpc.agents import AgentNotFoundError, load_agent
 
@@ -460,10 +461,7 @@ def models(agent: str | None) -> None:
             from acpc.agents import is_installed
 
             all_agents = list_agents()
-            stale = [
-                a for a in all_agents
-                if is_installed(a) and not is_cache_fresh(a.identity)
-            ]
+            stale = [a for a in all_agents if is_installed(a) and not is_cache_fresh(a.identity)]
             if stale:
                 names = ", ".join(a.identity for a in stale)
                 stderr(f"fetching models for {names}...")
@@ -547,8 +545,7 @@ async def _fetch_models_live(agent_identity: str) -> int:
         async with _spawn_agent(_NoopClient(), command, *args, cwd=cwd) as (conn, _process):
             await conn.initialize(protocol_version=acp.PROTOCOL_VERSION)
             resp = await conn.new_session(cwd=cwd)
-            _cache_available_models(agent_identity, resp)
-            return 0
+            return 0 if _cache_available_models(agent_identity, resp) else 1
     except (RequestError, OSError, RuntimeError):
         return 1
 

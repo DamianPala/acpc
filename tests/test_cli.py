@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-from unittest.mock import patch
+import asyncio
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from click.testing import CliRunner
 
 from acpc import __version__
-from acpc.cli import cli
+from acpc.cli import _fetch_models_live, cli
 
 
 class TestVersion:
@@ -118,3 +121,25 @@ class TestSessionsErrors:
         runner = CliRunner()
         result = runner.invoke(cli, ["sessions", "codex"])
         assert result.exit_code == 1
+
+
+class TestFetchModelsLive:
+    def test_returns_failure_when_adapter_advertises_no_models(self) -> None:
+        connection = SimpleNamespace(
+            initialize=AsyncMock(),
+            new_session=AsyncMock(return_value=SimpleNamespace()),
+        )
+
+        @asynccontextmanager
+        async def fake_spawn(*args, **kwargs):  # noqa: ANN002, ANN003, ARG001
+            yield connection, None
+
+        agent = SimpleNamespace(run_command="fake-agent")
+        with (
+            patch("acpc.agents.load_agent", return_value=agent),
+            patch("acpc.runner._spawn_agent", new=fake_spawn),
+            patch("acpc.runner._cache_available_models", return_value=False),
+        ):
+            exit_code = asyncio.run(_fetch_models_live("codex"))
+
+        assert exit_code == 1
