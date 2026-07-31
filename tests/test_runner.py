@@ -3,10 +3,13 @@
 import asyncio
 import subprocess
 import sys
+import time
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, call, patch
 
+from acpc.client import AcpcClient, PermissionLevel
+from acpc.output import OutputHandler, OutputMode
 from acpc.runner import (
     EXIT_AGENT_ERROR,
     EXIT_PERMISSION_DENIED,
@@ -15,10 +18,12 @@ from acpc.runner import (
     EXIT_SIGTERM,
     EXIT_TIMEOUT,
     EXIT_USAGE_ERROR,
+    _EXIT_TIMEOUT,
     RunConfig,
     _cache_available_models,
     _drain_notifications,
     _process_group_kwargs,
+    _spawn_agent,
     _try_set_model,
 )
 
@@ -214,6 +219,41 @@ class TestTrySetModel:
             ),
         ]
         connection.set_session_model.assert_not_awaited()
+
+
+class TestTeardownIsBounded:
+    """An adapter that ignores stdin EOF must not hold the CLI open.
+
+    codex-acp is exactly this case: it exits on a flat internal timer of about
+    two seconds regardless of session state, so acpc always ends up killing its
+    process group. What must stay true is that the kill happens on our schedule,
+    not the adapter's.
+    """
+
+    def test_stubborn_adapter_is_killed_within_budget(self) -> None:
+        client = AcpcClient(
+            output=OutputHandler(OutputMode.QUIET),
+            permission_level=PermissionLevel.NONE,
+            is_tty=False,
+        )
+
+        async def scenario() -> tuple[float, int | None]:
+            start = time.perf_counter()
+            # Never reads stdin, so write_eof cannot end it.
+            async with _spawn_agent(
+                client, sys.executable, "-c", "import time; time.sleep(30)"
+            ) as (
+                _conn,
+                process,
+            ):
+                pass
+            return time.perf_counter() - start, process.returncode
+
+        elapsed, returncode = asyncio.run(scenario())
+
+        assert returncode is not None, "adapter process was never reaped"
+        budget = _EXIT_TIMEOUT * 2 + 2.0
+        assert elapsed < budget, f"teardown took {elapsed:.1f}s, budget is {budget:.1f}s"
 
 
 class TestDrainNotifications:

@@ -49,8 +49,17 @@ _STOP_REASON_EXIT: dict[str, int] = {
     "cancelled": EXIT_SIGINT,
 }
 
-# Graceful shutdown timeout (seconds)
-_SHUTDOWN_TIMEOUT = 2.0
+# How long an adapter gets to exit on its own after stdin EOF, and to be reaped
+# after SIGKILL. Exit is detected the moment it happens, so this is a tolerance
+# budget rather than a fixed cost: claude-agent-acp leaves in ~25 ms and gemini
+# in ~400 ms, while codex-acp sits on a flat internal timer of ~2.03 s (the same
+# with or without an open session) and so is killed here either way.
+_EXIT_TIMEOUT = 1.0
+
+# How long the agent gets after Ctrl+C before its process tree is killed. Longer
+# than teardown on purpose: the agent is mid-turn and has a cancellation to
+# process, not just a socket to close.
+_CANCEL_GRACE = 2.0
 
 # Upper bound on waiting for in-flight notifications after a prompt completes
 _DRAIN_TIMEOUT = 5.0
@@ -168,13 +177,13 @@ async def _spawn_agent(
 
         # 3. Wait briefly for graceful exit
         with contextlib.suppress(asyncio.TimeoutError):
-            await asyncio.wait_for(process.wait(), timeout=_SHUTDOWN_TIMEOUT)
+            await asyncio.wait_for(process.wait(), timeout=_EXIT_TIMEOUT)
 
         # 4. Kill entire process tree (adapter + all children)
         if process.returncode is None:
             kill_process_tree(pid)
             with contextlib.suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(process.wait(), timeout=_SHUTDOWN_TIMEOUT)
+                await asyncio.wait_for(process.wait(), timeout=_EXIT_TIMEOUT)
 
 
 def _setup_signals(
@@ -194,7 +203,7 @@ def _setup_signals(
             await conn.cancel(session_id=session_id)
 
         # 2. Give agent time to shut down gracefully
-        await asyncio.sleep(_SHUTDOWN_TIMEOUT)
+        await asyncio.sleep(_CANCEL_GRACE)
 
         # 3. Kill entire process tree
         kill_process_tree(pid)
