@@ -17,6 +17,7 @@ from acpc.runner import (
     EXIT_USAGE_ERROR,
     RunConfig,
     _cache_available_models,
+    _drain_notifications,
     _process_group_kwargs,
     _try_set_model,
 )
@@ -214,3 +215,69 @@ class TestTrySetModel:
         ]
         connection.set_session_model.assert_not_awaited()
 
+
+class TestDrainNotifications:
+    """The SDK hands notifications to background tasks, so a completed prompt
+    does not imply the last agent_message_chunk has been delivered."""
+
+    @staticmethod
+    def _conn(queue: Any = None, tasks: Any = None) -> Any:
+        """Mirror the SDK layout: ClientSideConnection._conn._tasks is the
+        TaskSupervisor, whose own _tasks holds the live task set."""
+        supervisor = None if tasks is None else SimpleNamespace(_tasks=tasks)
+        return SimpleNamespace(_conn=SimpleNamespace(_queue=queue, _tasks=supervisor))
+
+    def test_waits_for_pending_notification_task(self) -> None:
+        delivered: list[str] = []
+
+        async def scenario() -> None:
+            async def late_notification() -> None:
+                await asyncio.sleep(0.05)
+                delivered.append("chunk")
+
+            task = asyncio.create_task(late_notification(), name="acp.Dispatcher.notification")
+            queue = SimpleNamespace(join=AsyncMock())
+            await _drain_notifications(self._conn(queue=queue, tasks={task}))
+
+        asyncio.run(scenario())
+        assert delivered == ["chunk"], "drain returned before the notification handler ran"
+
+    def test_joins_the_message_queue(self) -> None:
+        queue = SimpleNamespace(join=AsyncMock())
+        asyncio.run(_drain_notifications(self._conn(queue=queue, tasks=set())))
+        queue.join.assert_awaited_once()
+
+    def test_ignores_unrelated_tasks(self) -> None:
+        """Only notification tasks are awaited; a long receive loop must not block."""
+
+        async def scenario() -> None:
+            forever = asyncio.create_task(asyncio.sleep(30), name="acp.Connection.receive")
+            try:
+                queue = SimpleNamespace(join=AsyncMock())
+                await asyncio.wait_for(
+                    _drain_notifications(self._conn(queue=queue, tasks={forever})),
+                    timeout=2,
+                )
+            finally:
+                forever.cancel()
+
+        asyncio.run(scenario())
+
+    def test_missing_internals_are_tolerated(self) -> None:
+        """SDK layout changes must degrade, not crash a finished prompt."""
+        asyncio.run(_drain_notifications(cast(Any, SimpleNamespace())))
+        asyncio.run(_drain_notifications(self._conn()))
+
+    def test_sdk_layout_we_depend_on_still_exists(self) -> None:
+        """Canary: _drain_notifications reaches into SDK privates.
+
+        If an SDK upgrade moves these, the drain silently degrades and the
+        truncation bug returns. Fail loudly here instead.
+        """
+        from acp.task.dispatcher import DefaultMessageDispatcher
+        from acp.task.queue import InMemoryMessageQueue
+        from acp.task.supervisor import TaskSupervisor
+
+        assert hasattr(InMemoryMessageQueue, "join")
+        assert hasattr(TaskSupervisor(source="canary"), "_tasks")
+        assert hasattr(DefaultMessageDispatcher, "_dispatch_notification")

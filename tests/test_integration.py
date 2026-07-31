@@ -93,11 +93,12 @@ class TestBasicPrompt:
         assert "hello from test" in result.stdout
 
     def test_echo_with_quiet(self, tmp_path: Path) -> None:
-        """Quiet mode collects and emits final text."""
-        # Retry once if flaky (subprocess stdout capture timing)
+        """Quiet mode collects and emits final text.
+
+        No retry: a miss here means notifications are again being dropped
+        between the prompt response and finalize.
+        """
         result = _run_acpc_with_mock(tmp_path, "prompt", "mock", "quiet test", "--quiet")
-        if result.returncode == 0 and "quiet test" not in result.stdout:
-            result = _run_acpc_with_mock(tmp_path, "prompt", "mock", "quiet test", "--quiet")
         assert result.returncode == 0
         assert "quiet test" in result.stdout
 

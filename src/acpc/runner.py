@@ -52,6 +52,9 @@ _STOP_REASON_EXIT: dict[str, int] = {
 # Graceful shutdown timeout (seconds)
 _SHUTDOWN_TIMEOUT = 2.0
 
+# Upper bound on waiting for in-flight notifications after a prompt completes
+_DRAIN_TIMEOUT = 5.0
+
 
 @dataclass
 class RunConfig:
@@ -202,6 +205,36 @@ def _setup_signals(
     if sys.platform != "win32":
         loop.add_signal_handler(signal.SIGINT, _handler, signal.SIGINT)
         loop.add_signal_handler(signal.SIGTERM, _handler, signal.SIGTERM)
+
+
+async def _drain_notifications(conn: ClientSideConnection) -> None:
+    """Wait for queued session/update notifications to reach the client.
+
+    The ACP SDK resolves responses inline but routes notifications through a
+    queue whose handlers run as separate supervised tasks. A session/prompt
+    response can therefore be delivered before the final agent_message_chunk
+    has been dispatched, silently truncating --quiet output and -o files.
+
+    Reaches into SDK internals, so every step is optional: if the layout
+    changes this degrades to the previous (racy) behaviour rather than
+    breaking the run.
+    """
+    connection = getattr(conn, "_conn", None)
+    queue = getattr(connection, "_queue", None)
+    supervisor = getattr(connection, "_tasks", None)
+
+    # Best-effort: a completed prompt must never fail because the drain did.
+    with contextlib.suppress(Exception):
+        async with asyncio.timeout(_DRAIN_TIMEOUT):
+            if queue is not None and hasattr(queue, "join"):
+                await queue.join()
+            pending = {
+                task
+                for task in getattr(supervisor, "_tasks", set())
+                if not task.done() and "notification" in (task.get_name() or "")
+            }
+            if pending:
+                await asyncio.wait(pending)
 
 
 async def _heartbeat(quiet: bool) -> None:
@@ -539,6 +572,7 @@ async def run(config: RunConfig) -> int:
 
             # 8. Send prompt (with heartbeat, retry on model error)
             result = await _send_prompt(conn, session_id, config, model_was_set, stderr)
+            await _drain_notifications(conn)
 
             # 9. Finalize output
             exit_code = _STOP_REASON_EXIT.get(result.stop_reason, EXIT_AGENT_ERROR)
