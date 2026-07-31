@@ -18,7 +18,7 @@ class TestLoadBuiltinAgents:
         assert agent.identity == "codex"
         assert agent.name == "Codex CLI"
         assert agent.author == "OpenAI"
-        assert agent.run_command == "npx -y @agentclientprotocol/codex-acp"
+        assert agent.run_command == "codex-acp"
         assert agent.install_command == "npm install -g @agentclientprotocol/codex-acp"
 
     def test_load_claude(self) -> None:
@@ -26,7 +26,7 @@ class TestLoadBuiltinAgents:
         assert agent.identity == "claude"
         assert agent.name == "Claude Code"
         assert agent.author == "Anthropic"
-        assert agent.run_command == "npx -y @agentclientprotocol/claude-agent-acp"
+        assert agent.run_command == "claude-agent-acp"
         assert agent.install_command == "npm install -g @agentclientprotocol/claude-agent-acp"
 
     def test_load_gemini(self) -> None:
@@ -149,3 +149,16 @@ class TestIsInstalled:
         )
         with patch("acpc.agents.shutil.which", return_value=None):
             assert is_installed(agent) is False
+
+    def test_env_prefixed_command_resolves_on_first_token(self) -> None:
+        """`env VAR=x cmd` prefixes resolve the same way they do at spawn time."""
+        agent = Agent(
+            identity="test",
+            name="Test",
+            author="Test",
+            run_command="env CODEX_HOME=/tmp/x codex-acp",
+            install_command="echo noop",
+        )
+        with patch("acpc.agents.shutil.which", return_value="/usr/bin/env") as which:
+            assert is_installed(agent) is True
+            which.assert_called_with("env")

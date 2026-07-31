@@ -1,5 +1,5 @@
 identity = "codex"
 name = "Codex CLI"
 author = "OpenAI"
-run_command = "npx -y @agentclientprotocol/codex-acp"
+run_command = "codex-acp"
 install_command = "npm install -g @agentclientprotocol/codex-acp"

@@ -1,5 +1,5 @@
 identity = "claude"
 name = "Claude Code"
 author = "Anthropic"
-run_command = "npx -y @agentclientprotocol/claude-agent-acp"
+run_command = "claude-agent-acp"
 install_command = "npm install -g @agentclientprotocol/claude-agent-acp"

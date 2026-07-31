@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.resources
+import shlex
 import shutil
 import tomllib
 from dataclasses import dataclass
@@ -124,7 +125,8 @@ def list_agents() -> list[Agent]:
 def is_installed(agent: Agent) -> bool:
     """Check if the agent's run_command executable is available on PATH.
 
-    Extracts the first word of run_command and checks with shutil.which().
+    Uses shlex so that quoted paths and `env VAR=x cmd` prefixes resolve
+    the same way they do at spawn time.
     """
-    executable = agent.run_command.split()[0]
+    executable = shlex.split(agent.run_command)[0]
     return shutil.which(executable) is not None
