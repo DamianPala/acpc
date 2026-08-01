@@ -4,9 +4,12 @@ import asyncio
 import subprocess
 import sys
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, call, patch
+
+import acp
 
 from acpc.client import AcpcClient, PermissionLevel
 from acpc.output import OutputHandler, OutputMode
@@ -27,6 +30,37 @@ from acpc.runner import (
     _spawn_agent,
     _try_set_model,
 )
+
+
+MOCK_AGENT_SCRIPT = Path(__file__).with_name("mock_agent.py")
+
+
+def _quiet_client() -> AcpcClient:
+    return AcpcClient(
+        output=OutputHandler(OutputMode.QUIET),
+        permission_level=PermissionLevel.NONE,
+        is_tty=False,
+    )
+
+
+async def _run_mock_prompt(command: str, *args: str) -> None:
+    client = _quiet_client()
+    async with _spawn_agent(
+        client,
+        command,
+        *args,
+        cwd=str(Path.cwd()),
+        drain_stderr=True,
+    ) as (conn, _process):
+        init_response = await conn.initialize(protocol_version=acp.PROTOCOL_VERSION)
+        assert init_response.agent_capabilities is not None
+        session = await conn.new_session(cwd=str(Path.cwd()))
+        result = await conn.prompt(
+            session.session_id,
+            [acp.text_block("stderr:TEXT")],
+        )
+        await _drain_notifications(conn)
+        assert result.stop_reason == "end_turn"
 
 
 class TestRunConfig:
@@ -258,6 +292,32 @@ class TestTrySetModel:
         assert messages == [
             "warning: cannot set model 'gpt-5.6-luna': session advertises no model config option"
         ]
+
+
+class TestAdapterStderr:
+    def test_forwards_adapter_stderr(self, capsys: Any) -> None:
+        asyncio.run(_run_mock_prompt(sys.executable, str(MOCK_AGENT_SCRIPT)))
+
+        assert "TEXT" in capsys.readouterr().err
+
+    def test_chatty_adapter_completes_prompt(self, tmp_path: Path) -> None:
+        wrapper = tmp_path / "chatty_adapter.py"
+        wrapper.write_text(
+            """import os
+import sys
+
+payload = memoryview(b"x" * (32 * 1024 * 1024))
+while payload:
+    payload = payload[os.write(sys.stderr.fileno(), payload) :]
+os.execv(sys.executable, [sys.executable, sys.argv[1]])
+""",
+            encoding="utf-8",
+        )
+
+        async def scenario() -> None:
+            await _run_mock_prompt(sys.executable, str(wrapper), str(MOCK_AGENT_SCRIPT))
+
+        asyncio.run(asyncio.wait_for(scenario(), timeout=1.0))
 
 
 class TestTeardownIsBounded:

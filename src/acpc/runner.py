@@ -121,6 +121,42 @@ def kill_process_tree(pid: int) -> None:
             pass
 
 
+async def _forward_stderr(stream: asyncio.StreamReader) -> None:
+    """Forward adapter stderr to acpc's stderr while the adapter is running."""
+    try:
+        while True:
+            chunk = await stream.read(4096)
+            if not chunk:
+                return
+            try:
+                stderr_buffer = getattr(sys.stderr, "buffer", None)
+                if stderr_buffer is not None:
+                    stderr_buffer.write(chunk)
+                    stderr_buffer.flush()
+                else:
+                    sys.stderr.write(chunk.decode(errors="replace"))
+                    sys.stderr.flush()
+            except (OSError, UnicodeError, ValueError):
+                return
+    except (OSError, ValueError):
+        return
+
+
+async def _stop_stderr_forwarder(task: asyncio.Task[None]) -> None:
+    """Wait briefly for stderr EOF, then cancel the forwarder if needed."""
+    try:
+        await asyncio.wait_for(task, timeout=_EXIT_TIMEOUT)
+    except asyncio.TimeoutError:
+        task.cancel()
+    except Exception:
+        pass
+    finally:
+        if not task.done():
+            task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+
+
 @asynccontextmanager
 async def _spawn_agent(
     client: Any,
@@ -128,12 +164,16 @@ async def _spawn_agent(
     *args: str,
     env: dict[str, str] | None = None,
     cwd: str | None = None,
+    drain_stderr: bool = False,
 ) -> AsyncIterator[tuple[ClientSideConnection, aio_subprocess.Process]]:
     """Spawn ACP agent in its own process group for reliable cleanup.
 
     Like acp.spawn_agent_process but with process group isolation
     (start_new_session on Unix, CREATE_NEW_PROCESS_GROUP on Windows).
     On exit, kills the entire process tree via killpg/taskkill.
+
+    When enabled, drain the agent's stderr pipe and forward it to acpc's
+    stderr. Callers that consume the pipe themselves must leave this disabled.
     """
     merged_env = dict(os.environ)
     merged_env.update(default_environment())
@@ -152,12 +192,20 @@ async def _spawn_agent(
         **_process_group_kwargs(),
     )
 
-    if process.stdout is None or process.stdin is None:
+    if process.stdout is None or process.stdin is None or process.stderr is None:
         process.kill()
         await process.wait()
         raise RuntimeError("failed to create stdio pipes for agent process")
 
     conn = ClientSideConnection(client, process.stdin, process.stdout)
+    stderr_task = (
+        asyncio.create_task(
+            _forward_stderr(process.stderr),
+            name="acpc.adapter.stderr",
+        )
+        if drain_stderr
+        else None
+    )
     pid = process.pid
 
     try:
@@ -188,6 +236,11 @@ async def _spawn_agent(
             kill_process_tree(pid)
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(process.wait(), timeout=_EXIT_TIMEOUT)
+
+        # 5. Drain any final diagnostics, but never let a broken or inherited
+        # stderr pipe keep the runner alive.
+        if stderr_task is not None:
+            await _stop_stderr_forwarder(stderr_task)
 
 
 def _setup_signals(
@@ -538,6 +591,7 @@ async def run(config: RunConfig) -> int:
             *args,
             cwd=cwd,
             env=config.env or None,
+            drain_stderr=True,
         ) as (conn, process):
             if process.pid is None:
                 stderr_error("agent process failed to start")
