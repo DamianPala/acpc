@@ -83,6 +83,7 @@ class RunConfig:
     timeout: int | None = None
     is_tty: bool = True
     env: dict[str, str] = field(default_factory=dict)
+    no_daemon: bool = False
 
 
 # --- Process group management (Zed pattern) ---

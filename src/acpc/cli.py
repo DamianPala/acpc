@@ -113,6 +113,7 @@ def cli() -> None:
 @click.option("--input-file", type=click.Path(exists=True), help="Read prompt from file")
 @click.option("--timeout", type=int, help="Timeout in seconds")
 @click.option("--dry-run", is_flag=True, help="Resolve config and exit without running")
+@click.option("--no-daemon", is_flag=True, help="Use the direct adapter path")
 def prompt(
     agent: str,
     prompt_text: str | None,
@@ -128,6 +129,7 @@ def prompt(
     input_file: str | None,
     timeout: int | None,
     dry_run: bool,
+    no_daemon: bool,
 ) -> None:
     """Send a prompt to an ACP agent."""
     import asyncio
@@ -174,6 +176,8 @@ def prompt(
         if permissions is None:
             permissions = "prompt" if is_tty else "read"
 
+        daemon_disabled = no_daemon or _env_flag("ACPC_NO_DAEMON")
+
         # Resolve model presets (fast/standard/max → vendor-specific model ID)
         resolved_model = model
         model_preset = None
@@ -195,6 +199,7 @@ def prompt(
                 click.echo(f"mode: {mode}")
             click.echo(f"permissions: {permissions}")
             click.echo(f"cwd: {cwd or os.getcwd()}")
+            click.echo(f"daemon: {'disabled' if daemon_disabled else 'enabled'}")
             sys.exit(0)
 
         config = RunConfig(
@@ -211,6 +216,7 @@ def prompt(
             output_file=output_file,
             timeout=timeout,
             is_tty=is_tty,
+            no_daemon=daemon_disabled,
         )
 
         exit_code = asyncio.run(run(config))
@@ -228,6 +234,12 @@ def prompt(
 
 # Make 'run' an alias for 'prompt'
 cli.add_command(prompt, name="run")
+
+
+def _env_flag(name: str) -> bool:
+    """Read a conventional boolean environment flag, defaulting to false."""
+    value = os.environ.get(name)
+    return value is not None and value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 # ---------------------------------------------------------------------------
