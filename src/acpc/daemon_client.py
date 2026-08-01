@@ -573,6 +573,9 @@ class DaemonClient:
         try:
             self._popen_factory(
                 [sys.executable, "-m", "acpc.daemon", self.target],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
         except OSError as error:

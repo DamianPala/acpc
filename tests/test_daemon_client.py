@@ -24,6 +24,7 @@ from acpc.daemon_client import (
     DaemonUnavailableError,
     cancel_daemon_prompt,
     daemon_status,
+    shutdown_daemon,
 )
 from acpc.ipc import Connection, UnixSocketTransport, lock_path_for_target, socket_path_for_target
 from acpc.output import OutputHandler, OutputMode
@@ -364,6 +365,50 @@ def test_shutting_down_retries_directly_once(
     assert calls == ["direct"]
 
 
+def test_real_cold_start_cli_terminates_with_captured_output(
+    daemon_environment: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mock_agent_dir: Path,
+) -> None:
+    """A real auto-started daemon must not keep the CLI's capture pipes open."""
+    monkeypatch.setenv("ACPC_USER_AGENTS_DIR", str(mock_agent_dir))
+    environment = os.environ.copy()
+    command = [
+        sys.executable,
+        "-c",
+        "from acpc.cli import cli; cli()",
+        "prompt",
+        "mock",
+        "--cwd",
+        str(daemon_environment),
+        "cold-start",
+    ]
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=environment,
+    )
+    try:
+        try:
+            stdout, stderr = process.communicate(timeout=3)
+        except subprocess.TimeoutExpired as error:
+            pytest.fail(f"cold-start CLI did not terminate: {error}")
+        assert process.returncode == 0, stderr
+        assert stdout == "cold-start"
+        status = asyncio.run(daemon_status("mock"))
+        assert len(status["sessions"]) == 1
+        assert status["sessions"][0]["state"] == "idle"
+    finally:
+        with contextlib.suppress(DaemonUnavailableError, OSError):
+            asyncio.run(shutdown_daemon("mock"))
+        if process.poll() is None:
+            process.kill()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            process.communicate(timeout=3)
+
+
 def test_auto_start_spawns_and_polls_until_socket_appears(
     daemon_environment: Path,
 ) -> None:
@@ -404,7 +449,12 @@ def test_auto_start_spawns_and_polls_until_socket_appears(
     asyncio.run(scenario())
     assert len(popen_calls) == 1
     assert popen_calls[0][0] == [sys.executable, "-m", "acpc.daemon", "mock"]
-    assert popen_calls[0][1] == {"start_new_session": True}
+    assert popen_calls[0][1] == {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+        "start_new_session": True,
+    }
 
 
 def test_auto_start_timeout_is_bounded_and_clean(
