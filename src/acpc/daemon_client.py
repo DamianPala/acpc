@@ -853,7 +853,7 @@ async def run_daemon(
     try:
         return await client.prompt(
             text=config.prompt_text,
-            cwd=config.cwd if session_id is not None else os.getcwd(),
+            cwd=config.cwd or os.getcwd(),
             permissions=config.permission_level,
             output=output,
             model=config.model,
