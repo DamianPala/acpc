@@ -54,6 +54,9 @@ class MockAgent(Agent):
 
     def __init__(self) -> None:
         self._sessions: dict[str, list[str]] = {}
+        self._barrier = asyncio.Event()
+        self._barrier_waiters = 0
+        self._initialized = False
 
     def on_connect(self, conn: Client) -> None:
         self._conn = conn
@@ -65,6 +68,7 @@ class MockAgent(Agent):
         client_info: Any = None,
         **kwargs: Any,
     ) -> InitializeResponse:
+        self._initialized = True
         return InitializeResponse(
             protocol_version=protocol_version,
             agent_capabilities=AgentCapabilities(load_session=True),
@@ -77,6 +81,8 @@ class MockAgent(Agent):
         mcp_servers: list[HttpMcpServer | SseMcpServer | McpServerStdio] | None = None,
         **kwargs: Any,
     ) -> NewSessionResponse:
+        if not self._initialized:
+            raise RuntimeError("initialize must run before session/new")
         session_id = uuid4().hex[:12]
         self._sessions[session_id] = []
         return NewSessionResponse(session_id=session_id)
@@ -88,8 +94,18 @@ class MockAgent(Agent):
         mcp_servers: list[HttpMcpServer | SseMcpServer | McpServerStdio] | None = None,
         **kwargs: Any,
     ) -> LoadSessionResponse | None:
+        if not self._initialized:
+            raise RuntimeError("initialize must run before session/load")
+        if session_id == "load-fail":
+            raise RuntimeError("load failed")
         if session_id not in self._sessions:
-            self._sessions[session_id] = []
+            self._sessions[session_id] = ["history"] if session_id.startswith("load-") else []
+        elif not session_id.startswith("load-"):
+            self._sessions[session_id].append("reloaded")
+        if session_id.startswith("load-"):
+            await self._send_text(session_id, "history")
+            if session_id == "load-slow":
+                await asyncio.sleep(0.2)
         return LoadSessionResponse()
 
     async def set_session_model(
@@ -128,6 +144,20 @@ class MockAgent(Agent):
             delay = int(prompt_text.split(":")[1])
             await asyncio.sleep(delay)
             await self._send_text(session_id, f"waited {delay}s")
+            return PromptResponse(stop_reason="end_turn")
+
+        if prompt_text.startswith("burst:"):
+            for chunk in prompt_text.split(":", 1)[1].split("|"):
+                await self._send_text(session_id, chunk)
+                await asyncio.sleep(0)
+            return PromptResponse(stop_reason="end_turn")
+
+        if prompt_text.startswith("barrier:"):
+            self._barrier_waiters += 1
+            if self._barrier_waiters >= 2:
+                self._barrier.set()
+            await self._barrier.wait()
+            await self._send_text(session_id, prompt_text.split(":", 1)[1])
             return PromptResponse(stop_reason="end_turn")
 
         if prompt_text.startswith("tool:"):

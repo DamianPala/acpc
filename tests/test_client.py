@@ -179,6 +179,29 @@ class TestHistoryReplay:
 
         assert client.session_id == "sess-42"
 
+    def test_replay_state_and_updates_are_scoped_to_each_session(self) -> None:
+        events: dict[str, list[str]] = {"A": [], "B": []}
+        client = AcpcClient(OutputHandler(mode=OutputMode.QUIET), PermissionLevel.ALL, is_tty=False)
+
+        async def collect_a(frame: dict[str, object]) -> None:
+            events["A"].append(frame["update"]["content"]["text"])  # type: ignore[index]
+
+        async def collect_b(frame: dict[str, object]) -> None:
+            events["B"].append(frame["update"]["content"]["text"])  # type: ignore[index]
+
+        client.register_session("A", update_sink=collect_a)
+        client.register_session("B", update_sink=collect_b)
+
+        async def scenario() -> None:
+            with client.replaying_history("A"):
+                await client.session_update("A", _make_agent_message_chunk("old A"))
+                await client.session_update("B", _make_agent_message_chunk("live B"))
+            await client.session_update("A", _make_agent_message_chunk("live A"))
+
+        asyncio.run(scenario())
+
+        assert events == {"A": ["live A"], "B": ["live B"]}
+
 
 # ---------------------------------------------------------------------------
 # Permission policy
@@ -186,6 +209,19 @@ class TestHistoryReplay:
 
 
 class TestPermissions:
+    def test_permissions_are_scoped_to_registered_session(self, output: OutputHandler) -> None:
+        client = AcpcClient(output, PermissionLevel.ALL, is_tty=False, strict_sessions=True)
+        client.register_session("none", permission_level=PermissionLevel.NONE)
+        client.register_session("default", permission_level=PermissionLevel.ALL)
+        options = _make_permission_options()
+        tc = _make_tool_call_update(kind="edit", title="Edit file")
+
+        denied = asyncio.run(client.request_permission(options, "none", tc))
+        allowed = asyncio.run(client.request_permission(options, "default", tc))
+
+        assert denied.outcome.outcome == "cancelled"
+        assert allowed.outcome.outcome == "selected"
+
     def test_all_allows_everything(self, output: OutputHandler) -> None:
         client = AcpcClient(output, PermissionLevel.ALL, is_tty=False)
         options = _make_permission_options()
@@ -254,3 +290,17 @@ class TestPermissions:
         resp = asyncio.run(client.request_permission(options, "sess-1", tc))
 
         assert resp.outcome.outcome == "selected"
+
+
+class TestMultiplexedFileOperations:
+    def test_unknown_session_is_rejected_for_read(self, output: OutputHandler) -> None:
+        client = AcpcClient(output, PermissionLevel.ALL, is_tty=False, strict_sessions=True)
+
+        with pytest.raises(ValueError, match="unknown session id"):
+            asyncio.run(client.read_text_file("missing.txt", "unknown"))
+
+    def test_unknown_session_is_rejected_for_write(self, output: OutputHandler) -> None:
+        client = AcpcClient(output, PermissionLevel.ALL, is_tty=False, strict_sessions=True)
+
+        with pytest.raises(ValueError, match="unknown session id"):
+            asyncio.run(client.write_text_file("text", "missing.txt", "unknown"))
