@@ -10,16 +10,19 @@ import time
 from pathlib import Path
 from typing import Any
 
-from platformdirs import user_state_dir
-
 from acpc.presets import _BUILTIN_PRESETS, _load_config, get_presets
+from acpc.sessions import state_dir
 
-_CACHE_DIR = Path(user_state_dir("acpc")) / "models"
 _TTL_SECONDS = 7 * 24 * 3600  # 7 days
 
 
+def _cache_dir() -> Path:
+    """Return the model cache directory for the current state configuration."""
+    return state_dir() / "models"
+
+
 def _cache_path(agent: str) -> Path:
-    return _CACHE_DIR / f"{agent}.json"
+    return _cache_dir() / f"{agent}.json"
 
 
 _FILTERED_MODEL_IDS = frozenset(("default",))
@@ -27,7 +30,7 @@ _FILTERED_MODEL_IDS = frozenset(("default",))
 
 def save_models(agent: str, available_models: list[dict[str, Any]]) -> None:
     """Cache available_models from a new_session() response."""
-    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    _cache_dir().mkdir(parents=True, exist_ok=True)
     filtered = [m for m in available_models if m.get("model_id") not in _FILTERED_MODEL_IDS]
     data = {
         "agent": agent,
@@ -71,8 +74,9 @@ def reverse_model_to_agent() -> dict[str, tuple[str, str]]:
     result: dict[str, tuple[str, str]] = {}
 
     # 1. Cached models (lower priority, added first so presets override)
-    if _CACHE_DIR.is_dir():
-        for cache_file in _CACHE_DIR.glob("*.json"):
+    cache_dir = _cache_dir()
+    if cache_dir.is_dir():
+        for cache_file in cache_dir.glob("*.json"):
             agent = cache_file.stem
             cached = load_cached_models(agent)
             if cached:

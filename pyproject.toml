@@ -8,7 +8,7 @@ license-files = ["LICENSE"]
 authors = [
     { name = "Damian Pala", email = "noreply@damianpala.com" },
 ]
-requires-python = ">=3.12"
+requires-python = ">=3.13"
 keywords = ["acp", "agent-client-protocol", "ai-agents", "claude", "codex", "gemini", "cli", "llm"]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -47,17 +47,19 @@ dev = [
     "pyright",
     "pytest>=8.0",
     "pytest-cov",
+    "pytest-timeout",
 ]
 
 [tool.ruff]
 line-length = 100
 
 [tool.pyright]
-pythonVersion = "3.12"
+pythonVersion = "3.13"
 typeCheckingMode = "standard"
 
 [tool.pytest.ini_options]
 minversion = "8.0"
+timeout = 5
 testpaths = ["tests"]
 python_files = ["test_*.py", "*_test.py"]
 

@@ -15,15 +15,35 @@ from typing import Any
 
 from platformdirs import user_state_dir
 
-STATE_DIR = Path(user_state_dir("acpc"))
+
+def state_dir() -> Path:
+    """Return the current acpc state directory.
+
+    Resolve the environment on every call so daemon tests and separate acpc
+    processes can use isolated state without reloading this module.
+    """
+    configured_dir = os.environ.get("ACPC_STATE_DIR")
+    if configured_dir:
+        return Path(configured_dir)
+    return Path(user_state_dir("acpc"))
 
 
 def _sessions_file() -> Path:
-    return STATE_DIR / "sessions.json"
+    return state_dir() / "sessions.json"
 
 
 def _last_dir() -> Path:
-    return STATE_DIR / "last"
+    return state_dir() / "last"
+
+
+def run_dir() -> Path:
+    """Return the directory for daemon sockets and lock files."""
+    return state_dir() / "run"
+
+
+def log_dir() -> Path:
+    """Return the directory for daemon logs."""
+    return state_dir() / "log"
 
 
 @dataclass
