@@ -32,7 +32,7 @@ from acpc.ipc import (
     lock_path_for_target,
     socket_path_for_target,
 )
-from acpc.output import OutputHandler, OutputMode, stderr, stderr_error
+from acpc.output import OutputHandler, OutputMode, stderr, stderr_error, stderr_permission
 from acpc.sessions import (
     load_last_session,
     process_cmdline,
@@ -247,6 +247,8 @@ class DaemonClient:
                     printed_session_id = True
             elif frame_type == "session_update":
                 await self._handle_update(acp_client, frame)
+            elif frame_type == "permission":
+                self._handle_permission(frame)
             elif frame_type == "queued":
                 self._handle_queued(frame)
             elif frame_type == "cancel_ack":
@@ -281,6 +283,18 @@ class DaemonClient:
         except ValueError as error:
             raise DaemonProtocolError(f"invalid session_update payload: {error}") from error
         await client.session_update(notification.session_id, notification.update)
+
+    @classmethod
+    def _handle_permission(cls, frame: dict[str, Any]) -> None:
+        cls._session_id(frame)
+        kind = frame.get("kind")
+        title = frame.get("title")
+        outcome = frame.get("outcome")
+        if not isinstance(kind, str) or not isinstance(title, str) or not isinstance(outcome, str):
+            raise DaemonProtocolError("permission frame has invalid fields")
+        if outcome not in {"allow", "deny"}:
+            raise DaemonProtocolError(f"permission frame has invalid outcome: {outcome!r}")
+        stderr_permission(kind, title, outcome)
 
     @staticmethod
     def _handle_queued(frame: dict[str, Any]) -> None:

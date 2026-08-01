@@ -241,6 +241,46 @@ class TestHistoryReplay:
 
 
 class TestPermissions:
+    @pytest.mark.parametrize(
+        ("permission_level", "outcome"),
+        [(PermissionLevel.ALL, "allow"), (PermissionLevel.NONE, "deny")],
+    )
+    def test_policy_decision_is_forwarded_to_session_sink(
+        self,
+        output: OutputHandler,
+        permission_level: PermissionLevel,
+        outcome: str,
+    ) -> None:
+        frames: list[dict[str, object]] = []
+
+        async def collect(frame: dict[str, object]) -> None:
+            frames.append(frame)
+
+        client = AcpcClient(output, PermissionLevel.NONE, is_tty=False, strict_sessions=True)
+        client.register_session(
+            "sess-1",
+            permission_level=permission_level,
+            update_sink=collect,
+        )
+
+        asyncio.run(
+            client.request_permission(
+                _make_permission_options(),
+                "sess-1",
+                _make_tool_call_update(title="write sentinel.txt"),
+            )
+        )
+
+        assert frames == [
+            {
+                "type": "permission",
+                "session_id": "sess-1",
+                "kind": "edit",
+                "title": "write sentinel.txt",
+                "outcome": outcome,
+            }
+        ]
+
     def test_permissions_are_scoped_to_registered_session(self, output: OutputHandler) -> None:
         client = AcpcClient(output, PermissionLevel.ALL, is_tty=False, strict_sessions=True)
         client.register_session("none", permission_level=PermissionLevel.NONE)

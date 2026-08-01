@@ -286,7 +286,7 @@ class AcpcClient:
     async def request_permission(
         self,
         options: list[PermissionOption],
-        session_id: str,  # noqa: ARG002
+        session_id: str,
         tool_call: ToolCallUpdate,
         **kwargs: Any,  # noqa: ARG002
     ) -> RequestPermissionResponse:
@@ -302,6 +302,19 @@ class AcpcClient:
             decision = self._prompt_user(kind_str or "unknown", title, is_tty=session.is_tty)
 
         outcome_label = "allow" if decision else "deny"
+        if session.update_sink is not None:
+            try:
+                await session.update_sink(
+                    {
+                        "type": "permission",
+                        "session_id": session_id,
+                        "kind": kind_str or "unknown",
+                        "title": title,
+                        "outcome": outcome_label,
+                    }
+                )
+            except (ConnectionError, OSError):
+                session.update_sink = None
         stderr_permission(kind_str or "unknown", title, outcome_label)
 
         option_id = _find_option(options, decision)
