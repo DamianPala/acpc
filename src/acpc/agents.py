@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.resources
+import os
 import shlex
 import shutil
 import tomllib
@@ -29,6 +30,9 @@ class Agent:
 
 def _user_agents_dir() -> Path:
     """Return platform-specific user config directory for agent overrides."""
+    configured_dir = os.environ.get("ACPC_USER_AGENTS_DIR")
+    if configured_dir:
+        return Path(configured_dir)
     return Path(platformdirs.user_config_dir("acpc")) / "agents"
 
 

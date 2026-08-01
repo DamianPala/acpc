@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import pytest
 from click.testing import CliRunner
 
 from acpc import __version__
@@ -36,14 +38,21 @@ class TestHelp:
         assert result.exit_code == 0
         for opt in (
             "--last",
+            "--continue",
             "--session",
             "--model",
             "--mode",
             "--permissions",
             "--quiet",
             "--json",
+            "--print-session-id",
         ):
             assert opt in result.output
+
+    def test_daemon_commands_are_available(self) -> None:
+        result = CliRunner().invoke(cli, ["--help"])
+        assert result.exit_code == 0
+        assert "daemon" in result.output
 
 
 class TestAgents:
@@ -63,6 +72,41 @@ class TestStatus:
             result = runner.invoke(cli, ["status"])
         assert result.exit_code == 0
         assert "No running sessions" in result.output
+
+    def test_status_marks_daemon_hosted_sessions(self) -> None:
+        frame = {
+            "pid": 123,
+            "uptime_s": 4,
+            "log": "/tmp/mock.log",
+            "sessions": [{"id": "sess-1", "cwd": "/tmp/work", "state": "idle"}],
+        }
+        with (
+            patch("acpc.sessions.list_running", return_value={}),
+            patch("acpc.cli._daemon_statuses", return_value=[("mock", frame)]),
+        ):
+            result = CliRunner().invoke(cli, ["status"])
+        assert result.exit_code == 0
+        assert "sess-1" in result.output
+        assert "(daemon)" in result.output
+
+    def test_daemon_status_and_stop_use_management_frames(self) -> None:
+        frame = {
+            "pid": 123,
+            "uptime_s": 4,
+            "log": "/tmp/mock.log",
+            "sessions": [{"id": "sess-1", "cwd": "/tmp/work", "state": "active"}],
+        }
+        with (
+            patch("acpc.daemon_client.daemon_targets", return_value=["mock"]),
+            patch("acpc.daemon_client.daemon_status", new=AsyncMock(return_value=frame)),
+            patch("acpc.daemon_client.shutdown_daemon", new=AsyncMock()) as shutdown,
+        ):
+            status_result = CliRunner().invoke(cli, ["daemon", "status"])
+            stop_result = CliRunner().invoke(cli, ["daemon", "stop", "mock"])
+        assert status_result.exit_code == 0
+        assert "sess-1" in status_result.output
+        assert stop_result.exit_code == 0
+        shutdown.assert_awaited_once_with("mock")
 
 
 class TestPromptErrors:
@@ -91,6 +135,90 @@ class TestPromptErrors:
         result = runner.invoke(cli, ["prompt", "codex", "-"], input="   \n  \n")
         assert result.exit_code == 2
 
+    @pytest.mark.parametrize(
+        "options",
+        [
+            ["--print-session-id"],
+            ["--print-session-id", "--quiet"],
+            ["--print-session-id", "-o", "result.txt"],
+            ["--print-session-id", "--quiet", "--json", "-o", "result.txt"],
+        ],
+    )
+    def test_print_session_id_is_restricted_to_quiet_output_file(self, options: list[str]) -> None:
+        result = CliRunner().invoke(cli, ["prompt", *options, "codex", "hello"])
+        assert result.exit_code == 2
+        assert "requires --quiet -o FILE" in result.output
+
+    def test_print_session_id_accepts_only_the_documented_combination(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        captured: list[object] = []
+
+        async def fake_run(config: object) -> int:
+            captured.append(config)
+            return 0
+
+        with patch("acpc.runner.run", new=fake_run):
+            result = CliRunner().invoke(
+                cli,
+                [
+                    "prompt",
+                    "--print-session-id",
+                    "--quiet",
+                    "-o",
+                    str(tmp_path / "result.txt"),
+                    "codex",
+                    "hello",
+                ],
+            )
+        assert result.exit_code == 0
+        assert len(captured) == 1
+        assert getattr(captured[0], "print_session_id") is True
+
+    def test_print_session_id_is_first_line_when_runner_records_session(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        async def fake_run(config: object) -> int:  # noqa: ARG001
+            return 0
+
+        with (
+            patch("acpc.runner.run", new=fake_run),
+            patch("acpc.sessions.load_last_session", return_value="sess-1"),
+        ):
+            result = CliRunner().invoke(
+                cli,
+                [
+                    "prompt",
+                    "--print-session-id",
+                    "--quiet",
+                    "-o",
+                    str(tmp_path / "result.txt"),
+                    "codex",
+                    "hello",
+                ],
+            )
+        assert result.exit_code == 0
+        assert result.output.splitlines()[0] == "sess-1"
+
+    def test_continue_alias_sets_last_session_flag(self, monkeypatch) -> None:  # noqa: ANN001
+        captured: list[object] = []
+
+        async def fake_run(config: object) -> int:
+            captured.append(config)
+            return 0
+
+        monkeypatch.setattr("acpc.runner.run", fake_run)
+        result = CliRunner().invoke(cli, ["prompt", "-c", "codex", "hello"])
+        assert result.exit_code == 0
+        assert captured and getattr(captured[0], "use_last") is True
+
+    def test_cwd_must_be_absolute_and_existing(self) -> None:
+        result = CliRunner().invoke(cli, ["prompt", "--cwd", ".", "codex", "hello"])
+        assert result.exit_code == 2
+        assert "absolute existing directory" in result.output
+
 
 class TestStopErrors:
     def test_no_args_shows_error(self) -> None:
@@ -102,6 +230,24 @@ class TestStopErrors:
         runner = CliRunner()
         result = runner.invoke(cli, ["stop", "-s", "nonexistent-session-id"])
         assert result.exit_code != 0
+
+    def test_daemon_session_stop_sends_cancel(self) -> None:
+        with (
+            patch("acpc.sessions.list_running", return_value={}),
+            patch(
+                "acpc.cli._daemon_statuses",
+                return_value=[
+                    (
+                        "mock",
+                        {"sessions": [{"id": "sess-1"}]},
+                    )
+                ],
+            ),
+            patch("acpc.daemon_client.cancel_daemon_prompt", new=AsyncMock()) as cancel,
+        ):
+            result = CliRunner().invoke(cli, ["stop", "-s", "sess-1"])
+        assert result.exit_code == 0
+        cancel.assert_awaited_once_with("mock", session_id="sess-1")
 
 
 class TestInstallErrors:

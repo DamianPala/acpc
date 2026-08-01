@@ -4,8 +4,10 @@ Manages local state for running sessions and last-session tracking.
 Atomic writes via tempfile+rename. PID verification for stale cleanup.
 """
 
+import contextlib
 import json
 import os
+import sys
 import tempfile
 import time
 from dataclasses import asdict, dataclass
@@ -36,6 +38,10 @@ def _last_dir() -> Path:
     return state_dir() / "last"
 
 
+def _session_metadata_file() -> Path:
+    return state_dir() / "session_metadata.json"
+
+
 def run_dir() -> Path:
     """Return the directory for daemon sockets and lock files."""
     return state_dir() / "run"
@@ -44,6 +50,33 @@ def run_dir() -> Path:
 def log_dir() -> Path:
     """Return the directory for daemon logs."""
     return state_dir() / "log"
+
+
+def process_start_time(pid: int | None = None) -> str | None:
+    """Return the kernel process-start token used for PID-reuse checks."""
+    if sys.platform != "linux":
+        return None
+    process_id = os.getpid() if pid is None else pid
+    try:
+        stat = Path(f"/proc/{process_id}/stat").read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return None
+    try:
+        return stat.rsplit(")", 1)[1].split()[19]
+    except (IndexError, ValueError):
+        return None
+
+
+def process_cmdline(pid: int | None = None) -> list[str] | None:
+    """Return the process command line from procfs, if available."""
+    if sys.platform != "linux":
+        return None
+    process_id = os.getpid() if pid is None else pid
+    try:
+        data = Path(f"/proc/{process_id}/cmdline").read_bytes()
+    except (FileNotFoundError, OSError):
+        return None
+    return [part.decode("utf-8", errors="surrogateescape") for part in data.split(b"\0") if part]
 
 
 @dataclass
@@ -149,7 +182,51 @@ def get_running_by_agent(agent: str) -> list[RunningSession]:
 # --- Last session tracking (per-PPID) ---
 
 
-def save_last_session(agent: str, session_id: str) -> None:
+def _read_last_session_record(path: Path) -> tuple[str, str | None] | None:
+    try:
+        data = json.loads(path.read_text())
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        try:
+            session_id = path.read_text().strip()
+        except (FileNotFoundError, OSError):
+            return None
+        return (session_id, None) if session_id else None
+    if not isinstance(data, dict):
+        return None
+    session_id = data.get("session_id")
+    cwd = data.get("cwd")
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    return session_id, cwd if isinstance(cwd, str) else None
+
+
+def _load_session_metadata() -> dict[str, dict[str, str]]:
+    try:
+        data = json.loads(_session_metadata_file().read_text())
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    result: dict[str, dict[str, str]] = {}
+    for agent, sessions in data.items():
+        if not isinstance(agent, str) or not isinstance(sessions, dict):
+            continue
+        result[agent] = {
+            session_id: cwd
+            for session_id, cwd in sessions.items()
+            if isinstance(session_id, str) and isinstance(cwd, str)
+        }
+    return result
+
+
+def _write_last_session(path: Path, session_id: str, cwd: str | None) -> None:
+    if cwd is None:
+        path.write_text(session_id)
+    else:
+        path.write_text(json.dumps({"session_id": session_id, "cwd": cwd}))
+
+
+def save_last_session(agent: str, session_id: str, cwd: str | None = None) -> None:
     """Save last session ID for agent, scoped by PPID.
 
     Creates {last_dir}/{agent}.{PPID} and {agent}.default as fallback.
@@ -161,8 +238,51 @@ def save_last_session(agent: str, session_id: str) -> None:
     ppid_file = last / f"{agent}.{ppid}"
     default_file = last / f"{agent}.default"
 
-    ppid_file.write_text(session_id)
-    default_file.write_text(session_id)
+    if cwd is None:
+        previous = _read_last_session_record(ppid_file) or _read_last_session_record(default_file)
+        if previous is not None and previous[0] == session_id:
+            cwd = previous[1]
+    _write_last_session(ppid_file, session_id, cwd)
+    _write_last_session(default_file, session_id, cwd)
+
+    metadata = _load_session_metadata()
+    metadata.setdefault(agent, {})[session_id] = cwd or metadata.get(agent, {}).get(session_id, "")
+    if not metadata[agent][session_id]:
+        metadata[agent].pop(session_id, None)
+    _atomic_write(_session_metadata_file(), metadata)
+
+
+def load_last_session_record(agent: str) -> tuple[str, str | None] | None:
+    """Load the last session ID and its recorded working directory."""
+    last = _last_dir()
+    ppid = os.getppid()
+    for name in (f"{agent}.{ppid}", f"{agent}.default"):
+        record = _read_last_session_record(last / name)
+        if record is not None:
+            return record
+    return None
+
+
+def load_session_cwd(agent: str, session_id: str) -> str | None:
+    """Return persisted cwd metadata for one local session reference."""
+    return _load_session_metadata().get(agent, {}).get(session_id)
+
+
+def evict_session_metadata(agent: str, session_id: str) -> None:
+    """Remove a dead session's local reference and cwd metadata."""
+    metadata = _load_session_metadata()
+    sessions = metadata.get(agent)
+    if sessions is not None:
+        sessions.pop(session_id, None)
+        if not sessions:
+            metadata.pop(agent, None)
+        _atomic_write(_session_metadata_file(), metadata)
+    last = _last_dir()
+    for path in (last / f"{agent}.{os.getppid()}", last / f"{agent}.default"):
+        record = _read_last_session_record(path)
+        if record is not None and record[0] == session_id:
+            with contextlib.suppress(FileNotFoundError, OSError):
+                path.unlink()
 
 
 def load_last_session(agent: str) -> str | None:
@@ -171,18 +291,8 @@ def load_last_session(agent: str) -> str | None:
     Try {agent}.{PPID} first, fall back to {agent}.default.
     Return None if neither exists.
     """
-    last = _last_dir()
-    ppid = os.getppid()
-
-    for name in (f"{agent}.{ppid}", f"{agent}.default"):
-        try:
-            text = (last / name).read_text().strip()
-            if text:
-                return text
-        except (FileNotFoundError, OSError):
-            continue
-
-    return None
+    record = load_last_session_record(agent)
+    return record[0] if record is not None else None
 
 
 def cleanup_last_sessions(max_age_hours: int = 24) -> None:

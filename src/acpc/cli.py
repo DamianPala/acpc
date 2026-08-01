@@ -3,6 +3,7 @@
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 import click
 
@@ -45,6 +46,7 @@ echo "prompt" | acpc prompt codex -
 ## Multi-turn
 acpc prompt codex "remember: X=42"
 acpc prompt codex --last "what is X?"
+acpc prompt codex -c "what is X?"
 acpc prompt codex -s SESSION_ID "follow up"
 
 ## Model & mode
@@ -70,6 +72,8 @@ echo "fix" | acpc prompt codex -              # from stdin
 acpc status                                   # running sessions
 acpc stop codex                               # stop by agent
 acpc stop -s SESSION_ID                       # stop by session
+acpc daemon status                            # daemon sessions
+acpc daemon stop [TARGET]                     # stop daemon(s)
 
 ## Other
 acpc agents                                   # list + install status
@@ -89,6 +93,101 @@ def cli() -> None:
     """acpc - Thin CLI client for the Agent Client Protocol (ACP)."""
 
 
+@cli.group()
+def daemon() -> None:
+    """Manage persistent target daemons."""
+
+
+@daemon.command(name="status")
+@click.argument("target", required=False)
+def daemon_status_command(target: str | None) -> None:
+    """Show daemon status and hosted sessions."""
+    import asyncio
+
+    from acpc.daemon_client import DaemonUnavailableError, daemon_status, daemon_targets
+
+    targets = [target] if target else daemon_targets()
+    if not targets:
+        click.echo("No running daemons.", err=True)
+        return
+    for daemon_target in targets:
+        try:
+            frame = asyncio.run(daemon_status(daemon_target))
+        except (DaemonUnavailableError, OSError) as error:
+            if target:
+                stderr_error(str(error))
+                sys.exit(1)
+            continue
+        _print_daemon_status(daemon_target, frame)
+
+
+@daemon.command(name="stop")
+@click.argument("target", required=False)
+def daemon_stop_command(target: str | None) -> None:
+    """Stop one target daemon, or every running daemon when TARGET is omitted."""
+    import asyncio
+
+    from acpc.daemon_client import DaemonUnavailableError, daemon_targets, shutdown_daemon
+
+    targets = [target] if target else daemon_targets()
+    for daemon_target in targets:
+        try:
+            asyncio.run(shutdown_daemon(daemon_target))
+        except DaemonUnavailableError:
+            if target:
+                stderr_error(f"daemon '{daemon_target}' is not running")
+                sys.exit(1)
+            continue
+        click.echo(f"stopped daemon {daemon_target}")
+
+
+def _print_daemon_status(target: str, frame: dict[str, object]) -> None:
+    """Print one daemon status frame in a stable human-readable form."""
+    pid = frame.get("pid", "?")
+    uptime = frame.get("uptime_s", "?")
+    log_path = frame.get("log", "?")
+    click.echo(f"{target}: pid {pid}, uptime {uptime}s, log {log_path}")
+    sessions = frame.get("sessions", [])
+    if not isinstance(sessions, list) or not sessions:
+        click.echo("  sessions: none")
+        return
+    for session in sessions:
+        if not isinstance(session, dict):
+            continue
+        click.echo(
+            f"  {session.get('id', '?')}  {session.get('state', '?')}  "
+            f"{session.get('cwd', '?')}  (daemon)"
+        )
+
+
+def _daemon_statuses() -> list[tuple[str, dict[str, object]]]:
+    """Read reachable daemon statuses without auto-starting missing daemons."""
+    import asyncio
+
+    from acpc.daemon_client import DaemonUnavailableError, daemon_status, daemon_targets
+
+    statuses: list[tuple[str, dict[str, object]]] = []
+    for target in daemon_targets():
+        try:
+            statuses.append((target, asyncio.run(daemon_status(target))))
+        except (DaemonUnavailableError, OSError):
+            continue
+    return statuses
+
+
+def _find_daemon_session(session_id: str) -> str | None:
+    """Return the target that reports a hosted session ID, if any."""
+    for target, frame in _daemon_statuses():
+        sessions = frame.get("sessions", [])
+        if not isinstance(sessions, list):
+            continue
+        if any(
+            isinstance(session, dict) and session.get("id") == session_id for session in sessions
+        ):
+            return target
+    return None
+
+
 # ---------------------------------------------------------------------------
 # prompt (+ run alias)
 # ---------------------------------------------------------------------------
@@ -98,6 +197,7 @@ def cli() -> None:
 @click.argument("agent")
 @click.argument("prompt_text", required=False)
 @click.option("--last", is_flag=True, help="Resume last session")
+@click.option("-c", "--continue", "continue_session", is_flag=True, help="Resume last session")
 @click.option("-s", "--session", "session_id", help="Resume session by ID")
 @click.option("--model", help="Model ID or preset (fast/standard/max)")
 @click.option("--mode", help="Set mode (ACP: session/set_mode)")
@@ -106,7 +206,7 @@ def cli() -> None:
     type=click.Choice(["all", "write", "read", "none", "prompt"]),
     help="Permission policy",
 )
-@click.option("--cwd", type=click.Path(exists=True), help="Working directory")
+@click.option("--cwd", type=click.Path(), help="Working directory")
 @click.option("--json", "use_json", is_flag=True, help="NDJSON output")
 @click.option("--quiet", is_flag=True, help="Final text only")
 @click.option("-o", "--output", "output_file", type=click.Path(), help="Write output to file")
@@ -114,10 +214,16 @@ def cli() -> None:
 @click.option("--timeout", type=int, help="Timeout in seconds")
 @click.option("--dry-run", is_flag=True, help="Resolve config and exit without running")
 @click.option("--no-daemon", is_flag=True, help="Use the direct adapter path")
+@click.option(
+    "--print-session-id",
+    is_flag=True,
+    help="Print the session ID (requires --quiet and -o FILE)",
+)
 def prompt(
     agent: str,
     prompt_text: str | None,
     last: bool,
+    continue_session: bool,
     session_id: str | None,
     model: str | None,
     mode: str | None,
@@ -130,6 +236,7 @@ def prompt(
     timeout: int | None,
     dry_run: bool,
     no_daemon: bool,
+    print_session_id: bool,
 ) -> None:
     """Send a prompt to an ACP agent."""
     import asyncio
@@ -163,6 +270,20 @@ def prompt(
         if not final_prompt or not final_prompt.strip():
             stderr_error("no prompt provided (use argument, --input-file, or pipe to stdin)")
             sys.exit(2)
+
+        if print_session_id and (not quiet or not output_file or use_json or dry_run):
+            stderr_error("--print-session-id requires --quiet -o FILE")
+            sys.exit(2)
+        if timeout is not None and timeout <= 0:
+            stderr_error("--timeout must be a positive number of seconds")
+            sys.exit(2)
+
+        if cwd is not None:
+            cwd_path = Path(cwd)
+            if not cwd_path.is_absolute() or not cwd_path.is_dir():
+                stderr_error(f"cwd must be an absolute existing directory: {cwd}")
+                sys.exit(2)
+            cwd = str(cwd_path.resolve())
 
         # Determine output mode
         if use_json:
@@ -211,15 +332,38 @@ def prompt(
             permission_level=permissions,
             cwd=cwd,
             session_id=session_id,
-            use_last=last,
+            use_last=last or continue_session,
             output_mode=output_mode,
             output_file=output_file,
             timeout=timeout,
             is_tty=is_tty,
             no_daemon=daemon_disabled,
         )
+        # RunConfig is shared with the direct runner, which has no need to know
+        # about this daemon-only output control yet.
+        setattr(config, "print_session_id", print_session_id)
 
-        exit_code = asyncio.run(run(config))
+        if print_session_id:
+            import contextlib
+            import io
+
+            from acpc.sessions import load_last_session
+
+            captured_stdout = io.StringIO()
+            with contextlib.redirect_stdout(captured_stdout):
+                exit_code = asyncio.run(run(config))
+            captured = captured_stdout.getvalue()
+            resolved_session_id = load_last_session(agent)
+            if (
+                exit_code == 0
+                and resolved_session_id
+                and not captured.startswith(f"{resolved_session_id}\n")
+            ):
+                click.echo(resolved_session_id)
+            sys.stdout.write(captured)
+            sys.stdout.flush()
+        else:
+            exit_code = asyncio.run(run(config))
         sys.exit(exit_code)
 
     except AgentNotFoundError as e:
@@ -338,8 +482,11 @@ def install(agent: str) -> None:
 @click.option("-s", "--session", "session_id", help="Stop specific session")
 def stop(agent: str | None, session_id: str | None) -> None:
     """Stop running agent sessions."""
+    import asyncio
+
     from acpc.output import stderr
     from acpc.runner import kill_process_tree
+    from acpc.daemon_client import cancel_daemon_prompt
     from acpc.sessions import get_running_by_agent, list_running, remove_running
 
     def _stop_session(rs, sid: str) -> None:  # noqa: ANN001
@@ -358,19 +505,48 @@ def stop(agent: str | None, session_id: str | None) -> None:
         if session_id:
             running = list_running()
             if session_id not in running:
-                stderr_error(f"session {session_id} not found in running sessions")
-                sys.exit(1)
-            _stop_session(running[session_id], session_id)
+                target = _find_daemon_session(session_id)
+                if target is None:
+                    stderr_error(f"session {session_id} not found in running sessions")
+                    sys.exit(1)
+                accepted = asyncio.run(cancel_daemon_prompt(target, session_id=session_id))
+                if not accepted:
+                    stderr_error(f"session {session_id} has no active prompt")
+                    sys.exit(1)
+                stderr(f"cancel requested for daemon session {session_id} ({target})")
+                return
+            rs = running[session_id]
+            if getattr(rs, "daemon", False):
+                accepted = asyncio.run(cancel_daemon_prompt(rs.agent, session_id=session_id))
+                if not accepted:
+                    stderr_error(f"session {session_id} has no active prompt")
+                    sys.exit(1)
+                stderr(f"cancel requested for daemon session {session_id} ({rs.agent})")
+                return
+            _stop_session(rs, session_id)
             return
 
         if agent:
             sessions = get_running_by_agent(agent)
-            if not sessions:
-                stderr_error(f"no running sessions for agent '{agent}'")
-                sys.exit(1)
             for rs in sessions:
-                _stop_session(rs, rs.session_id)
-            return
+                if getattr(rs, "daemon", False):
+                    accepted = asyncio.run(cancel_daemon_prompt(agent, session_id=rs.session_id))
+                    if not accepted:
+                        stderr_error(f"session {rs.session_id} has no active prompt")
+                        sys.exit(1)
+                else:
+                    _stop_session(rs, rs.session_id)
+            if sessions:
+                return
+            if agent in {target for target, _ in _daemon_statuses()}:
+                accepted = asyncio.run(cancel_daemon_prompt(agent))
+                if not accepted:
+                    stderr_error(f"daemon '{agent}' has no active prompt")
+                    sys.exit(1)
+                stderr(f"cancel requested for daemon '{agent}'")
+                return
+            stderr_error(f"no running sessions for agent '{agent}'")
+            sys.exit(1)
 
         stderr_error("specify an agent name or --session ID")
         sys.exit(2)
@@ -396,16 +572,21 @@ def status() -> None:
         from acpc.sessions import list_running
 
         running = list_running()
-        if not running:
+        daemon_statuses = _daemon_statuses()
+        if not running and not daemon_statuses:
             click.echo("No running sessions.", err=True)
             return
 
-        # Header
-        header = f"{'SESSION_ID':<40}  {'AGENT':<12}  {'PID':<8}  {'CWD':<30}  {'STARTED'}"
-        click.echo(header)
-        for rs in running.values():
-            line = f"{rs.session_id:<40}  {rs.agent:<12}  {rs.pid:<8}  {rs.cwd:<30}  {rs.started}"
-            click.echo(line)
+        if running:
+            header = f"{'SESSION_ID':<40}  {'AGENT':<20}  {'PID':<8}  {'CWD':<30}  {'STARTED'}"
+            click.echo(header)
+            for rs in running.values():
+                line = (
+                    f"{rs.session_id:<40}  {rs.agent:<20}  {rs.pid:<8}  {rs.cwd:<30}  {rs.started}"
+                )
+                click.echo(line)
+        for target, frame in daemon_statuses:
+            _print_daemon_status(target, frame)
     except KeyboardInterrupt:
         sys.exit(130)
     except Exception as e:

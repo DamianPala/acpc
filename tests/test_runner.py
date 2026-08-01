@@ -23,6 +23,7 @@ from acpc.runner import (
     _cache_available_models,
     _drain_notifications,
     _process_group_kwargs,
+    _resolve_run_cwd,
     _spawn_agent,
     _try_set_model,
 )
@@ -86,6 +87,25 @@ class TestExitCodes:
         assert EXIT_SIGINT == 130
         assert EXIT_SIGPIPE == 141
         assert EXIT_SIGTERM == 143
+
+
+def test_resume_cwd_is_loaded_and_deleted_metadata_is_evicted(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from acpc.sessions import load_session_cwd, save_last_session
+
+    monkeypatch.setenv("ACPC_STATE_DIR", str(tmp_path / "state"))
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    save_last_session("mock", "sess-1", str(cwd))
+
+    resolved, error = _resolve_run_cwd("mock", "sess-1", None)
+    assert resolved == str(cwd)
+    assert error is None
+
+    cwd.rmdir()
+    resolved, error = _resolve_run_cwd("mock", "sess-1", None)
+    assert resolved is None
+    assert error == f"session cwd no longer exists: {cwd}"
+    assert load_session_cwd("mock", "sess-1") is None
 
 
 class TestProcessGroupKwargs:

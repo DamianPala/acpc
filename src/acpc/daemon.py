@@ -35,7 +35,7 @@ from acpc.ipc import (
 )
 from acpc.output import OutputHandler, OutputMode
 from acpc.runner import _drain_notifications, _spawn_agent, _try_set_model
-from acpc.sessions import state_dir
+from acpc.sessions import process_cmdline, process_start_time, state_dir
 
 SessionState = Literal["idle", "active"]
 SessionUpdateSink = Callable[[dict[str, Any]], Awaitable[None]]
@@ -303,7 +303,7 @@ class Daemon:
                     task.add_done_callback(prompt_tasks.discard)
                     continue
                 if frame_type == "cancel":
-                    await self._cancel_connection_prompt(connection)
+                    await self._handle_cancel(connection, frame)
                     continue
                 if frame_type == "status":
                     await self._send(connection, self._status_frame())
@@ -376,6 +376,8 @@ class Daemon:
             raise ValueError("session_id must be a string or null")
         if requested_id is None:
             await self._ensure_can_create_session()
+            if cwd is None:
+                raise ValueError("cwd must be an absolute existing directory")
             response = await self._require_connection().new_session(cwd=cwd)
             record = self._new_record(response.session_id, cwd)
             record.session_response = response
@@ -411,15 +413,16 @@ class Daemon:
         self,
         context: PromptContext,
         session_id: str,
-        cwd: str,
+        cwd: str | None,
         permission: PermissionLevel,
     ) -> tuple[SessionRecord, Literal["loaded"]]:
+        load_cwd = self._load_cwd_for_session(session_id, cwd)
         loop = asyncio.get_running_loop()
         loading = loop.create_future()
         self._loading_sessions[session_id] = loading
         record = SessionRecord(
             session_id=session_id,
-            cwd=cwd,
+            cwd=load_cwd,
             created_at=time.time(),
             last_used=time.monotonic(),
             permission_level=permission,
@@ -428,7 +431,7 @@ class Daemon:
         try:
             with self.client.replaying_history(session_id):
                 record.session_response = await self._require_connection().load_session(
-                    cwd=cwd,
+                    cwd=load_cwd,
                     session_id=session_id,
                 )
             self.client.detach_session(session_id)
@@ -711,18 +714,50 @@ class Daemon:
         for position, request in enumerate(waiting, start=1):
             await self._send(request.connection, {"type": "queued", "position": position})
 
-    async def _cancel_connection_prompt(self, connection: Connection) -> None:
-        for context in self._connection_contexts.get(connection.id, ()):
-            request = context.request
-            if request is None or not request.started_prompt:
-                continue
-            request.cancel_requested = True
-            with contextlib.suppress(RequestError, OSError, RuntimeError):
-                await asyncio.wait_for(
-                    self._require_connection().cancel(session_id=request.session_id),
-                    timeout=_CANCEL_TIMEOUT,
-                )
+    async def _handle_cancel(self, connection: Connection, frame: dict[str, Any]) -> None:
+        requested_id = frame.get("session_id")
+        if requested_id is not None and not isinstance(requested_id, str):
+            await self._send_cancel_ack(connection, None, False)
             return
+        request = self._find_cancel_request(connection, requested_id)
+        if request is None:
+            await self._send_cancel_ack(connection, requested_id, False)
+            return
+        request.cancel_requested = True
+        with contextlib.suppress(RequestError, OSError, RuntimeError, asyncio.TimeoutError):
+            await asyncio.wait_for(
+                self._require_connection().cancel(session_id=request.session_id),
+                timeout=_CANCEL_TIMEOUT,
+            )
+        await self._send_cancel_ack(connection, request.session_id, True)
+
+    def _find_cancel_request(
+        self, connection: Connection, session_id: str | None
+    ) -> PromptRequest | None:
+        if session_id is None:
+            requests = (
+                context.request for context in self._connection_contexts.get(connection.id, ())
+            )
+        else:
+            requests = iter(self._all_requests.values())
+        return next(
+            (
+                request
+                for request in requests
+                if request is not None
+                and request.started_prompt
+                and (session_id is None or request.session_id == session_id)
+            ),
+            None,
+        )
+
+    async def _send_cancel_ack(
+        self, connection: Connection, session_id: str | None, accepted: bool
+    ) -> None:
+        await self._send(
+            connection,
+            {"type": "cancel_ack", "session_id": session_id, "accepted": accepted},
+        )
 
     async def _abandon_context(self, context: PromptContext) -> None:
         if context.abandoned:
@@ -920,8 +955,10 @@ class Daemon:
             "sessions": sessions,
         }
 
-    def _request_cwd(self, frame: dict[str, Any]) -> str:
+    def _request_cwd(self, frame: dict[str, Any]) -> str | None:
         cwd = frame.get("cwd")
+        if cwd is None:
+            return None
         if not isinstance(cwd, str):
             raise ValueError("cwd must be an absolute existing directory")
         return self._canonical_cwd(cwd)
@@ -939,16 +976,51 @@ class Daemon:
             raise ValueError(f"cwd must be an absolute existing directory: {cwd}")
         return str(resolved)
 
-    def _validate_resume_cwd(self, record: SessionRecord, requested_cwd: str) -> None:
+    def _validate_resume_cwd(self, record: SessionRecord, requested_cwd: str | None) -> None:
         try:
             recorded_cwd = self._canonical_cwd(record.cwd)
         except ValueError as error:
-            self.sessions.pop(record.session_id, None)
-            self.client.unregister_session(record.session_id)
+            self._evict_session(record.session_id)
             raise ValueError(f"session cwd no longer exists: {record.cwd}") from error
         record.cwd = recorded_cwd
-        if recorded_cwd != requested_cwd:
+        if requested_cwd is not None and recorded_cwd != requested_cwd:
             raise ValueError(f"session cwd is {recorded_cwd}, --cwd says {requested_cwd}")
+
+    def _load_cwd_for_session(self, session_id: str, requested_cwd: str | None) -> str:
+        recorded_cwd = self._session_cwd_metadata(session_id)
+        if requested_cwd is None:
+            if recorded_cwd is None:
+                raise ValueError(
+                    f"session cwd is unknown for {session_id}; provide --cwd to load it"
+                )
+            requested_cwd = recorded_cwd
+        elif recorded_cwd is not None:
+            try:
+                recorded_cwd = self._canonical_cwd(recorded_cwd)
+            except ValueError as error:
+                self._evict_session(session_id)
+                raise ValueError(f"session cwd no longer exists: {recorded_cwd}") from error
+            if recorded_cwd != requested_cwd:
+                raise ValueError(f"session cwd is {recorded_cwd}, --cwd says {requested_cwd}")
+        try:
+            return self._canonical_cwd(requested_cwd)
+        except ValueError as error:
+            if recorded_cwd is not None:
+                self._evict_session(session_id)
+                raise ValueError(f"session cwd no longer exists: {recorded_cwd}") from error
+            raise
+
+    def _session_cwd_metadata(self, session_id: str) -> str | None:
+        from acpc.sessions import load_session_cwd
+
+        return load_session_cwd(self.target, session_id)
+
+    def _evict_session(self, session_id: str) -> None:
+        self.sessions.pop(session_id, None)
+        self.client.unregister_session(session_id)
+        from acpc.sessions import evict_session_metadata
+
+        evict_session_metadata(self.target, session_id)
 
     @staticmethod
     def _permission_level(frame: dict[str, Any]) -> PermissionLevel:
@@ -1020,6 +1092,8 @@ class Daemon:
             "acpc_version": __version__,
             "target": self.target,
             "start_time": time.time(),
+            "process_start_time": process_start_time(),
+            "cmdline": process_cmdline(),
         }
         self._lock_file.seek(0)
         self._lock_file.truncate()
