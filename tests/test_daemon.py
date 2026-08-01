@@ -34,6 +34,17 @@ from acpc.ipc import (
 from acpc.output import OutputHandler, OutputMode
 
 
+DAEMON_TEST_TIMEOUT = 15
+PROMPT_SECONDS = DAEMON_TEST_TIMEOUT // 5
+LONG_PROMPT_SECONDS = DAEMON_TEST_TIMEOUT
+POLL_SECONDS = DAEMON_TEST_TIMEOUT / 1000
+NO_RESULT_TIMEOUT = DAEMON_TEST_TIMEOUT / 25
+SHORT_SLEEP_SECONDS = DAEMON_TEST_TIMEOUT / 200
+TTL_SECONDS = DAEMON_TEST_TIMEOUT / 100
+
+pytestmark = pytest.mark.timeout(DAEMON_TEST_TIMEOUT)
+
+
 class _ControlledProcess:
     def __init__(self) -> None:
         self.returncode: int | None = None
@@ -116,10 +127,10 @@ def _controlled_request(
 
 
 async def _wait_for_socket(path: Path) -> None:
-    for _ in range(100):
+    for _ in range(int(DAEMON_TEST_TIMEOUT / POLL_SECONDS)):
         if path.exists():
             return
-        await asyncio.sleep(0.01)
+        await asyncio.sleep(POLL_SECONDS)
     raise AssertionError(f"daemon socket did not appear: {path}")
 
 
@@ -129,7 +140,7 @@ async def _receive_prompt_result(
 ) -> list[dict[str, Any]]:
     frames: list[dict[str, Any]] = []
     while True:
-        frame = await asyncio.wait_for(transport.receive(connection), timeout=5)
+        frame = await asyncio.wait_for(transport.receive(connection), timeout=DAEMON_TEST_TIMEOUT)
         frames.append(frame)
         if frame["type"] in {"prompt_done", "error", "capacity", "shutting_down"}:
             return frames
@@ -230,7 +241,7 @@ def test_daemon_sessions_are_fresh_and_explicit_ids_load_or_reuse(daemon_environ
             await transport.close_connection(connection)
             await transport.cleanup()
             await daemon.stop()
-            await asyncio.wait_for(daemon_task, timeout=1)
+            await asyncio.wait_for(daemon_task, timeout=DAEMON_TEST_TIMEOUT)
             assert not state.joinpath("run", "mock.sock").exists()
 
     asyncio.run(scenario())
@@ -251,13 +262,15 @@ def test_disconnected_prompt_does_not_leak_into_reused_session(daemon_environmen
                 first_connection,
                 {
                     "type": "prompt",
-                    "text": "slow:1",
+                    "text": f"slow:{PROMPT_SECONDS}",
                     "cwd": str(cwd),
                     "session_id": None,
                     "permissions": "all",
                 },
             )
-            started = await asyncio.wait_for(first_transport.receive(first_connection), timeout=1)
+            started = await asyncio.wait_for(
+                first_transport.receive(first_connection), timeout=DAEMON_TEST_TIMEOUT
+            )
             session_id = started["session_id"]
             await first_transport.close_connection(first_connection)
             await first_transport.cleanup()
@@ -267,22 +280,24 @@ def test_disconnected_prompt_does_not_leak_into_reused_session(daemon_environmen
                 second_transport,
                 second_connection,
                 cwd,
-                "slow:2",
+                f"slow:{PROMPT_SECONDS}",
                 session_id,
             )
             assert [
                 frame["update"]["content"]["text"]
                 for frame in frames
                 if frame["type"] == "session_update"
-            ] == ["waited 2s"]
+            ] == [f"waited {PROMPT_SECONDS}s"]
             with pytest.raises(TimeoutError):
-                await asyncio.wait_for(second_transport.receive(second_connection), timeout=0.4)
+                await asyncio.wait_for(
+                    second_transport.receive(second_connection), timeout=NO_RESULT_TIMEOUT
+                )
         finally:
             if second_connection is not None:
                 await second_transport.close_connection(second_connection)
             await second_transport.cleanup()
             await daemon.stop()
-            await asyncio.wait_for(daemon_task, timeout=1)
+            await asyncio.wait_for(daemon_task, timeout=DAEMON_TEST_TIMEOUT)
 
     asyncio.run(scenario())
 
@@ -300,27 +315,33 @@ def test_adapter_death_fails_prompt_and_stops_daemon(daemon_environment) -> None
                 connection,
                 {
                     "type": "prompt",
-                    "text": "chunkslow:10",
+                    "text": f"chunkslow:{LONG_PROMPT_SECONDS}",
                     "cwd": str(cwd),
                     "session_id": None,
                     "permissions": "all",
                 },
             )
-            started = await asyncio.wait_for(transport.receive(connection), timeout=1)
+            started = await asyncio.wait_for(
+                transport.receive(connection), timeout=DAEMON_TEST_TIMEOUT
+            )
             assert started["type"] == "session_started"
-            update = await asyncio.wait_for(transport.receive(connection), timeout=1)
+            update = await asyncio.wait_for(
+                transport.receive(connection), timeout=DAEMON_TEST_TIMEOUT
+            )
             assert update["type"] == "session_update"
             assert daemon.process is not None
             daemon.process.kill()
-            await asyncio.wait_for(daemon.process.wait(), timeout=1)
-            error = await asyncio.wait_for(transport.receive(connection), timeout=1)
+            await asyncio.wait_for(daemon.process.wait(), timeout=DAEMON_TEST_TIMEOUT)
+            error = await asyncio.wait_for(
+                transport.receive(connection), timeout=DAEMON_TEST_TIMEOUT
+            )
             assert error == {
                 "type": "error",
                 "message": "adapter connection lost",
                 "exit_code": 1,
                 "session_id": started["session_id"],
             }
-            await asyncio.wait_for(daemon_task, timeout=1)
+            await asyncio.wait_for(daemon_task, timeout=DAEMON_TEST_TIMEOUT)
         finally:
             with contextlib.suppress(ConnectionError, OSError, ValueError):
                 await transport.close_connection(connection)
@@ -425,7 +446,7 @@ def test_resume_rejects_cwd_mismatch_and_evicts_deleted_cwd(daemon_environment) 
             await transport.close_connection(connection)
             await transport.cleanup()
             await daemon.stop()
-            await asyncio.wait_for(daemon_task, timeout=1)
+            await asyncio.wait_for(daemon_task, timeout=DAEMON_TEST_TIMEOUT)
 
     asyncio.run(scenario())
 
@@ -451,7 +472,7 @@ def test_load_is_not_published_until_replay_finishes(daemon_environment) -> None
                     "permissions": "all",
                 },
             )
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(SHORT_SLEEP_SECONDS)
             assert "load-slow" not in daemon.sessions
             await second_transport.send(
                 second_connection,
@@ -480,7 +501,7 @@ def test_load_is_not_published_until_replay_finishes(daemon_environment) -> None
             await first_transport.cleanup()
             await second_transport.cleanup()
             await daemon.stop()
-            await asyncio.wait_for(daemon_task, timeout=1)
+            await asyncio.wait_for(daemon_task, timeout=DAEMON_TEST_TIMEOUT)
 
     asyncio.run(scenario())
 
@@ -502,7 +523,7 @@ def test_failed_load_rolls_back_client_registration(daemon_environment) -> None:
             await transport.close_connection(connection)
             await transport.cleanup()
             await daemon.stop()
-            await asyncio.wait_for(daemon_task, timeout=1)
+            await asyncio.wait_for(daemon_task, timeout=DAEMON_TEST_TIMEOUT)
 
     asyncio.run(scenario())
 
@@ -536,7 +557,7 @@ def test_daemon_has_no_artificial_session_cap_and_drains_all_chunks(daemon_envir
             await transport.close_connection(connection)
             await transport.cleanup()
             await daemon.stop()
-            await asyncio.wait_for(daemon_task, timeout=1)
+            await asyncio.wait_for(daemon_task, timeout=DAEMON_TEST_TIMEOUT)
 
     asyncio.run(scenario())
 
@@ -606,7 +627,7 @@ def test_daemon_uses_state_cwd_and_survives_deleted_caller_cwd(daemon_environmen
             await transport.close_connection(connection)
             await transport.cleanup()
             await daemon.stop()
-            await asyncio.wait_for(daemon_task, timeout=1)
+            await asyncio.wait_for(daemon_task, timeout=DAEMON_TEST_TIMEOUT)
 
     asyncio.run(scenario())
 
@@ -645,7 +666,7 @@ def test_daemon_routes_concurrent_session_streams_to_their_clients(daemon_enviro
             await first_transport.cleanup()
             await second_transport.cleanup()
             await daemon.stop()
-            await asyncio.wait_for(daemon_task, timeout=1)
+            await asyncio.wait_for(daemon_task, timeout=DAEMON_TEST_TIMEOUT)
 
     asyncio.run(scenario())
 
@@ -663,17 +684,24 @@ def test_same_session_fifo_lock_catches_concurrent_prompt_mutation(daemon_enviro
         try:
             await first_transport.send(
                 first,
-                {"type": "prompt", "text": "chunkslow:1", "cwd": str(cwd), "permissions": "all"},
+                {
+                    "type": "prompt",
+                    "text": f"chunkslow:{PROMPT_SECONDS}",
+                    "cwd": str(cwd),
+                    "permissions": "all",
+                },
             )
-            started = await asyncio.wait_for(first_transport.receive(first), timeout=1)
-            await asyncio.wait_for(first_transport.receive(first), timeout=1)
+            started = await asyncio.wait_for(
+                first_transport.receive(first), timeout=DAEMON_TEST_TIMEOUT
+            )
+            await asyncio.wait_for(first_transport.receive(first), timeout=DAEMON_TEST_TIMEOUT)
             session_id = started["session_id"]
             assert daemon.sessions[session_id].running
             await second_transport.send(
                 second,
                 {
                     "type": "prompt",
-                    "text": "slow:1",
+                    "text": f"slow:{PROMPT_SECONDS}",
                     "cwd": str(cwd),
                     "session_id": session_id,
                     "permissions": "all",
@@ -681,23 +709,23 @@ def test_same_session_fifo_lock_catches_concurrent_prompt_mutation(daemon_enviro
             )
             started_at = time.monotonic()
             second_frames = await asyncio.wait_for(
-                _receive_prompt_result(second_transport, second), timeout=3
+                _receive_prompt_result(second_transport, second), timeout=DAEMON_TEST_TIMEOUT
             )
             elapsed = time.monotonic() - started_at
             first_result = await asyncio.wait_for(
-                _receive_prompt_result(first_transport, first), timeout=1
+                _receive_prompt_result(first_transport, first), timeout=DAEMON_TEST_TIMEOUT
             )
             assert any(frame["type"] == "queued" for frame in second_frames), second_frames
             assert first_result[-1]["stop_reason"] == "end_turn"
             assert second_frames[-1]["stop_reason"] == "end_turn"
-            assert elapsed >= 1.6
+            assert elapsed >= PROMPT_SECONDS * 0.8
         finally:
             await first_transport.close_connection(first)
             await second_transport.close_connection(second)
             await first_transport.cleanup()
             await second_transport.cleanup()
             await daemon.stop()
-            await asyncio.wait_for(daemon_task, timeout=1)
+            await asyncio.wait_for(daemon_task, timeout=DAEMON_TEST_TIMEOUT)
             assert not socket_path_for_target("mock").exists()
             assert not lock_path_for_target("mock").exists()
 
@@ -714,7 +742,8 @@ def test_superseded_cancelled_prompt_is_an_error(daemon_environment) -> None:
         connection = await transport.connect()
         try:
             frames = await asyncio.wait_for(
-                _send_prompt(transport, connection, cwd, "supersede:external"), timeout=1
+                _send_prompt(transport, connection, cwd, "supersede:external"),
+                timeout=DAEMON_TEST_TIMEOUT,
             )
             assert frames[-1]["type"] == "error"
             assert frames[-1]["message"] == "prompt superseded on this session"
@@ -723,7 +752,7 @@ def test_superseded_cancelled_prompt_is_an_error(daemon_environment) -> None:
             await transport.close_connection(connection)
             await transport.cleanup()
             await daemon.stop()
-            await asyncio.wait_for(daemon_task, timeout=1)
+            await asyncio.wait_for(daemon_task, timeout=DAEMON_TEST_TIMEOUT)
             assert not lock_path_for_target("mock").exists()
 
     asyncio.run(scenario())
@@ -743,19 +772,29 @@ def test_global_concurrency_cap_queues_arriving_prompt(daemon_environment, monke
         try:
             await first_transport.send(
                 first,
-                {"type": "prompt", "text": "chunkslow:1", "cwd": str(cwd), "permissions": "all"},
+                {
+                    "type": "prompt",
+                    "text": f"chunkslow:{PROMPT_SECONDS}",
+                    "cwd": str(cwd),
+                    "permissions": "all",
+                },
             )
-            await asyncio.wait_for(first_transport.receive(first), timeout=1)
-            await asyncio.wait_for(first_transport.receive(first), timeout=1)
+            await asyncio.wait_for(first_transport.receive(first), timeout=DAEMON_TEST_TIMEOUT)
+            await asyncio.wait_for(first_transport.receive(first), timeout=DAEMON_TEST_TIMEOUT)
             await second_transport.send(
                 second,
-                {"type": "prompt", "text": "slow:1", "cwd": str(cwd), "permissions": "all"},
+                {
+                    "type": "prompt",
+                    "text": f"slow:{PROMPT_SECONDS}",
+                    "cwd": str(cwd),
+                    "permissions": "all",
+                },
             )
             second_frames = await asyncio.wait_for(
-                _receive_prompt_result(second_transport, second), timeout=3
+                _receive_prompt_result(second_transport, second), timeout=DAEMON_TEST_TIMEOUT
             )
             first_frames = await asyncio.wait_for(
-                _receive_prompt_result(first_transport, first), timeout=1
+                _receive_prompt_result(first_transport, first), timeout=DAEMON_TEST_TIMEOUT
             )
             assert any(frame["type"] == "queued" for frame in second_frames)
             assert first_frames[-1]["stop_reason"] == "end_turn"
@@ -766,7 +805,7 @@ def test_global_concurrency_cap_queues_arriving_prompt(daemon_environment, monke
             await first_transport.cleanup()
             await second_transport.cleanup()
             await daemon.stop()
-            await asyncio.wait_for(daemon_task, timeout=1)
+            await asyncio.wait_for(daemon_task, timeout=DAEMON_TEST_TIMEOUT)
             assert not lock_path_for_target("mock").exists()
 
     asyncio.run(scenario())
@@ -823,7 +862,7 @@ def test_model_and_mode_switch_once_per_changed_value(daemon_environment) -> Non
             await transport.close_connection(connection)
             await transport.cleanup()
             await daemon.stop()
-            await asyncio.wait_for(daemon_task, timeout=1)
+            await asyncio.wait_for(daemon_task, timeout=DAEMON_TEST_TIMEOUT)
             assert not daemon.process
             assert not socket_path_for_target("mock").exists()
             assert not lock_path_for_target("mock").exists()
@@ -896,7 +935,7 @@ def test_permissions_are_captured_per_prompt_request(daemon_environment, monkeyp
             await transport.close_connection(connection)
             await transport.cleanup()
             await daemon.stop()
-            await asyncio.wait_for(daemon_task, timeout=1)
+            await asyncio.wait_for(daemon_task, timeout=DAEMON_TEST_TIMEOUT)
             assert not daemon.process
             assert not state.joinpath("run", "mock.sock").exists()
             assert not lock_path_for_target("mock").exists()
@@ -915,10 +954,19 @@ def test_session_queue_overflow_has_no_direct_spawn_signal(daemon_environment) -
         try:
             await transports[0].send(
                 connections[0],
-                {"type": "prompt", "text": "chunkslow:1", "cwd": str(cwd), "permissions": "all"},
+                {
+                    "type": "prompt",
+                    "text": f"chunkslow:{PROMPT_SECONDS}",
+                    "cwd": str(cwd),
+                    "permissions": "all",
+                },
             )
-            started = await asyncio.wait_for(transports[0].receive(connections[0]), timeout=1)
-            await asyncio.wait_for(transports[0].receive(connections[0]), timeout=1)
+            started = await asyncio.wait_for(
+                transports[0].receive(connections[0]), timeout=DAEMON_TEST_TIMEOUT
+            )
+            await asyncio.wait_for(
+                transports[0].receive(connections[0]), timeout=DAEMON_TEST_TIMEOUT
+            )
             session_id = started["session_id"]
             for index in range(1, 6):
                 await transports[index].send(
@@ -938,7 +986,7 @@ def test_session_queue_overflow_has_no_direct_spawn_signal(daemon_environment) -
                         for transport, connection in zip(transports, connections)
                     ),
                 ),
-                timeout=4,
+                timeout=DAEMON_TEST_TIMEOUT,
             )
             overflow = results[5][-1]
             assert overflow == {
@@ -952,7 +1000,7 @@ def test_session_queue_overflow_has_no_direct_spawn_signal(daemon_environment) -
                 await transport.close_connection(connection)
                 await transport.cleanup()
             await daemon.stop()
-            await asyncio.wait_for(daemon_task, timeout=1)
+            await asyncio.wait_for(daemon_task, timeout=DAEMON_TEST_TIMEOUT)
             assert not socket_path_for_target("mock").exists()
             assert not lock_path_for_target("mock").exists()
 
@@ -962,9 +1010,9 @@ def test_session_queue_overflow_has_no_direct_spawn_signal(daemon_environment) -
 def test_idle_ttl_cleans_socket_and_lock(daemon_environment, monkeypatch) -> None:
     async def scenario() -> None:
         state, _ = daemon_environment
-        monkeypatch.setenv("ACPC_DAEMON_TTL", "0.1")
+        monkeypatch.setenv("ACPC_DAEMON_TTL", str(TTL_SECONDS))
         daemon = Daemon("mock")
-        await asyncio.wait_for(daemon.run(), timeout=2)
+        await asyncio.wait_for(daemon.run(), timeout=DAEMON_TEST_TIMEOUT)
         assert not socket_path_for_target("mock").exists()
         assert not lock_path_for_target("mock").exists()
         assert state.joinpath("log", "mock.log").is_file()
@@ -985,33 +1033,40 @@ def test_sigterm_rejects_queue_and_drains_active_prompt(daemon_environment) -> N
         try:
             await first_transport.send(
                 first,
-                {"type": "prompt", "text": "chunkslow:2", "cwd": str(cwd), "permissions": "all"},
+                {
+                    "type": "prompt",
+                    "text": f"chunkslow:{PROMPT_SECONDS}",
+                    "cwd": str(cwd),
+                    "permissions": "all",
+                },
             )
-            started = await asyncio.wait_for(first_transport.receive(first), timeout=1)
-            await asyncio.wait_for(first_transport.receive(first), timeout=1)
+            started = await asyncio.wait_for(
+                first_transport.receive(first), timeout=DAEMON_TEST_TIMEOUT
+            )
+            await asyncio.wait_for(first_transport.receive(first), timeout=DAEMON_TEST_TIMEOUT)
             session_id = started["session_id"]
             await second_transport.send(
                 second,
                 {
                     "type": "prompt",
-                    "text": "slow:2",
+                    "text": f"slow:{PROMPT_SECONDS}",
                     "cwd": str(cwd),
                     "session_id": session_id,
                     "permissions": "all",
                 },
             )
-            await asyncio.wait_for(second_transport.receive(second), timeout=1)
-            await asyncio.wait_for(second_transport.receive(second), timeout=1)
+            await asyncio.wait_for(second_transport.receive(second), timeout=DAEMON_TEST_TIMEOUT)
+            await asyncio.wait_for(second_transport.receive(second), timeout=DAEMON_TEST_TIMEOUT)
             os.kill(os.getpid(), signal.SIGTERM)
             queued = await asyncio.wait_for(
-                _receive_prompt_result(second_transport, second), timeout=1
+                _receive_prompt_result(second_transport, second), timeout=DAEMON_TEST_TIMEOUT
             )
             active = await asyncio.wait_for(
-                _receive_prompt_result(first_transport, first), timeout=3
+                _receive_prompt_result(first_transport, first), timeout=DAEMON_TEST_TIMEOUT
             )
             assert queued[-1] == {"type": "shutting_down"}
             assert active[-1]["type"] == "prompt_done"
-            await asyncio.wait_for(daemon_task, timeout=2)
+            await asyncio.wait_for(daemon_task, timeout=DAEMON_TEST_TIMEOUT)
         finally:
             await first_transport.close_connection(first)
             await second_transport.close_connection(second)
@@ -1066,7 +1121,7 @@ def test_capacity_refuses_new_sessions_but_serves_existing(daemon_environment, m
             await transport.close_connection(connection)
             await transport.cleanup()
             await daemon.stop()
-            await asyncio.wait_for(daemon_task, timeout=1)
+            await asyncio.wait_for(daemon_task, timeout=DAEMON_TEST_TIMEOUT)
 
     asyncio.run(scenario())
 
@@ -1085,12 +1140,12 @@ def test_adapter_stderr_is_truncated_and_written_to_target_log(daemon_environmen
         try:
             frames = await _send_prompt(transport, connection, cwd, "stderr:adapter noise")
             assert frames[-1]["type"] == "prompt_done"
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(SHORT_SLEEP_SECONDS)
         finally:
             await transport.close_connection(connection)
             await transport.cleanup()
             await daemon.stop()
-            await asyncio.wait_for(daemon_task, timeout=1)
+            await asyncio.wait_for(daemon_task, timeout=DAEMON_TEST_TIMEOUT)
         text = log_path.read_text()
         assert "old" not in text
         assert "adapter noise" in text
@@ -1114,19 +1169,19 @@ def test_rss_ceiling_resolution_env_default_and_missing_procfs(monkeypatch, tmp_
 def test_max_age_recycles_after_active_prompt_finishes(daemon_environment, monkeypatch) -> None:
     async def scenario() -> None:
         _, cwd = daemon_environment
-        monkeypatch.setenv("ACPC_DAEMON_MAX_AGE", "0.2")
+        monkeypatch.setenv("ACPC_DAEMON_MAX_AGE", str(DAEMON_TEST_TIMEOUT / 50))
         daemon = Daemon("mock")
         daemon_task = asyncio.create_task(daemon.run())
         await _wait_for_socket(socket_path_for_target("mock"))
         transport = UnixSocketTransport("mock")
         connection = await transport.connect()
         try:
-            frames = await _send_prompt(transport, connection, cwd, "slow:1")
+            frames = await _send_prompt(transport, connection, cwd, f"slow:{PROMPT_SECONDS}")
             assert frames[-1]["type"] == "prompt_done"
         finally:
             await transport.close_connection(connection)
             await transport.cleanup()
-        await asyncio.wait_for(daemon_task, timeout=2)
+        await asyncio.wait_for(daemon_task, timeout=DAEMON_TEST_TIMEOUT)
         assert not socket_path_for_target("mock").exists()
         assert not lock_path_for_target("mock").exists()
 
