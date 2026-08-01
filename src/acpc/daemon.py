@@ -581,6 +581,13 @@ class Daemon:
             except ValueError as error:
                 await self._send_request_error(request, str(error), exit_code=2)
             except (RequestError, OSError, RuntimeError) as error:
+                if self._adapter_lost:
+                    return
+                if isinstance(error, ConnectionError):
+                    self._adapter_lost = True
+                    await self._send_request_error(request, "adapter connection lost")
+                    await self._begin_shutdown()
+                    return
                 if _is_auth_error(error):
                     await self._begin_shutdown(recycle=True)
                 await self._send_request_error(request, str(error))
@@ -622,8 +629,8 @@ class Daemon:
             except RequestError as error:
                 self._log(f"warning: failed to set mode '{request.mode}': {error}")
         return await self._require_connection().prompt(
+            record.session_id,
             [acp.text_block(request.text)],
-            session_id=record.session_id,
         )
 
     async def _finish_prompt(
@@ -817,11 +824,11 @@ class Daemon:
         if self._stopping or self._adapter_lost:
             return
         self._adapter_lost = True
-        with contextlib.suppress(Exception):
-            await connection.close()
         for request in tuple(self._all_requests.values()):
             if request.started_prompt and not request.context.abandoned:
                 await self._send_request_error(request, "adapter connection lost")
+        with contextlib.suppress(Exception):
+            await connection.close()
         await self._begin_shutdown()
 
     async def _cleanup_failed_start(self) -> None:

@@ -9,19 +9,110 @@ import os
 import signal
 import time
 from pathlib import Path
-from typing import Any, Iterator
+from types import SimpleNamespace
+from typing import Any, Iterator, cast
 
 import pytest
 from acp.schema import PermissionOption, ToolCallUpdate
 
 from acpc.client import PermissionLevel
-from acpc.daemon import Daemon, read_mem_available_mb, rss_ceiling_mb
+from acpc.daemon import (
+    Daemon,
+    PromptContext,
+    PromptRequest,
+    SessionRecord,
+    read_mem_available_mb,
+    rss_ceiling_mb,
+)
 from acpc.ipc import (
     Connection,
+    DaemonTransport,
     UnixSocketTransport,
     lock_path_for_target,
     socket_path_for_target,
 )
+from acpc.output import OutputHandler, OutputMode
+
+
+class _ControlledProcess:
+    def __init__(self) -> None:
+        self.returncode: int | None = None
+        self.exited = asyncio.Event()
+
+    def exit(self) -> None:
+        self.returncode = 1
+        self.exited.set()
+
+    async def wait(self) -> int:
+        await self.exited.wait()
+        return self.returncode or 0
+
+
+class _RecordingTransport:
+    def __init__(self) -> None:
+        self.frames: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self.events: list[str] = []
+        self.closed = False
+
+    async def send(self, connection: Any, frame: dict[str, Any]) -> None:
+        del connection
+        if self.closed:
+            raise ConnectionError("IPC connection is closed")
+        self.events.append("send")
+        await self.frames.put(frame)
+
+    async def stop_accepting(self) -> None:
+        return
+
+
+class _ControlledAdapterConnection:
+    def __init__(self, transport: _RecordingTransport) -> None:
+        self.transport = transport
+        self.prompt_started = asyncio.Event()
+        self.release_prompt = asyncio.Event()
+        self.closed = False
+
+    async def prompt(self, session_id: str, prompt: list[Any]) -> Any:
+        del session_id, prompt
+        self.prompt_started.set()
+        await self.release_prompt.wait()
+        raise ConnectionError("connection closed")
+
+    async def close(self) -> None:
+        self.closed = True
+        self.transport.events.append("acp_close")
+        self.transport.closed = True
+
+
+def _controlled_request(
+    daemon: Daemon,
+    connection: Any,
+    session_id: str = "sess-1",
+) -> tuple[SessionRecord, PromptRequest]:
+    loop = asyncio.get_running_loop()
+    record = SessionRecord(
+        session_id=session_id,
+        cwd="/tmp",
+        created_at=0.0,
+        last_used=0.0,
+    )
+    context = PromptContext(connection=connection)
+    request = PromptRequest(
+        context=context,
+        connection=connection,
+        session_id=session_id,
+        text="pending",
+        cwd="/tmp",
+        permission_level=PermissionLevel.ALL,
+        model=None,
+        mode=None,
+        output=OutputHandler(mode=OutputMode.QUIET),
+        done=loop.create_future(),
+        sequence=1,
+    )
+    daemon.sessions[session_id] = record
+    daemon._all_requests[id(request)] = request
+    return record, request
 
 
 async def _wait_for_socket(path: Path) -> None:
@@ -209,7 +300,7 @@ def test_adapter_death_fails_prompt_and_stops_daemon(daemon_environment) -> None
                 connection,
                 {
                     "type": "prompt",
-                    "text": "slow:10",
+                    "text": "chunkslow:10",
                     "cwd": str(cwd),
                     "session_id": None,
                     "permissions": "all",
@@ -217,6 +308,8 @@ def test_adapter_death_fails_prompt_and_stops_daemon(daemon_environment) -> None
             )
             started = await asyncio.wait_for(transport.receive(connection), timeout=1)
             assert started["type"] == "session_started"
+            update = await asyncio.wait_for(transport.receive(connection), timeout=1)
+            assert update["type"] == "session_update"
             assert daemon.process is not None
             daemon.process.kill()
             await asyncio.wait_for(daemon.process.wait(), timeout=1)
@@ -233,6 +326,67 @@ def test_adapter_death_fails_prompt_and_stops_daemon(daemon_environment) -> None
                 await transport.close_connection(connection)
             await transport.cleanup()
             await daemon.stop()
+
+    asyncio.run(scenario())
+
+
+def test_adapter_death_sends_error_before_closing_acp_connection(daemon_environment) -> None:
+    async def scenario() -> None:
+        transport = _RecordingTransport()
+        daemon = Daemon("mock", transport=cast(DaemonTransport, transport))
+        process = _ControlledProcess()
+        adapter = _ControlledAdapterConnection(transport)
+        ipc_connection = SimpleNamespace(id="client-1")
+        daemon.connection = cast(Any, adapter)
+        daemon.process = cast(Any, process)
+        record, request = _controlled_request(daemon, ipc_connection)
+
+        request_task = asyncio.create_task(daemon._run_request(record, request))
+        await adapter.prompt_started.wait()
+        watcher_task = asyncio.create_task(
+            daemon._watch_process(cast(Any, process), cast(Any, adapter))
+        )
+        process.exit()
+        await watcher_task
+
+        assert transport.events == ["send", "acp_close"]
+        assert transport.frames.get_nowait() == {
+            "type": "error",
+            "session_id": "sess-1",
+            "message": "adapter connection lost",
+            "exit_code": 1,
+        }
+
+        adapter.release_prompt.set()
+        await request_task
+
+    asyncio.run(scenario())
+
+
+def test_prompt_error_after_adapter_exit_reports_adapter_loss(daemon_environment) -> None:
+    async def scenario() -> None:
+        transport = _RecordingTransport()
+        daemon = Daemon("mock", transport=cast(DaemonTransport, transport))
+        process = _ControlledProcess()
+        adapter = _ControlledAdapterConnection(transport)
+        ipc_connection = SimpleNamespace(id="client-1")
+        daemon.connection = cast(Any, adapter)
+        daemon.process = cast(Any, process)
+        record, request = _controlled_request(daemon, ipc_connection)
+
+        request_task = asyncio.create_task(daemon._run_request(record, request))
+        await adapter.prompt_started.wait()
+        process.exit()
+        adapter.release_prompt.set()
+        await request_task
+
+        assert transport.events == ["send"]
+        assert transport.frames.get_nowait() == {
+            "type": "error",
+            "session_id": "sess-1",
+            "message": "adapter connection lost",
+            "exit_code": 1,
+        }
 
     asyncio.run(scenario())
 
@@ -831,7 +985,7 @@ def test_sigterm_rejects_queue_and_drains_active_prompt(daemon_environment) -> N
         try:
             await first_transport.send(
                 first,
-                {"type": "prompt", "text": "chunkslow:1", "cwd": str(cwd), "permissions": "all"},
+                {"type": "prompt", "text": "chunkslow:2", "cwd": str(cwd), "permissions": "all"},
             )
             started = await asyncio.wait_for(first_transport.receive(first), timeout=1)
             await asyncio.wait_for(first_transport.receive(first), timeout=1)
@@ -840,7 +994,7 @@ def test_sigterm_rejects_queue_and_drains_active_prompt(daemon_environment) -> N
                 second,
                 {
                     "type": "prompt",
-                    "text": "slow:1",
+                    "text": "slow:2",
                     "cwd": str(cwd),
                     "session_id": session_id,
                     "permissions": "all",
@@ -853,7 +1007,7 @@ def test_sigterm_rejects_queue_and_drains_active_prompt(daemon_environment) -> N
                 _receive_prompt_result(second_transport, second), timeout=1
             )
             active = await asyncio.wait_for(
-                _receive_prompt_result(first_transport, first), timeout=2
+                _receive_prompt_result(first_transport, first), timeout=3
             )
             assert queued[-1] == {"type": "shutting_down"}
             assert active[-1]["type"] == "prompt_done"

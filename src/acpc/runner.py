@@ -285,7 +285,7 @@ async def _try_set_model(
     session_response: Any | None,
     log: Callable[[str], None],
 ) -> bool:
-    """Set the model through the current ACP API, with legacy fallback.
+    """Set the model through the current ACP config-option API.
 
     Returns True if the adapter accepted the model selection call.
     """
@@ -306,19 +306,17 @@ async def _try_set_model(
         model_id = base_model
         reasoning_effort = suffix
 
-    valid_ids: list[str] = []
-    if model_config is not None:
-        valid_ids = [
-            option.value
-            for option in getattr(model_config, "options", None) or []
-            if isinstance(getattr(option, "value", None), str)
-        ]
-    elif session_response is not None and hasattr(session_response, "models"):
-        models_state = session_response.models
-        if models_state is not None and hasattr(models_state, "available_models"):
-            available = models_state.available_models
-            if available:
-                valid_ids = [m.model_id for m in available if hasattr(m, "model_id")]
+    if model_config is None:
+        log(  # type: ignore[operator]
+            f"warning: cannot set model '{model}': session advertises no model config option"
+        )
+        return False
+
+    valid_ids = [
+        option.value
+        for option in getattr(model_config, "options", None) or []
+        if isinstance(getattr(option, "value", None), str)
+    ]
 
     # Lists can be incomplete, so warn but still pass the model through.
     if valid_ids and model_id not in valid_ids:
@@ -328,20 +326,17 @@ async def _try_set_model(
         )
 
     try:
-        if model_config is not None:
+        await conn.set_config_option(
+            config_id=getattr(model_config, "id", "model"),
+            session_id=session_id,
+            value=model_id,
+        )
+        if reasoning_effort is not None:
             await conn.set_config_option(
-                config_id=getattr(model_config, "id", "model"),
+                config_id="reasoning_effort",
                 session_id=session_id,
-                value=model_id,
+                value=reasoning_effort,
             )
-            if reasoning_effort is not None:
-                await conn.set_config_option(
-                    config_id="reasoning_effort",
-                    session_id=session_id,
-                    value=reasoning_effort,
-                )
-        else:
-            await conn.set_session_model(model_id=model, session_id=session_id)
         return True
     except RequestError as e:
         log(f"warning: failed to set model '{model}': {e}")  # type: ignore[operator]
@@ -355,15 +350,15 @@ async def _send_prompt(
     model_was_set: bool,
     log: Callable[[str], None],
 ) -> Any:
-    """Send prompt with heartbeat. Retry without model if prompt fails after set_model.
+    """Send prompt with heartbeat. Retry without model if prompt fails after selection.
 
-    Some adapters (codex-acp) accept set_session_model but then fail on prompt()
-    with Internal error. This retries once without the model override.
+    Some adapters accept a model selection call but then fail on prompt() with an
+    internal error. This retries once without the model override.
     """
     is_quiet = config.output_mode == "quiet"
     heartbeat_task = asyncio.create_task(_heartbeat(is_quiet))
     try:
-        prompt_coro = conn.prompt([acp.text_block(config.prompt_text)], session_id=session_id)
+        prompt_coro = conn.prompt(session_id, [acp.text_block(config.prompt_text)])
         if config.timeout:
             result = await asyncio.wait_for(prompt_coro, timeout=config.timeout)
         else:
@@ -376,7 +371,7 @@ async def _send_prompt(
         log(  # type: ignore[operator]
             f"warning: prompt failed after --model ('{e}'), retrying without model override"
         )
-        prompt_coro = conn.prompt([acp.text_block(config.prompt_text)], session_id=session_id)
+        prompt_coro = conn.prompt(session_id, [acp.text_block(config.prompt_text)])
         if config.timeout:
             return await asyncio.wait_for(prompt_coro, timeout=config.timeout)
         return await prompt_coro

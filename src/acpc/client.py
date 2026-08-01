@@ -21,7 +21,7 @@ from acp.schema import (
     CreateTerminalResponse,
     DeniedOutcome,
     EnvVariable,
-    KillTerminalCommandResponse,
+    KillTerminalResponse,
     PermissionOption,
     ReadTextFileResponse,
     ReleaseTerminalResponse,
@@ -245,6 +245,8 @@ class AcpcClient:
             return
         discriminator: str = getattr(update, "session_update", "")
         event = update.model_dump(mode="json", by_alias=True)
+        if event.get("messageId") is None:
+            event.pop("messageId", None)
 
         if session.update_sink is not None:
             try:
@@ -381,7 +383,7 @@ class AcpcClient:
         session_id: str,  # noqa: ARG002
         terminal_id: str,  # noqa: ARG002
         **kwargs: Any,  # noqa: ARG002
-    ) -> KillTerminalCommandResponse:
+    ) -> KillTerminalResponse:
         raise NotImplementedError("Terminal not supported in acpc v0.1")
 
     async def release_terminal(

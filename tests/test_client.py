@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 
 import pytest
 
@@ -30,10 +31,11 @@ def output() -> OutputHandler:
     return OutputHandler(mode=OutputMode.TEXT)
 
 
-def _make_agent_message_chunk(text: str) -> AgentMessageChunk:
+def _make_agent_message_chunk(text: str, message_id: str | None = None) -> AgentMessageChunk:
     return AgentMessageChunk(
         session_update="agent_message_chunk",
         content=TextContentBlock(type="text", text=text),
+        message_id=message_id,
     )
 
 
@@ -94,6 +96,36 @@ class TestSessionUpdate:
 
         captured = capsys.readouterr()
         assert captured.out == "hello"
+
+    def test_json_event_preserves_populated_message_id(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        client = AcpcClient(
+            OutputHandler(mode=OutputMode.JSON),
+            PermissionLevel.ALL,
+            is_tty=False,
+        )
+
+        asyncio.run(client.session_update("sess-1", _make_agent_message_chunk("hello", "msg-1")))
+
+        event = json.loads(capsys.readouterr().out)
+        assert event["messageId"] == "msg-1"
+
+    def test_json_event_omits_absent_message_id(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        client = AcpcClient(
+            OutputHandler(mode=OutputMode.JSON),
+            PermissionLevel.ALL,
+            is_tty=False,
+        )
+
+        asyncio.run(client.session_update("sess-1", _make_agent_message_chunk("hello")))
+
+        event = json.loads(capsys.readouterr().out)
+        assert "messageId" not in event
 
     def test_dispatches_tool_call(
         self,

@@ -180,7 +180,6 @@ class TestTrySetModel:
     def test_uses_current_config_option_api_when_advertised(self) -> None:
         connection = SimpleNamespace(
             set_config_option=AsyncMock(),
-            set_session_model=AsyncMock(),
         )
         response = SimpleNamespace(
             models=None,
@@ -218,7 +217,27 @@ class TestTrySetModel:
                 value="medium",
             ),
         ]
-        connection.set_session_model.assert_not_awaited()
+
+    def test_fails_when_session_has_no_model_capability(self) -> None:
+        connection = SimpleNamespace(set_config_option=AsyncMock())
+        response = SimpleNamespace(models=None, config_options=[])
+        messages: list[str] = []
+
+        was_set = asyncio.run(
+            _try_set_model(
+                cast(Any, connection),
+                "session-1",
+                "gpt-5.6-luna",
+                response,
+                messages.append,
+            )
+        )
+
+        assert was_set is False
+        connection.set_config_option.assert_not_awaited()
+        assert messages == [
+            "warning: cannot set model 'gpt-5.6-luna': session advertises no model config option"
+        ]
 
 
 class TestTeardownIsBounded:

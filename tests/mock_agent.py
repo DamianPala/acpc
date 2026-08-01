@@ -29,9 +29,11 @@ from acp import (
 from acp.helpers import start_tool_call, update_tool_call
 from acp.interfaces import Client
 from acp.schema import (
+    AcpMcpServer,
     AgentCapabilities,
     AudioContentBlock,
     AuthenticateResponse,
+    CloseSessionResponse,
     EmbeddedResourceContentBlock,
     ForkSessionResponse,
     HttpMcpServer,
@@ -42,12 +44,15 @@ from acp.schema import (
     McpServerStdio,
     ResourceContentBlock,
     ResumeSessionResponse,
-    SessionConfigOption,
+    SessionCapabilities,
+    SessionCloseCapabilities,
     SessionConfigOptionSelect,
     SessionConfigSelectOption,
+    SessionForkCapabilities,
+    SessionListCapabilities,
+    SessionResumeCapabilities,
     SetSessionConfigOptionResponse,
     SetSessionModeResponse,
-    SetSessionModelResponse,
     SseMcpServer,
     TextContentBlock,
 )
@@ -80,14 +85,24 @@ class MockAgent(Agent):
         self._initialized = True
         return InitializeResponse(
             protocol_version=protocol_version,
-            agent_capabilities=AgentCapabilities(load_session=True),
+            agent_capabilities=AgentCapabilities(
+                load_session=True,
+                session_capabilities=SessionCapabilities(
+                    close=SessionCloseCapabilities(),
+                    fork=SessionForkCapabilities(),
+                    list=SessionListCapabilities(),
+                    resume=SessionResumeCapabilities(),
+                ),
+            ),
             agent_info=Implementation(name="mock-agent", title="Mock Agent", version="0.1.0"),
         )
 
     async def new_session(
         self,
         cwd: str,
-        mcp_servers: list[HttpMcpServer | SseMcpServer | McpServerStdio] | None = None,
+        additional_directories: list[str] | None = None,
+        mcp_servers: list[HttpMcpServer | SseMcpServer | AcpMcpServer | McpServerStdio]
+        | None = None,
         **kwargs: Any,
     ) -> NewSessionResponse:
         if not self._initialized:
@@ -95,19 +110,17 @@ class MockAgent(Agent):
         session_id = uuid4().hex[:12]
         self._sessions[session_id] = []
         self._cancel_events[session_id] = asyncio.Event()
-        model_option = SessionConfigOption(
-            root=SessionConfigOptionSelect(
-                type="select",
-                id="model",
-                name="Model",
-                category="model",
-                current_value="default",
-                options=[
-                    SessionConfigSelectOption(name="Default", value="default"),
-                    SessionConfigSelectOption(name="Model A", value="model-a"),
-                    SessionConfigSelectOption(name="Model B", value="model-b"),
-                ],
-            )
+        model_option = SessionConfigOptionSelect(
+            type="select",
+            id="model",
+            name="Model",
+            category="model",
+            current_value="default",
+            options=[
+                SessionConfigSelectOption(name="Default", value="default"),
+                SessionConfigSelectOption(name="Model A", value="model-a"),
+                SessionConfigSelectOption(name="Model B", value="model-b"),
+            ],
         )
         return NewSessionResponse(session_id=session_id, config_options=[model_option])
 
@@ -115,7 +128,9 @@ class MockAgent(Agent):
         self,
         cwd: str,
         session_id: str,
-        mcp_servers: list[HttpMcpServer | SseMcpServer | McpServerStdio] | None = None,
+        mcp_servers: list[HttpMcpServer | SseMcpServer | AcpMcpServer | McpServerStdio]
+        | None = None,
+        additional_directories: list[str] | None = None,
         **kwargs: Any,
     ) -> LoadSessionResponse | None:
         if not self._initialized:
@@ -133,15 +148,8 @@ class MockAgent(Agent):
                 await asyncio.sleep(0.2)
         return LoadSessionResponse()
 
-    async def set_session_model(
-        self, model_id: str, session_id: str, **kwargs: Any
-    ) -> SetSessionModelResponse | None:
-        self._models[session_id] = model_id
-        self._model_calls[session_id] = self._model_calls.get(session_id, 0) + 1
-        return SetSessionModelResponse()
-
     async def set_session_mode(
-        self, mode_id: str, session_id: str, **kwargs: Any
+        self, session_id: str, mode_id: str, **kwargs: Any
     ) -> SetSessionModeResponse | None:
         self._modes[session_id] = mode_id
         self._mode_calls[session_id] = self._mode_calls.get(session_id, 0) + 1
@@ -149,6 +157,7 @@ class MockAgent(Agent):
 
     async def prompt(
         self,
+        session_id: str,
         prompt: list[
             TextContentBlock
             | ImageContentBlock
@@ -156,7 +165,6 @@ class MockAgent(Agent):
             | ResourceContentBlock
             | EmbeddedResourceContentBlock
         ],
-        session_id: str,
         **kwargs: Any,
     ) -> PromptResponse:
         prompt_text = ""
@@ -268,15 +276,26 @@ class MockAgent(Agent):
     async def cancel(self, session_id: str, **kwargs: Any) -> None:
         self._cancel_events.setdefault(session_id, asyncio.Event()).set()
 
+    async def close_session(self, session_id: str, **kwargs: Any) -> CloseSessionResponse:
+        if session_id not in self._sessions:
+            raise ValueError(f"unknown session id: {session_id}")
+        self._sessions.pop(session_id)
+        self._cancel_events.pop(session_id, None)
+        self._models.pop(session_id, None)
+        self._modes.pop(session_id, None)
+        self._model_calls.pop(session_id, None)
+        self._mode_calls.pop(session_id, None)
+        return CloseSessionResponse()
+
     async def list_sessions(
-        self, cursor: str | None = None, cwd: str | None = None, **kwargs: Any
+        self, cwd: str | None = None, cursor: str | None = None, **kwargs: Any
     ) -> ListSessionsResponse:
         return ListSessionsResponse(sessions=[])
 
     async def set_config_option(
-        self, config_id: str, session_id: str, value: str, **kwargs: Any
+        self, config_id: str, session_id: str, value: str | bool, **kwargs: Any
     ) -> SetSessionConfigOptionResponse | None:
-        if config_id == "model":
+        if config_id == "model" and isinstance(value, str):
             self._models[session_id] = value
             self._model_calls[session_id] = self._model_calls.get(session_id, 0) + 1
         return SetSessionConfigOptionResponse(config_options=[])
@@ -286,18 +305,22 @@ class MockAgent(Agent):
 
     async def fork_session(
         self,
-        cwd: str,
         session_id: str,
-        mcp_servers: list[HttpMcpServer | SseMcpServer | McpServerStdio] | None = None,
+        cwd: str,
+        additional_directories: list[str] | None = None,
+        mcp_servers: list[HttpMcpServer | SseMcpServer | AcpMcpServer | McpServerStdio]
+        | None = None,
         **kwargs: Any,
     ) -> ForkSessionResponse:
         return ForkSessionResponse(session_id=uuid4().hex[:12])
 
     async def resume_session(
         self,
-        cwd: str,
         session_id: str,
-        mcp_servers: list[HttpMcpServer | SseMcpServer | McpServerStdio] | None = None,
+        cwd: str,
+        additional_directories: list[str] | None = None,
+        mcp_servers: list[HttpMcpServer | SseMcpServer | AcpMcpServer | McpServerStdio]
+        | None = None,
         **kwargs: Any,
     ) -> ResumeSessionResponse:
         return ResumeSessionResponse()
