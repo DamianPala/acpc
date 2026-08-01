@@ -525,7 +525,47 @@ def _resolve_run_cwd(
     return requested_cwd, None
 
 
+def _should_bypass_daemon(config: RunConfig) -> bool:
+    """Return whether this prompt must use the direct adapter path."""
+    if config.no_daemon or os.environ.get("ACPC_NO_DAEMON") == "1":
+        return True
+    if sys.platform == "win32":
+        return True
+    if config.permission_level == "prompt" and config.is_tty:
+        from acpc.output import stderr
+
+        stderr("daemon: interactive permissions require direct mode")
+        return True
+    return False
+
+
 async def run(config: RunConfig) -> int:
+    """Route a prompt through the daemon unless a direct bypass applies."""
+    from acpc.agents import load_agent
+
+    # Validate before auto-starting a daemon, so an unknown target remains a CLI usage error.
+    load_agent(config.agent_identity)
+
+    if _should_bypass_daemon(config):
+        return await _run_direct(config)
+
+    from acpc.daemon_client import DaemonProtocolError, DaemonUnavailableError, run_daemon
+    from acpc.output import stderr
+
+    async def direct_retry() -> int:
+        return await _run_direct(config)
+
+    try:
+        return await run_daemon(config, direct_retry=direct_retry)
+    except (DaemonUnavailableError, DaemonProtocolError, ConnectionError, OSError) as error:
+        if str(error) == "daemon is at capacity":
+            stderr("daemon: at capacity, running direct")
+        else:
+            stderr(f"daemon: unavailable ({error}), running direct")
+        return await direct_retry()
+
+
+async def _run_direct(config: RunConfig) -> int:
     """Execute a prompt against an ACP agent. Returns exit code.
 
     Steps:

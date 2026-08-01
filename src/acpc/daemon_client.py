@@ -862,5 +862,8 @@ async def run_daemon(
             print_session_id=bool(getattr(config, "print_session_id", False)),
         )
     except (DaemonUnavailableError, DaemonProtocolError, ConnectionError, OSError) as error:
-        stderr(f"warning: daemon unavailable ({error}), running direct")
+        if str(error) == "daemon is at capacity":
+            stderr("daemon: at capacity, running direct")
+        else:
+            stderr(f"daemon: unavailable ({error}), running direct")
         return await retry()
