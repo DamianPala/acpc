@@ -15,6 +15,7 @@ import sys
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import acp
@@ -24,7 +25,9 @@ from acp.transports import default_environment
 
 from acpc.sessions import (
     add_running,
+    evict_session_metadata,
     load_last_session,
+    load_session_cwd,
     make_running_session,
     remove_running,
     save_last_session,
@@ -423,6 +426,52 @@ def _cache_available_models(agent: str, new_session_resp: Any) -> bool:
         return False  # Best-effort, never fail the prompt
 
 
+def _canonical_cwd(cwd: str) -> str:
+    path = Path(cwd)
+    if not path.is_absolute():
+        raise ValueError(f"cwd must be an absolute existing directory: {cwd}")
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as error:
+        raise ValueError(f"cwd must be an absolute existing directory: {cwd}") from error
+    if not resolved.is_dir():
+        raise ValueError(f"cwd must be an absolute existing directory: {cwd}")
+    return str(resolved)
+
+
+def _resolve_run_cwd(
+    agent: str,
+    session_id: str | None,
+    requested_cwd: str | None,
+) -> tuple[str | None, str | None]:
+    if session_id is None:
+        if requested_cwd is None:
+            return os.getcwd(), None
+        try:
+            return _canonical_cwd(requested_cwd), None
+        except ValueError as error:
+            return None, str(error)
+
+    recorded_cwd = load_session_cwd(agent, session_id)
+    if recorded_cwd is not None:
+        try:
+            recorded_cwd = _canonical_cwd(recorded_cwd)
+        except ValueError:
+            evict_session_metadata(agent, session_id)
+            return None, f"session cwd no longer exists: {recorded_cwd}"
+    if requested_cwd is None:
+        if recorded_cwd is None:
+            return None, f"session cwd is unknown for {session_id}; provide --cwd to load it"
+        return recorded_cwd, None
+    try:
+        requested_cwd = _canonical_cwd(requested_cwd)
+    except ValueError as error:
+        return None, str(error)
+    if recorded_cwd is not None and recorded_cwd != requested_cwd:
+        return None, f"session cwd is {recorded_cwd}, --cwd says {requested_cwd}"
+    return requested_cwd, None
+
+
 async def run(config: RunConfig) -> int:
     """Execute a prompt against an ACP agent. Returns exit code.
 
@@ -464,7 +513,22 @@ async def run(config: RunConfig) -> int:
     command = parts[0]
     args = parts[1:]
 
-    cwd = config.cwd or os.getcwd()
+    session_id = config.session_id
+    explicitly_requested = config.use_last or config.session_id is not None
+    if config.use_last and session_id is None:
+        session_id = load_last_session(config.agent_identity)
+        if session_id is None:
+            stderr_error("no previous session found")
+            return EXIT_USAGE_ERROR
+        stderr(
+            f"warning: --last resolved to session {session_id}. "
+            "For reliable multi-agent orchestration, use -s SESSION_ID instead."
+        )
+
+    cwd, cwd_error = _resolve_run_cwd(config.agent_identity, session_id, config.cwd)
+    if cwd_error is not None or cwd is None:
+        stderr_error(cwd_error or "could not resolve session cwd")
+        return EXIT_USAGE_ERROR
 
     # 4. Spawn in own process group and run
     try:
@@ -489,19 +553,6 @@ async def run(config: RunConfig) -> int:
             supports_load = bool(caps and caps.load_session)
 
             # 6. Create or load session
-            session_id = config.session_id
-            explicitly_requested = config.use_last or config.session_id is not None
-
-            if config.use_last and session_id is None:
-                session_id = load_last_session(config.agent_identity)
-                if session_id is None:
-                    stderr_error("no previous session found")
-                    return EXIT_USAGE_ERROR
-                stderr(
-                    f"warning: --last resolved to session {session_id}. "
-                    "For reliable multi-agent orchestration, use -s SESSION_ID instead."
-                )
-
             session_resp = None
             if session_id and supports_load:
                 try:
@@ -585,7 +636,7 @@ async def run(config: RunConfig) -> int:
             output.finalize()
 
             # 10. Save state and return
-            save_last_session(config.agent_identity, session_id)
+            save_last_session(config.agent_identity, session_id, cwd=cwd)
             remove_running(session_id)
             return exit_code
 

@@ -14,9 +14,11 @@ from acpc.sessions import (
     _is_process_alive,
     add_running,
     cleanup_last_sessions,
+    evict_session_metadata,
     get_running_by_agent,
     list_running,
     load_last_session,
+    load_session_cwd,
     make_running_session,
     remove_running,
     log_dir as get_log_dir,
@@ -200,6 +202,18 @@ class TestLastSession:
 
         result = load_last_session("codex")
         assert result == "sess-ppid"
+
+    def test_persists_and_evicts_session_cwd(self, state_dir: Path) -> None:
+        cwd = state_dir / "work"
+        cwd.mkdir()
+        save_last_session("codex", "sess-cwd", str(cwd))
+
+        assert load_session_cwd("codex", "sess-cwd") == str(cwd)
+        cwd.rmdir()
+        evict_session_metadata("codex", "sess-cwd")
+
+        assert load_session_cwd("codex", "sess-cwd") is None
+        assert load_last_session("codex") is None
 
 
 class TestCleanupLastSessions:
