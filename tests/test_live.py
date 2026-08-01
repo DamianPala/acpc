@@ -8,12 +8,14 @@ Skipped by default. Run explicitly:
 All tests use the cheapest available model per agent to minimize cost.
 Estimated run time: ~3 minutes.
 
-Isolation: tests run with HOME=~/.agent-test-home to prevent loading
-user skills and config. Setup: copy auth files to that directory
-(see _build_test_env). Known limitation: claude-agent-acp still loads
-the real ~/.claude/CLAUDE.md regardless of HOME override.
+Isolation: each test gets a temporary ACPC state directory. Agent tests
+also run with HOME=~/.agent-test-home to prevent loading user skills and
+config. The directory must contain only the auth files needed by the
+adapters. Known limitation: claude-agent-acp still loads the real
+~/.claude/CLAUDE.md regardless of HOME override.
 """
 
+from contextvars import ContextVar
 import json
 import os
 import re
@@ -21,6 +23,7 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
+from typing import Iterator
 
 import pytest
 
@@ -39,18 +42,24 @@ TEST_MODELS: dict[str, str] = {
     "claude": "fast",
 }
 
-# Isolated env: no skills, no user config, just auth.
-# Setup: see tests/codex-test-home.sh for instructions.
+# Isolated agent env: no skills, no user config, just auth.
 _AGENT_TEST_HOME = Path(os.environ.get("AGENT_TEST_HOME", Path.home() / ".agent-test-home"))
+_CURRENT_TEST_ENV: ContextVar[dict[str, str] | None] = ContextVar("_CURRENT_TEST_ENV", default=None)
 
 
-def _build_test_env() -> dict[str, str]:
-    """Build env with isolated agent home (no skills, no user config).
+def _build_test_env(state_dir: Path, *, route_daemon: bool) -> dict[str, str]:
+    """Build a per-test env with isolated ACPC and agent state.
 
-    Structure: ~/.agent-test-homes/{.codex/,.claude/} with auth only.
-    HOME override prevents loading user skills from ~/.agents/ etc.
+    The direct/daemon choice is explicit so routing cannot depend on the
+    developer's ambient environment.
     """
     env = dict(os.environ)
+    env["ACPC_STATE_DIR"] = str(state_dir)
+    if route_daemon:
+        env.pop("ACPC_NO_DAEMON", None)
+    else:
+        env["ACPC_NO_DAEMON"] = "1"
+
     if _AGENT_TEST_HOME.exists():
         env["HOME"] = str(_AGENT_TEST_HOME)
         codex_dir = _AGENT_TEST_HOME / ".codex"
@@ -62,38 +71,58 @@ def _build_test_env() -> dict[str, str]:
     return env
 
 
-_TEST_ENV = _build_test_env()
+@pytest.fixture(autouse=True)
+def _isolated_test_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Give every live test isolated ACPC state and direct routing."""
+    state_dir = tmp_path / "acpc-state"
+    state_dir.mkdir()
+    test_env = _build_test_env(state_dir, route_daemon=False)
+    for key in ("ACPC_STATE_DIR", "ACPC_NO_DAEMON", "HOME", "CODEX_HOME", "CLAUDE_CONFIG_DIR"):
+        if key in test_env:
+            monkeypatch.setenv(key, test_env[key])
+
+    token = _CURRENT_TEST_ENV.set(test_env)
+    try:
+        yield
+    finally:
+        _CURRENT_TEST_ENV.reset(token)
 
 
-def _run_acpc(
+def _active_test_env() -> dict[str, str]:
+    """Return the environment installed by the autouse fixture."""
+    env = _CURRENT_TEST_ENV.get()
+    if env is None:
+        raise RuntimeError("live test helpers must run inside pytest")
+    return env
+
+
+def _run_acpc_direct(
     *args: str,
     input_text: str | None = None,
     timeout: int = 60,
-    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Run acpc as subprocess with isolated agent env."""
+    """Run acpc directly with the current test's isolated environment."""
     return subprocess.run(
         [*ACPC, *args],
         input=input_text,
         capture_output=True,
         text=True,
         timeout=timeout,
-        env=env or _TEST_ENV,
+        env=_active_test_env(),
     )
 
 
-def _run_acpc_cheap(
+def _run_acpc_cheap_direct(
     agent: str,
     *args: str,
     input_text: str | None = None,
     timeout: int = 60,
-    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Run acpc prompt with the cheapest model for the given agent."""
+    """Run a direct prompt with the cheapest model for the given agent."""
     model = TEST_MODELS.get(agent)
     model_args = ("--model", model) if model else ()
-    return _run_acpc(
-        "prompt", agent, *args, *model_args, input_text=input_text, timeout=timeout, env=env
+    return _run_acpc_direct(
+        "prompt", agent, *args, *model_args, input_text=input_text, timeout=timeout
     )
 
 
@@ -114,7 +143,7 @@ class TestHelloWorld:
 
     def test_hello_response(self, agent: str) -> None:
         """Agent returns a non-empty response."""
-        result = _run_acpc_cheap(
+        result = _run_acpc_cheap_direct(
             agent, "Respond with exactly one word: hello", "--permissions", "none", "--quiet"
         )
         assert result.returncode == 0, f"stderr: {result.stderr}"
@@ -122,7 +151,7 @@ class TestHelloWorld:
 
     def test_session_id_emitted(self, agent: str) -> None:
         """Session ID and resume hint appear on stderr."""
-        result = _run_acpc_cheap(
+        result = _run_acpc_cheap_direct(
             agent, "Respond with exactly one word: hi", "--permissions", "none", "--quiet"
         )
         assert result.returncode == 0, f"stderr: {result.stderr}"
@@ -140,7 +169,7 @@ class TestMultiTurn:
         model_args = ("--model", model) if model else ()
 
         # Turn 1: give agent a fact to remember
-        r1 = _run_acpc(
+        r1 = _run_acpc_direct(
             "prompt",
             agent,
             "For this test session, the project name we are working on is 'FizzBuzz'. "
@@ -155,7 +184,7 @@ class TestMultiTurn:
         assert session_id, f"No session ID in stderr: {r1.stderr}"
 
         # Turn 2: ask for the fact back (same model, resume session)
-        r2 = _run_acpc(
+        r2 = _run_acpc_direct(
             "prompt",
             agent,
             "-s",
@@ -176,7 +205,7 @@ class TestJsonOutput:
 
     def test_ndjson_structure(self, agent: str) -> None:
         """JSON output is valid NDJSON with session lifecycle events."""
-        result = _run_acpc_cheap(
+        result = _run_acpc_cheap_direct(
             agent, "Respond with exactly: json test ok", "--permissions", "none", "--json"
         )
         assert result.returncode == 0, f"stderr: {result.stderr}"
@@ -203,7 +232,7 @@ class TestToolCallPermissions:
 
     def test_permissions_all_allows_read(self, agent: str) -> None:
         """With --permissions all, agent can read files."""
-        result = _run_acpc_cheap(
+        result = _run_acpc_cheap_direct(
             agent,
             "Read the file pyproject.toml in the current directory "
             "and tell me the project name. Reply with just the name.",
@@ -216,7 +245,7 @@ class TestToolCallPermissions:
 
     def test_permissions_none_denies_tools(self, agent: str) -> None:
         """With --permissions none, tool calls are denied."""
-        result = _run_acpc_cheap(
+        result = _run_acpc_cheap_direct(
             agent,
             "Read the file pyproject.toml and tell me the version.",
             "--permissions",
@@ -244,7 +273,7 @@ class TestModelSelection:
 
     def test_model_identifies_itself(self, agent: str, model: str, expected: str) -> None:
         """Agent reports using the requested model."""
-        result = _run_acpc(
+        result = _run_acpc_direct(
             "prompt",
             agent,
             "What AI model are you? Reply with just your model name/identifier, nothing else.",
@@ -266,7 +295,7 @@ class TestModelSelectionUnsupported:
 
     def test_unsupported_model_warns(self, agent: str) -> None:
         """Agent that doesn't support set_model still works (warns on stderr)."""
-        result = _run_acpc(
+        result = _run_acpc_direct(
             "prompt",
             agent,
             "Respond with exactly one word: hello",
@@ -288,7 +317,7 @@ class TestOutputFile:
     def test_output_written_to_file(self, agent: str, tmp_path: Path) -> None:
         """Agent response is written to output file."""
         out_file = tmp_path / "response.txt"
-        result = _run_acpc_cheap(
+        result = _run_acpc_cheap_direct(
             agent,
             "Respond with exactly: file output works",
             "--permissions",
@@ -308,7 +337,7 @@ class TestStdinPipe:
 
     def test_stdin_pipe_input(self, agent: str) -> None:
         """Piped stdin is used as prompt text."""
-        result = _run_acpc_cheap(
+        result = _run_acpc_cheap_direct(
             agent,
             "-",
             "--permissions",
@@ -328,7 +357,7 @@ class TestInputFile:
         """Prompt text read from file."""
         prompt_file = tmp_path / "prompt.txt"
         prompt_file.write_text("Respond with exactly one word: filed")
-        result = _run_acpc_cheap(
+        result = _run_acpc_cheap_direct(
             agent, "--input-file", str(prompt_file), "--permissions", "none", "--quiet"
         )
         assert result.returncode == 0, f"stderr: {result.stderr}"
@@ -341,7 +370,7 @@ class TestTimeout:
 
     def test_timeout_exits_124(self, agent: str) -> None:
         """Very short timeout causes exit 124."""
-        result = _run_acpc_cheap(
+        result = _run_acpc_cheap_direct(
             agent,
             "Write a detailed 5000-word analysis of the history of computing, "
             "covering every decade from the 1940s to 2020s with specific examples.",
@@ -371,7 +400,7 @@ class TestResumeWithLast:
         model_args = ("--model", model) if model else ()
 
         # Turn 1: establish a fact
-        r1 = _run_acpc(
+        r1 = _run_acpc_direct(
             "prompt",
             agent,
             "For this test, the color is 'Magenta'. Confirm by saying just the color.",
@@ -383,7 +412,7 @@ class TestResumeWithLast:
         assert r1.returncode == 0, f"Turn 1 failed: {r1.stderr}"
 
         # Turn 2: resume with --last
-        r2 = _run_acpc(
+        r2 = _run_acpc_direct(
             "prompt",
             agent,
             "--last",
@@ -403,7 +432,7 @@ class TestProcessCleanup:
 
     def test_no_orphans_after_normal_exit(self, agent: str) -> None:
         """No adapter processes remain after a normal prompt completes."""
-        result = _run_acpc_cheap(
+        result = _run_acpc_cheap_direct(
             agent, "Respond with exactly one word: cleanup", "--permissions", "none", "--quiet"
         )
         assert result.returncode == 0, f"stderr: {result.stderr}"
@@ -425,5 +454,5 @@ class TestStatus:
 
     def test_status_no_sessions(self) -> None:
         """Status with no running sessions exits cleanly."""
-        result = _run_acpc("status")
+        result = _run_acpc_direct("status")
         assert result.returncode == 0, f"stderr: {result.stderr}"
