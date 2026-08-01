@@ -9,11 +9,13 @@ Behavior controlled by prompt text:
 - "write-file:NAME": requests edit permission and writes NAME in the session cwd
 - "slow:N": waits N seconds before responding (for timeout tests)
 - "error": returns stop_reason=refusal
+- "hold:N": allocates and holds N MiB of resident memory for the session
 - "multi:TEXT": echoes text, supports load_session for multi-turn
 - "large:N": returns N kilobytes of text (for buffer tests)
 """
 
 import asyncio
+import mmap
 import sys
 from pathlib import Path
 from typing import Any
@@ -74,6 +76,7 @@ class MockAgent(Agent):
         self._modes: dict[str, str] = {}
         self._model_calls: dict[str, int] = {}
         self._mode_calls: dict[str, int] = {}
+        self._held_memory: dict[str, bytearray] = {}
         self._barrier = asyncio.Event()
         self._barrier_waiters = 0
         self._initialized = False
@@ -195,6 +198,17 @@ class MockAgent(Agent):
             except asyncio.TimeoutError:
                 pass
             await self._send_text(session_id, f"waited {delay}s")
+            return PromptResponse(stop_reason="end_turn")
+
+        if prompt_text.startswith("hold:"):
+            megabytes = int(prompt_text.split(":", 1)[1])
+            if megabytes <= 0:
+                raise ValueError("hold size must be positive")
+            memory = bytearray(megabytes * 1024 * 1024)
+            for offset in range(0, len(memory), mmap.PAGESIZE):
+                memory[offset] = 1
+            self._held_memory[session_id] = memory
+            await self._send_text(session_id, prompt_text)
             return PromptResponse(stop_reason="end_turn")
 
         if prompt_text.startswith("chunkslow:"):
@@ -349,6 +363,7 @@ class MockAgent(Agent):
         self._sessions.pop(session_id)
         self._session_cwds.pop(session_id, None)
         self._cancel_events.pop(session_id, None)
+        self._held_memory.pop(session_id, None)
         self._models.pop(session_id, None)
         self._modes.pop(session_id, None)
         self._model_calls.pop(session_id, None)
