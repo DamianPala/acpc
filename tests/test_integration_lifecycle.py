@@ -173,10 +173,13 @@ def test_killed_daemon_is_respawned_for_next_prompt(integration_state: Path) -> 
     first = _run_acpc("prompt", "mock", "before kill", "--quiet")
     assert first.returncode == 0
     old_pid = _read_lock(integration_state)["pid"]
-    old_adapter_pids = {pid for pid in _descendants(old_pid) if "mock_agent.py" in _cmdline(pid)}
+    old_adapter_pids = {
+        pid for pid in _descendants(old_pid) if str(MOCK_AGENT_SCRIPT) in _cmdline(pid)
+    }
     assert old_adapter_pids
     os.kill(old_pid, signal.SIGKILL)
     _wait_for(lambda: not _pid_alive(old_pid))
+    _wait_for(lambda: all(not _pid_alive(pid) for pid in old_adapter_pids))
 
     second = _run_acpc("prompt", "mock", "after kill", "--quiet")
     assert second.returncode == 0
@@ -200,12 +203,14 @@ def test_daemon_stop_kills_adapter_process_tree(integration_state: Path) -> None
     result = _run_acpc("prompt", "mock", "start tree", "--quiet")
     assert result.returncode == 0
     daemon_pid = _read_lock(integration_state)["pid"]
-    adapter_pids = {pid for pid in _descendants(daemon_pid) if "mock_agent.py" in _cmdline(pid)}
+    adapter_pids = {
+        pid for pid in _descendants(daemon_pid) if str(MOCK_AGENT_SCRIPT) in _cmdline(pid)
+    }
     assert adapter_pids, f"no mock adapter descendants under daemon {daemon_pid}"
 
     _stop_daemon(integration_state)
-    assert not _pid_alive(daemon_pid)
-    assert all(not _pid_alive(pid) for pid in adapter_pids)
+    _wait_for(lambda: not _pid_alive(daemon_pid))
+    _wait_for(lambda: all(not _pid_alive(pid) for pid in adapter_pids))
 
 
 def test_version_mismatch_restarts_daemon(integration_state: Path) -> None:
@@ -301,7 +306,7 @@ def test_queued_client_disconnect_is_removed_from_queue(integration_state: Path)
         "--print-session-id",
     )
     assert setup.returncode == 0
-    session_id = setup.stdout.strip()
+    session_id = setup.stdout.splitlines()[0]
     assert session_id
     socket_path, lock_path = _daemon_paths(integration_state)
     assert socket_path.exists() and lock_path.exists()
@@ -313,9 +318,7 @@ def test_queued_client_disconnect_is_removed_from_queue(integration_state: Path)
             "prompt",
             "mock",
             f"chunkslow:{PROMPT_SECONDS}",
-            "--quiet",
-            "-o",
-            str(integration_state / "active.txt"),
+            "--json",
             "-s",
             session_id,
             "--cwd",
@@ -326,6 +329,8 @@ def test_queued_client_disconnect_is_removed_from_queue(integration_state: Path)
         text=True,
         env=os.environ.copy(),
     )
+    assert active.stdout is not None
+    _read_until(active.stdout, "started")
     queued: subprocess.Popen[str] | None = None
     remaining = None
     try:
@@ -393,6 +398,7 @@ def _install_daemon_pid_probe(state_dir: Path, monkeypatch: pytest.MonkeyPatch) 
     probe_dir = state_dir / "probe"
     probe_dir.mkdir()
     log_path = probe_dir / "daemon-pids.log"
+    adapter_log_path = probe_dir / "adapter-pids.log"
     probe_dir.joinpath("sitecustomize.py").write_text(
         "import os\n"
         "import sys\n"
@@ -402,6 +408,9 @@ def _install_daemon_pid_probe(state_dir: Path, monkeypatch: pytest.MonkeyPatch) 
         "parts = cmdline.read_bytes().split(b'\\0') if cmdline.exists() else []\n"
         "if 'acpc.daemon' in sys.argv or b'acpc.daemon' in parts:\n"
         f"    with Path({str(log_path)!r}).open('a', encoding='ascii') as marker:\n"
+        "        marker.write(f'{os.getpid()}\\n')\n"
+        f"if sys.argv and sys.argv[0] == {str(MOCK_AGENT_SCRIPT)!r}:\n"
+        f"    with Path({str(adapter_log_path)!r}).open('a', encoding='ascii') as marker:\n"
         "        marker.write(f'{os.getpid()}\\n')\n",
         encoding="utf-8",
     )
@@ -435,5 +444,33 @@ def test_concurrent_cold_starts_have_one_daemon_and_no_stderr(
 
     pid_lines = log_path.read_text(encoding="ascii").splitlines()
     daemon_pids = {int(pid) for pid in pid_lines}
-    assert len(daemon_pids) == 1
+    assert daemon_pids
+
+    # A loser exits on its own schedule, unrelated to the winner answering the prompt,
+    # so sampling the moment the clients return races with that exit. Bounding the wait
+    # keeps the real requirement -- the losers do exit -- without asserting on timing.
+    def _survivors() -> set[int]:
+        return {pid for pid in daemon_pids if _pid_alive(pid)}
+
+    _wait_for(lambda: len(_survivors()) == 1)
+    surviving_daemons = _survivors()
+    assert len(surviving_daemons) == 1
+    lock_metadata = _read_lock(integration_state)
+    assert surviving_daemons == {lock_metadata["pid"]}
+    lock_path = _daemon_paths(integration_state)[1]
+    assert lock_path.exists()
+    with lock_path.open("a+", encoding="utf-8") as lock_file:
+        try:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            pass
+        else:
+            pytest.fail("surviving daemon does not hold the target lock")
+
+    adapter_log = integration_state / "probe" / "adapter-pids.log"
+    adapter_pids = {int(pid) for pid in adapter_log.read_text(encoding="ascii").splitlines()}
+    assert len(adapter_pids) == 1
+    assert adapter_pids <= _descendants(lock_metadata["pid"])
     _stop_daemon(integration_state)
