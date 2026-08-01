@@ -43,6 +43,7 @@ SessionUpdateSink = Callable[[dict[str, Any]], Awaitable[None]]
 _MAX_QUEUE_DEPTH = 4
 _DEFAULT_CONCURRENT = 4
 _DEFAULT_TTL = 300.0
+_DEFAULT_SESSION_TTL = 10 * 60.0
 _DEFAULT_MAX_AGE = 4 * 60 * 60.0
 _RSS_FLOOR_MB = 2048
 _CANCEL_TIMEOUT = 2.0
@@ -113,6 +114,7 @@ class SessionRecord:
     running: bool = False
     reserved: bool = False
     reserved_context: PromptContext | None = None
+    closing: bool = False
 
 
 class FifoLimiter:
@@ -191,10 +193,12 @@ class Daemon:
         self._draining = False
         self._adapter_lost = False
         self._recycling = False
+        self._session_close_supported = False
         self._started_at = 0.0
         self._idle_since: float | None = None
         self._limiter = FifoLimiter(_env_int("ACPC_DAEMON_MAX_CONCURRENT", _DEFAULT_CONCURRENT))
         self._ttl = _env_float("ACPC_DAEMON_TTL", _DEFAULT_TTL)
+        self._session_ttl = _env_float("ACPC_DAEMON_SESSION_TTL", _DEFAULT_SESSION_TTL)
         self._max_age = _env_float("ACPC_DAEMON_MAX_AGE", _DEFAULT_MAX_AGE)
         self._lock_file: Any | None = None
         self._log_file: Any | None = None
@@ -232,7 +236,13 @@ class Daemon:
                 self._watch_process(process, connection),
                 name="acpc.daemon.process-watch",
             )
-            await connection.initialize(protocol_version=acp.PROTOCOL_VERSION)
+            initialize_response = await connection.initialize(protocol_version=acp.PROTOCOL_VERSION)
+            capabilities = initialize_response.agent_capabilities
+            self._session_close_supported = (
+                capabilities is not None
+                and capabilities.session_capabilities is not None
+                and capabilities.session_capabilities.close is not None
+            )
             self._lifecycle_task = asyncio.create_task(self._lifecycle_monitor())
             self._log("daemon started")
             return True
@@ -385,6 +395,9 @@ class Daemon:
             return record, "new"
         while True:
             record = self.sessions.get(requested_id)
+            if record is not None and record.closing:
+                await asyncio.sleep(0)
+                continue
             if record is not None:
                 self._validate_resume_cwd(record, cwd)
                 await self._reserve_record(record, context)
@@ -824,9 +837,10 @@ class Daemon:
 
     async def _lifecycle_monitor(self) -> None:
         while not self._stop_event.is_set():
-            interval = min(0.1, max(self._ttl / 4, 0.01))
+            interval = min(0.1, max(min(self._ttl, self._session_ttl) / 4, 0.01))
             await asyncio.sleep(interval)
             now = time.monotonic()
+            await self._close_idle_sessions(now=now)
             if self._max_age >= 0 and now - self._started_at >= self._max_age:
                 await self._begin_shutdown(recycle=True)
                 continue
@@ -1065,10 +1079,49 @@ class Daemon:
         if process is None or process.pid is None:
             raise RuntimeError("daemon adapter is not initialized")
         rss_mb = sample_process_tree_rss_mb(process.pid)
-        if rss_mb > rss_ceiling_mb():
+        ceiling_mb = rss_ceiling_mb()
+        if rss_mb <= ceiling_mb:
+            return
+        await self._close_idle_sessions(force=True)
+        rss_mb = sample_process_tree_rss_mb(process.pid)
+        if rss_mb > ceiling_mb:
             self._log(f"capacity: rss={rss_mb}MB")
             self._recycling = True
             raise CapacityError(rss_mb)
+
+    async def _close_idle_sessions(self, *, force: bool = False, now: float | None = None) -> None:
+        """Close idle adapter sessions that support surgical reclamation."""
+        if not self._session_close_supported:
+            return
+        reference_time = time.monotonic() if now is None else now
+        for record in tuple(self.sessions.values()):
+            await self._close_idle_session(record, force, reference_time)
+
+    async def _close_idle_session(
+        self, record: SessionRecord, force: bool, reference_time: float
+    ) -> None:
+        async with record.admission_lock:
+            if not self._is_idle_close_candidate(record, force, reference_time):
+                return
+            record.closing = True
+        try:
+            await self._require_connection().close_session(record.session_id)
+        except Exception as error:
+            record.closing = False
+            self._log(f"warning: failed to close session '{record.session_id}': {error}")
+            return
+        if self.sessions.get(record.session_id) is record:
+            self.sessions.pop(record.session_id, None)
+            self.client.unregister_session(record.session_id)
+
+    def _is_idle_close_candidate(
+        self, record: SessionRecord, force: bool, reference_time: float
+    ) -> bool:
+        if record.closing or record.state != "idle":
+            return False
+        if record.running or record.reserved or record.queue or record.connected_client is not None:
+            return False
+        return force or reference_time - record.last_used >= self._session_ttl
 
     def _acquire_lock(self) -> bool:
         path = lock_path_for_target(self.target)

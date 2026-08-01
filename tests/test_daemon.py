@@ -10,13 +10,15 @@ import signal
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Iterator, cast
+from typing import Any, Callable, Iterator, cast
 
 import pytest
+from acp.client import ClientSideConnection
 from acp.schema import PermissionOption, ToolCallUpdate
 
 from acpc.client import PermissionLevel
 from acpc.daemon import (
+    CapacityError,
     Daemon,
     PromptContext,
     PromptRequest,
@@ -95,6 +97,23 @@ class _ControlledAdapterConnection:
         self.transport.closed = True
 
 
+class _CloseTrackingConnection:
+    def __init__(self, error: Exception | None = None) -> None:
+        self.calls: list[str] = []
+        self.load_calls: list[str] = []
+        self.error = error
+
+    async def close_session(self, session_id: str, **kwargs: Any) -> None:
+        del kwargs
+        self.calls.append(session_id)
+        if self.error is not None:
+            raise self.error
+
+    async def load_session(self, cwd: str, session_id: str, **kwargs: Any) -> None:
+        del cwd, kwargs
+        self.load_calls.append(session_id)
+
+
 def _controlled_request(
     daemon: Daemon,
     connection: Any,
@@ -132,6 +151,14 @@ async def _wait_for_socket(path: Path) -> None:
             return
         await asyncio.sleep(POLL_SECONDS)
     raise AssertionError(f"daemon socket did not appear: {path}")
+
+
+async def _wait_until(predicate: Callable[[], bool]) -> None:
+    for _ in range(int(DAEMON_TEST_TIMEOUT / POLL_SECONDS)):
+        if predicate():
+            return
+        await asyncio.sleep(POLL_SECONDS)
+    raise AssertionError("condition did not become true")
 
 
 async def _receive_prompt_result(
@@ -1184,5 +1211,201 @@ def test_max_age_recycles_after_active_prompt_finishes(daemon_environment, monke
         await asyncio.wait_for(daemon_task, timeout=DAEMON_TEST_TIMEOUT)
         assert not socket_path_for_target("mock").exists()
         assert not lock_path_for_target("mock").exists()
+
+    asyncio.run(scenario())
+
+
+def test_idle_session_closes_unregisters_and_cold_loads(daemon_environment, monkeypatch) -> None:
+    async def scenario() -> None:
+        _, cwd = daemon_environment
+        monkeypatch.setenv("ACPC_DAEMON_SESSION_TTL", str(TTL_SECONDS))
+        daemon = Daemon("mock")
+        daemon._session_close_supported = True
+        adapter = _CloseTrackingConnection()
+        daemon.connection = cast(Any, adapter)
+        session_id = "cold-session"
+        record = SessionRecord(
+            session_id=session_id,
+            cwd=str(cwd),
+            created_at=0.0,
+            last_used=time.monotonic() - TTL_SECONDS * 2,
+        )
+        daemon.sessions[session_id] = record
+        daemon.client.register_session(session_id)
+        ipc_connection = cast(Connection, SimpleNamespace(id="client-1"))
+
+        await daemon._close_idle_sessions()
+
+        assert adapter.calls == [session_id]
+        assert session_id not in daemon.sessions
+        assert session_id not in daemon.client.session_ids
+
+        context = PromptContext(connection=ipc_connection)
+        loaded, reused = await daemon._load_session(
+            context,
+            session_id,
+            str(cwd),
+            PermissionLevel.ALL,
+        )
+        assert reused == "loaded"
+        assert loaded.session_id == session_id
+        assert adapter.load_calls == [session_id]
+
+    asyncio.run(scenario())
+
+
+def test_initialize_records_advertised_close_capability(daemon_environment) -> None:
+    async def scenario() -> None:
+        _, cwd = daemon_environment
+        daemon = Daemon("mock")
+        daemon_task = asyncio.create_task(daemon.run())
+        await _wait_for_socket(socket_path_for_target("mock"))
+        transport = UnixSocketTransport("mock")
+        connection = await transport.connect()
+        try:
+            await _send_prompt(transport, connection, cwd, "first")
+            assert daemon._session_close_supported is True
+        finally:
+            await transport.close_connection(connection)
+            await transport.cleanup()
+            await daemon.stop()
+            await asyncio.wait_for(daemon_task, timeout=DAEMON_TEST_TIMEOUT)
+
+    asyncio.run(scenario())
+
+
+def test_unadvertised_close_capability_is_never_called(daemon_environment, monkeypatch) -> None:
+    original_initialize = ClientSideConnection.initialize
+    close_calls: list[str] = []
+
+    async def initialize_without_close(self: Any, *args: Any, **kwargs: Any) -> Any:
+        response = await original_initialize(self, *args, **kwargs)
+        assert response.agent_capabilities is not None
+        assert response.agent_capabilities.session_capabilities is not None
+        response.agent_capabilities.session_capabilities.close = None
+        return response
+
+    monkeypatch.setattr(ClientSideConnection, "initialize", initialize_without_close)
+
+    async def scenario() -> None:
+        _, cwd = daemon_environment
+        monkeypatch.setenv("ACPC_DAEMON_SESSION_TTL", str(TTL_SECONDS))
+        daemon = Daemon("mock")
+        daemon_task = asyncio.create_task(daemon.run())
+        await _wait_for_socket(socket_path_for_target("mock"))
+        transport = UnixSocketTransport("mock")
+        connection = await transport.connect()
+        try:
+            first = await _send_prompt(transport, connection, cwd, "first")
+            session_id = first[0]["session_id"]
+            assert daemon.connection is not None
+            close_session = daemon.connection.close_session
+
+            async def tracking_close(session_id: str, **kwargs: Any) -> Any:
+                close_calls.append(session_id)
+                return await close_session(session_id, **kwargs)
+
+            monkeypatch.setattr(daemon.connection, "close_session", tracking_close)
+            await asyncio.sleep(TTL_SECONDS * 2)
+            assert session_id in daemon.sessions
+            assert session_id in daemon.client.session_ids
+            assert close_calls == []
+            assert daemon._session_close_supported is False
+        finally:
+            await transport.close_connection(connection)
+            await transport.cleanup()
+            await daemon.stop()
+            await asyncio.wait_for(daemon_task, timeout=DAEMON_TEST_TIMEOUT)
+
+    asyncio.run(scenario())
+
+
+def test_idle_close_skips_active_queued_and_attached_sessions(daemon_environment) -> None:
+    async def scenario() -> None:
+        daemon = Daemon("mock")
+        daemon._session_close_supported = True
+        adapter = _CloseTrackingConnection()
+        daemon.connection = cast(Any, adapter)
+        ipc_connection = SimpleNamespace(id="client-1")
+
+        active, _ = _controlled_request(daemon, ipc_connection, "active")
+        active.running = True
+        queued, queued_request = _controlled_request(daemon, ipc_connection, "queued")
+        queued.queue.append(queued_request)
+        attached, _ = _controlled_request(daemon, ipc_connection, "attached")
+        attached.connected_client = cast(Connection, ipc_connection)
+        for session_id in ("active", "queued", "attached"):
+            daemon.client.register_session(session_id)
+
+        await daemon._close_idle_sessions(force=True)
+
+        assert adapter.calls == []
+        assert set(daemon.sessions) == {"active", "queued", "attached"}
+        assert set(daemon.client.session_ids) == {"active", "queued", "attached"}
+
+    asyncio.run(scenario())
+
+
+def test_failed_idle_close_keeps_session_and_daemon_running(
+    daemon_environment, monkeypatch
+) -> None:
+    async def scenario() -> None:
+        daemon = Daemon("mock")
+        daemon._session_close_supported = True
+        adapter = _CloseTrackingConnection(RuntimeError("close refused"))
+        daemon.connection = cast(Any, adapter)
+        record, _ = _controlled_request(daemon, SimpleNamespace(id="client-1"), "failed")
+        daemon.client.register_session(record.session_id)
+        messages: list[str] = []
+        monkeypatch.setattr(daemon, "_log", messages.append)
+
+        await daemon._close_idle_sessions(force=True)
+
+        assert adapter.calls == ["failed"]
+        assert "failed" in daemon.sessions
+        assert "failed" in daemon.client.session_ids
+        assert daemon._stopping is False
+        assert any("failed to close session 'failed'" in message for message in messages)
+
+    asyncio.run(scenario())
+
+
+def test_rss_guard_closes_idle_sessions_before_recycling(daemon_environment, monkeypatch) -> None:
+    async def scenario() -> None:
+        daemon = Daemon("mock")
+        daemon.process = cast(Any, SimpleNamespace(pid=1))
+        daemon._session_close_supported = True
+        adapter = _CloseTrackingConnection()
+        daemon.connection = cast(Any, adapter)
+        record, _ = _controlled_request(daemon, SimpleNamespace(id="client-1"), "reclaim")
+        daemon.client.register_session(record.session_id)
+        monkeypatch.setattr("acpc.daemon.rss_ceiling_mb", lambda: 1)
+        samples = iter((2, 0))
+        monkeypatch.setattr("acpc.daemon.sample_process_tree_rss_mb", lambda pid: next(samples))
+
+        await daemon._ensure_can_create_session()
+
+        assert adapter.calls == ["reclaim"]
+        assert daemon._recycling is False
+        assert "reclaim" not in daemon.sessions
+        assert "reclaim" not in daemon.client.session_ids
+
+        daemon = Daemon("mock")
+        daemon.process = cast(Any, SimpleNamespace(pid=1))
+        daemon._session_close_supported = True
+        adapter = _CloseTrackingConnection()
+        daemon.connection = cast(Any, adapter)
+        record, _ = _controlled_request(daemon, SimpleNamespace(id="client-1"), "recycle")
+        daemon.client.register_session(record.session_id)
+        samples = iter((2, 2))
+        monkeypatch.setattr("acpc.daemon.sample_process_tree_rss_mb", lambda pid: next(samples))
+
+        with pytest.raises(CapacityError):
+            await daemon._ensure_can_create_session()
+
+        assert adapter.calls == ["recycle"]
+        assert daemon._recycling is True
+        assert "recycle" not in daemon.sessions
+        assert "recycle" not in daemon.client.session_ids
 
     asyncio.run(scenario())
