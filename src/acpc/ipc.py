@@ -84,6 +84,10 @@ class DaemonTransport(ABC):
     async def cleanup(self) -> None:
         """Release the endpoint and all connections owned by this transport."""
 
+    async def stop_accepting(self) -> None:
+        """Stop accepting new clients while preserving existing connections."""
+        return
+
 
 def short_target_hash(value: str) -> str:
     """Return a stable short hash for a full socket path or other input."""
@@ -107,6 +111,12 @@ def socket_path_for_target(target: str) -> Path:
             "Unix limit; set ACPC_STATE_DIR to a shorter absolute path"
         )
     return hashed_path
+
+
+def lock_path_for_target(target: str) -> Path:
+    """Return the daemon lock path for a target within the current run dir."""
+    _validate_target(target)
+    return run_dir() / f"{target}.lock"
 
 
 class UnixSocketTransport(DaemonTransport):
@@ -144,6 +154,8 @@ class UnixSocketTransport(DaemonTransport):
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.path.parent.chmod(0o700)
+            with contextlib.suppress(FileNotFoundError):
+                self.path.unlink()
             self._server = await asyncio.start_unix_server(
                 self._queue_connection,
                 path=str(self.path),
@@ -156,6 +168,15 @@ class UnixSocketTransport(DaemonTransport):
                 f"failed to bind daemon socket '{self.path}': {error}. "
                 "Check ACPC_STATE_DIR permissions and remove a stale socket before retrying"
             ) from error
+
+    async def stop_accepting(self) -> None:
+        """Stop accepting new clients while keeping existing writers open."""
+        self._closing = True
+        self._closing_event.set()
+        server = self._server
+        self._server = None
+        if server is not None:
+            server.close()
 
     async def accept(self) -> Connection:
         """Wait for one client connection accepted by the server."""
@@ -273,13 +294,10 @@ class UnixSocketTransport(DaemonTransport):
 
     async def cleanup(self) -> None:
         """Stop accepting and close every connection within a bounded grace period."""
-        self._closing = True
-        self._closing_event.set()
         server = self._server
+        await self.stop_accepting()
         if server is not None:
-            server.close()
             server.close_clients()
-            self._server = None
 
         writers = tuple(self._writers)
         self._writers.clear()
@@ -305,6 +323,9 @@ class UnixSocketTransport(DaemonTransport):
                 f"timed out cleaning up daemon transport for target '{self._target}' "
                 f"after {_CLEANUP_GRACE_PERIOD:g}s; aborted active connections"
             ) from error
+        if self._role == "listener" and self._path is not None:
+            with contextlib.suppress(FileNotFoundError, OSError):
+                self._path.unlink()
 
     async def _queue_connection(
         self,

@@ -13,6 +13,7 @@ Behavior controlled by prompt text:
 """
 
 import asyncio
+import sys
 from typing import Any
 from uuid import uuid4
 
@@ -41,6 +42,9 @@ from acp.schema import (
     McpServerStdio,
     ResourceContentBlock,
     ResumeSessionResponse,
+    SessionConfigOption,
+    SessionConfigOptionSelect,
+    SessionConfigSelectOption,
     SetSessionConfigOptionResponse,
     SetSessionModeResponse,
     SetSessionModelResponse,
@@ -54,6 +58,11 @@ class MockAgent(Agent):
 
     def __init__(self) -> None:
         self._sessions: dict[str, list[str]] = {}
+        self._cancel_events: dict[str, asyncio.Event] = {}
+        self._models: dict[str, str] = {}
+        self._modes: dict[str, str] = {}
+        self._model_calls: dict[str, int] = {}
+        self._mode_calls: dict[str, int] = {}
         self._barrier = asyncio.Event()
         self._barrier_waiters = 0
         self._initialized = False
@@ -85,7 +94,22 @@ class MockAgent(Agent):
             raise RuntimeError("initialize must run before session/new")
         session_id = uuid4().hex[:12]
         self._sessions[session_id] = []
-        return NewSessionResponse(session_id=session_id)
+        self._cancel_events[session_id] = asyncio.Event()
+        model_option = SessionConfigOption(
+            root=SessionConfigOptionSelect(
+                type="select",
+                id="model",
+                name="Model",
+                category="model",
+                current_value="default",
+                options=[
+                    SessionConfigSelectOption(name="Default", value="default"),
+                    SessionConfigSelectOption(name="Model A", value="model-a"),
+                    SessionConfigSelectOption(name="Model B", value="model-b"),
+                ],
+            )
+        )
+        return NewSessionResponse(session_id=session_id, config_options=[model_option])
 
     async def load_session(
         self,
@@ -100,6 +124,7 @@ class MockAgent(Agent):
             raise RuntimeError("load failed")
         if session_id not in self._sessions:
             self._sessions[session_id] = ["history"] if session_id.startswith("load-") else []
+            self._cancel_events[session_id] = asyncio.Event()
         elif not session_id.startswith("load-"):
             self._sessions[session_id].append("reloaded")
         if session_id.startswith("load-"):
@@ -111,11 +136,15 @@ class MockAgent(Agent):
     async def set_session_model(
         self, model_id: str, session_id: str, **kwargs: Any
     ) -> SetSessionModelResponse | None:
+        self._models[session_id] = model_id
+        self._model_calls[session_id] = self._model_calls.get(session_id, 0) + 1
         return SetSessionModelResponse()
 
     async def set_session_mode(
         self, mode_id: str, session_id: str, **kwargs: Any
     ) -> SetSessionModeResponse | None:
+        self._modes[session_id] = mode_id
+        self._mode_calls[session_id] = self._mode_calls.get(session_id, 0) + 1
         return SetSessionModeResponse()
 
     async def prompt(
@@ -136,14 +165,49 @@ class MockAgent(Agent):
                 prompt_text += block.text
 
         self._sessions.setdefault(session_id, []).append(prompt_text)
+        cancel_event = self._cancel_events.setdefault(session_id, asyncio.Event())
+        cancel_event.clear()
 
         if prompt_text.startswith("error"):
             return PromptResponse(stop_reason="refusal")
 
         if prompt_text.startswith("slow:"):
             delay = int(prompt_text.split(":")[1])
-            await asyncio.sleep(delay)
+            try:
+                await asyncio.wait_for(cancel_event.wait(), timeout=delay)
+                return PromptResponse(stop_reason="cancelled")
+            except asyncio.TimeoutError:
+                pass
             await self._send_text(session_id, f"waited {delay}s")
+            return PromptResponse(stop_reason="end_turn")
+
+        if prompt_text.startswith("chunkslow:"):
+            delay = int(prompt_text.split(":")[1])
+            await self._send_text(session_id, "started")
+            try:
+                await asyncio.wait_for(cancel_event.wait(), timeout=delay)
+                return PromptResponse(stop_reason="cancelled")
+            except asyncio.TimeoutError:
+                pass
+            await self._send_text(session_id, "finished")
+            return PromptResponse(stop_reason="end_turn")
+
+        if prompt_text.startswith("supersede:"):
+            return PromptResponse(stop_reason="cancelled")
+
+        if prompt_text.startswith("stderr:"):
+            print(prompt_text.split(":", 1)[1], file=sys.stderr, flush=True)
+            await self._send_text(session_id, prompt_text.split(":", 1)[1])
+            return PromptResponse(stop_reason="end_turn")
+
+        if prompt_text == "settings":
+            settings = (
+                f"{self._models.get(session_id, '-')}/"
+                f"{self._modes.get(session_id, '-')}/"
+                f"{self._model_calls.get(session_id, 0)}/"
+                f"{self._mode_calls.get(session_id, 0)}"
+            )
+            await self._send_text(session_id, settings)
             return PromptResponse(stop_reason="end_turn")
 
         if prompt_text.startswith("burst:"):
@@ -202,7 +266,7 @@ class MockAgent(Agent):
         await self._conn.session_update(session_id=session_id, update=chunk)
 
     async def cancel(self, session_id: str, **kwargs: Any) -> None:
-        pass
+        self._cancel_events.setdefault(session_id, asyncio.Event()).set()
 
     async def list_sessions(
         self, cursor: str | None = None, cwd: str | None = None, **kwargs: Any
@@ -212,6 +276,9 @@ class MockAgent(Agent):
     async def set_config_option(
         self, config_id: str, session_id: str, value: str, **kwargs: Any
     ) -> SetSessionConfigOptionResponse | None:
+        if config_id == "model":
+            self._models[session_id] = value
+            self._model_calls[session_id] = self._model_calls.get(session_id, 0) + 1
         return SetSessionConfigOptionResponse(config_options=[])
 
     async def authenticate(self, method_id: str, **kwargs: Any) -> AuthenticateResponse | None:
