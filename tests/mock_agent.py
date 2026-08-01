@@ -6,6 +6,7 @@ Behavior controlled by prompt text:
 - Any text: echoes it back as agent_message_chunk
 - "tool:TITLE": simulates a tool call with given title (kind=read)
 - "tool-edit:TITLE": simulates a tool call requiring edit permission
+- "write-file:NAME": requests edit permission and writes NAME in the session cwd
 - "slow:N": waits N seconds before responding (for timeout tests)
 - "error": returns stop_reason=refusal
 - "multi:TEXT": echoes text, supports load_session for multi-turn
@@ -14,6 +15,7 @@ Behavior controlled by prompt text:
 
 import asyncio
 import sys
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -26,14 +28,16 @@ from acp import (
     text_block,
     update_agent_message,
 )
-from acp.helpers import start_tool_call, update_tool_call
+from acp.helpers import start_edit_tool_call, start_tool_call, update_tool_call
 from acp.interfaces import Client
 from acp.schema import (
     AcpMcpServer,
     AgentCapabilities,
     AudioContentBlock,
+    AllowedOutcome,
     AuthenticateResponse,
     CloseSessionResponse,
+    DeniedOutcome,
     EmbeddedResourceContentBlock,
     ForkSessionResponse,
     HttpMcpServer,
@@ -42,6 +46,7 @@ from acp.schema import (
     ListSessionsResponse,
     LoadSessionResponse,
     McpServerStdio,
+    PermissionOption,
     ResourceContentBlock,
     ResumeSessionResponse,
     SessionCapabilities,
@@ -63,6 +68,7 @@ class MockAgent(Agent):
 
     def __init__(self) -> None:
         self._sessions: dict[str, list[str]] = {}
+        self._session_cwds: dict[str, Path] = {}
         self._cancel_events: dict[str, asyncio.Event] = {}
         self._models: dict[str, str] = {}
         self._modes: dict[str, str] = {}
@@ -109,6 +115,7 @@ class MockAgent(Agent):
             raise RuntimeError("initialize must run before session/new")
         session_id = uuid4().hex[:12]
         self._sessions[session_id] = []
+        self._session_cwds[session_id] = Path(cwd)
         self._cancel_events[session_id] = asyncio.Event()
         model_option = SessionConfigOptionSelect(
             type="select",
@@ -142,6 +149,7 @@ class MockAgent(Agent):
             self._cancel_events[session_id] = asyncio.Event()
         elif not session_id.startswith("load-"):
             self._sessions[session_id].append("reloaded")
+        self._session_cwds[session_id] = Path(cwd)
         if session_id.startswith("load-"):
             await self._send_text(session_id, "history")
             if session_id == "load-slow":
@@ -252,6 +260,13 @@ class MockAgent(Agent):
             await self._send_text(session_id, f"edit {title} done")
             return PromptResponse(stop_reason="end_turn")
 
+        if prompt_text.startswith("write-file:"):
+            name = prompt_text.split(":", 1)[1]
+            allowed = await self._write_file_with_permission(session_id, name)
+            result = "done" if allowed else "denied"
+            await self._send_text(session_id, f"write {name} {result}")
+            return PromptResponse(stop_reason="end_turn")
+
         if prompt_text.startswith("large:"):
             kb = int(prompt_text.split(":")[1])
             payload = "X" * (kb * 1024)
@@ -273,6 +288,58 @@ class MockAgent(Agent):
         chunk = update_agent_message(text_block(text))
         await self._conn.session_update(session_id=session_id, update=chunk)
 
+    async def _write_file_with_permission(self, session_id: str, name: str) -> bool:
+        path = self._session_cwds[session_id] / name
+        content = f"written by mock agent: {name}\n"
+        tool_id = uuid4().hex[:8]
+        tool_call = start_edit_tool_call(
+            tool_call_id=tool_id,
+            title=f"write {name}",
+            path=str(path),
+            content=content,
+        )
+        await self._conn.session_update(session_id=session_id, update=tool_call)
+        permission = await self._conn.request_permission(
+            session_id=session_id,
+            tool_call=update_tool_call(
+                tool_call_id=tool_id,
+                title=tool_call.title,
+                kind="edit",
+                status="in_progress",
+                locations=tool_call.locations,
+                raw_input=tool_call.raw_input,
+            ),
+            options=[
+                PermissionOption(option_id="allow", name="Allow", kind="allow_once"),
+                PermissionOption(option_id="deny", name="Deny", kind="reject_once"),
+            ],
+        )
+        if isinstance(permission.outcome, DeniedOutcome):
+            done = update_tool_call(
+                tool_call_id=tool_id,
+                title=tool_call.title,
+                status="failed",
+                raw_output={"error": "permission denied"},
+            )
+            await self._conn.session_update(session_id=session_id, update=done)
+            return False
+        if not isinstance(permission.outcome, AllowedOutcome):
+            raise TypeError(f"unexpected permission outcome: {permission.outcome!r}")
+
+        await self._conn.write_text_file(
+            session_id=session_id,
+            path=str(path),
+            content=content,
+        )
+        done = update_tool_call(
+            tool_call_id=tool_id,
+            title=tool_call.title,
+            status="completed",
+            raw_output={"path": str(path)},
+        )
+        await self._conn.session_update(session_id=session_id, update=done)
+        return True
+
     async def cancel(self, session_id: str, **kwargs: Any) -> None:
         self._cancel_events.setdefault(session_id, asyncio.Event()).set()
 
@@ -280,6 +347,7 @@ class MockAgent(Agent):
         if session_id not in self._sessions:
             raise ValueError(f"unknown session id: {session_id}")
         self._sessions.pop(session_id)
+        self._session_cwds.pop(session_id, None)
         self._cancel_events.pop(session_id, None)
         self._models.pop(session_id, None)
         self._modes.pop(session_id, None)
@@ -312,7 +380,9 @@ class MockAgent(Agent):
         | None = None,
         **kwargs: Any,
     ) -> ForkSessionResponse:
-        return ForkSessionResponse(session_id=uuid4().hex[:12])
+        new_session_id = uuid4().hex[:12]
+        self._session_cwds[new_session_id] = Path(cwd)
+        return ForkSessionResponse(session_id=new_session_id)
 
     async def resume_session(
         self,
@@ -323,6 +393,7 @@ class MockAgent(Agent):
         | None = None,
         **kwargs: Any,
     ) -> ResumeSessionResponse:
+        self._session_cwds[session_id] = Path(cwd)
         return ResumeSessionResponse()
 
     async def ext_method(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
