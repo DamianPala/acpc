@@ -161,6 +161,30 @@ async def _wait_until(predicate: Callable[[], bool]) -> None:
     raise AssertionError("condition did not become true")
 
 
+async def _wait_for_session_state(
+    transport: UnixSocketTransport,
+    connection: Connection,
+    session_id: str,
+    state: str,
+    *,
+    timeout: float,
+) -> None:
+    deadline = time.monotonic() + timeout
+    observed: str | None = None
+    while True:
+        await transport.send(connection, {"type": "status"})
+        frame = await asyncio.wait_for(transport.receive(connection), timeout=DAEMON_TEST_TIMEOUT)
+        states = {entry["id"]: entry["state"] for entry in frame["sessions"]}
+        observed = states.get(session_id)
+        if observed == state:
+            return
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f"session {session_id} stayed {observed!r} instead of {state!r} within {timeout}s"
+            )
+        await asyncio.sleep(POLL_SECONDS)
+
+
 async def _receive_prompt_result(
     transport: UnixSocketTransport,
     connection: Connection,
@@ -289,7 +313,7 @@ def test_disconnected_prompt_does_not_leak_into_reused_session(daemon_environmen
                 first_connection,
                 {
                     "type": "prompt",
-                    "text": f"slow:{PROMPT_SECONDS}",
+                    "text": f"slow:{LONG_PROMPT_SECONDS}",
                     "cwd": str(cwd),
                     "session_id": None,
                     "permissions": "all",
@@ -303,6 +327,18 @@ def test_disconnected_prompt_does_not_leak_into_reused_session(daemon_environmen
             await first_transport.cleanup()
 
             second_connection = await second_transport.connect()
+            # The abandoned turn still had LONG_PROMPT_SECONDS of work left. Losing the
+            # socket has to cancel it, not merely stop forwarding its output: otherwise
+            # the session stays busy and the next caller silently queues behind a turn
+            # nobody is waiting for. Asserted on the session state rather than on how
+            # long the prompt below takes, so a regression fails instead of dragging.
+            await _wait_for_session_state(
+                second_transport,
+                second_connection,
+                session_id,
+                "idle",
+                timeout=PROMPT_SECONDS,
+            )
             frames = await _send_prompt(
                 second_transport,
                 second_connection,
