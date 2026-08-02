@@ -398,6 +398,23 @@ def _adapter_name(agent: str) -> str:
     return Path(command_parts[0]).name
 
 
+def _adapter_root_pid(daemon_pid: int, agent: str) -> int:
+    """Return the adapter process the daemon started, ignoring its descendants.
+
+    One agent adds a process per session and reaps none, so the set of processes
+    matching the adapter name grows with every session. The identity worth holding
+    across sessions is the process the daemon itself spawned.
+    """
+    snapshot = _process_snapshot()
+    roots = [
+        pid
+        for pid in _adapter_pids(_process_tree(daemon_pid), agent)
+        if pid in snapshot and snapshot[pid][1] == daemon_pid
+    ]
+    assert len(roots) == 1, f"Expected one adapter under daemon {daemon_pid}, got {roots}"
+    return roots[0]
+
+
 def _capacity_rss_values(log_path: Path) -> list[int]:
     """Read RSS values recorded when the daemon refused a new session."""
     if not log_path.exists():
@@ -730,7 +747,7 @@ class TestDaemonLive:
         daemon_test_env["ACPC_DAEMON_RSS_MAX"] = str(RSS_CEILING_MB)
 
         rss_samples: list[int] = []
-        adapter_pids: set[int] | None = None
+        adapter_root: int | None = None
         capacity_seen = False
         for _ in range(RSS_SESSION_COUNT):
             result = _run_acpc_cheap(
@@ -751,14 +768,18 @@ class TestDaemonLive:
                 continue
 
             _assert_daemon_routed(result, agent)
-            _, tree, _ = _capture_daemon_tree(agent)
-            current_adapter_pids = _adapter_pids(tree, agent)
-            assert current_adapter_pids, f"No adapter process in daemon tree: {tree}"
-            if adapter_pids is None:
-                adapter_pids = current_adapter_pids
-            elif current_adapter_pids != adapter_pids:
+            daemon_pid, _, _ = _capture_daemon_tree(agent)
+            current_root = _adapter_root_pid(daemon_pid, agent)
+            if adapter_root is None or capacity_seen:
+                # Hitting the ceiling recycles the daemon, so a fresh adapter after that
+                # point is the guard working. Before it, a new root means the adapter died
+                # or was respawned for some other reason, which is what this catches.
+                adapter_root = current_root
+            elif current_root != adapter_root:
                 pytest.fail("Adapter was respawned before the RSS guard fired")
-            rss_mb = sample_process_tree_rss_mb(next(iter(current_adapter_pids)))
+            # Sampled from the root so the figure covers the whole adapter tree. One agent
+            # adds a process per session, and that growth is the point of the measurement.
+            rss_mb = sample_process_tree_rss_mb(current_root)
             assert rss_mb > 0, "Adapter RSS sample was unavailable"
             rss_samples.append(rss_mb)
 
