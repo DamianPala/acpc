@@ -32,7 +32,12 @@ _acpc_bin = shutil.which("acpc")
 assert _acpc_bin is not None, "acpc not installed in venv. Run: uv sync"
 ACPC = [_acpc_bin]
 
-pytestmark = pytest.mark.live
+# The project-wide pytest timeout is 5s, which suits unit tests and kills every
+# test here mid-inference. Each subprocess call carries its own timeout, so this
+# is only a backstop against a hung adapter.
+LIVE_TEST_TIMEOUT_SECONDS = 300
+
+pytestmark = [pytest.mark.live, pytest.mark.timeout(LIVE_TEST_TIMEOUT_SECONDS)]
 
 # Models used in live tests. Presets, not raw model ids: the advertised
 # model list changes with adapter releases and account tier, so a hardcoded
