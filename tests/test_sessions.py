@@ -14,20 +14,25 @@ from acpc.sessions import (
     _is_process_alive,
     add_running,
     cleanup_last_sessions,
+    evict_session_metadata,
     get_running_by_agent,
     list_running,
     load_last_session,
+    load_session_cwd,
     make_running_session,
     remove_running,
+    log_dir as get_log_dir,
+    run_dir as get_run_dir,
     save_last_session,
+    state_dir as get_state_dir,
 )
 
 
 @pytest.fixture()
-def state_dir(tmp_path: Path):
-    """Patch STATE_DIR to use tmp_path."""
-    with patch("acpc.sessions.STATE_DIR", tmp_path):
-        yield tmp_path
+def state_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Redirect all session state through the supported environment setting."""
+    monkeypatch.setenv("ACPC_STATE_DIR", str(tmp_path))
+    return tmp_path
 
 
 def _make_session(
@@ -66,6 +71,28 @@ class TestAddRunning:
         assert len(data) == 2
         assert "sess-1" in data
         assert "sess-2" in data
+
+
+class TestStateDir:
+    def test_environment_is_resolved_per_call(self, tmp_path: Path, monkeypatch) -> None:
+        first_dir = tmp_path / "first"
+        second_dir = tmp_path / "second"
+
+        monkeypatch.setenv("ACPC_STATE_DIR", str(first_dir))
+        add_running(_make_session("first"))
+        save_last_session("codex", "first")
+
+        monkeypatch.setenv("ACPC_STATE_DIR", str(second_dir))
+        add_running(_make_session("second"))
+        save_last_session("codex", "second")
+
+        assert get_state_dir() == second_dir
+        assert (first_dir / "sessions.json").exists()
+        assert (first_dir / "last" / "codex.default").read_text() == "first"
+        assert (second_dir / "sessions.json").exists()
+        assert (second_dir / "last" / "codex.default").read_text() == "second"
+        assert get_run_dir() == second_dir / "run"
+        assert get_log_dir() == second_dir / "log"
 
 
 class TestRemoveRunning:
@@ -175,6 +202,18 @@ class TestLastSession:
 
         result = load_last_session("codex")
         assert result == "sess-ppid"
+
+    def test_persists_and_evicts_session_cwd(self, state_dir: Path) -> None:
+        cwd = state_dir / "work"
+        cwd.mkdir()
+        save_last_session("codex", "sess-cwd", str(cwd))
+
+        assert load_session_cwd("codex", "sess-cwd") == str(cwd)
+        cwd.rmdir()
+        evict_session_metadata("codex", "sess-cwd")
+
+        assert load_session_cwd("codex", "sess-cwd") is None
+        assert load_last_session("codex") is None
 
 
 class TestCleanupLastSessions:

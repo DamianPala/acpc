@@ -7,8 +7,9 @@ policy based on tool_call.kind.
 from __future__ import annotations
 
 import sys
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -20,7 +21,7 @@ from acp.schema import (
     CreateTerminalResponse,
     DeniedOutcome,
     EnvVariable,
-    KillTerminalCommandResponse,
+    KillTerminalResponse,
     PermissionOption,
     ReadTextFileResponse,
     ReleaseTerminalResponse,
@@ -50,6 +51,20 @@ class PermissionLevel(Enum):
     READ = "read"
     NONE = "none"
     PROMPT = "prompt"
+
+
+SessionUpdateSink = Callable[[dict[str, Any]], Awaitable[None]]
+
+
+@dataclass
+class ClientSession:
+    """Per-session state used while one ACP connection is multiplexed."""
+
+    output: OutputHandler
+    permission_level: PermissionLevel
+    is_tty: bool
+    replaying: bool = False
+    update_sink: SessionUpdateSink | None = None
 
 
 def _classify_kind(kind: str | None) -> str:
@@ -103,19 +118,93 @@ def _find_option(
 
 
 class AcpcClient:
-    """ACP Client implementation that dispatches events to OutputHandler."""
+    """ACP client that keeps direct and multiplexed session state separate."""
 
     def __init__(
         self,
         output: OutputHandler,
         permission_level: PermissionLevel,
         is_tty: bool,
+        *,
+        strict_sessions: bool = False,
     ) -> None:
-        self.output = output
-        self.permission_level = permission_level
-        self.is_tty = is_tty
+        self._default_session = ClientSession(
+            output=output,
+            permission_level=permission_level,
+            is_tty=is_tty,
+        )
+        self._sessions: dict[str, ClientSession] = {}
+        self._strict_sessions = strict_sessions
         self.session_id: str | None = None
-        self.replaying = False
+
+    @property
+    def output(self) -> OutputHandler:
+        """Return the direct-path output handler for backwards compatibility."""
+        return self._default_session.output
+
+    @property
+    def permission_level(self) -> PermissionLevel:
+        """Return the direct-path permission policy for backwards compatibility."""
+        return self._default_session.permission_level
+
+    @property
+    def is_tty(self) -> bool:
+        """Return whether direct-path permission prompts may use the terminal."""
+        return self._default_session.is_tty
+
+    @property
+    def replaying(self) -> bool:
+        """Return the direct-path replay flag for backwards compatibility."""
+        return self._default_session.replaying
+
+    def register_session(
+        self,
+        session_id: str,
+        *,
+        output: OutputHandler | None = None,
+        permission_level: PermissionLevel | None = None,
+        is_tty: bool | None = None,
+        update_sink: SessionUpdateSink | None = None,
+    ) -> ClientSession:
+        """Attach per-session output, permissions, terminal state, and sink."""
+        session = self._sessions.get(session_id)
+        if session is None:
+            session = ClientSession(
+                output=output or self._default_session.output,
+                permission_level=permission_level or self._default_session.permission_level,
+                is_tty=self._default_session.is_tty if is_tty is None else is_tty,
+            )
+            self._sessions[session_id] = session
+        elif output is not None:
+            session.output = output
+        if permission_level is not None:
+            session.permission_level = permission_level
+        if is_tty is not None:
+            session.is_tty = is_tty
+        session.update_sink = update_sink
+        return session
+
+    def unregister_session(self, session_id: str) -> None:
+        """Remove a session mapping after its transport is no longer usable."""
+        self._sessions.pop(session_id, None)
+
+    @property
+    def session_ids(self) -> tuple[str, ...]:
+        """Return registered session ids for daemon bookkeeping cleanup."""
+        return tuple(self._sessions)
+
+    def detach_session(self, session_id: str) -> None:
+        """Stop forwarding notifications while retaining session policy and output."""
+        session = self._sessions.get(session_id)
+        if session is not None:
+            session.update_sink = None
+
+    def _session_for(self, session_id: str) -> ClientSession:
+        """Return registered state, optionally rejecting unknown multiplexed ids."""
+        session = self._sessions.get(session_id)
+        if session is None and self._strict_sessions:
+            raise ValueError(f"unknown session id: {session_id}")
+        return session or self._default_session
 
     # -- connection callback ------------------------------------------------
 
@@ -125,7 +214,7 @@ class AcpcClient:
     # -- history replay -----------------------------------------------------
 
     @contextmanager
-    def replaying_history(self) -> Iterator[None]:
+    def replaying_history(self, session_id: str | None = None) -> Iterator[None]:
         """Suppress event output while the agent replays past conversation.
 
         ACP requires an agent to emit session/update notifications for the
@@ -133,11 +222,13 @@ class AcpcClient:
         events are indistinguishable from live ones, so without this guard
         every resume reprints the whole transcript ahead of the new answer.
         """
-        self.replaying = True
+        session = self._default_session if session_id is None else self._session_for(session_id)
+        was_replaying = session.replaying
+        session.replaying = True
         try:
             yield
         finally:
-            self.replaying = False
+            session.replaying = was_replaying
 
     # -- session_update -----------------------------------------------------
 
@@ -148,52 +239,82 @@ class AcpcClient:
         **kwargs: Any,  # noqa: ARG002
     ) -> None:
         """Dispatch session_update to the output handler."""
+        session = self._session_for(session_id)
         self.session_id = session_id
-        if self.replaying:
+        if session.replaying:
             return
         discriminator: str = getattr(update, "session_update", "")
+        event = update.model_dump(mode="json", by_alias=True)
+        if event.get("messageId") is None:
+            event.pop("messageId", None)
+
+        if session.update_sink is not None:
+            try:
+                await session.update_sink(
+                    {
+                        "type": "session_update",
+                        "session_id": session_id,
+                        "update": event,
+                    }
+                )
+            except (ConnectionError, OSError):
+                session.update_sink = None
 
         if discriminator == "agent_message_chunk":
             chunk: AgentMessageChunk = update
             if hasattr(chunk.content, "text"):
-                self.output.on_agent_message_chunk(chunk.content.text)
+                session.output.on_agent_message_chunk(chunk.content.text)
 
         if discriminator == "tool_call":
             tc_start: ToolCallStart = update
-            self.output.on_tool_call(tc_start.title, kind=tc_start.kind)
+            session.output.on_tool_call(tc_start.title, kind=tc_start.kind)
 
         if discriminator == "tool_call_update":
             tc_progress: ToolCallProgress = update
             if tc_progress.title:
-                self.output.on_tool_call(
+                session.output.on_tool_call(
                     tc_progress.title,
                     kind=tc_progress.kind,
                 )
 
         # JSON mode gets every event
-        if self.output.mode is OutputMode.JSON:
-            self.output.on_event(update.model_dump(mode="json", by_alias=True))
+        if session.output.mode is OutputMode.JSON:
+            session.output.on_event(event)
 
     # -- permissions --------------------------------------------------------
 
     async def request_permission(
         self,
         options: list[PermissionOption],
-        session_id: str,  # noqa: ARG002
+        session_id: str,
         tool_call: ToolCallUpdate,
         **kwargs: Any,  # noqa: ARG002
     ) -> RequestPermissionResponse:
         """Apply permission policy based on tool_call.kind."""
+        session = self._session_for(session_id)
         kind_str: str | None = tool_call.kind
         category = _classify_kind(kind_str)
-        decision = _should_allow(self.permission_level, category)
+        decision = _should_allow(session.permission_level, category)
 
         title = getattr(tool_call, "title", None) or ""
 
         if decision is None:
-            decision = self._prompt_user(kind_str or "unknown", title)
+            decision = self._prompt_user(kind_str or "unknown", title, is_tty=session.is_tty)
 
         outcome_label = "allow" if decision else "deny"
+        if session.update_sink is not None:
+            try:
+                await session.update_sink(
+                    {
+                        "type": "permission",
+                        "session_id": session_id,
+                        "kind": kind_str or "unknown",
+                        "title": title,
+                        "outcome": outcome_label,
+                    }
+                )
+            except (ConnectionError, OSError):
+                session.update_sink = None
         stderr_permission(kind_str or "unknown", title, outcome_label)
 
         option_id = _find_option(options, decision)
@@ -209,9 +330,9 @@ class AcpcClient:
             outcome=DeniedOutcome(outcome="cancelled"),
         )
 
-    def _prompt_user(self, kind_str: str, title: str) -> bool:
+    def _prompt_user(self, kind_str: str, title: str, *, is_tty: bool) -> bool:
         """Ask the user on stderr/stdin. Returns False if not a TTY."""
-        if not self.is_tty:
+        if not is_tty:
             stderr_error("permission prompt requires a TTY (use --permissions all/write/read/none)")
             return False
 
@@ -238,6 +359,7 @@ class AcpcClient:
         **kwargs: Any,  # noqa: ARG002
     ) -> ReadTextFileResponse:
         """Read file from disk and return content."""
+        _ = self._session_for(session_id)
         content = Path(path).read_text(encoding="utf-8")
         return ReadTextFileResponse(content=content)
 
@@ -249,6 +371,7 @@ class AcpcClient:
         **kwargs: Any,  # noqa: ARG002
     ) -> WriteTextFileResponse:
         """Write content to file on disk."""
+        _ = self._session_for(session_id)
         file_path = Path(path)
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(content, encoding="utf-8")
@@ -273,7 +396,7 @@ class AcpcClient:
         session_id: str,  # noqa: ARG002
         terminal_id: str,  # noqa: ARG002
         **kwargs: Any,  # noqa: ARG002
-    ) -> KillTerminalCommandResponse:
+    ) -> KillTerminalResponse:
         raise NotImplementedError("Terminal not supported in acpc v0.1")
 
     async def release_terminal(

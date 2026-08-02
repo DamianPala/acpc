@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 
 import pytest
 
@@ -30,10 +31,11 @@ def output() -> OutputHandler:
     return OutputHandler(mode=OutputMode.TEXT)
 
 
-def _make_agent_message_chunk(text: str) -> AgentMessageChunk:
+def _make_agent_message_chunk(text: str, message_id: str | None = None) -> AgentMessageChunk:
     return AgentMessageChunk(
         session_update="agent_message_chunk",
         content=TextContentBlock(type="text", text=text),
+        message_id=message_id,
     )
 
 
@@ -94,6 +96,36 @@ class TestSessionUpdate:
 
         captured = capsys.readouterr()
         assert captured.out == "hello"
+
+    def test_json_event_preserves_populated_message_id(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        client = AcpcClient(
+            OutputHandler(mode=OutputMode.JSON),
+            PermissionLevel.ALL,
+            is_tty=False,
+        )
+
+        asyncio.run(client.session_update("sess-1", _make_agent_message_chunk("hello", "msg-1")))
+
+        event = json.loads(capsys.readouterr().out)
+        assert event["messageId"] == "msg-1"
+
+    def test_json_event_omits_absent_message_id(
+        self,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        client = AcpcClient(
+            OutputHandler(mode=OutputMode.JSON),
+            PermissionLevel.ALL,
+            is_tty=False,
+        )
+
+        asyncio.run(client.session_update("sess-1", _make_agent_message_chunk("hello")))
+
+        event = json.loads(capsys.readouterr().out)
+        assert "messageId" not in event
 
     def test_dispatches_tool_call(
         self,
@@ -179,6 +211,29 @@ class TestHistoryReplay:
 
         assert client.session_id == "sess-42"
 
+    def test_replay_state_and_updates_are_scoped_to_each_session(self) -> None:
+        events: dict[str, list[str]] = {"A": [], "B": []}
+        client = AcpcClient(OutputHandler(mode=OutputMode.QUIET), PermissionLevel.ALL, is_tty=False)
+
+        async def collect_a(frame: dict[str, object]) -> None:
+            events["A"].append(frame["update"]["content"]["text"])  # type: ignore[index]
+
+        async def collect_b(frame: dict[str, object]) -> None:
+            events["B"].append(frame["update"]["content"]["text"])  # type: ignore[index]
+
+        client.register_session("A", update_sink=collect_a)
+        client.register_session("B", update_sink=collect_b)
+
+        async def scenario() -> None:
+            with client.replaying_history("A"):
+                await client.session_update("A", _make_agent_message_chunk("old A"))
+                await client.session_update("B", _make_agent_message_chunk("live B"))
+            await client.session_update("A", _make_agent_message_chunk("live A"))
+
+        asyncio.run(scenario())
+
+        assert events == {"A": ["live A"], "B": ["live B"]}
+
 
 # ---------------------------------------------------------------------------
 # Permission policy
@@ -186,6 +241,59 @@ class TestHistoryReplay:
 
 
 class TestPermissions:
+    @pytest.mark.parametrize(
+        ("permission_level", "outcome"),
+        [(PermissionLevel.ALL, "allow"), (PermissionLevel.NONE, "deny")],
+    )
+    def test_policy_decision_is_forwarded_to_session_sink(
+        self,
+        output: OutputHandler,
+        permission_level: PermissionLevel,
+        outcome: str,
+    ) -> None:
+        frames: list[dict[str, object]] = []
+
+        async def collect(frame: dict[str, object]) -> None:
+            frames.append(frame)
+
+        client = AcpcClient(output, PermissionLevel.NONE, is_tty=False, strict_sessions=True)
+        client.register_session(
+            "sess-1",
+            permission_level=permission_level,
+            update_sink=collect,
+        )
+
+        asyncio.run(
+            client.request_permission(
+                _make_permission_options(),
+                "sess-1",
+                _make_tool_call_update(title="write sentinel.txt"),
+            )
+        )
+
+        assert frames == [
+            {
+                "type": "permission",
+                "session_id": "sess-1",
+                "kind": "edit",
+                "title": "write sentinel.txt",
+                "outcome": outcome,
+            }
+        ]
+
+    def test_permissions_are_scoped_to_registered_session(self, output: OutputHandler) -> None:
+        client = AcpcClient(output, PermissionLevel.ALL, is_tty=False, strict_sessions=True)
+        client.register_session("none", permission_level=PermissionLevel.NONE)
+        client.register_session("default", permission_level=PermissionLevel.ALL)
+        options = _make_permission_options()
+        tc = _make_tool_call_update(kind="edit", title="Edit file")
+
+        denied = asyncio.run(client.request_permission(options, "none", tc))
+        allowed = asyncio.run(client.request_permission(options, "default", tc))
+
+        assert denied.outcome.outcome == "cancelled"
+        assert allowed.outcome.outcome == "selected"
+
     def test_all_allows_everything(self, output: OutputHandler) -> None:
         client = AcpcClient(output, PermissionLevel.ALL, is_tty=False)
         options = _make_permission_options()
@@ -254,3 +362,17 @@ class TestPermissions:
         resp = asyncio.run(client.request_permission(options, "sess-1", tc))
 
         assert resp.outcome.outcome == "selected"
+
+
+class TestMultiplexedFileOperations:
+    def test_unknown_session_is_rejected_for_read(self, output: OutputHandler) -> None:
+        client = AcpcClient(output, PermissionLevel.ALL, is_tty=False, strict_sessions=True)
+
+        with pytest.raises(ValueError, match="unknown session id"):
+            asyncio.run(client.read_text_file("missing.txt", "unknown"))
+
+    def test_unknown_session_is_rejected_for_write(self, output: OutputHandler) -> None:
+        client = AcpcClient(output, PermissionLevel.ALL, is_tty=False, strict_sessions=True)
+
+        with pytest.raises(ValueError, match="unknown session id"):
+            asyncio.run(client.write_text_file("text", "missing.txt", "unknown"))

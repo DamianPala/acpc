@@ -1,14 +1,26 @@
 """Tests for acpc.runner module."""
 
 import asyncio
+import contextlib
 import subprocess
 import sys
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, call, patch
 
+import acp
+import pytest
+
 from acpc.client import AcpcClient, PermissionLevel
+from acpc.daemon_client import (
+    DaemonProtocolError,
+    DaemonUnavailableError,
+    daemon_status,
+    shutdown_daemon,
+)
+from acpc.ipc import lock_path_for_target, socket_path_for_target
 from acpc.output import OutputHandler, OutputMode
 from acpc.runner import (
     EXIT_AGENT_ERROR,
@@ -23,9 +35,42 @@ from acpc.runner import (
     _cache_available_models,
     _drain_notifications,
     _process_group_kwargs,
+    _resolve_run_cwd,
+    run,
     _spawn_agent,
     _try_set_model,
 )
+
+
+MOCK_AGENT_SCRIPT = Path(__file__).with_name("mock_agent.py")
+
+
+def _quiet_client() -> AcpcClient:
+    return AcpcClient(
+        output=OutputHandler(OutputMode.QUIET),
+        permission_level=PermissionLevel.NONE,
+        is_tty=False,
+    )
+
+
+async def _run_mock_prompt(command: str, *args: str) -> None:
+    client = _quiet_client()
+    async with _spawn_agent(
+        client,
+        command,
+        *args,
+        cwd=str(Path.cwd()),
+        drain_stderr=True,
+    ) as (conn, _process):
+        init_response = await conn.initialize(protocol_version=acp.PROTOCOL_VERSION)
+        assert init_response.agent_capabilities is not None
+        session = await conn.new_session(cwd=str(Path.cwd()))
+        result = await conn.prompt(
+            session.session_id,
+            [acp.text_block("stderr:TEXT")],
+        )
+        await _drain_notifications(conn)
+        assert result.stop_reason == "end_turn"
 
 
 class TestRunConfig:
@@ -86,6 +131,25 @@ class TestExitCodes:
         assert EXIT_SIGINT == 130
         assert EXIT_SIGPIPE == 141
         assert EXIT_SIGTERM == 143
+
+
+def test_resume_cwd_is_loaded_and_deleted_metadata_is_evicted(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    from acpc.sessions import load_session_cwd, save_last_session
+
+    monkeypatch.setenv("ACPC_STATE_DIR", str(tmp_path / "state"))
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    save_last_session("mock", "sess-1", str(cwd))
+
+    resolved, error = _resolve_run_cwd("mock", "sess-1", None)
+    assert resolved == str(cwd)
+    assert error is None
+
+    cwd.rmdir()
+    resolved, error = _resolve_run_cwd("mock", "sess-1", None)
+    assert resolved is None
+    assert error == f"session cwd no longer exists: {cwd}"
+    assert load_session_cwd("mock", "sess-1") is None
 
 
 class TestProcessGroupKwargs:
@@ -180,7 +244,6 @@ class TestTrySetModel:
     def test_uses_current_config_option_api_when_advertised(self) -> None:
         connection = SimpleNamespace(
             set_config_option=AsyncMock(),
-            set_session_model=AsyncMock(),
         )
         response = SimpleNamespace(
             models=None,
@@ -218,7 +281,53 @@ class TestTrySetModel:
                 value="medium",
             ),
         ]
-        connection.set_session_model.assert_not_awaited()
+
+    def test_fails_when_session_has_no_model_capability(self) -> None:
+        connection = SimpleNamespace(set_config_option=AsyncMock())
+        response = SimpleNamespace(models=None, config_options=[])
+        messages: list[str] = []
+
+        was_set = asyncio.run(
+            _try_set_model(
+                cast(Any, connection),
+                "session-1",
+                "gpt-5.6-luna",
+                response,
+                messages.append,
+            )
+        )
+
+        assert was_set is False
+        connection.set_config_option.assert_not_awaited()
+        assert messages == [
+            "warning: cannot set model 'gpt-5.6-luna': session advertises no model config option"
+        ]
+
+
+class TestAdapterStderr:
+    def test_forwards_adapter_stderr(self, capsys: Any) -> None:
+        asyncio.run(_run_mock_prompt(sys.executable, str(MOCK_AGENT_SCRIPT)))
+
+        assert "TEXT" in capsys.readouterr().err
+
+    def test_chatty_adapter_completes_prompt(self, tmp_path: Path) -> None:
+        wrapper = tmp_path / "chatty_adapter.py"
+        wrapper.write_text(
+            """import os
+import sys
+
+payload = memoryview(b"x" * (32 * 1024 * 1024))
+while payload:
+    payload = payload[os.write(sys.stderr.fileno(), payload) :]
+os.execv(sys.executable, [sys.executable, sys.argv[1]])
+""",
+            encoding="utf-8",
+        )
+
+        async def scenario() -> None:
+            await _run_mock_prompt(sys.executable, str(wrapper), str(MOCK_AGENT_SCRIPT))
+
+        asyncio.run(asyncio.wait_for(scenario(), timeout=1.0))
 
 
 class TestTeardownIsBounded:
@@ -321,3 +430,199 @@ class TestDrainNotifications:
         assert hasattr(InMemoryMessageQueue, "join")
         assert hasattr(TaskSupervisor(source="canary"), "_tasks")
         assert hasattr(DefaultMessageDispatcher, "_dispatch_notification")
+
+
+def _configure_mock_agent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Expose the standalone mock agent to the runner and daemon subprocess."""
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir()
+    (agents_dir / "mock.toml").write_text(
+        f'''identity = "mock"
+name = "Mock Agent"
+author = "Test"
+run_command = "{sys.executable} {MOCK_AGENT_SCRIPT}"
+install_command = "true"
+''',
+        encoding="utf-8",
+    )
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    monkeypatch.setenv("ACPC_USER_AGENTS_DIR", str(agents_dir))
+    monkeypatch.setenv("ACPC_STATE_DIR", str(state_dir))
+    return state_dir
+
+
+def _mock_run_config(prompt_text: str = "hello", **overrides: Any) -> RunConfig:
+    """Build a non-interactive config suitable for daemon routing tests."""
+    values: dict[str, Any] = {
+        "agent_identity": "mock",
+        "prompt_text": prompt_text,
+        "permission_level": "read",
+        "is_tty": False,
+        "output_mode": "quiet",
+    }
+    values.update(overrides)
+    return RunConfig(**values)
+
+
+def test_default_run_uses_a_real_daemon(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The normal runner decision reaches a real daemon and its adapter."""
+    _configure_mock_agent(tmp_path, monkeypatch)
+    monkeypatch.setenv("ACPC_DAEMON_TTL", "30")
+
+    async def scenario() -> tuple[int, dict[str, Any]]:
+        try:
+            exit_code = await run(_mock_run_config("daemon route"))
+            return exit_code, await daemon_status("mock")
+        finally:
+            with contextlib.suppress(DaemonUnavailableError, OSError):
+                await shutdown_daemon("mock")
+
+    exit_code, status = asyncio.run(scenario())
+
+    assert exit_code == 0
+    assert len(status["sessions"]) == 1
+
+
+def test_no_daemon_flag_is_a_silent_direct_bypass(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: Any,
+) -> None:
+    _configure_mock_agent(tmp_path, monkeypatch)
+    with patch("acpc.daemon_client.run_daemon", new=AsyncMock(return_value=99)) as daemon_run:
+        assert asyncio.run(run(_mock_run_config(no_daemon=True))) == 0
+
+    daemon_run.assert_not_awaited()
+    assert "daemon:" not in capsys.readouterr().err
+
+
+def test_no_daemon_environment_is_a_silent_direct_bypass(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: Any,
+) -> None:
+    _configure_mock_agent(tmp_path, monkeypatch)
+    monkeypatch.setenv("ACPC_NO_DAEMON", "1")
+    with patch("acpc.daemon_client.run_daemon", new=AsyncMock(return_value=99)) as daemon_run:
+        assert asyncio.run(run(_mock_run_config())) == 0
+
+    daemon_run.assert_not_awaited()
+    assert "daemon:" not in capsys.readouterr().err
+
+
+def test_windows_is_a_silent_direct_bypass_without_socket_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: Any,
+) -> None:
+    state_dir = _configure_mock_agent(tmp_path, monkeypatch)
+    with (
+        patch("acpc.runner.sys", SimpleNamespace(platform="win32")),
+        patch("acpc.runner._process_group_kwargs", return_value={}),
+        patch("acpc.daemon_client.run_daemon", new=AsyncMock(return_value=99)) as daemon_run,
+    ):
+        assert asyncio.run(run(_mock_run_config())) == 0
+
+    daemon_run.assert_not_awaited()
+    assert not socket_path_for_target("mock").exists()
+    assert not lock_path_for_target("mock").exists()
+    assert "daemon:" not in capsys.readouterr().err
+    assert state_dir.exists()
+
+
+def test_interactive_permissions_note_and_use_direct_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: Any,
+) -> None:
+    _configure_mock_agent(tmp_path, monkeypatch)
+    config = _mock_run_config(permission_level="prompt", is_tty=True)
+    with patch("acpc.daemon_client.run_daemon", new=AsyncMock(return_value=99)) as daemon_run:
+        assert asyncio.run(run(config)) == 0
+
+    daemon_run.assert_not_awaited()
+    assert "[acpc] daemon: interactive permissions require direct mode" in capsys.readouterr().err
+
+
+def test_daemon_failure_mid_attempt_falls_back_without_orphan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: Any,
+) -> None:
+    _configure_mock_agent(tmp_path, monkeypatch)
+    active_prompts = 0
+    prompt_calls = 0
+
+    class FailingDaemonClient:
+        def __init__(self, target: str, **kwargs: Any) -> None:
+            del target, kwargs
+
+        async def prompt(self, **kwargs: Any) -> int:
+            nonlocal active_prompts, prompt_calls
+            del kwargs
+            prompt_calls += 1
+            active_prompts += 1
+            try:
+                raise DaemonProtocolError("connection closed mid-prompt")
+            finally:
+                active_prompts -= 1
+
+    with patch("acpc.daemon_client.DaemonClient", FailingDaemonClient):
+        assert asyncio.run(run(_mock_run_config("recover"))) == 0
+
+    assert prompt_calls == 1
+    assert active_prompts == 0
+    assert "[acpc] daemon: unavailable (connection closed mid-prompt), running direct" in (
+        capsys.readouterr().err
+    )
+
+
+def test_capacity_falls_back_for_a_new_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: Any,
+) -> None:
+    _configure_mock_agent(tmp_path, monkeypatch)
+    prompt_sessions: list[str | None] = []
+
+    class FullDaemonClient:
+        def __init__(self, target: str, **kwargs: Any) -> None:
+            del target, kwargs
+
+        async def prompt(self, **kwargs: Any) -> int:
+            prompt_sessions.append(kwargs["session_id"])
+            raise DaemonUnavailableError("daemon is at capacity")
+
+    with patch("acpc.daemon_client.DaemonClient", FullDaemonClient):
+        assert asyncio.run(run(_mock_run_config("new"))) == 0
+
+    assert prompt_sessions == [None]
+    assert "[acpc] daemon: at capacity, running direct" in capsys.readouterr().err
+
+
+def test_capacity_still_routes_a_live_session_through_daemon(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_mock_agent(tmp_path, monkeypatch)
+    prompt_sessions: list[str | None] = []
+
+    class FullDaemonClient:
+        def __init__(self, target: str, **kwargs: Any) -> None:
+            del target, kwargs
+
+        async def prompt(self, **kwargs: Any) -> int:
+            prompt_sessions.append(kwargs["session_id"])
+            if kwargs["session_id"] is None:
+                raise DaemonUnavailableError("daemon is at capacity")
+            return 0
+
+    with patch("acpc.daemon_client.DaemonClient", FullDaemonClient):
+        config = _mock_run_config("continue", session_id="live", cwd=str(tmp_path))
+        assert asyncio.run(run(config)) == 0
+
+    assert prompt_sessions == ["live"]

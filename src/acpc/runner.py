@@ -15,6 +15,7 @@ import sys
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import acp
@@ -24,7 +25,9 @@ from acp.transports import default_environment
 
 from acpc.sessions import (
     add_running,
+    evict_session_metadata,
     load_last_session,
+    load_session_cwd,
     make_running_session,
     remove_running,
     save_last_session,
@@ -83,6 +86,7 @@ class RunConfig:
     timeout: int | None = None
     is_tty: bool = True
     env: dict[str, str] = field(default_factory=dict)
+    no_daemon: bool = False
 
 
 # --- Process group management (Zed pattern) ---
@@ -117,6 +121,42 @@ def kill_process_tree(pid: int) -> None:
             pass
 
 
+async def _forward_stderr(stream: asyncio.StreamReader) -> None:
+    """Forward adapter stderr to acpc's stderr while the adapter is running."""
+    try:
+        while True:
+            chunk = await stream.read(4096)
+            if not chunk:
+                return
+            try:
+                stderr_buffer = getattr(sys.stderr, "buffer", None)
+                if stderr_buffer is not None:
+                    stderr_buffer.write(chunk)
+                    stderr_buffer.flush()
+                else:
+                    sys.stderr.write(chunk.decode(errors="replace"))
+                    sys.stderr.flush()
+            except (OSError, UnicodeError, ValueError):
+                return
+    except (OSError, ValueError):
+        return
+
+
+async def _stop_stderr_forwarder(task: asyncio.Task[None]) -> None:
+    """Wait briefly for stderr EOF, then cancel the forwarder if needed."""
+    try:
+        await asyncio.wait_for(task, timeout=_EXIT_TIMEOUT)
+    except asyncio.TimeoutError:
+        task.cancel()
+    except Exception:
+        pass
+    finally:
+        if not task.done():
+            task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await task
+
+
 @asynccontextmanager
 async def _spawn_agent(
     client: Any,
@@ -124,12 +164,16 @@ async def _spawn_agent(
     *args: str,
     env: dict[str, str] | None = None,
     cwd: str | None = None,
+    drain_stderr: bool = False,
 ) -> AsyncIterator[tuple[ClientSideConnection, aio_subprocess.Process]]:
     """Spawn ACP agent in its own process group for reliable cleanup.
 
     Like acp.spawn_agent_process but with process group isolation
     (start_new_session on Unix, CREATE_NEW_PROCESS_GROUP on Windows).
     On exit, kills the entire process tree via killpg/taskkill.
+
+    When enabled, drain the agent's stderr pipe and forward it to acpc's
+    stderr. Callers that consume the pipe themselves must leave this disabled.
     """
     merged_env = dict(os.environ)
     merged_env.update(default_environment())
@@ -148,12 +192,20 @@ async def _spawn_agent(
         **_process_group_kwargs(),
     )
 
-    if process.stdout is None or process.stdin is None:
+    if process.stdout is None or process.stdin is None or process.stderr is None:
         process.kill()
         await process.wait()
         raise RuntimeError("failed to create stdio pipes for agent process")
 
     conn = ClientSideConnection(client, process.stdin, process.stdout)
+    stderr_task = (
+        asyncio.create_task(
+            _forward_stderr(process.stderr),
+            name="acpc.adapter.stderr",
+        )
+        if drain_stderr
+        else None
+    )
     pid = process.pid
 
     try:
@@ -184,6 +236,11 @@ async def _spawn_agent(
             kill_process_tree(pid)
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(process.wait(), timeout=_EXIT_TIMEOUT)
+
+        # 5. Drain any final diagnostics, but never let a broken or inherited
+        # stderr pipe keep the runner alive.
+        if stderr_task is not None:
+            await _stop_stderr_forwarder(stderr_task)
 
 
 def _setup_signals(
@@ -284,7 +341,7 @@ async def _try_set_model(
     session_response: Any | None,
     log: Callable[[str], None],
 ) -> bool:
-    """Set the model through the current ACP API, with legacy fallback.
+    """Set the model through the current ACP config-option API.
 
     Returns True if the adapter accepted the model selection call.
     """
@@ -305,19 +362,17 @@ async def _try_set_model(
         model_id = base_model
         reasoning_effort = suffix
 
-    valid_ids: list[str] = []
-    if model_config is not None:
-        valid_ids = [
-            option.value
-            for option in getattr(model_config, "options", None) or []
-            if isinstance(getattr(option, "value", None), str)
-        ]
-    elif session_response is not None and hasattr(session_response, "models"):
-        models_state = session_response.models
-        if models_state is not None and hasattr(models_state, "available_models"):
-            available = models_state.available_models
-            if available:
-                valid_ids = [m.model_id for m in available if hasattr(m, "model_id")]
+    if model_config is None:
+        log(  # type: ignore[operator]
+            f"warning: cannot set model '{model}': session advertises no model config option"
+        )
+        return False
+
+    valid_ids = [
+        option.value
+        for option in getattr(model_config, "options", None) or []
+        if isinstance(getattr(option, "value", None), str)
+    ]
 
     # Lists can be incomplete, so warn but still pass the model through.
     if valid_ids and model_id not in valid_ids:
@@ -327,20 +382,17 @@ async def _try_set_model(
         )
 
     try:
-        if model_config is not None:
+        await conn.set_config_option(
+            config_id=getattr(model_config, "id", "model"),
+            session_id=session_id,
+            value=model_id,
+        )
+        if reasoning_effort is not None:
             await conn.set_config_option(
-                config_id=getattr(model_config, "id", "model"),
+                config_id="reasoning_effort",
                 session_id=session_id,
-                value=model_id,
+                value=reasoning_effort,
             )
-            if reasoning_effort is not None:
-                await conn.set_config_option(
-                    config_id="reasoning_effort",
-                    session_id=session_id,
-                    value=reasoning_effort,
-                )
-        else:
-            await conn.set_session_model(model_id=model, session_id=session_id)
         return True
     except RequestError as e:
         log(f"warning: failed to set model '{model}': {e}")  # type: ignore[operator]
@@ -354,15 +406,15 @@ async def _send_prompt(
     model_was_set: bool,
     log: Callable[[str], None],
 ) -> Any:
-    """Send prompt with heartbeat. Retry without model if prompt fails after set_model.
+    """Send prompt with heartbeat. Retry without model if prompt fails after selection.
 
-    Some adapters (codex-acp) accept set_session_model but then fail on prompt()
-    with Internal error. This retries once without the model override.
+    Some adapters accept a model selection call but then fail on prompt() with an
+    internal error. This retries once without the model override.
     """
     is_quiet = config.output_mode == "quiet"
     heartbeat_task = asyncio.create_task(_heartbeat(is_quiet))
     try:
-        prompt_coro = conn.prompt([acp.text_block(config.prompt_text)], session_id=session_id)
+        prompt_coro = conn.prompt(session_id, [acp.text_block(config.prompt_text)])
         if config.timeout:
             result = await asyncio.wait_for(prompt_coro, timeout=config.timeout)
         else:
@@ -375,7 +427,7 @@ async def _send_prompt(
         log(  # type: ignore[operator]
             f"warning: prompt failed after --model ('{e}'), retrying without model override"
         )
-        prompt_coro = conn.prompt([acp.text_block(config.prompt_text)], session_id=session_id)
+        prompt_coro = conn.prompt(session_id, [acp.text_block(config.prompt_text)])
         if config.timeout:
             return await asyncio.wait_for(prompt_coro, timeout=config.timeout)
         return await prompt_coro
@@ -427,7 +479,93 @@ def _cache_available_models(agent: str, new_session_resp: Any) -> bool:
         return False  # Best-effort, never fail the prompt
 
 
+def _canonical_cwd(cwd: str) -> str:
+    path = Path(cwd)
+    if not path.is_absolute():
+        raise ValueError(f"cwd must be an absolute existing directory: {cwd}")
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as error:
+        raise ValueError(f"cwd must be an absolute existing directory: {cwd}") from error
+    if not resolved.is_dir():
+        raise ValueError(f"cwd must be an absolute existing directory: {cwd}")
+    return str(resolved)
+
+
+def _resolve_run_cwd(
+    agent: str,
+    session_id: str | None,
+    requested_cwd: str | None,
+) -> tuple[str | None, str | None]:
+    if session_id is None:
+        if requested_cwd is None:
+            return os.getcwd(), None
+        try:
+            return _canonical_cwd(requested_cwd), None
+        except ValueError as error:
+            return None, str(error)
+
+    recorded_cwd = load_session_cwd(agent, session_id)
+    if recorded_cwd is not None:
+        try:
+            recorded_cwd = _canonical_cwd(recorded_cwd)
+        except ValueError:
+            evict_session_metadata(agent, session_id)
+            return None, f"session cwd no longer exists: {recorded_cwd}"
+    if requested_cwd is None:
+        if recorded_cwd is None:
+            return None, f"session cwd is unknown for {session_id}; provide --cwd to load it"
+        return recorded_cwd, None
+    try:
+        requested_cwd = _canonical_cwd(requested_cwd)
+    except ValueError as error:
+        return None, str(error)
+    if recorded_cwd is not None and recorded_cwd != requested_cwd:
+        return None, f"session cwd is {recorded_cwd}, --cwd says {requested_cwd}"
+    return requested_cwd, None
+
+
+def _should_bypass_daemon(config: RunConfig) -> bool:
+    """Return whether this prompt must use the direct adapter path."""
+    if config.no_daemon or os.environ.get("ACPC_NO_DAEMON") == "1":
+        return True
+    if sys.platform == "win32":
+        return True
+    if config.permission_level == "prompt" and config.is_tty:
+        from acpc.output import stderr
+
+        stderr("daemon: interactive permissions require direct mode")
+        return True
+    return False
+
+
 async def run(config: RunConfig) -> int:
+    """Route a prompt through the daemon unless a direct bypass applies."""
+    from acpc.agents import load_agent
+
+    # Validate before auto-starting a daemon, so an unknown target remains a CLI usage error.
+    load_agent(config.agent_identity)
+
+    if _should_bypass_daemon(config):
+        return await _run_direct(config)
+
+    from acpc.daemon_client import DaemonProtocolError, DaemonUnavailableError, run_daemon
+    from acpc.output import stderr
+
+    async def direct_retry() -> int:
+        return await _run_direct(config)
+
+    try:
+        return await run_daemon(config, direct_retry=direct_retry)
+    except (DaemonUnavailableError, DaemonProtocolError, ConnectionError, OSError) as error:
+        if str(error) == "daemon is at capacity":
+            stderr("daemon: at capacity, running direct")
+        else:
+            stderr(f"daemon: unavailable ({error}), running direct")
+        return await direct_retry()
+
+
+async def _run_direct(config: RunConfig) -> int:
     """Execute a prompt against an ACP agent. Returns exit code.
 
     Steps:
@@ -468,7 +606,22 @@ async def run(config: RunConfig) -> int:
     command = parts[0]
     args = parts[1:]
 
-    cwd = config.cwd or os.getcwd()
+    session_id = config.session_id
+    explicitly_requested = config.use_last or config.session_id is not None
+    if config.use_last and session_id is None:
+        session_id = load_last_session(config.agent_identity)
+        if session_id is None:
+            stderr_error("no previous session found")
+            return EXIT_USAGE_ERROR
+        stderr(
+            f"warning: --last resolved to session {session_id}. "
+            "For reliable multi-agent orchestration, use -s SESSION_ID instead."
+        )
+
+    cwd, cwd_error = _resolve_run_cwd(config.agent_identity, session_id, config.cwd)
+    if cwd_error is not None or cwd is None:
+        stderr_error(cwd_error or "could not resolve session cwd")
+        return EXIT_USAGE_ERROR
 
     # 4. Spawn in own process group and run
     try:
@@ -478,6 +631,7 @@ async def run(config: RunConfig) -> int:
             *args,
             cwd=cwd,
             env=config.env or None,
+            drain_stderr=True,
         ) as (conn, process):
             if process.pid is None:
                 stderr_error("agent process failed to start")
@@ -493,19 +647,6 @@ async def run(config: RunConfig) -> int:
             supports_load = bool(caps and caps.load_session)
 
             # 6. Create or load session
-            session_id = config.session_id
-            explicitly_requested = config.use_last or config.session_id is not None
-
-            if config.use_last and session_id is None:
-                session_id = load_last_session(config.agent_identity)
-                if session_id is None:
-                    stderr_error("no previous session found")
-                    return EXIT_USAGE_ERROR
-                stderr(
-                    f"warning: --last resolved to session {session_id}. "
-                    "For reliable multi-agent orchestration, use -s SESSION_ID instead."
-                )
-
             session_resp = None
             if session_id and supports_load:
                 try:
@@ -589,7 +730,7 @@ async def run(config: RunConfig) -> int:
             output.finalize()
 
             # 10. Save state and return
-            save_last_session(config.agent_identity, session_id)
+            save_last_session(config.agent_identity, session_id, cwd=cwd)
             remove_running(session_id)
             return exit_code
 

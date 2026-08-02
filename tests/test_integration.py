@@ -4,6 +4,7 @@ Tests the full pipeline: CLI -> runner -> ACP handshake -> mock agent -> output.
 """
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -11,29 +12,6 @@ from pathlib import Path
 
 ACPC_CMD = [sys.executable, "-m", "acpc.cli"]
 MOCK_AGENT_SCRIPT = str(Path(__file__).parent / "mock_agent.py")
-
-
-def _run_acpc(
-    *args: str,
-    input_text: str | None = None,
-    timeout: int = 30,
-    mock_toml_dir: Path | None = None,
-) -> subprocess.CompletedProcess[str]:
-    """Run acpc as subprocess with mock agent registered."""
-    env = None
-    if mock_toml_dir:
-        import os
-
-        env = {**os.environ, "ACPC_TEST_AGENTS_DIR": str(mock_toml_dir)}
-
-    return subprocess.run(
-        [*ACPC_CMD, *args],
-        input=input_text,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        env=env,
-    )
 
 
 def _make_mock_toml(tmp_path: Path) -> Path:
@@ -56,9 +34,25 @@ def _run_acpc_with_mock(
     *args: str,
     input_text: str | None = None,
     timeout: int = 30,
+    route_daemon: bool = False,
 ) -> subprocess.CompletedProcess[str]:
-    """Run acpc with mock agent available via monkeypatched registry."""
+    """Run acpc with an isolated state directory and a mock agent.
+
+    The v0.1 CLI tests use the direct path by default. A caller must opt into
+    daemon routing explicitly for a test that covers the routing decision.
+    """
     agents_dir = _make_mock_toml(tmp_path)
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(exist_ok=True)
+    env = {
+        **os.environ,
+        "ACPC_STATE_DIR": str(state_dir),
+        "ACPC_USER_AGENTS_DIR": str(agents_dir),
+    }
+    if route_daemon:
+        env.pop("ACPC_NO_DAEMON", None)
+    else:
+        env["ACPC_NO_DAEMON"] = "1"
 
     # We need to inject the mock agent into acpc's registry.
     # Since we run as subprocess, we use a wrapper script.
@@ -80,6 +74,7 @@ with patch("acpc.agents._user_agents_dir", return_value=agents_dir):
         capture_output=True,
         text=True,
         timeout=timeout,
+        env=env,
     )
 
 
@@ -88,7 +83,9 @@ class TestBasicPrompt:
 
     def test_echo_response(self, tmp_path: Path) -> None:
         """Mock agent echoes prompt text back."""
-        result = _run_acpc_with_mock(tmp_path, "prompt", "mock", "hello from test")
+        result = _run_acpc_with_mock(
+            tmp_path, "prompt", "mock", "hello from test", route_daemon=False
+        )
         assert result.returncode == 0
         assert "hello from test" in result.stdout
 
@@ -98,13 +95,15 @@ class TestBasicPrompt:
         No retry: a miss here means notifications are again being dropped
         between the prompt response and finalize.
         """
-        result = _run_acpc_with_mock(tmp_path, "prompt", "mock", "quiet test", "--quiet")
+        result = _run_acpc_with_mock(
+            tmp_path, "prompt", "mock", "quiet test", "--quiet", route_daemon=False
+        )
         assert result.returncode == 0
         assert "quiet test" in result.stdout
 
     def test_session_id_on_stderr(self, tmp_path: Path) -> None:
         """Session ID and resume hint printed to stderr."""
-        result = _run_acpc_with_mock(tmp_path, "prompt", "mock", "hello")
+        result = _run_acpc_with_mock(tmp_path, "prompt", "mock", "hello", route_daemon=False)
         assert result.returncode == 0
         assert "[acpc] session:" in result.stderr
         assert "[acpc] resume:" in result.stderr
@@ -115,7 +114,9 @@ class TestJsonOutput:
 
     def test_json_has_session_events(self, tmp_path: Path) -> None:
         """JSON mode emits session_started, events, and session_ended."""
-        result = _run_acpc_with_mock(tmp_path, "prompt", "mock", "json test", "--json")
+        result = _run_acpc_with_mock(
+            tmp_path, "prompt", "mock", "json test", "--json", route_daemon=False
+        )
         assert result.returncode == 0
         lines = [json.loads(line) for line in result.stdout.strip().split("\n") if line.strip()]
         acpc_events = [line.get("acpc") for line in lines if "acpc" in line]
@@ -124,7 +125,9 @@ class TestJsonOutput:
 
     def test_json_contains_agent_message(self, tmp_path: Path) -> None:
         """JSON mode includes agent_message_chunk events."""
-        result = _run_acpc_with_mock(tmp_path, "prompt", "mock", "json msg", "--json")
+        result = _run_acpc_with_mock(
+            tmp_path, "prompt", "mock", "json msg", "--json", route_daemon=False
+        )
         assert result.returncode == 0
         lines = [json.loads(line) for line in result.stdout.strip().split("\n") if line.strip()]
         updates = [line.get("sessionUpdate") for line in lines if "sessionUpdate" in line]
@@ -137,7 +140,9 @@ class TestOutputFile:
     def test_output_written_to_file(self, tmp_path: Path) -> None:
         """Output file contains agent response."""
         out_file = tmp_path / "out.txt"
-        result = _run_acpc_with_mock(tmp_path, "prompt", "mock", "file test", "-o", str(out_file))
+        result = _run_acpc_with_mock(
+            tmp_path, "prompt", "mock", "file test", "-o", str(out_file), route_daemon=False
+        )
         assert result.returncode == 0
         assert out_file.exists()
         assert "file test" in out_file.read_text()
@@ -149,14 +154,26 @@ class TestPermissions:
     def test_permissions_all_allows_tool(self, tmp_path: Path) -> None:
         """With --permissions all, tool calls proceed."""
         result = _run_acpc_with_mock(
-            tmp_path, "prompt", "mock", "tool:read file", "--permissions", "all"
+            tmp_path,
+            "prompt",
+            "mock",
+            "tool:read file",
+            "--permissions",
+            "all",
+            route_daemon=False,
         )
         assert result.returncode == 0
 
     def test_permissions_read_allows_read_tool(self, tmp_path: Path) -> None:
         """With --permissions read, read tools are allowed."""
         result = _run_acpc_with_mock(
-            tmp_path, "prompt", "mock", "tool:search code", "--permissions", "read"
+            tmp_path,
+            "prompt",
+            "mock",
+            "tool:search code",
+            "--permissions",
+            "read",
+            route_daemon=False,
         )
         assert result.returncode == 0
 
@@ -166,13 +183,13 @@ class TestErrorHandling:
 
     def test_refusal_returns_exit_1(self, tmp_path: Path) -> None:
         """Agent refusal returns exit code 1."""
-        result = _run_acpc_with_mock(tmp_path, "prompt", "mock", "error")
+        result = _run_acpc_with_mock(tmp_path, "prompt", "mock", "error", route_daemon=False)
         assert result.returncode == 1
 
     def test_unknown_agent_returns_exit_2(self, tmp_path: Path) -> None:
         """Unknown agent identity returns exit code 2."""
-        result = _run_acpc_with_mock(tmp_path, "prompt", "nonexistent", "hello")
-        assert result.returncode != 0
+        result = _run_acpc_with_mock(tmp_path, "prompt", "nonexistent", "hello", route_daemon=True)
+        assert result.returncode == 2
         assert "error" in result.stderr.lower()
 
 
@@ -181,7 +198,9 @@ class TestTimeout:
 
     def test_timeout_kills_slow_agent(self, tmp_path: Path) -> None:
         """Timeout exits 124 when agent takes too long."""
-        result = _run_acpc_with_mock(tmp_path, "prompt", "mock", "slow:30", "--timeout", "2")
+        result = _run_acpc_with_mock(
+            tmp_path, "prompt", "mock", "slow:30", "--timeout", "2", route_daemon=False
+        )
         assert result.returncode == 124
 
 
@@ -196,6 +215,7 @@ class TestStdinInput:
             "mock",
             "-",
             input_text="piped input",
+            route_daemon=False,
         )
         assert result.returncode == 0
         assert "piped input" in result.stdout
@@ -208,6 +228,13 @@ class TestInputFile:
         """Prompt text read from file."""
         prompt_file = tmp_path / "prompt.md"
         prompt_file.write_text("file prompt content")
-        result = _run_acpc_with_mock(tmp_path, "prompt", "mock", "--input-file", str(prompt_file))
+        result = _run_acpc_with_mock(
+            tmp_path,
+            "prompt",
+            "mock",
+            "--input-file",
+            str(prompt_file),
+            route_daemon=False,
+        )
         assert result.returncode == 0
         assert "file prompt content" in result.stdout
