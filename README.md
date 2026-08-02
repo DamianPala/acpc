@@ -83,7 +83,9 @@ acpc prompt codex --model max         # most capable
 
 Run `acpc models` to see what each preset resolves to for a given agent.
 
-Presets live in `~/.agents/config.toml`. If the file doesn't exist, built-in defaults are used:
+Presets live in `config.toml` in acpc's config directory, which on Linux is
+`~/.config/acpc/config.toml`, alongside the `agents/` directory holding agent definitions.
+Set `ACPC_CONFIG_DIR` to put it elsewhere. If the file doesn't exist, built-in defaults are used:
 
 ```toml
 [models.claude]
