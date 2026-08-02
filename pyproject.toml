@@ -97,5 +97,7 @@ message = "chore(release): bump version {current_version} → {new_version}"
 
 [[tool.bumpversion.files]]
 filename = "pyproject.toml"
-search = 'name = "acpc"\nversion = "{current_version}"'
-replace = 'name = "acpc"\nversion = "{new_version}"'
+search = '''name = "acpc"
+version = "{current_version}"'''
+replace = '''name = "acpc"
+version = "{new_version}"'''
