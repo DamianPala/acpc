@@ -253,6 +253,36 @@ Session IDs and resume commands appear on stderr:
 
 Last-session tracking is scoped per PPID to avoid race conditions in concurrent use.
 
+### What the daemon actually saves
+
+Measured 2026-08-02 on one machine, cheapest model per agent, one-word answers.
+
+| Agent | Path | Wall | CPU (user+sys) |
+|-------|------|------|----------------|
+| codex | direct | 6,46 s | **6,15 s** |
+| codex | daemon | 3,51 s | **0,44 s** |
+| claude | direct | 4,19 s | **1,24 s** |
+| claude | daemon | 4,50 s | **0,50 s** |
+
+**Read the CPU column, not the wall column.** What the daemon removes is adapter startup;
+what dominates the wall clock is waiting on the model, which the daemon cannot help with
+and which varies by seconds between identical calls. One of the runs above has the daemon
+path finishing slower in wall time while using a third of the CPU. If you call acpc once
+and wait, expect little. If you call it in a loop, the CPU column is your saving, and it is
+much larger for the adapter that is expensive to start.
+
+Adapter memory over ten consecutive sessions on one daemon:
+
+| Agent | Resident set | Behaviour |
+|-------|--------------|-----------|
+| codex | 298 → 323 MB | grows steadily, releases nothing |
+| claude | swings 381 ↔ 645 MB | closes idle sessions and reclaims |
+
+Neither approaches the default ceiling in ordinary use. The daemon samples the adapter
+process tree before admitting a new session and, above the ceiling, first closes idle
+sessions where the adapter supports it, then refuses the session and recycles itself.
+Refused calls fall back to the direct path rather than failing.
+
 ## Agent registry
 
 Agents are defined in TOML files. Three agents ship built-in (codex, claude, gemini).

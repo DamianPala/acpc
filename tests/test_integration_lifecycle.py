@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import select
 import signal
 import subprocess
@@ -537,7 +538,17 @@ def test_concurrent_cold_starts_have_one_daemon_and_no_stderr(
     for index, (stdout, stderr) in enumerate(results):
         assert processes[index].returncode == 0
         assert stdout == f"cold answer {index}"
-        assert stderr == ""
+        # Losing the race must be silent. Each client still reports which daemon served
+        # it, so the requirement is that nothing beyond that line appears: no warning,
+        # no error, and no fallback to the direct path.
+        remaining = [
+            line
+            for line in stderr.splitlines()
+            if not re.fullmatch(r"\[acpc\] daemon: (started|connected)( \(pid \d+\))?", line)
+        ]
+        assert remaining == [], stderr
+        assert "unavailable" not in stderr
+        assert "warning" not in stderr.lower()
 
     pid_lines = log_path.read_text(encoding="ascii").splitlines()
     daemon_pids = {int(pid) for pid in pid_lines}

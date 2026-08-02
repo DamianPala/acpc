@@ -109,11 +109,25 @@ class DaemonClient:
         self.poll_interval = poll_interval
         self.stale_shutdown_timeout = stale_shutdown_timeout
         self._popen_factory = popen_factory
+        self._spawned_daemon = False
+
+    def _report_connected(self) -> None:
+        """Say which daemon served this call, and whether we had to start it.
+
+        Reported after connecting rather than after spawning: every client spawns a
+        daemon and the losers of the lock exit, so the process we started is often
+        not the one answering. The PID here is the one that holds the lock.
+        """
+        metadata = self._read_lock_metadata() or {}
+        pid = metadata.get("pid")
+        where = f" (pid {pid})" if isinstance(pid, int) else ""
+        stderr(f"daemon: {'started' if self._spawned_daemon else 'connected'}{where}")
 
     async def connect(self) -> tuple[UnixSocketTransport, Connection]:
         """Connect to a ready daemon, reconciling stale state before polling."""
         if sys.platform == "win32":
             raise DaemonUnavailableError("daemon transport is unavailable on Windows")
+        self._spawned_daemon = False
         await self._prepare_endpoint()
 
         deadline = asyncio.get_running_loop().time() + self.readiness_timeout
@@ -122,6 +136,7 @@ class DaemonClient:
             socket_was_present = self._socket_path().exists()
             connection = await self._try_connect()
             if connection is not None:
+                self._report_connected()
                 return connection
             if socket_was_present and not recovered_connection:
                 await self._recover_after_connection_failure()
@@ -584,6 +599,7 @@ class DaemonClient:
         return transport, connection
 
     def _spawn_daemon(self) -> None:
+        self._spawned_daemon = True
         try:
             self._popen_factory(
                 [sys.executable, "-m", "acpc.daemon", self.target],
