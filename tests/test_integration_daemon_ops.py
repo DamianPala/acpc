@@ -151,6 +151,7 @@ def _create_session(state_dir: Path, cwd: Path, prompt: str) -> tuple[str, int]:
         str(cwd),
     )
     assert result.returncode == 0, result.stderr
+    assert "[acpc] daemon: unavailable" not in result.stderr
     session_id = result.stdout.splitlines()[0].strip()
     assert session_id
     assert output_path.read_text(encoding="utf-8") == prompt
@@ -209,6 +210,7 @@ def test_timeout_on_live_session(integration_state: Path) -> None:
         session_id,
     )
     assert next_prompt.returncode == 0, next_prompt.stderr
+    assert "[acpc] daemon: unavailable" not in next_prompt.stderr
     assert next_prompt.stdout == "after-timeout"
     assert _read_lock(integration_state)["pid"] == daemon_pid
     _stop_daemon(integration_state)
@@ -220,6 +222,7 @@ def test_resume_against_deleted_cwd(integration_state: Path) -> None:
     session_id, _ = _create_session(integration_state, session_cwd, "before-delete")
 
     status_before = _run_acpc("daemon", "status", "mock")
+    assert status_before.returncode == 0, status_before.stderr
     assert session_id in status_before.stdout
     assert str(session_cwd) in status_before.stdout
     shutil.rmtree(session_cwd)
@@ -245,6 +248,7 @@ def test_log_file_contains_adapter_stderr_and_status_path(integration_state: Pat
     marker = "daemon-log-marker"
     result = _run_acpc("prompt", "mock", f"stderr:{marker}", "--quiet")
     assert result.returncode == 0, result.stderr
+    assert "[acpc] daemon: unavailable" not in result.stderr
 
     status = _run_acpc("daemon", "status", "mock")
     assert status.returncode == 0, status.stderr
@@ -353,6 +357,7 @@ def test_max_age_recycles_after_draining_in_flight_prompt(
 
         fresh = _run_acpc("prompt", "mock", "fresh-daemon", "--quiet")
         assert fresh.returncode == 0, fresh.stderr
+        assert "[acpc] daemon: unavailable" not in fresh.stderr
         assert fresh.stdout == "fresh-daemon"
         fresh_pid = _read_lock(integration_state)["pid"]
         assert isinstance(fresh_pid, int)

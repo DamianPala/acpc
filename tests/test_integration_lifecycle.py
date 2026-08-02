@@ -21,6 +21,7 @@ PROMPT_SECONDS = DAEMON_TEST_TIMEOUT // 5
 TTL_SECONDS = DAEMON_TEST_TIMEOUT // 7
 POLL_SECONDS = DAEMON_TEST_TIMEOUT / 1000
 SHORT_SLEEP_SECONDS = DAEMON_TEST_TIMEOUT / 200
+CLIENT_CANCEL_SECONDS = max(1, DAEMON_TEST_TIMEOUT // 15)
 
 pytestmark = pytest.mark.timeout(DAEMON_TEST_TIMEOUT)
 
@@ -163,16 +164,20 @@ def test_idle_ttl_cleans_daemon_files(
     monkeypatch.setenv("ACPC_DAEMON_TTL", str(TTL_SECONDS))
     result = _run_acpc("prompt", "mock", "ttl", "--quiet")
     assert result.returncode == 0, result.stderr
+    assert "[acpc] daemon: unavailable" not in result.stderr
     socket_path, lock_path = _daemon_paths(integration_state)
     daemon_pid = _read_lock(integration_state)["pid"]
+    assert _pid_alive(daemon_pid)
     _wait_for(lambda: not _pid_alive(daemon_pid))
     _wait_for(lambda: not socket_path.exists() and not lock_path.exists())
 
 
 def test_killed_daemon_is_respawned_for_next_prompt(integration_state: Path) -> None:
     first = _run_acpc("prompt", "mock", "before kill", "--quiet")
-    assert first.returncode == 0
+    assert first.returncode == 0, first.stderr
+    assert "[acpc] daemon: unavailable" not in first.stderr
     old_pid = _read_lock(integration_state)["pid"]
+    assert _pid_alive(old_pid)
     old_adapter_pids = {
         pid for pid in _descendants(old_pid) if str(MOCK_AGENT_SCRIPT) in _cmdline(pid)
     }
@@ -182,7 +187,8 @@ def test_killed_daemon_is_respawned_for_next_prompt(integration_state: Path) -> 
     _wait_for(lambda: all(not _pid_alive(pid) for pid in old_adapter_pids))
 
     second = _run_acpc("prompt", "mock", "after kill", "--quiet")
-    assert second.returncode == 0
+    assert second.returncode == 0, second.stderr
+    assert "[acpc] daemon: unavailable" not in second.stderr
     assert second.stdout == "after kill"
     new_pid = _read_lock(integration_state)["pid"]
     assert new_pid != old_pid
@@ -201,8 +207,10 @@ def test_no_daemon_flag_does_not_create_socket(integration_state: Path) -> None:
 
 def test_daemon_stop_kills_adapter_process_tree(integration_state: Path) -> None:
     result = _run_acpc("prompt", "mock", "start tree", "--quiet")
-    assert result.returncode == 0
+    assert result.returncode == 0, result.stderr
+    assert "[acpc] daemon: unavailable" not in result.stderr
     daemon_pid = _read_lock(integration_state)["pid"]
+    assert _pid_alive(daemon_pid)
     adapter_pids = {
         pid for pid in _descendants(daemon_pid) if str(MOCK_AGENT_SCRIPT) in _cmdline(pid)
     }
@@ -215,15 +223,18 @@ def test_daemon_stop_kills_adapter_process_tree(integration_state: Path) -> None
 
 def test_version_mismatch_restarts_daemon(integration_state: Path) -> None:
     first = _run_acpc("prompt", "mock", "old version", "--quiet")
-    assert first.returncode == 0
+    assert first.returncode == 0, first.stderr
+    assert "[acpc] daemon: unavailable" not in first.stderr
     old_pid = _read_lock(integration_state)["pid"]
+    assert _pid_alive(old_pid)
     _, lock_path = _daemon_paths(integration_state)
     metadata = _read_lock(integration_state)
     metadata["acpc_version"] = "0.0.0-test-mismatch"
     lock_path.write_text(json.dumps(metadata), encoding="utf-8")
 
     second = _run_acpc("prompt", "mock", "new version", "--quiet")
-    assert second.returncode == 0
+    assert second.returncode == 0, second.stderr
+    assert "[acpc] daemon: unavailable" not in second.stderr
     assert second.stdout == "new version"
     new_pid = _read_lock(integration_state)["pid"]
     assert new_pid != old_pid
@@ -242,8 +253,12 @@ def test_permissions_are_per_request_and_deny_effect(integration_state: Path) ->
         "--cwd",
         str(integration_state),
     )
+    assert denied.returncode == 0, denied.stderr
+    assert "[acpc] daemon: unavailable" not in denied.stderr
     assert "[acpc] permission: edit write sentinel.txt -> deny" in denied.stderr
     assert not sentinel.exists()
+    daemon_pid = _read_lock(integration_state)["pid"]
+    assert _pid_alive(daemon_pid)
 
     allowed = _run_acpc(
         "prompt",
@@ -255,17 +270,73 @@ def test_permissions_are_per_request_and_deny_effect(integration_state: Path) ->
         "--cwd",
         str(integration_state),
     )
-    assert allowed.returncode == 0
+    assert allowed.returncode == 0, allowed.stderr
+    assert "[acpc] daemon: unavailable" not in allowed.stderr
     assert "[acpc] permission: edit write sentinel.txt -> allow" in allowed.stderr
     assert sentinel.read_text(encoding="utf-8") == "written by mock agent: sentinel.txt\n"
+    assert _read_lock(integration_state)["pid"] == daemon_pid
     _stop_daemon(integration_state)
 
 
-def test_client_disconnect_cancels_prompt_without_cross_client_output(
+def _install_mock_event_probe(state_dir: Path) -> Path:
+    probe_script = state_dir / "probed_mock_agent.py"
+    events_path = state_dir / "mock-events.log"
+    probe_script.write_text(
+        "import asyncio\n"
+        "import importlib.util\n"
+        "import sys\n"
+        "from pathlib import Path\n"
+        "\n"
+        f"events_path = Path({str(events_path)!r})\n"
+        f"spec = importlib.util.spec_from_file_location('probed_mock_agent', {str(MOCK_AGENT_SCRIPT)!r})\n"
+        "if spec is None or spec.loader is None:\n"
+        "    raise RuntimeError('cannot load mock agent')\n"
+        "module = importlib.util.module_from_spec(spec)\n"
+        "sys.modules[spec.name] = module\n"
+        "spec.loader.exec_module(module)\n"
+        "\n"
+        "def record(event):\n"
+        "    with events_path.open('a', encoding='utf-8') as event_file:\n"
+        "        event_file.write(event + '\\n')\n"
+        "\n"
+        "class ProbedMockAgent(module.MockAgent):\n"
+        "    async def cancel(self, session_id, **kwargs):\n"
+        "        record(f'cancel:{session_id}')\n"
+        "        await super().cancel(session_id, **kwargs)\n"
+        "\n"
+        "    async def _send_text(self, session_id, text):\n"
+        "        record(f'text:{session_id}:{text}')\n"
+        "        await super()._send_text(session_id, text)\n"
+        "\n"
+        "asyncio.run(module.run_agent(ProbedMockAgent()))\n",
+        encoding="utf-8",
+    )
+    agents_path = state_dir / "agents" / "mock.toml"
+    agents_path.write_text(
+        f'''identity = "mock"
+name = "Mock Agent"
+author = "Test"
+run_command = "{sys.executable} {probe_script}"
+install_command = "true"
+''',
+        encoding="utf-8",
+    )
+    return events_path
+
+
+def test_client_timeout_cancels_prompt_without_cross_client_output(
     integration_state: Path,
 ) -> None:
+    events_path = _install_mock_event_probe(integration_state)
     first = subprocess.Popen(
-        [*ACPC_COMMAND, "prompt", "mock", f"chunkslow:{PROMPT_SECONDS}"],
+        [
+            *ACPC_COMMAND,
+            "prompt",
+            "mock",
+            f"chunkslow:{PROMPT_SECONDS}",
+            "--timeout",
+            str(CLIENT_CANCEL_SECONDS),
+        ],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -274,6 +345,22 @@ def test_client_disconnect_cancels_prompt_without_cross_client_output(
     try:
         assert first.stdout is not None
         _read_until(first.stdout, "started")
+        _wait_for(
+            lambda: (
+                events_path.exists()
+                and any(
+                    line.endswith(":started")
+                    for line in events_path.read_text(encoding="utf-8").splitlines()
+                )
+            )
+        )
+        started_events = [
+            line
+            for line in events_path.read_text(encoding="utf-8").splitlines()
+            if line.endswith(":started")
+        ]
+        assert len(started_events) == 1
+        session_id = started_events[0].removeprefix("text:").removesuffix(":started")
         socket_path, lock_path = _daemon_paths(integration_state)
         assert socket_path.exists() and lock_path.exists()
         sibling = subprocess.run(
@@ -283,11 +370,21 @@ def test_client_disconnect_cancels_prompt_without_cross_client_output(
             timeout=DAEMON_TEST_TIMEOUT,
             env=os.environ.copy(),
         )
-        first.kill()
         first.wait(timeout=DAEMON_TEST_TIMEOUT)
+        assert first.returncode == 124
+        _wait_for(
+            lambda: (
+                events_path.exists()
+                and f"cancel:{session_id}\n" in events_path.read_text(encoding="utf-8")
+            )
+        )
         assert sibling.returncode == 0
         assert sibling.stdout == "sibling"
         assert "finished" not in sibling.stdout
+        assert "[acpc] daemon: unavailable" not in sibling.stderr
+        time.sleep(PROMPT_SECONDS + SHORT_SLEEP_SECONDS)
+        events = events_path.read_text(encoding="utf-8")
+        assert f"text:{session_id}:finished\n" not in events
     finally:
         if first.poll() is None:
             first.kill()

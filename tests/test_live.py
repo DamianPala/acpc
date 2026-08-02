@@ -21,12 +21,16 @@ from contextvars import ContextVar
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import time
 from pathlib import Path
 
 import pytest
+
+from acpc.agents import load_agent
+from acpc.daemon import sample_process_tree_rss_mb
 
 # Use the installed entry point, not python -m (no __main__.py)
 _acpc_bin = shutil.which("acpc")
@@ -48,6 +52,8 @@ DAEMON_IDLE_TTL_SECONDS = 3
 DAEMON_SHUTDOWN_GRACE_SECONDS = 10
 DAEMON_IDLE_WAIT_TIMEOUT_SECONDS = DAEMON_IDLE_TTL_SECONDS + DAEMON_SHUTDOWN_GRACE_SECONDS
 TIMEOUT_REQUEST_SECONDS = 2
+RSS_SESSION_COUNT = 10
+RSS_CEILING_MB = 512
 
 pytestmark = [pytest.mark.live, pytest.mark.timeout(LIVE_TEST_TIMEOUT_SECONDS)]
 
@@ -66,6 +72,17 @@ TEST_MODELS: dict[str, str] = {
 # the failure mode the comment above is really about.
 SWITCH_MODELS: dict[str, str] = {
     "codex": "gpt-5.4-mini",
+    # No cheap alternative exists here: the advertised list is haiku, sonnet, opus and a
+    # million-token variant, and haiku is already the fast preset. Sonnet is the least
+    # expensive of the three that would actually prove a switch happened.
+    "claude": "sonnet",
+}
+
+# Claude releases idle-session memory on session/close. Codex does not expose
+# that capability, so a capacity check has different cleanup expectations.
+SESSION_CLOSE_RECLAIMS_RSS: dict[str, bool] = {
+    "codex": False,
+    "claude": True,
 }
 
 # Isolated agent env: no skills, no user config, just auth.
@@ -370,8 +387,32 @@ def _has_path_component(cmdline: list[str] | None, component: str) -> bool:
 
 def _adapter_pids(pids: set[int], agent: str) -> set[int]:
     """Return adapter processes in a daemon tree by executable path."""
-    adapter_name = f"{agent}-acp"
+    adapter_name = _adapter_name(agent)
     return {pid for pid in pids if _has_path_component(_cmdline(pid), adapter_name)}
+
+
+def _adapter_name(agent: str) -> str:
+    """Return the executable name from the selected agent definition."""
+    command_parts = shlex.split(load_agent(agent).run_command)
+    assert command_parts, f"Agent {agent!r} has an empty run_command"
+    return Path(command_parts[0]).name
+
+
+def _capacity_rss_values(log_path: Path) -> list[int]:
+    """Read RSS values recorded when the daemon refused a new session."""
+    if not log_path.exists():
+        return []
+    marker = "capacity: rss="
+    values: list[int] = []
+    for line in log_path.read_text(encoding="utf-8").splitlines():
+        if marker not in line:
+            continue
+        value = line.split(marker, 1)[1].split("MB", 1)[0]
+        try:
+            values.append(int(value))
+        except ValueError:
+            continue
+    return values
 
 
 def _capture_daemon_tree(agent: str) -> tuple[int, set[int], set[int]]:
@@ -380,7 +421,7 @@ def _capture_daemon_tree(agent: str) -> tuple[int, set[int], set[int]]:
     _wait_for(lambda: bool(_adapter_pids(_process_tree(daemon_pid), agent)))
     tree = _process_tree(daemon_pid)
     adapter_pids = _adapter_pids(tree, agent)
-    assert adapter_pids, f"No {agent}-acp process in daemon tree: {tree}"
+    assert adapter_pids, f"No {_adapter_name(agent)} process in daemon tree: {tree}"
     groups = {info[2] for pid, info in _process_snapshot().items() if pid in tree}
     return daemon_pid, tree, groups
 
@@ -474,9 +515,9 @@ def _run_concurrent_prompts(
         raise
 
 
-@pytest.mark.parametrize("agent", ["codex"], ids=["codex"])
+@pytest.mark.parametrize("agent", ["codex", "claude"], ids=["codex", "claude"])
 class TestDaemonLive:
-    """Phase 4 coverage for one live, daemon-routed adapter."""
+    """Phase 4 coverage for live, daemon-routed adapters."""
 
     @pytest.fixture(autouse=True)
     def _route_daemon_for_class(self, daemon_test_env: dict[str, str]) -> None:
@@ -677,6 +718,65 @@ class TestDaemonLive:
         assert "switched" in switched.stdout
         log_path = _assert_daemon_log(agent)
         assert "warning: failed to set model" not in log_path.read_text(encoding="utf-8")
+
+    def test_rss_growth_over_ten_sessions(
+        self,
+        agent: str,
+        daemon_test_env: dict[str, str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Measure ten cheap sessions and keep adapter RSS below a safe ceiling."""
+        monkeypatch.setenv("ACPC_DAEMON_RSS_MAX", str(RSS_CEILING_MB))
+        daemon_test_env["ACPC_DAEMON_RSS_MAX"] = str(RSS_CEILING_MB)
+
+        rss_samples: list[int] = []
+        adapter_pids: set[int] | None = None
+        capacity_seen = False
+        for _ in range(RSS_SESSION_COUNT):
+            result = _run_acpc_cheap(
+                agent,
+                "Respond with exactly: ok",
+                "--permissions",
+                "none",
+                "--quiet",
+            )
+            assert result.returncode == 0, result.stderr
+            assert result.stdout.strip()
+
+            if "[acpc] daemon: at capacity, running direct" in result.stderr:
+                capacity_seen = True
+                continue
+            if "[acpc] daemon: unavailable" in result.stderr:
+                assert capacity_seen, result.stderr
+                continue
+
+            _assert_daemon_routed(result, agent)
+            _, tree, _ = _capture_daemon_tree(agent)
+            current_adapter_pids = _adapter_pids(tree, agent)
+            assert current_adapter_pids, f"No adapter process in daemon tree: {tree}"
+            if adapter_pids is None:
+                adapter_pids = current_adapter_pids
+            elif current_adapter_pids != adapter_pids:
+                pytest.fail("Adapter was respawned before the RSS guard fired")
+            rss_mb = sample_process_tree_rss_mb(next(iter(current_adapter_pids)))
+            assert rss_mb > 0, "Adapter RSS sample was unavailable"
+            rss_samples.append(rss_mb)
+
+        assert rss_samples, "No daemon-routed session produced an RSS sample"
+        growth_mb = max(rss_samples) - rss_samples[0]
+        print(f"{agent}: RSS samples={rss_samples}, growth={growth_mb}MB")
+
+        log_path = Path(daemon_test_env["ACPC_STATE_DIR"]) / "log" / f"{agent}.log"
+        capacity_values = _capacity_rss_values(log_path)
+        if capacity_seen:
+            _wait_for(lambda: bool(_capacity_rss_values(log_path)))
+            capacity_values = _capacity_rss_values(log_path)
+            assert capacity_values
+            assert all(value > RSS_CEILING_MB for value in capacity_values)
+            assert max(capacity_values) < RSS_CEILING_MB * 2
+        else:
+            max_allowed_rss = RSS_CEILING_MB * (2 if SESSION_CLOSE_RECLAIMS_RSS[agent] else 1)
+            assert max(rss_samples) <= max_allowed_rss
 
     def test_idle_ttl_removes_daemon_process_tree(
         self,
