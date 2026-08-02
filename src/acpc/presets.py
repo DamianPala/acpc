@@ -27,9 +27,9 @@ _BUILTIN_PRESETS: dict[str, dict[str, str]] = {
         "max": "opus",
     },
     "codex": {
-        "fast": "gpt-5.1-codex-mini/medium",
-        "standard": "gpt-5.1-codex-max",
-        "max": "gpt-5.4/high",
+        "fast": "gpt-5.6-luna/high",
+        "standard": "gpt-5.6-terra/xhigh",
+        "max": "gpt-5.6-sol/xhigh",
     },
 }
 
