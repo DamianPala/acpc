@@ -24,7 +24,7 @@ export SCRIPT_DIR
 # ==============================================================================
 declare -A SECTION_READY=(
     [S06-run]=ready         # sync run, session dir layout, -o/--quiet/--max-output/--json, exit codes
-    [S07-daemon-bg]=pending # --bg, wait, SIGTERM detach, daemon status/stop, concurrency, orphans
+    [S07-daemon-bg]=ready # --bg, wait, SIGTERM detach, daemon status/stop, concurrency, orphans
     [S08-views]=ready       # status views, log views + footers + cursors
     [S09-continue]=pending  # continue: context, rotation, cross-turn cursor space, errors
     [S10-agents]=pending    # agents list/detail/--models/--commands/--check/init, install
@@ -585,7 +585,9 @@ ${BG1_DIR}" "$LAST_OUT"
 
     # SIGTERM detaches: session survives, client exits 143, id printed to stderr
     set +e
-    bash -c 'acpc run mock "slow:30 sigterm probe" --quiet' \
+    # exec, as for the SIGINT probe: without it SIGTERM kills the wrapper
+    # shell, which exits 143 on its own and acpc never gets to detach.
+    bash -c 'exec uv run --project "$SCRIPT_DIR" acpc run mock "slow:30 sigterm probe" --quiet' \
         >"${SCRATCH}/sigterm.out" 2>"${SCRATCH}/sigterm.err" &
     SIGTERM_PID=$!
     sleep 2
@@ -607,7 +609,9 @@ ${BG1_DIR}" "$LAST_OUT"
     run_acpc daemon status
     assert_eq "daemon status exits 0" "0" "$LAST_RC"
     assert_contains "daemon status names the mock target" "$LAST_OUT" "mock"
-    run_acpc run mock "daemon stop victim" --bg --quiet
+    # Slow on purpose: the assertion below is about *active* sessions, and a
+    # default mock turn is finished well inside the sleep that follows.
+    run_acpc run mock "slow:30 daemon stop victim" --bg --quiet
     DSTOP_ID="$(head -n1 <<<"$LAST_OUT")"
     sleep 1
     run_acpc daemon stop mock

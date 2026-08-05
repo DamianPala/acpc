@@ -27,7 +27,16 @@ from typing import Any
 
 from acp import PROTOCOL_VERSION, text_block
 
-from acpc import cache, daemon_client, environment, sessions, targets, transcript, vocab
+from acpc import (
+    cache,
+    daemon_client,
+    environment,
+    paths,
+    sessions,
+    targets,
+    transcript,
+    vocab,
+)
 from acpc.client import AcpcClient
 from acpc.permissions import PermissionLevel
 from acpc.registry import CallResolution, RegistryError
@@ -70,6 +79,10 @@ class TurnOutcome:
     adapter_session_id: str | None = None
     advertised: dict[str, Any] = field(default_factory=dict)
     route_note: str | None = None
+    # Set when the daemon owns the session and has already written it out;
+    # finalizing again here would overwrite the daemon's own result.
+    finalized_elsewhere: bool = False
+    queued: bool = False
 
     @property
     def exit_code(self) -> int:
@@ -298,23 +311,148 @@ def _install_signal_handlers(
         )
 
 
-async def _execute(session_id: str, request: TurnRequest) -> TurnOutcome:
-    events = transcript.Transcript(sessions.transcript_path(session_id))
-    cancel = _CancelSignal()
+def daemon_payload(request: TurnRequest) -> dict[str, Any]:
+    """The serializable shape of a turn, for the daemon to rebuild.
 
+    Only the call's own inputs travel: the daemon reads the same `ACPC_HOME`,
+    so it re-resolves the entry itself rather than trusting a resolution that
+    crossed a socket.
+    """
+    resolution = request.resolution
+    return {
+        "entry": resolution.entry.entry,
+        "model": resolution.model,
+        "effort": resolution.effort,
+        "permissions": resolution.permissions,
+        "home": resolution.home,
+        "cwd": request.cwd,
+        "mode": request.mode,
+        "timeout": request.timeout,
+        "prompt": request.prompt,
+        "resume_adapter_session": request.resume_adapter_session,
+    }
+
+
+def routes_direct(request: TurnRequest) -> str | None:
+    """Why this call cannot use the daemon, or None when it can.
+
+    A `prompt` policy needs a terminal to ask on and the daemon has none, so
+    such a call stays a direct child even when a daemon is available.
+    """
+    if request.permission_prompt is not None or request.resolution.permissions == "prompt":
+        return "--permissions prompt needs this terminal"
+    return None
+
+
+async def _route(request: TurnRequest) -> tuple[Any | None, str | None]:
+    """Pick the daemon or the direct path, and say so when it is the latter."""
+    forced = routes_direct(request)
+    if forced is not None:
+        return None, f"direct child ({forced})"
     routed = await daemon_client.ensure_daemon(call_target(request.resolution))
-    route_note: str | None = None
     if isinstance(routed, daemon_client.DaemonUnavailable):
-        route_note = f"direct child ({routed.reason})"
+        return None, f"direct child ({routed.reason})"
+    return routed, None
 
-    _install_signal_handlers(asyncio.get_running_loop(), cancel, daemon_routed=route_note is None)
 
+async def _execute(session_id: str, request: TurnRequest) -> TurnOutcome:
+    cancel = _CancelSignal()
+    daemon, route_note = await _route(request)
+    _install_signal_handlers(asyncio.get_running_loop(), cancel, daemon_routed=daemon is not None)
+
+    if daemon is not None:
+        target = call_target(request.resolution)
+        return await _execute_via_daemon(session_id, request, daemon, cancel, target)
+
+    events = transcript.Transcript(sessions.transcript_path(session_id))
     sessions.mark_running(session_id, pid=_host_pid())
     events.append("state", **{"from": "starting", "to": "running"})
-
     outcome = await _drive_turn(session_id, request, events, cancel)
     outcome.route_note = route_note
     return outcome
+
+
+async def _execute_via_daemon(
+    session_id: str,
+    request: TurnRequest,
+    daemon: Any,
+    cancel: _CancelSignal,
+    target: str,
+) -> TurnOutcome:
+    """Hand the turn to the daemon and mirror its result.
+
+    The daemon owns the session from here: it writes the transcript and
+    finalizes `meta.json`, so this side must not finalize again. A SIGTERM
+    detaches — the client stops watching and the turn carries on.
+    """
+    try:
+        started = await daemon.start_turn(session_id, daemon_payload(request))
+        if not started.get("ok"):
+            raise RunnerError(str(started.get("error", "the daemon refused the turn")))
+        queued = bool(started.get("queued"))
+
+        waiting = asyncio.ensure_future(daemon.await_turn(session_id))
+        signalled = asyncio.ensure_future(cancel.requested.wait())
+        done, _pending = await asyncio.wait(
+            {waiting, signalled}, return_when=asyncio.FIRST_COMPLETED
+        )
+
+        if waiting not in done:
+            if cancel.state == "detached":
+                waiting.cancel()
+                signalled.cancel()
+                return TurnOutcome(
+                    state="detached",
+                    stop_reason=None,
+                    answer="",
+                    finalized_elsewhere=True,
+                    queued=queued,
+                )
+            await daemon_client.cancel_turn(target, session_id)
+        signalled.cancel()
+        reply = await waiting
+        outcome = reply.get("outcome") or {}
+        return TurnOutcome(
+            state=str(outcome.get("state", "failed")),
+            stop_reason=outcome.get("stop_reason"),
+            answer=_answer_on_disk(session_id),
+            finalized_elsewhere=True,
+            queued=queued,
+        )
+    finally:
+        with contextlib.suppress(Exception):
+            await daemon.close()
+
+
+def _answer_on_disk(session_id: str) -> str:
+    """Read back what the daemon wrote; the client never saw the stream."""
+    try:
+        return sessions.answer_path(session_id).read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+async def dispatch_background(session_id: str, request: TurnRequest) -> str | None:
+    """Start a turn the caller will not wait for; None on success.
+
+    `--bg` needs an owner that outlives this process, which is exactly what the
+    daemon is. Without one there is nobody to hand the session to, so this
+    reports why instead of silently running a child that dies on exit.
+    """
+    forced = routes_direct(request)
+    if forced is not None:
+        return f"--bg needs the daemon, and {forced}"
+    routed = await daemon_client.ensure_daemon(call_target(request.resolution))
+    if isinstance(routed, daemon_client.DaemonUnavailable):
+        return f"--bg needs the daemon: {routed.reason}"
+    try:
+        started = await routed.start_turn(session_id, daemon_payload(request))
+        if not started.get("ok"):
+            return str(started.get("error", "the daemon refused the turn"))
+    finally:
+        with contextlib.suppress(Exception):
+            await routed.close()
+    return None
 
 
 def _host_pid() -> int:
@@ -338,7 +476,8 @@ def execute_turn(session_id: str, request: TurnRequest) -> TurnOutcome:
         outcome = TurnOutcome(state="failed", stop_reason="error", answer="")
         _finalize(session_id, outcome, error=error)
         return outcome
-    _finalize(session_id, outcome)
+    if not outcome.finalized_elsewhere:
+        _finalize(session_id, outcome)
     return outcome
 
 
@@ -443,3 +582,82 @@ def _source_label(source: Any) -> str:
     if path is not None and kind == "entry":
         return f"{label} ({path})"
     return label
+
+
+# Polling interval for `wait` when the session has no daemon to ask.
+WAIT_POLL_INTERVAL = 0.1
+
+
+async def _await_session(session_id: str, target: str | None, timeout: float | None) -> str | None:
+    """Block until the session finishes; None means the wait timed out.
+
+    Asks the owning daemon when there is one, because that returns the moment
+    the turn ends. A session with no daemon (direct path, or a daemon that has
+    since gone) is watched through `meta.json` instead.
+    """
+    deadline = None if timeout is None else asyncio.get_running_loop().time() + timeout
+    daemon = None
+    if target is not None:
+        routed = await daemon_client.connect(target)
+        daemon = routed
+
+    try:
+        if daemon is not None:
+            waiting = asyncio.ensure_future(daemon.await_turn(session_id))
+            try:
+                reply = await asyncio.wait_for(asyncio.shield(waiting), timeout=timeout)
+            except TimeoutError:
+                waiting.cancel()
+                return None
+            outcome = reply.get("outcome") or {}
+            return str(outcome.get("state", "failed"))
+
+        while True:
+            meta = sessions.load(session_id)
+            if meta.is_finished:
+                return meta.state
+            if deadline is not None and asyncio.get_running_loop().time() >= deadline:
+                return None
+            await asyncio.sleep(WAIT_POLL_INTERVAL)
+    finally:
+        if daemon is not None:
+            with contextlib.suppress(Exception):
+                await daemon.close()
+
+
+def wait_for_session(session_id: str, *, timeout: float | None = None) -> str | None:
+    """Block until a session finishes, returning its state or None on timeout.
+
+    SPEC.md `wait`: the timeout stops *waiting* only — unlike `run --timeout`,
+    the session is left running.
+    """
+    meta = sessions.load(session_id)
+    if meta.is_finished:
+        return meta.state
+    return asyncio.run(_await_session(session_id, meta.target, timeout))
+
+
+def daemon_targets_for(agent: str) -> list[str]:
+    """Every known daemon target under an agent or variant name.
+
+    SPEC.md `daemon`: the `[target]` argument is an agent or variant name and
+    addresses every concrete target beneath it.
+    """
+    prefix = f"{agent}~"
+    return [
+        target for target in all_daemon_targets() if target == agent or target.startswith(prefix)
+    ]
+
+
+def all_daemon_targets() -> list[str]:
+    """Every target this state root has ever started a daemon for.
+
+    Read from the lock files, not the sockets: a long `ACPC_HOME` pushes the
+    socket path past the Unix limit and `ipc` falls back to a hashed name, so a
+    socket's filename is not reliably its target. Lock names never are hashed.
+    A target whose daemon has since exited simply fails to connect.
+    """
+    directory = paths.daemon_dir()
+    if not directory.exists():
+        return []
+    return sorted(entry.name.removesuffix(".lock") for entry in directory.glob("*.lock"))

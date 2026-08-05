@@ -14,7 +14,17 @@ from typing import Any
 
 import click
 
-from acpc import __version__, config, output, render, runner, sessions, transcript, vocab
+from acpc import (
+    __version__,
+    config,
+    daemon_client,
+    output,
+    render,
+    runner,
+    sessions,
+    transcript,
+    vocab,
+)
 from acpc.registry import AgentRegistry, CallResolution, RegistryError
 
 
@@ -320,6 +330,7 @@ def log_command(
     metavar="BYTES",
     help="Cap on stdout bytes; 0 disables the cap.",
 )
+@click.option("--bg", "background", is_flag=True, help="Dispatch and return the session id.")
 @click.option("--quiet", is_flag=True, help="Suppress the stderr summary line.")
 @click.option("--json", "json_mode", is_flag=True, help="Emit this command's output as JSON.")
 @click.help_option("-h", "--help")
@@ -337,6 +348,7 @@ def run_command(
     timeout: float | None,
     alias: str | None,
     dry_run: bool,
+    background: bool,
     max_output: int,
     quiet: bool,
     json_mode: bool,
@@ -401,6 +413,10 @@ def run_command(
     # The policy the TTY rules produced is what the client must enforce.
     request = _with_policy(request, policy)
 
+    if background:
+        _dispatch_background(meta.session_id, request, json_mode=json_mode)
+        return
+
     try:
         outcome = runner.execute_turn(meta.session_id, request)
     except runner.RunnerError as error:
@@ -419,10 +435,50 @@ def run_command(
     )
     _write_stdout(result.text)
 
+    if outcome.state == "detached":
+        # SPEC *Output contract*: the session outlives this client, so the way
+        # out has to say which session the caller can still reach.
+        click.echo(f"-- {meta.session_id} detached · still running", err=True)
+        raise SystemExit(outcome.exit_code)
+
     if not quiet:
-        output.emit_summary(final, route_note=outcome.route_note)
+        output.emit_summary(final, route_note=_route_note(outcome))
 
     raise SystemExit(outcome.exit_code)
+
+
+def _route_note(outcome: runner.TurnOutcome) -> str | None:
+    """Fold the routing and queueing notes into the one `--` summary line.
+
+    SPEC counts `--` lines: a queued turn and a direct-child fallback are both
+    notes about how the call was served, so they ride the same line.
+    """
+    notes = [note for note in (outcome.route_note, _queue_note(outcome)) if note]
+    return " · ".join(notes) if notes else None
+
+
+def _queue_note(outcome: runner.TurnOutcome) -> str | None:
+    return "queued for a daemon slot" if outcome.queued else None
+
+
+def _dispatch_background(session_id: str, request: runner.TurnRequest, *, json_mode: bool) -> None:
+    """Hand the turn to the daemon and print what the caller needs to find it.
+
+    SPEC `run --bg`: stdout is exactly the session id and its directory, so a
+    shell caller can read both without parsing prose.
+    """
+    import asyncio
+
+    problem = asyncio.run(runner.dispatch_background(session_id, request))
+    if problem is not None:
+        raise AgentProblem(problem)
+    if json_mode:
+        import json
+
+        payload = {"session_id": session_id, "paths": sessions.session_paths(session_id)}
+        _write_stdout(json.dumps(payload, ensure_ascii=False) + "\n")
+        return
+    _write_stdout(f"{session_id}\n{sessions.session_dir(session_id)}\n")
 
 
 def _with_policy(request: runner.TurnRequest, policy: str) -> runner.TurnRequest:
@@ -433,3 +489,129 @@ def _with_policy(request: runner.TurnRequest, policy: str) -> runner.TurnRequest
 
     resolution: _CallResolution = replace(request.resolution, permissions=policy)
     return replace(request, resolution=resolution)
+
+
+@main.command(name="wait")
+@click.argument("selector")
+@click.option("--timeout", type=click.FloatRange(min=0), default=None, metavar="S")
+@click.option("-o", "--output", "output_file", metavar="FILE", help="Write the answer to a file.")
+@click.option(
+    "--max-output",
+    type=click.IntRange(min=0),
+    default=output.DEFAULT_MAX_OUTPUT,
+    show_default=True,
+    metavar="BYTES",
+)
+@click.option("--quiet", is_flag=True, help="Suppress the stderr summary line.")
+@click.option("--json", "json_mode", is_flag=True, help="Emit this command's output as JSON.")
+@click.help_option("-h", "--help")
+def wait_command(
+    selector: str,
+    timeout: float | None,
+    output_file: str | None,
+    max_output: int,
+    quiet: bool,
+    json_mode: bool,
+) -> None:
+    """Block until a background session finishes, then print its answer."""
+    meta = _load_view_session(selector)
+    state = runner.wait_for_session(meta.session_id, timeout=timeout)
+    if state is None:
+        # SPEC `wait`: the timeout stops waiting only — the session runs on.
+        raise SystemExit(vocab.EXIT_TIMEOUT)
+
+    final = sessions.read_meta(meta.session_id)
+    answer = _answer_text(meta.session_id)
+    if output_file is not None:
+        output.write_output_file(output_file, answer)
+
+    result = output.render_result(
+        final,
+        answer,
+        json_mode=json_mode,
+        output_file=output_file,
+        max_output=max_output,
+    )
+    _write_stdout(result.text)
+    if not quiet:
+        output.emit_summary(final)
+    raise SystemExit(runner.exit_code_for(final.state, final.stop_reason))
+
+
+def _answer_text(session_id: str) -> str:
+    try:
+        return sessions.answer_path(session_id).read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+@main.group(name="daemon", invoke_without_command=False)
+@click.help_option("-h", "--help")
+def daemon_group() -> None:
+    """Inspect and stop the per-target daemons."""
+
+
+@daemon_group.command(name="status")
+@click.argument("agent", required=False)
+@click.option("--json", "json_mode", is_flag=True, help="Emit the status as JSON.")
+@click.help_option("-h", "--help")
+def daemon_status_command(agent: str | None, json_mode: bool) -> None:
+    """Report each live daemon with its pid, uptime and log path."""
+    import asyncio
+
+    entries = asyncio.run(_collect_daemon_status(agent))
+    if json_mode:
+        import json
+
+        _write_stdout(json.dumps({"daemons": entries}, ensure_ascii=False) + "\n")
+        return
+    if not entries:
+        click.echo("-- no daemons running", err=True)
+        return
+    lines = [
+        f"{item['target']:<28} pid {item['pid']:<8} up {output.format_duration(item['uptime'])} "
+        f"· {len(item['sessions'])} sessions · {item['log']}"
+        for item in entries
+    ]
+    _write_stdout("\n".join(lines) + "\n")
+
+
+async def _collect_daemon_status(agent: str | None) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for target in runner.daemon_targets_for(agent) if agent else runner.all_daemon_targets():
+        daemon = await daemon_client.connect(target)
+        if daemon is None:
+            continue
+        try:
+            reply = await daemon.status()
+        finally:
+            await daemon.close()
+        if reply.get("ok"):
+            entries.append({key: value for key, value in reply.items() if key != "ok"})
+    return entries
+
+
+@daemon_group.command(name="stop")
+@click.argument("agent", required=False)
+@click.help_option("-h", "--help")
+def daemon_stop_command(agent: str | None) -> None:
+    """Stop daemons; their sessions are failed with a reason, never orphaned."""
+    import asyncio
+
+    stopped = asyncio.run(_stop_daemons(agent))
+    click.echo(f"-- stopped {stopped} daemon(s)", err=True)
+
+
+async def _stop_daemons(agent: str | None) -> int:
+    stopped = 0
+    for target in runner.daemon_targets_for(agent) if agent else runner.all_daemon_targets():
+        daemon = await daemon_client.connect(target)
+        if daemon is None:
+            continue
+        try:
+            reply = await daemon.stop()
+        finally:
+            await daemon.close()
+        if reply.get("ok"):
+            stopped += 1
+    return stopped
