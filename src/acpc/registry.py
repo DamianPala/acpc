@@ -466,8 +466,10 @@ def _to_resolved(
         return value if isinstance(value, str) else None
 
     def strings(key: str) -> tuple[str, ...]:
-        value = data.get(key, [])
-        return tuple(value) if isinstance(value, list) else ()
+        # Both shapes are real: a file yields a list, an inherited parent
+        # field arrives as the parent ResolvedEntry's tuple.
+        value = data.get(key, ())
+        return tuple(value) if isinstance(value, (list, tuple)) else ()
 
     raw_env = data.get("env", {})
     env = dict(raw_env) if isinstance(raw_env, dict) else {}

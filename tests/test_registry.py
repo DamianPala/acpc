@@ -72,6 +72,27 @@ def test_variant_inherits_and_reports_nearest_field_provenance(tmp_path: Path) -
     assert child.provenance["effort"].path.name == "child.toml"
 
 
+def test_a_variant_inherits_the_parent_adapter_contract_lists(tmp_path: Path) -> None:
+    agents = tmp_path / "agents"
+    write_entry(
+        agents,
+        "base",
+        'name = "Base"\ncommand = "python -m base"\n'
+        'efforts = ["low", "high"]\nbypass_modes = ["yolo"]\n'
+        'env_passthrough = ["BASE_KEY"]\n',
+    )
+    write_entry(agents, "worker", 'extends = "base"\nmodel = "base-model"\n')
+
+    registry = AgentRegistry(agents)
+    worker = registry.resolve("worker")
+
+    assert worker.efforts == ("low", "high")
+    assert worker.bypass_modes == ("yolo",)
+    assert worker.env_passthrough == ("BASE_KEY",)
+    with pytest.raises(RegistryError, match="low, high"):
+        registry.resolve_call("worker", effort="medium")
+
+
 def test_user_override_new_adapter_and_variant_are_distinct_cases(tmp_path: Path) -> None:
     agents = tmp_path / "agents"
     write_entry(agents, "codex", 'home = "~/.codex-local"\n')
