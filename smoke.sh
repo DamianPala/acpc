@@ -16,12 +16,14 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Exported so the exported `acpc` function below still resolves it inside `bash -c`.
+export SCRIPT_DIR
 
 # ==============================================================================
 # Section readiness -- the PLAN.md slice map. Stage 2 flips values to "ready".
 # ==============================================================================
 declare -A SECTION_READY=(
-    [S06-run]=pending       # sync run, session dir layout, -o/--quiet/--max-output/--json, exit codes
+    [S06-run]=ready         # sync run, session dir layout, -o/--quiet/--max-output/--json, exit codes
     [S07-daemon-bg]=pending # --bg, wait, SIGTERM detach, daemon status/stop, concurrency, orphans
     [S08-views]=pending     # status views, log views + footers + cursors
     [S09-continue]=pending  # continue: context, rotation, cross-turn cursor space, errors
@@ -451,7 +453,10 @@ if begin_section S06-run "run sync + session dir layout + output contract + exit
     assert_eq "no prompt source is a usage error" "2" "$LAST_RC"
     run_acpc run mock "arg" --prompt-file /dev/null
     assert_eq "two prompt sources is a usage error" "2" "$LAST_RC"
-    printf 'stdin prompt body' | run_acpc run mock - --quiet
+    # Redirect, not a pipe: a pipeline runs run_acpc in a subshell and its
+    # LAST_RC/LAST_OUT never reach this shell.
+    printf 'stdin prompt body' >"${SCRATCH}/stdin.txt"
+    run_acpc run mock - --quiet <"${SCRATCH}/stdin.txt"
     assert_eq "stdin prompt via - works" "0" "$LAST_RC"
     printf 'echo:file prompt body' >"${SCRATCH}/prompt.txt"
     run_acpc run mock --prompt-file "${SCRATCH}/prompt.txt" --quiet
@@ -500,7 +505,9 @@ if begin_section S06-run "run sync + session dir layout + output contract + exit
     assert_eq "run --timeout exits 124" "124" "$RUN_TIMEOUT_RC"
 
     set +e
-    bash -c 'acpc run mock "slow:30 sigint probe" --quiet' \
+    # exec, so SIGINT lands on acpc itself rather than on a wrapper shell that
+    # cannot exec away because `acpc` is a function.
+    bash -c 'exec uv run --project "$SCRIPT_DIR" acpc run mock "slow:30 sigint probe" --quiet' \
         >"${SCRATCH}/sigint.out" 2>"${SCRATCH}/sigint.err" &
     SIGINT_PID=$!
     sleep 2

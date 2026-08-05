@@ -185,6 +185,17 @@ def _slow_messages() -> dict[int, str]:
     }
 
 
+def _leading_delay(prompt: str) -> int:
+    """Read the delay from a `slow:<n>` / `chunkslow:<n>` prompt.
+
+    Callers append descriptive text after the number so that concurrently
+    dispatched probes are distinguishable in `status` (SPEC: "five
+    backgrounded codex runs must not look identical"), so only the first
+    whitespace-delimited token after the colon is the delay.
+    """
+    return int(prompt.split(":", 1)[1].split()[0])
+
+
 def select_scenario(prompt: str) -> str | None:
     """MVP keyword selection: case-insensitive substring, first match wins."""
     lower = prompt.lower()
@@ -413,7 +424,7 @@ class MockAgent(Agent):
             return PromptResponse(stop_reason="refusal")
 
         if prompt_text.startswith("slow:"):
-            delay = int(prompt_text.split(":")[1])
+            delay = _leading_delay(prompt_text)
             try:
                 await asyncio.wait_for(cancel_event.wait(), timeout=delay)
                 return PromptResponse(stop_reason="cancelled")
@@ -423,7 +434,7 @@ class MockAgent(Agent):
             return PromptResponse(stop_reason="end_turn")
 
         if prompt_text.startswith("chunkslow:"):
-            delay = int(prompt_text.split(":")[1])
+            delay = _leading_delay(prompt_text)
             await self._send_text(session_id, "started")
             try:
                 await asyncio.wait_for(cancel_event.wait(), timeout=delay)

@@ -2,7 +2,7 @@
 
 ## Now
 
-Stage 2, wave 2 in flight. Wave 1 (S01, S02, S03) is landed on `rewrite/0.3` and gated green: 211 tests, ruff + pyright clean, `./smoke.sh` exit 0 with all sections still pending (no slice in wave 1 owns a smoke section). S04 and S05 are dispatched in their own worktrees.
+Stage 2, serial tail. S01–S06 are landed on `rewrite/0.3` and gated green: 303 tests, ruff + pyright clean, `./smoke.sh` **156/156** with `S06-run` flipped to ready. Next up: S08 (status + log views).
 
 ## Done
 
@@ -12,6 +12,12 @@ Stage 2, wave 2 in flight. Wave 1 (S01, S02, S03) is landed on `rewrite/0.3` and
   - **S03 — transcript** (`b26be12`, Luna, 2 rounds): `Transcript` with `append`/`read`, versioned header, global index, torn-tail tolerance and repair, `since`/`tail` selection with `next_cursor`.
   - **Review rounds:** both Luna slices were sent back once, for the same two problems. (1) Speculative API surface — S01 shipped 8 unused aliases/entry points, S03 shipped 9 names for 4 operations; the ground rules forbid this and both were cut to one name per operation. (2) A real defect each: S01 typed provenance as `Mapping[str, Path]` and used a fake `Path("<call>")` to mean "came from a flag" (replaced with `FieldSource(kind, path)`, which is what `--dry-run` and `agents <name>` actually need); S03's `append` re-read and re-parsed the whole transcript per event (O(N²) on the streaming path — restructured to scan once at open and track the index). Both fixed in round 2; no escalation to `--effort max` was needed.
   - One reviewer fix applied directly rather than spending a third round: S01's duration error said "must be greater than zero" for any malformed value; it now names the actual value and the accepted syntax.
+
+- **Stage 2 wave 2 + S06 (2026-08-05):**
+  - **S04 — ACP client** and **S05 — output/render** landed (both Luna, 2 rounds each). S04's round-2 fix was a vacuous test: `assert "thought" not in client.answer` could never fail because the frozen mock never emits `AgentThoughtChunk`; the client is now driven with a real thought chunk instead (2 tests).
+  - **S06 — runner + `run` verb** (Opus, tier max): `runner.py`, `cli.py` (`run` only), `daemon_client.py` and `cache.py` as the sanctioned stubs, plus `tests/test_runner.py` + `tests/test_cli_run.py` (65 tests). Full sync path against the mock: resolve → session create → spawn → client → finalize; exit codes 0/1/2/124/130/143; `--timeout` cancels into state `timeout`; SIGINT/SIGTERM go through ACP `session/cancel` with the bounded ack wait; the direct-child fallback note rides the single `--` summary line. Mutation-checked 8/8 caught (timeout exit code, SIGTERM state, answer finalization, bypass guard, non-TTY permission default, `set_session_mode`, route note, prompt-source count).
+  - S06 found a defect in already-landed S01: with no `--model`, the model resolved to `None` because the `standard` preset was not treated as the adapter default. The whole suite passed before *and* after, which is what proved nothing covered it. Fixed in place with 4 tests.
+  - `exit_code_for` had no case for `terminated` (SIGTERM on the direct path), so it returned 1 instead of 143. Caught by a new test, fixed.
 
 - **Stage 2 prep (2026-08-05):**
   - Fresh Opus review of PLAN/HANDOFF/AGENTS vs SPEC/ARCHITECTURE. All findings fixed: smoke gates now passable in dispatch order (S08 snippet assertion via `--all`, long-lived prelude guarded on S09/S11 too, orphan kill isolated on the `loner` target), HANDOFF uses the dev1 CLI's real verbs (`run -s`, `status -s --tail`; no `continue`/`log`).
@@ -44,3 +50,9 @@ Stage 2, wave 2 in flight. Wave 1 (S01, S02, S03) is landed on `rewrite/0.3` and
 - 2026-08-05: field provenance is `FieldSource(kind, path)` with `kind` ∈ `entry | adapter-default | call | default | unset`, not a bare file path. SPEC's own `agents <name>` examples label sources that have no file behind them (`(adapter default)`, `(default)`, `(unset)`) and `--dry-run` must name call-site flags, so a `Path` cannot carry the contract. Views render the label; the registry only supplies the data.
 - 2026-08-05: the transcript assumes a single writing process per session, which the per-session lock in `sessions.py` already guarantees (ARCHITECTURE decision 4). That is what lets `append` track the index in memory instead of re-parsing the file per event; readers still parse from disk, so another process's writes are always visible.
 - 2026-08-05: slices land on `rewrite/0.3` by cherry-pick, not merge — one commit per slice, no merge commits (the repo's commitlint hook rejects merge subjects anyway).
+- 2026-08-05: **four edits to frozen files** (`smoke.sh`, `tests/mock_agent.py`), taken under the handoff's "orchestrator decides if the fix is trivially obvious" clause. All four are harness plumbing: none changes an assertion, an expected value, or any SPEC behavior — each one only lets an assertion actually reach the code it claims to test. **Flag for Stage 3 review.**
+  1. `smoke.sh`: `export SCRIPT_DIR`. The existing `export -f acpc` is plainly meant to make the `acpc` shell function usable inside `bash -c`, but the function body expands `$SCRIPT_DIR`, which was never exported — so both `bash -c` probes ran `uv run --project "" acpc` and died with exit 2 no matter what the code did.
+  2. `smoke.sh`: the stdin probe was `printf … | run_acpc run mock - --quiet`. A pipeline runs `run_acpc` in a subshell, so its `LAST_RC`/`LAST_OUT` never came back and the assertion read the *previous* command's exit 2. Changed to a file redirect; the bytes on stdin are identical.
+  3. `smoke.sh`: the SIGINT probe now `exec`s. `bash -c` cannot exec-optimize away when `acpc` is a function, so `kill -INT $!` hit the wrapper shell and never reached acpc. Verified separately that acpc exits 130 under SIGINT delivered directly and via `exec`.
+  4. `tests/mock_agent.py`: `slow:`/`chunkslow:` parsed the whole tail as an int, but smoke sends `slow:30 run-timeout probe` (descriptive text so concurrent probes are distinguishable in `status`). Added `_leading_delay` to read only the first token.
+
