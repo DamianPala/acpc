@@ -158,11 +158,11 @@ def test_variant_commands_view_reads_parent_cache(cli: CliRunner) -> None:
     assert "/parent-command" in result.stdout
 
 
-def test_adapter_detail_caps_catalogs_at_three_items(cli: CliRunner) -> None:
+def test_adapter_detail_caps_models_and_commands_but_never_modes(cli: CliRunner) -> None:
     cache.refresh_advertised(
         "mock",
         {
-            "modes": ["default", "acceptEdits", "plan", "yolo"],
+            "modes": ["default", "acceptEdits", "plan", "yolo", "extra-mode"],
             "models": ["model-1", "model-2", "model-3", "model-4"],
             "commands": [
                 {"name": "command-1", "description": "One."},
@@ -177,7 +177,7 @@ def test_adapter_detail_caps_catalogs_at_three_items(cli: CliRunner) -> None:
     result = invoke(cli, "agents", "mock")
 
     assert result.exit_code == vocab.EXIT_OK
-    assert "modes        4 · default · acceptEdits · plan · yolo" in result.stdout
+    assert "modes        5 · default · acceptEdits · plan · yolo · extra-mode" in result.stdout
     assert "models       4 · model-1 · model-2 · model-3 · …" in result.stdout
     assert "commands     4 · /command-1 · /command-2 · /command-3 · …" in result.stdout
 

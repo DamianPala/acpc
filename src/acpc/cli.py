@@ -396,7 +396,9 @@ def _render_advertised_detail(
     modes = [_mode_name(item) for item in advertised.get("modes", [])]
     models = [str(item) for item in advertised.get("models", [])]
     commands = [item for item in advertised.get("commands", []) if isinstance(item, Mapping)]
-    visible_modes = modes if len(modes) <= 4 else [*modes[:3], "…"]
+    # Modes are never capped: this view is where legal --mode values come
+    # from, and unlike models/commands there is no fuller view behind it.
+    visible_modes = modes
     visible_models = models[:3] + (["…"] if len(models) > 3 else [])
     visible_commands = [_command_name(item) for item in commands[:3]]
     if len(commands) > 3:
