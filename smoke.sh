@@ -28,7 +28,7 @@ declare -A SECTION_READY=(
     [S08-views]=ready       # status views, log views + footers + cursors
     [S09-continue]=ready  # continue: context, rotation, cross-turn cursor space, errors
     [S10-agents]=ready      # agents list/detail/--models/--commands/--check/init, install
-    [S11-maintenance]=pending # stop semantics, rm, prune
+    [S11-maintenance]=ready # stop semantics, rm, prune
     [S12-cli]=pending       # help contract, -V, TTY rules, hostile inputs
     [S13-permissions]=ready # permission tiers visible in log, bypass-mode guard (needs S06+S08)
 )
@@ -283,6 +283,17 @@ cat >"${ACPC_HOME}/agents/loner.toml" <<EOF
 extends = "mock"
 description = "Isolated target for the orphan test."
 home = "~/.mock-loner"
+EOF
+
+# stopper: the same reasoning as loner, for the `daemon stop` probe. That verb
+# is target-wide by definition, so running it against `mock` would take SLOW1
+# and SLOW2 down with it and S08 would later poll a session this section
+# killed. It cannot share `loner` either, because the orphan test kills that
+# target at roughly the same point.
+cat >"${ACPC_HOME}/agents/stopper.toml" <<EOF
+extends = "mock"
+description = "Isolated target for the daemon stop probe."
+home = "~/.mock-stopper"
 EOF
 
 cat >"${ACPC_HOME}/agents/phantom.toml" <<EOF
@@ -611,10 +622,10 @@ ${BG1_DIR}" "$LAST_OUT"
     assert_contains "daemon status names the mock target" "$LAST_OUT" "mock"
     # Slow on purpose: the assertion below is about *active* sessions, and a
     # default mock turn is finished well inside the sleep that follows.
-    run_acpc run mock "slow:30 daemon stop victim" --bg --quiet
+    run_acpc run stopper "slow:30 daemon stop victim" --bg --quiet
     DSTOP_ID="$(head -n1 <<<"$LAST_OUT")"
     sleep 1
-    run_acpc daemon stop mock
+    run_acpc daemon stop stopper
     assert_eq "daemon stop exits 0" "0" "$LAST_RC"
     run_acpc status "$DSTOP_ID" --json
     assert_eq "daemon stop fails its active sessions, never orphans" "failed" \

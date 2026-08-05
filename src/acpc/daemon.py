@@ -281,21 +281,28 @@ class Daemon:
         and killing its adapter would orphan it.
         """
         while True:
-            await asyncio.sleep(IDLE_CHECK_INTERVAL)
-            if self._endpoint_gone():
-                # Nothing can reach us any more, so staying warm serves no
-                # one. This is also what retires the daemons an acceptance run
-                # leaves behind when it removes its throwaway state root.
-                self._stop_reason = "the daemon's socket was removed"
-                self._shutdown.set()
-                return
-            if self._busy():
-                self._last_busy = time.monotonic()
+            try:
+                await asyncio.sleep(IDLE_CHECK_INTERVAL)
+                if self._endpoint_gone():
+                    # Nothing can reach us any more, so staying warm serves no
+                    # one. This is also what retires the daemons an acceptance run
+                    # leaves behind when it removes its throwaway state root.
+                    self._stop_reason = "the daemon's socket was removed"
+                    self._shutdown.set()
+                    return
+                if self._busy():
+                    self._last_busy = time.monotonic()
+                    continue
+                if time.monotonic() - self._last_busy >= self.ttl:
+                    self._stop_reason = "the daemon expired after its idle TTL"
+                    self._shutdown.set()
+                    return
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001, S112
+                # An incidental check failure must not kill this task: the next
+                # sweep can still observe a removed endpoint or an expired TTL.
                 continue
-            if time.monotonic() - self._last_busy >= self.ttl:
-                self._stop_reason = "the daemon expired after its idle TTL"
-                self._shutdown.set()
-                return
 
     def _busy(self) -> bool:
         return bool(self.turns)

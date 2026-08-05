@@ -24,6 +24,7 @@ from acpc import (
     daemon_client,
     output,
     paths,
+    proc,
     render,
     runner,
     sessions,
@@ -765,6 +766,121 @@ def install_command(agent: str, json_mode: bool) -> None:
         raise AgentProblem(f"install {agent} failed (exit {return_code})")
     if return_code != 0:
         raise SystemExit(vocab.EXIT_AGENT_ERROR)
+
+
+async def _cancel_with_daemon(target: str, session_id: str) -> bool | None:
+    """Request cancellation without allowing a dead daemon to hang ``stop``."""
+    try:
+        return await asyncio.wait_for(
+            daemon_client.cancel_turn(target, session_id),
+            timeout=runner.CANCEL_ACK_TIMEOUT,
+        )
+    except TimeoutError:
+        return None
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _wait_for_stop(session_id: str) -> sessions.SessionMeta:
+    """Give a daemon's cancellation time to finalize the session on disk."""
+    deadline = time.monotonic() + runner.CANCEL_ACK_TIMEOUT
+    while True:
+        meta = sessions.load(session_id)
+        if not meta.is_active or time.monotonic() >= deadline:
+            return meta
+        time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
+
+def _maintenance_json(payload: Mapping[str, Any]) -> None:
+    _write_stdout(json.dumps(dict(payload), ensure_ascii=False) + "\n")
+
+
+@main.command(name="stop")
+@click.argument("selector")
+@click.option("--json", "json_mode", is_flag=True, help="Emit the result as JSON.")
+@click.help_option("-h", "--help")
+def stop_command(selector: str, json_mode: bool) -> None:
+    """Cancel an active session, or do nothing when it is already finished."""
+    meta = _load_view_session(selector)
+    if meta.is_active:
+        cancelled = False
+        if meta.target is not None:
+            cancelled = asyncio.run(_cancel_with_daemon(meta.target, meta.session_id))
+        if cancelled is True:
+            meta = _wait_for_stop(meta.session_id)
+        elif cancelled is None:
+            meta = sessions.load(meta.session_id)
+        elif meta.pid is None:
+            meta = sessions.transition(
+                meta.session_id,
+                "cancelled",
+                exit_code=vocab.EXIT_CANCELLED,
+                stop_reason="stopped by user",
+            )
+        else:
+            result = proc.kill_process_tree(meta.pid, meta.process_start_time)
+            if result == "refused":
+                raise UsageProblem(
+                    f"could not stop session {meta.session_id}: refused to signal it"
+                )
+            meta = _wait_for_stop(meta.session_id)
+
+    payload = {
+        "session_id": meta.session_id,
+        "state": meta.state,
+        "stop_reason": meta.stop_reason,
+    }
+    if json_mode:
+        _maintenance_json(payload)
+    else:
+        _write_stdout(f"{meta.session_id} {meta.state}\n")
+    click.echo(f"-- stop {meta.session_id} · {meta.state}", err=True)
+
+
+@main.command(name="rm")
+@click.argument("selector")
+@click.option("--json", "json_mode", is_flag=True, help="Emit the result as JSON.")
+@click.help_option("-h", "--help")
+def rm_command(selector: str, json_mode: bool) -> None:
+    """Delete a finished session's on-disk state."""
+    meta = _load_view_session(selector)
+    advertised_paths = sessions.session_paths(meta.session_id)
+    try:
+        sessions.delete_session(meta.session_id)
+    except sessions.SessionStateError as error:
+        raise UsageProblem(str(error)) from None
+    payload = {"session_id": meta.session_id, "removed": True, "paths": advertised_paths}
+    if json_mode:
+        _maintenance_json(payload)
+    else:
+        _write_stdout(f"removed {meta.session_id}\n")
+    click.echo(f"-- removed session {meta.session_id}", err=True)
+
+
+@main.command(name="prune")
+@click.option("--older-than", default=None, metavar="D", help="Age threshold, such as 7d.")
+@click.option("--dry-run", is_flag=True, help="List candidates without deleting them.")
+@click.option("--json", "json_mode", is_flag=True, help="Emit the result as JSON.")
+@click.help_option("-h", "--help")
+def prune_command(older_than: str | None, dry_run: bool, json_mode: bool) -> None:
+    """Delete finished sessions older than the configured retention period."""
+    try:
+        settings = config.load_config()
+        duration = config.parse_duration(older_than or settings.retention)
+        candidates = sessions.prune_sessions(older_than=duration, dry_run=dry_run)
+    except (config.ConfigError, ValueError, sessions.SessionError) as error:
+        raise UsageProblem(str(error)) from None
+
+    session_ids = [meta.session_id for meta in candidates]
+    payload = {"sessions": session_ids, "dry_run": dry_run}
+    if json_mode:
+        _maintenance_json(payload)
+    elif session_ids:
+        _write_stdout("\n".join(session_ids) + "\n")
+    click.echo(
+        f"-- prune {'would remove' if dry_run else 'removed'} {len(session_ids)} session(s)",
+        err=True,
+    )
 
 
 def _load_view_session(selector: str) -> sessions.SessionMeta:
