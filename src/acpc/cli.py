@@ -52,7 +52,70 @@ class AgentProblem(click.ClickException):
         return self.message
 
 
-@click.group(invoke_without_command=True)
+_ROOT_HELP = """acpc — dispatch coding agents over ACP.
+
+Quick reference
+
+Sync run:
+  acpc run <agent> "Explain this code"
+  acpc run <agent> "Implement the fix" --permissions write
+
+Background run + wait:
+  id="$(acpc run <agent> "Run the tests" --bg | head -n1)"
+  acpc wait "$id"
+
+Continue:
+  acpc continue <id> "Now summarize the result"
+
+Status and log polling:
+  acpc status
+  acpc log <id> --wait-new --timeout 30
+
+Heredoc prompt:
+  acpc run <agent> - --permissions write <<'PROMPT'
+  Review the implementation and make the required edits.
+  PROMPT
+
+Common commands:
+  run, continue, wait, status, log, agents, daemon, stop, rm, prune, install
+  Use `acpc <command> --help` for the command's full reference.
+
+Flag → ACP
+  --mode         → session/set_mode
+  --permissions  → request_permission
+  --model        → session/new (model)
+  --effort       → session/new (effort)"""
+
+
+class _CheatSheetGroup(click.Group):
+    """Use the compact first-contact page for the root command."""
+
+    def get_help(self, ctx: click.Context) -> str:
+        return _ROOT_HELP
+
+    def main(self, *args: Any, **kwargs: Any) -> Any:
+        """Render Click usage errors as the CLI's single actionable line."""
+        if not kwargs.get("standalone_mode", True):
+            return super().main(*args, **kwargs)
+        kwargs["standalone_mode"] = False
+        try:
+            return super().main(*args, **kwargs)
+        except click.UsageError as error:
+            click.echo(f"Error: {error.format_message()}", err=True)
+            raise SystemExit(error.exit_code) from None
+        except click.ClickException as error:
+            error.show()
+            raise SystemExit(error.exit_code) from None
+
+
+class _RootHelpCommand(click.Command):
+    """Make a short command's help intentionally reuse the cheat sheet."""
+
+    def get_help(self, ctx: click.Context) -> str:
+        return _ROOT_HELP
+
+
+@click.group(cls=_CheatSheetGroup, invoke_without_command=True)
 @click.version_option(__version__, "-V", "--version", message="acpc %(version)s")
 @click.help_option("-h", "--help")
 @click.pass_context
@@ -95,14 +158,20 @@ def _read_prompt(prompt_text: str | None, prompt_file: str | None) -> str:
     return prompt_text or ""
 
 
-def _resolve_permissions(explicit: str | None, resolution: CallResolution, *, tty: bool) -> str:
+def _resolve_permissions(
+    explicit: str | None,
+    resolution: CallResolution,
+    *,
+    tty: bool,
+) -> str:
     """Apply SPEC's TTY rules to the resolved permission policy."""
     policy = explicit if explicit is not None else resolution.permissions
     if policy is None:
         policy = "prompt" if tty else "read"
     if policy == "prompt" and not tty:
         raise UsageProblem(
-            "--permissions prompt needs a terminal to ask on; "
+            "--permissions prompt needs a TTY (terminal) to ask on and cannot be used with "
+            "--bg; "
             "pass --permissions read, write, all or none"
         )
     return policy
@@ -615,7 +684,10 @@ def agents_group(
     check_live: bool,
     json_mode: bool,
 ) -> None:
-    """List adapters and variants, or inspect advertised adapter data."""
+    """List adapters and variants, or inspect advertised adapter data.
+
+    Example: ``acpc agents mock --models``
+    """
     if ctx.invoked_subcommand is None:
         _run_agents_view(None, models, commands, check_live, json_mode)
 
@@ -629,7 +701,10 @@ def agents_group(
 def _agent_view_command(
     name: str, models: bool, commands: bool, check_live: bool, json_mode: bool
 ) -> None:
-    """Render one named adapter or variant."""
+    """Render one named adapter or variant.
+
+    Example: ``acpc agents mock --commands``
+    """
     _run_agents_view(name, models, commands, check_live, json_mode)
 
 
@@ -677,7 +752,10 @@ def agents_init_command(
     home: str | None,
     json_mode: bool,
 ) -> None:
-    """Scaffold a variant entry."""
+    """Scaffold a variant entry.
+
+    Example: ``acpc agents init work --extends mock --permissions write``
+    """
     try:
         registry = AgentRegistry()
         registry.resolve(parent)
@@ -720,7 +798,7 @@ def agents_init_command(
         _write_stdout(f"created {target}\n")
 
 
-@main.command(name="install")
+@main.command(name="install", cls=_RootHelpCommand)
 @click.argument("agent")
 @click.option("--json", "json_mode", is_flag=True, help="Emit the install result as JSON.")
 @click.help_option("-h", "--help")
@@ -795,7 +873,7 @@ def _maintenance_json(payload: Mapping[str, Any]) -> None:
     _write_stdout(json.dumps(dict(payload), ensure_ascii=False) + "\n")
 
 
-@main.command(name="stop")
+@main.command(name="stop", cls=_RootHelpCommand)
 @click.argument("selector")
 @click.option("--json", "json_mode", is_flag=True, help="Emit the result as JSON.")
 @click.help_option("-h", "--help")
@@ -837,7 +915,7 @@ def stop_command(selector: str, json_mode: bool) -> None:
     click.echo(f"-- stop {meta.session_id} · {meta.state}", err=True)
 
 
-@main.command(name="rm")
+@main.command(name="rm", cls=_RootHelpCommand)
 @click.argument("selector")
 @click.option("--json", "json_mode", is_flag=True, help="Emit the result as JSON.")
 @click.help_option("-h", "--help")
@@ -863,7 +941,10 @@ def rm_command(selector: str, json_mode: bool) -> None:
 @click.option("--json", "json_mode", is_flag=True, help="Emit the result as JSON.")
 @click.help_option("-h", "--help")
 def prune_command(older_than: str | None, dry_run: bool, json_mode: bool) -> None:
-    """Delete finished sessions older than the configured retention period."""
+    """Delete finished sessions older than the configured retention period.
+
+    Example: ``acpc prune --older-than 7d --dry-run``
+    """
     try:
         settings = config.load_config()
         duration = config.parse_duration(older_than or settings.retention)
@@ -915,9 +996,22 @@ def _wait_for_new_events(
         else:
             time.sleep(_LOG_WAIT_POLL_INTERVAL)
 
-        available = transcript_file.read(since=since)
+        available = _read_transcript_page(transcript_file, since=since)
         if available.events:
-            return transcript_file.read(since=since, tail=tail)
+            return _read_transcript_page(transcript_file, since=since, tail=tail)
+
+
+def _read_transcript_page(
+    transcript_file: transcript.Transcript,
+    *,
+    since: int = 0,
+    tail: int | None = None,
+) -> transcript.TranscriptPage:
+    """Turn damaged transcript state into the CLI's one-line usage error."""
+    try:
+        return transcript_file.read(since=since, tail=tail)
+    except transcript.TranscriptError as error:
+        raise UsageProblem(str(error)) from None
 
 
 @main.command(name="status")
@@ -926,7 +1020,10 @@ def _wait_for_new_events(
 @click.option("--json", "json_mode", is_flag=True, help="Emit a JSON status object.")
 @click.help_option("-h", "--help")
 def status_command(selector: str | None, all_sessions: bool, json_mode: bool) -> None:
-    """Show liveness-verified session metadata without reading transcripts."""
+    """Show liveness-verified session metadata without reading transcripts.
+
+    Example: ``acpc status <session-id> --json``
+    """
     if selector is not None and all_sessions:
         raise UsageProblem("--all cannot be used with a session id")
 
@@ -978,14 +1075,20 @@ def log_command(
     timeout: float | None,
     quiet: bool,
 ) -> None:
-    """Render selected transcript events and keep metadata on stderr."""
+    """Render selected transcript events and keep metadata on stderr.
+
+    Example: ``acpc log <session-id> --prose --since 0``
+    """
     if prose and json_mode:
         raise UsageProblem("--prose and --json are mutually exclusive views")
     if timeout is not None and not wait_new:
         raise UsageProblem("--timeout requires --wait-new")
 
     meta = _load_view_session(selector)
-    transcript_file = transcript.Transcript(sessions.transcript_path(meta.session_id))
+    try:
+        transcript_file = transcript.Transcript(sessions.transcript_path(meta.session_id))
+    except transcript.TranscriptError as error:
+        raise UsageProblem(str(error)) from None
     explicit_since = since is not None
     cursor = 0 if since is None else since
     selection_tail = tail
@@ -993,8 +1096,8 @@ def log_command(
         selection_tail = _LOG_DEFAULT_TAIL
 
     if wait_new and not explicit_since:
-        cursor = transcript_file.read(since=0).next_cursor
-    page = transcript_file.read(since=cursor, tail=selection_tail)
+        cursor = _read_transcript_page(transcript_file).next_cursor
+    page = _read_transcript_page(transcript_file, since=cursor, tail=selection_tail)
     if wait_new and not page.events:
         page = _wait_for_new_events(
             transcript_file,
@@ -1019,7 +1122,7 @@ def log_command(
     if not quiet:
         # The cursor is a global transcript index, not an event count.  Read
         # the actual end so an empty page after a large --since stays honest.
-        event_count = transcript_file.read(since=0).next_cursor
+        event_count = _read_transcript_page(transcript_file).next_cursor
         footer = render.format_log_footer(
             meta,
             cursor=rendered.next_cursor,
@@ -1077,7 +1180,13 @@ def run_command(
     quiet: bool,
     json_mode: bool,
 ) -> None:
-    """Dispatch one agent; block and print the final answer."""
+    """Dispatch one agent; block and print the final answer.
+
+    The default permission policy is ``prompt`` on a TTY and ``read``
+    otherwise.  Background calls always use the non-TTY rule.
+
+    Example: ``acpc run codex "Fix the failing test" --permissions write``
+    """
     tty = _stdout_is_tty()
 
     try:
@@ -1088,7 +1197,9 @@ def run_command(
     except RegistryError as error:
         raise UsageProblem(str(error)) from None
 
-    policy = _resolve_permissions(permissions, resolution, tty=tty)
+    # A background client has already gone away when a permission request
+    # arrives, so it follows the non-TTY rule even when stdout is a terminal.
+    policy = _resolve_permissions(permissions, resolution, tty=tty and not background)
     _guard_bypass_mode(mode, policy, resolution)
     resolved_cwd = str(Path(cwd).expanduser().resolve()) if cwd else None
 
@@ -1260,7 +1371,10 @@ def continue_command(
     alias: str | None,
     dry_run: bool,
 ) -> None:
-    """Continue a finished session using its stored adapter resolution."""
+    """Continue a finished session using its stored adapter resolution.
+
+    Example: ``acpc continue <session-id> "Run the tests again"``
+    """
     run_only = {
         "--permissions": permissions,
         "--model": model,
@@ -1282,6 +1396,13 @@ def continue_command(
         raise UsageProblem(
             f"session {meta.session_id} is {meta.state} — wait for the current turn to finish"
         )
+    stored_policy = meta.resolution.get("resolved", {}).get("permissions", {}).get("value")
+    continue_tty = _stdout_is_tty() and not background
+    if stored_policy == "prompt" and not continue_tty:
+        raise UsageProblem(
+            "this session uses --permissions prompt, which needs a TTY and cannot be used "
+            "with --bg; continue it from a terminal or start a read/write session"
+        )
     try:
         request = runner.continue_request(
             meta,
@@ -1292,6 +1413,7 @@ def continue_command(
                 if meta.resolution.get("resolved", {}).get("permissions", {}).get("value")
                 == "prompt"
                 and _stdout_is_tty()
+                and continue_tty
                 else None
             ),
         )
@@ -1351,7 +1473,10 @@ def wait_command(
     quiet: bool,
     json_mode: bool,
 ) -> None:
-    """Block until a background session finishes, then print its answer."""
+    """Block until a background session finishes, then print its answer.
+
+    Example: ``acpc wait <session-id> --timeout 120``
+    """
     meta = _load_view_session(selector)
     state = runner.wait_for_session(meta.session_id, timeout=timeout)
     if state is None:
@@ -1386,7 +1511,10 @@ def _answer_text(session_id: str) -> str:
 @main.group(name="daemon", invoke_without_command=False)
 @click.help_option("-h", "--help")
 def daemon_group() -> None:
-    """Inspect and stop the per-target daemons."""
+    """Inspect and stop the per-target daemons.
+
+    Example: ``acpc daemon status``
+    """
 
 
 @daemon_group.command(name="status")
@@ -1394,7 +1522,10 @@ def daemon_group() -> None:
 @click.option("--json", "json_mode", is_flag=True, help="Emit the status as JSON.")
 @click.help_option("-h", "--help")
 def daemon_status_command(agent: str | None, json_mode: bool) -> None:
-    """Report each live daemon with its pid, uptime and log path."""
+    """Report each live daemon with its pid, uptime and log path.
+
+    Example: ``acpc daemon status --json``
+    """
     import asyncio
 
     entries = asyncio.run(_collect_daemon_status(agent))
@@ -1433,7 +1564,10 @@ async def _collect_daemon_status(agent: str | None) -> list[dict[str, Any]]:
 @click.argument("agent", required=False)
 @click.help_option("-h", "--help")
 def daemon_stop_command(agent: str | None) -> None:
-    """Stop daemons; their sessions are failed with a reason, never orphaned."""
+    """Stop daemons; their sessions are failed with a reason, never orphaned.
+
+    Example: ``acpc daemon stop mock``
+    """
     import asyncio
 
     stopped = asyncio.run(_stop_daemons(agent))

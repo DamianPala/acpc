@@ -29,7 +29,7 @@ declare -A SECTION_READY=(
     [S09-continue]=ready  # continue: context, rotation, cross-turn cursor space, errors
     [S10-agents]=ready      # agents list/detail/--models/--commands/--check/init, install
     [S11-maintenance]=ready # stop semantics, rm, prune
-    [S12-cli]=pending       # help contract, -V, TTY rules, hostile inputs
+    [S12-cli]=ready         # help contract, -V, TTY rules, hostile inputs
     [S13-permissions]=ready # permission tiers visible in log, bypass-mode guard (needs S06+S08)
 )
 
