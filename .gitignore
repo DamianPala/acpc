@@ -11,3 +11,7 @@ wheels/
 
 # Test artifacts
 .coverage
+
+# Local working docs
+HANDOFF.md
+docs/plans/
