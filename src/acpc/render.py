@@ -1,0 +1,402 @@
+"""On-demand rendering for transcript and session status views."""
+
+import json
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+from acpc import sessions
+from acpc.output import _format_duration, _format_tokens
+
+Clock = Callable[[], float]
+DEFAULT_LOG_MAX_OUTPUT = 128 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class RenderedEvents:
+    """A rendered log page and the cursor it safely covers."""
+
+    text: str
+    next_cursor: int
+    truncated: bool
+    printed_events: int
+
+
+def _validate_max_output(max_output: int) -> None:
+    if isinstance(max_output, bool) or not isinstance(max_output, int) or max_output < 0:
+        raise ValueError("max_output must be a non-negative integer")
+
+
+def _event_timestamp(event: Mapping[str, Any]) -> str:
+    value = event.get("ts")
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return "??:??:??"
+    try:
+        return datetime.fromtimestamp(float(value), tz=UTC).astimezone().strftime("%H:%M:%S")
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "??:??:??"
+
+
+def _single_line(value: object) -> str:
+    return " ".join(str(value).split())
+
+
+def _message_snippet(text: str, *, full: bool) -> str:
+    normalized = _single_line(text)
+    if full or len(normalized) <= 200:
+        return normalized
+    return normalized[:197].rstrip() + "..."
+
+
+def _event_index(event: Mapping[str, Any], fallback: int) -> int:
+    value = event.get("i")
+    return value if isinstance(value, int) and not isinstance(value, bool) else fallback
+
+
+def format_event(event: Mapping[str, Any], *, full_message: bool = False) -> str:
+    """Format one transcript event as a condensed, single-line view."""
+    event_type = str(event.get("type", "event"))
+    timestamp = _event_timestamp(event)
+    labels = {
+        "msg": "msg   ",
+        "thought": "thought ",
+        "tool": "tool  ",
+        "permission": "permission ",
+        "error": "error ",
+        "state": "state ",
+        "usage": "usage ",
+    }
+    label = labels.get(event_type, f"{event_type} ")
+
+    if event_type in {"msg", "thought"}:
+        text = str(event.get("text", ""))
+        snippet = _message_snippet(text, full=full_message)
+        return f"[{timestamp}] {label}{json.dumps(snippet, ensure_ascii=False)} ({len(text)} chars)"
+    if event_type == "tool":
+        name = _single_line(event.get("name", "tool"))
+        args = _single_line(event.get("args_summary", ""))
+        status = _single_line(event.get("status", "unknown"))
+        duration = event.get("duration_ms", 0)
+        try:
+            duration_text = f"{float(duration) / 1000:.1f}s"
+        except (TypeError, ValueError):
+            duration_text = "?s"
+        arguments = f" {args}" if args else ""
+        return f"[{timestamp}] {label}{name}{arguments} → {status} ({duration_text})"
+    if event_type == "permission":
+        return (
+            f"[{timestamp}] {label}{event.get('kind', 'unknown')} "
+            f"→ {event.get('decision', 'unknown')}"
+        )
+    if event_type == "error":
+        return f"[{timestamp}] {label}{_single_line(event.get('message', ''))}"
+    if event_type == "state":
+        return f"[{timestamp}] {label}{event.get('from', '?')} → {event.get('to', '?')}"
+    if event_type == "usage":
+        cost = event.get("cost")
+        cost_text = ""
+        if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+            cost_text = f" · cost ${cost:.2f}"
+        return f"[{timestamp}] {label}{event.get('tokens', 0)} tok{cost_text}"
+    return f"[{timestamp}] {label}{_single_line(event)}"
+
+
+def _prose_event(event: Mapping[str, Any]) -> str:
+    event_type = event.get("type")
+    if event_type == "msg":
+        return str(event.get("text", ""))
+    if event_type == "error":
+        return format_event(event)
+    return ""
+
+
+def _utf8_head(text: str, byte_limit: int) -> str:
+    if byte_limit <= 0:
+        return ""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= byte_limit:
+        return text
+    return encoded[:byte_limit].decode("utf-8", errors="ignore")
+
+
+def _truncation_marker(path: Path | str) -> str:
+    return f"[output truncated; full transcript: {path}]\n"
+
+
+def _text_with_marker(text: str, max_output: int, marker: str) -> str:
+    marker_bytes = len(marker.encode("utf-8"))
+    if marker_bytes >= max_output:
+        return marker
+    return _utf8_head(text, max_output - marker_bytes) + marker
+
+
+def _json_line(event: Mapping[str, Any]) -> str:
+    return json.dumps(dict(event), ensure_ascii=False, separators=(",", ":")) + "\n"
+
+
+def render_events(
+    events: Sequence[Mapping[str, Any]],
+    *,
+    prose: bool = False,
+    json_mode: bool = False,
+    max_output: int = DEFAULT_LOG_MAX_OUTPUT,
+    transcript_path: Path | str = "transcript.ndjson",
+    cursor: int = 0,
+    full_last_message: bool = False,
+) -> RenderedEvents:
+    """Render selected events while preserving the cursor contract.
+
+    Selection happens in :mod:`acpc.transcript`; this operation only renders
+    the supplied page.  A filtered prose event still advances the cursor, but
+    a budget overflow never advances past an event that was not covered by
+    stdout, except for the single over-budget-event case pinned by the spec.
+    """
+    _validate_max_output(max_output)
+    if prose and json_mode:
+        raise ValueError("--prose and --json are mutually exclusive views")
+
+    last_message_index = -1
+    if full_last_message:
+        for index, event in enumerate(events):
+            if event.get("type") == "msg":
+                last_message_index = index
+
+    if json_mode:
+        return _render_json_events(
+            events,
+            max_output=max_output,
+            transcript_path=transcript_path,
+            cursor=cursor,
+        )
+
+    entries: list[tuple[int, str]] = []
+    entry_cursor = cursor
+    prose_content = ""
+    for index, event in enumerate(events):
+        event_cursor = _event_index(event, entry_cursor)
+        rendered = (
+            _prose_event(event)
+            if prose
+            else format_event(event, full_message=index == last_message_index)
+        )
+        if (
+            prose
+            and event.get("type") == "error"
+            and prose_content
+            and not prose_content.endswith("\n")
+        ):
+            rendered = "\n" + rendered
+        unit = rendered if prose else rendered + "\n" if rendered else ""
+        entries.append((event_cursor, unit))
+        entry_cursor = event_cursor
+
+        if prose:
+            prose_content += unit
+
+    output = ""
+    next_cursor = cursor
+    printed_events = 0
+    marker = _truncation_marker(transcript_path)
+    for index, (event_cursor, unit) in enumerate(entries):
+        if not unit:
+            next_cursor = event_cursor
+            continue
+
+        has_later_output = any(later_unit for _, later_unit in entries[index + 1 :])
+        fits = max_output == 0 or len((output + unit).encode("utf-8")) <= max_output
+        marker_fits = max_output == 0 or len((output + unit + marker).encode("utf-8")) <= max_output
+        if fits and (not has_later_output or marker_fits):
+            output += unit
+            next_cursor = event_cursor
+            printed_events += 1
+            continue
+
+        if not output:
+            output = _text_with_marker(unit, max_output, marker)
+            next_cursor = event_cursor
+            printed_events += 1
+        else:
+            output += marker
+        return RenderedEvents(output, next_cursor, True, printed_events)
+
+    return RenderedEvents(output, next_cursor, False, printed_events)
+
+
+def _render_json_events(
+    events: Sequence[Mapping[str, Any]],
+    *,
+    max_output: int,
+    transcript_path: Path | str,
+    cursor: int,
+) -> RenderedEvents:
+    output = ""
+    next_cursor = cursor
+    printed_events = 0
+    for index, event in enumerate(events):
+        event_cursor = _event_index(event, next_cursor)
+        line = _json_line(event)
+        has_later_events = index < len(events) - 1
+        fits = max_output == 0 or len((output + line).encode("utf-8")) <= max_output
+        marker = _json_line({"type": "truncated", "path": str(transcript_path)})
+        marker_fits = max_output == 0 or len((output + line + marker).encode("utf-8")) <= max_output
+        if fits and (not has_later_events or marker_fits):
+            output += line
+            next_cursor = event_cursor
+            printed_events += 1
+            continue
+
+        # A partial JSON object would make the stream unusable.  The marker is
+        # itself a typed NDJSON event, and therefore remains parseable even if
+        # the event that crossed the budget was larger than the budget alone.
+        had_output = bool(output)
+        output += marker
+        if not had_output:
+            next_cursor = event_cursor
+        return RenderedEvents(output, next_cursor, True, printed_events)
+
+    return RenderedEvents(output, next_cursor, False, printed_events)
+
+
+def format_log_footer(
+    meta: sessions.SessionMeta,
+    *,
+    cursor: int,
+    event_count: int = 0,
+    runtime: float | None = None,
+    clock: Clock | None = None,
+) -> str:
+    """Format the stderr footer for a log page."""
+    if runtime is None:
+        runtime = sessions.runtime_seconds(meta, clock=clock)
+    if meta.is_finished:
+        qualifier = f" exit {meta.exit_code}" if meta.exit_code is not None else ""
+        parts = [
+            f"{meta.state}{qualifier}",
+            _format_duration(runtime),
+            _format_tokens(meta.tokens),
+            f"answer: {sessions.answer_path(meta.session_id)}",
+        ]
+    else:
+        parts = [
+            f"{meta.state} {_format_duration(runtime)}",
+            f"{event_count} events",
+        ]
+    parts.append(f"cursor: {cursor}")
+    return "-- " + " | ".join(parts)
+
+
+def _status_selection(
+    sessions_in: Sequence[sessions.SessionMeta], *, all_sessions: bool
+) -> list[sessions.SessionMeta]:
+    if all_sessions:
+        return list(sessions_in)
+    active = [meta for meta in sessions_in if meta.is_active]
+    finished = [meta for meta in sessions_in if meta.is_finished][:5]
+    return active + finished
+
+
+def _status_row(meta: sessions.SessionMeta, *, clock: Clock | None) -> str:
+    runtime = _format_duration(sessions.runtime_seconds(meta, clock=clock))
+    name = meta.name or "·"
+    snippet = json.dumps(meta.prompt_snippet, ensure_ascii=False)
+    return (
+        f"{meta.session_id:<4}  {meta.entry:<10} {meta.state:<9} {runtime:<8} {name:<16} {snippet}"
+    )
+
+
+def render_status_list(
+    sessions_in: Sequence[sessions.SessionMeta],
+    *,
+    all_sessions: bool = False,
+    clock: Clock | None = None,
+) -> str:
+    """Render the status list and its in-view summary footer."""
+    selected = _status_selection(sessions_in, all_sessions=all_sessions)
+    lines = [_status_row(meta, clock=clock) for meta in selected]
+    running_count = sum(meta.is_active for meta in sessions_in)
+    finished_count = len([meta for meta in sessions_in if meta.is_finished])
+    if all_sessions:
+        footer = f"-- {running_count} running · {len(sessions_in)} sessions"
+    else:
+        footer = (
+            f"-- {running_count} running · {min(5, finished_count)} recent · "
+            f"--all for all {len(sessions_in)}"
+        )
+    lines.append(footer)
+    return "\n".join(lines) + "\n"
+
+
+def _display_path(path: Path | str) -> str:
+    value = Path(path)
+    try:
+        relative = value.relative_to(Path.home())
+    except ValueError:
+        return str(value)
+    return str(Path("~") / relative) if relative.parts else "~"
+
+
+def render_status_detail(
+    meta: sessions.SessionMeta,
+    *,
+    clock: Clock | None = None,
+) -> str:
+    """Render one session's status detail view."""
+    runtime = _format_duration(sessions.runtime_seconds(meta, clock=clock))
+    exit_text = f"exit {meta.exit_code}" if meta.exit_code is not None else "exit ·"
+    tokens = _format_tokens(meta.tokens)
+    name = meta.name or "·"
+    directory = _display_path(sessions.session_dir(meta.session_id))
+    lines = [
+        f"state    {meta.state} · {exit_text} · {runtime} · {tokens}",
+        f"agent    {meta.entry} ({meta.base_adapter}) · name: {name}",
+        f"dir      {directory} · answer: {Path(sessions.answer_path(meta.session_id)).name}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def status_list_json(
+    sessions_in: Sequence[sessions.SessionMeta],
+    *,
+    all_sessions: bool = False,
+    clock: Clock | None = None,
+) -> dict[str, Any]:
+    """Build the JSON shape for ``status`` without an id."""
+    selected = _status_selection(sessions_in, all_sessions=all_sessions)
+    return {
+        "sessions": [
+            {
+                "session_id": meta.session_id,
+                "entry": meta.entry,
+                "state": meta.state,
+                "name": meta.name,
+                "prompt_snippet": meta.prompt_snippet,
+                "runtime": sessions.runtime_seconds(meta, clock=clock),
+            }
+            for meta in selected
+        ]
+    }
+
+
+def status_detail_json(
+    meta: sessions.SessionMeta,
+    *,
+    clock: Clock | None = None,
+) -> dict[str, Any]:
+    """Build the JSON shape for ``status <id>``."""
+    return {
+        "session_id": meta.session_id,
+        "state": meta.state,
+        "pid": meta.pid,
+        "turns": meta.turns,
+        "entry": meta.entry,
+        "base_adapter": meta.base_adapter,
+        "name": meta.name,
+        "runtime": sessions.runtime_seconds(meta, clock=clock),
+        "tokens": meta.tokens,
+        "cost": meta.cost,
+        "exit_code": meta.exit_code,
+        "stop_reason": meta.stop_reason,
+        "paths": sessions.session_paths(meta.session_id),
+    }
