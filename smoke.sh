@@ -721,10 +721,16 @@ if begin_section S08-views "status list/detail, log default/--since/--tail/--pro
     assert_not_contains "--prose has no tool lines" "$LAST_OUT" "tool"
     assert_contains "--prose keeps its footer on stderr" "$LAST_ERR" "cursor:"
 
+    # "Nothing new" has to come from a session that cannot produce anything
+    # new: SLOW1 emits every ~2s, so any timeout short enough to keep the suite
+    # quick is a coin flip against its cadence. A finished session blocks the
+    # full timeout and exits 124 -- SPEC's `--wait-new` row -- because activity
+    # is what is waited on; completion is `wait`'s job.
+    run_acpc log "$UTIL_ID" --wait-new --timeout 0.5
+    assert_eq "log --wait-new times out (124) with nothing new" "124" "$LAST_RC"
+
     if [[ $SLOW_MACHINERY -eq 1 ]]; then
         # Live long-poll against SLOW1 (still running: ~64s of ~2s-apart events)
-        run_acpc log "$SLOW1_ID" --since "$SLOW1_CURSOR" --wait-new --timeout 0.5
-        assert_eq "log --wait-new times out (124) with nothing new" "124" "$LAST_RC"
         run_acpc log "$SLOW1_ID" --since "$SLOW1_CURSOR" --wait-new --timeout 6
         assert_eq "log --wait-new returns once new events arrive" "0" "$LAST_RC"
         assert_true "--wait-new produced output" "$([[ -n "$LAST_OUT" ]] && echo 0 || echo 1)"
