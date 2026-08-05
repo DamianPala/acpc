@@ -163,16 +163,27 @@ def _resolve_permissions(
     resolution: CallResolution,
     *,
     tty: bool,
+    background: bool = False,
 ) -> str:
-    """Apply SPEC's TTY rules to the resolved permission policy."""
+    """Apply SPEC's TTY rules to the resolved permission policy.
+
+    A background client has already gone away by the time a permission
+    request arrives, so `--bg` follows the non-TTY rule even when stdout is
+    a terminal — and says so, because "needs a terminal" is baffling advice
+    to someone who is sitting at one.
+    """
+    interactive = tty and not background
     policy = explicit if explicit is not None else resolution.permissions
     if policy is None:
-        policy = "prompt" if tty else "read"
-    if policy == "prompt" and not tty:
+        policy = "prompt" if interactive else "read"
+    if policy == "prompt" and not interactive:
+        cause = (
+            "cannot be used with --bg, which returns before a request could be answered"
+            if background
+            else "needs a terminal to ask on"
+        )
         raise UsageProblem(
-            "--permissions prompt needs a TTY (terminal) to ask on and cannot be used with "
-            "--bg; "
-            "pass --permissions read, write, all or none"
+            f"--permissions prompt {cause}; pass --permissions read, write, all or none"
         )
     return policy
 
@@ -1197,9 +1208,7 @@ def run_command(
     except RegistryError as error:
         raise UsageProblem(str(error)) from None
 
-    # A background client has already gone away when a permission request
-    # arrives, so it follows the non-TTY rule even when stdout is a terminal.
-    policy = _resolve_permissions(permissions, resolution, tty=tty and not background)
+    policy = _resolve_permissions(permissions, resolution, tty=tty, background=background)
     _guard_bypass_mode(mode, policy, resolution)
     resolved_cwd = str(Path(cwd).expanduser().resolve()) if cwd else None
 
