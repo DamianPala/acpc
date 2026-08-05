@@ -443,7 +443,7 @@ File-based state is a feature: the agent can grep it, read fragments selectively
   config.toml                # global knobs — the complete file just below
   agents/<name>.toml         # variants, adapter overrides, new adapters — hand-editable; `agents init` is just a scaffold
   cache/<agent>/             # advertised models, modes, commands
-  daemon/<entry>-<hash>.log  # adapter stderr per concrete target; daemon sockets and locks live here too
+  daemon/<entry>~<hash>.log  # adapter stderr per concrete target; daemon sockets and locks live here too
   sessions/<id>/
     meta.json                # full resolved invocation (everything --dry-run shows) + state, timing, tokens/cost, exit code, stop_reason, prompt snippet, adapter session id
     prompt.md                # the prompt as sent, latest turn; earlier turns: prompt.<n>.md

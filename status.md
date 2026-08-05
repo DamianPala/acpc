@@ -2,9 +2,16 @@
 
 ## Now
 
-Stage 1 (foundation) complete, uncommitted, awaiting review. Stage 2 (Opus + Luna implement PLAN.md slices) is next.
+Stage 2 ready to launch: PLAN.md hardened after a fresh Opus review (4 blockers + 13 majors fixed), HANDOFF.md rewritten as the Stage 2 orchestrator boot doc. Next action: start the fresh Opus orchestrator session with HANDOFF.md.
 
 ## Done
+
+- **Stage 2 prep (2026-08-05):**
+  - Fresh Opus review of PLAN/HANDOFF/AGENTS vs SPEC/ARCHITECTURE. All findings fixed: smoke gates now passable in dispatch order (S08 snippet assertion via `--all`, long-lived prelude guarded on S09/S11 too, orphan kill isolated on the `loner` target), HANDOFF uses the dev1 CLI's real verbs (`run -s`, `status -s --tail`; no `continue`/`log`).
+  - PLAN.md precision pass: `meta.pid` semantics pinned (turn-hosting process; daemon kill orphans its whole target), transcript per-type fields pinned, `command` = shlex-split string, S06 ships `daemon_client` + `cache` stubs (sanctioned takeovers by S07/S10), S02 grace only until pid recorded + orphan placeholder `answer.md`, S04 captures advertised data, S05 owns footer variants, S07 builds the cancel transport for S11's `stop`, S01 owns the `install` executor, gemini ships presetless with `TODO(stage3)` on guessed vendor facts, `--json` added to S06/S07/S10/S11 DoDs, injectable time sources + smoke-section reading in ground rules.
+  - Tier ladder final: Luna (`builder` @ xhigh) → `builder --effort max` → Opus takeover; tier-max slices (S02/S06/S07) and all reviews are Opus. Recorded in AGENTS.md + PLAN.md.
+  - Cosmetics: SPEC daemon log name `<entry>~<hash>` (matches frozen `targets.py`), `help.py` noted in ARCHITECTURE.
+  - Verified after edits: shellcheck clean, `./smoke.sh` exit 0 all sections pending.
 
 - **Stage 1 (2026-08-05, Fable):**
   - Scaffold: fresh `uv_build` package, version `0.3.0.dev2` (`uv run acpc -V`), click entry point, dev group (ruff/pyright/pytest/timeout/xdist). `platformdirs` and `pytest-cov` dropped; no new deps.
@@ -18,7 +25,7 @@ Stage 1 (foundation) complete, uncommitted, awaiting review. Stage 2 (Opus + Lun
 
 ## Next
 
-- Stage 2: fresh Opus session with SPEC.md + PLAN.md (+ ARCHITECTURE.md); dispatch S01 per the plan's order and gate rule.
+- Stage 2: fresh Opus orchestrator session booted from HANDOFF.md; dispatch S01 per PLAN.md's order and gate rule.
 - Stage 3: Fable — full smoke green, real-agent test, final review, landing (reset main, tag, reinstall, drop archive branch; nothing pushed).
 
 ## Decisions

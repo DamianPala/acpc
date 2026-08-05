@@ -18,6 +18,16 @@
 
 ## Dispatching agents (Stage 2)
 
+Implementation slices go through the installed `acpc` (0.3.0.dev1) to the `builder` registry variant — gpt-5.6-luna @ xhigh, `permissions write`, OpenRouter home, already set up and working:
+
+```bash
+set -a && . ~/.config/secrets/base.env && set +a   # OpenRouter key via env_key
+acpc run builder --input-file <slice-prompt.md> --cwd <this worktree>
+```
+
+- **Tier `max` slices (PLAN.md):** Opus implements those itself (the orchestrator, or an Opus subagent via the Agent tool) — they are never dispatched to `builder`.
+- **Escalation after two failed reviews:** rerun `builder --effort max`; if that round fails review too, Opus takes the slice over.
+- **Slice reviews are Opus too** — the orchestrator itself or an Opus subagent, never the registry's `reviewer` variant (that one is a different stack).
 - Pass specs and long prompts with `--input-file`, never as a positional argument. Argv is visible in `ps`/`/proc/*/cmdline`; on 2026-08-04 a dispatch was SIGKILLed because the spec text in argv matched a cleanup helper's `pgrep -f` pattern.
 - Select provider/home by naming a registry variant; never export `CODEX_HOME`/`CLAUDE_CONFIG_DIR` around a dispatch. Daemons are keyed on the entry's declared environment, not ambient env — exporting the home binds the wrong provider into a shared daemon.
 

@@ -10,8 +10,10 @@ SPEC.md is normative; ARCHITECTURE.md fixes the module map and key decisions. Th
   - The donor repo `/home/haz/ai/lab/projects/acpc` — read-only reference at most.
   - `~/.acpc` and any real user state. All tests run against a temp `ACPC_HOME`.
   - Global installs (`uv tool install`), pushes, releases. Run via `uv run acpc`.
-- **Green bar:** `uv run pytest`, `uv run ruff check`, `uv run ruff format --check`, `uv run pyright` — all clean before a slice is submitted for review.
+- **Green bar:** `uv run pytest`, `uv run ruff check`, `uv run ruff format --check`, `uv run pyright`, `./smoke.sh` — all clean before a slice is submitted for review.
+- **Read your slice's section in `smoke.sh` before implementing** — it is the executable acceptance contract and asserts details (exact strings, stream separation) beyond this file. Flip only your own `SECTION_READY` key.
 - Tests follow the repo's style: behavior-focused, mock only boundaries, temp `ACPC_HOME` per test (`monkeypatch.setenv("ACPC_HOME", ...)`).
+- Time sources (grace windows, TTLs, durations) must be injectable; no test may sleep anywhere near the 30 s per-test timeout.
 
 ### Frozen foundation (Stage 1 harvests — read-only)
 
@@ -60,10 +62,19 @@ Slices must implement these shapes exactly; they are what makes independently bu
   `pid`, `process_start_time`, `created_at`/`started_at`/`finished_at` (epoch seconds, null until known),
   `turns` (int), `exit_code`, `stop_reason`, `tokens`, `cost`, `prompt_snippet`,
   `resolution` (model/effort/permissions/home/env + per-field source), `adapter_session_id`, `target`.
+  `pid`/`process_start_time` identify the process hosting the session's turns — the daemon
+  process on the daemon path, the acpc client process on the direct path. Killing a daemon
+  therefore orphans every session on its target; that is correct behavior, not a bug.
 - **`transcript.ndjson`** (S03 owns): line 1 header `{"schema": "acpc.transcript/1"}` (no `i`);
   every event is one line with a global 1-based index `i` (continuous across turns), `ts`,
   `type` ∈ `msg | thought | tool | permission | error | state | usage`, type-specific fields.
-  Consumers ignore unknown fields.
+  Consumers ignore unknown fields. Type-specific fields, pinned so producer (S04/S06) and
+  renderer (S05) agree: `msg`/`thought` → `text`; `tool` → `name`, `args_summary`, `status`,
+  `duration_ms` (one event, appended on completion); `permission` → `kind`, `decision`;
+  `error` → `message`; `usage` → `tokens`, `cost` (cumulative for the session);
+  `state` → `from`, `to` — appended by the turn machinery (S06/S07) at `starting → running`
+  and `running → <final>`. Orphan detection appends no transcript event; its record is the
+  meta flip plus the placeholder `answer.md`.
 - **`run`/`continue`/`wait` `--json` envelope** (S05/S06): `state`, `session_id`, `stop_reason`,
   `paths` (dir/prompt/transcript/answer), `cost`, `answer`, `truncated` (bool). `--bg`: only
   `session_id`, `state`, `paths`. `-o`: adds `output_file`, omits `answer`.
@@ -73,19 +84,25 @@ Slices must implement these shapes exactly; they are what makes independently bu
 - **Footers/summaries**: stderr + `--` prefix for `run` summary and `log` footers; part of the
   stdout view for `status`/`agents`. Segments `|`, peers `·`.
 - **Entry TOML schema**: per ARCHITECTURE.md Key decision 2 (smoke.sh's setup writes
-  `mock.toml`/`builder.toml`/`explorer.toml`/`phantom.toml` in exactly that schema).
+  `mock.toml`/`builder.toml`/`explorer.toml`/`loner.toml`/`phantom.toml` in exactly that
+  schema). `command` is a shell-style string, `shlex`-split at spawn (frozen `spawn_adapter`
+  takes executable and args separately); its head is what `shutil.which` checks for install
+  status.
 - **Adapter env delivery**: resolved `home` is exported to the adapter as the definition's
   `home_env` variable; declared `[env]` + passthrough go through `environment.adapter_environment`.
 
 ## Slices
 
-Tier `fast` = Luna (`acpc run codex --model fast` equivalent per Stage 2 setup); `max` from the first dispatch for the marked slices — subtle-race territory where post-hoc review is weak.
+Tier `fast` = Luna via the `builder` variant (see AGENTS.md *Dispatching agents*). Tier `max` = Opus implements the slice itself (the Stage 2 orchestrator, or an Opus subagent) — subtle-race territory where post-hoc review is weak; never dispatched to Luna.
+
+`src/acpc/cli.py` is shared across S06–S12 by design: slices land strictly in dispatch order, and each slice touches only the verbs its Modules line names — the rest of the file is off-limits to that slice.
 
 ### S01 — config + registry (tier: fast)
 
 - **Scope:** SPEC *Agent variants*, *State on disk* (config.toml, adapter definitions), `agents init` scaffolding data model. Strict config loader per the python-app skill (unknown key = hard error; the file has exactly 3 keys: `retention`, `daemon_ttl`, `daemon_max_concurrent`).
 - **Modules:** `src/acpc/config.py`, `src/acpc/registry.py`, `src/acpc/data/agents/{claude,codex,gemini}.toml`, `tests/test_config.py`, `tests/test_registry.py`.
-- **DoD:** entries resolve with nearest-wins inheritance, cycle + missing-base diagnostics, per-field provenance (field → defining file) exposed for `agents <name>` and `--dry-run`; presets resolve `--model fast|standard|max` with `--effort` override; effort values validated against the adapter's `efforts` (error lists supported levels); bypass-mode list readable; user file under an adapter name overrides fields; new adapter = `command` without `extends`; install status via `shutil.which` on the command head. Unit tests cover: inheritance, provenance, override/new-adapter/variant trichotomy, preset overrides via `[presets]`, malformed TOML → clean error.
+- **Vendor facts for the shipped TOMLs:** copy `command` (donor field `run_command`), `install_command`, `home_env` and `env_passthrough` from the donor's shipped definitions (`/home/haz/ai/lab/projects/acpc/src/acpc/data/agents/*.toml`, read-only) — do not invent them. Author fresh: default `home` (`~/.claude`, `~/.codex`, `~/.gemini`), `[presets]` exactly as SPEC's `agents --models` examples show for claude and codex — gemini ships **without** `[presets]` (a `--model` tier on a presetless adapter is an actionable error naming the mechanism); `efforts` and `bypass_modes` best-effort (known: claude `bypassPermissions`, gemini `yolo`; codex unknown → empty list) with a `# TODO(stage3): verify live` comment on every guessed value. Never invent model IDs.
+- **DoD:** entries resolve with nearest-wins inheritance, cycle + missing-base diagnostics, per-field provenance (field → defining file) exposed for `agents <name>` and `--dry-run`; presets resolve `--model fast|standard|max` with `--effort` override; effort values validated against the adapter's `efforts` (error lists supported levels); bypass-mode list readable; user file under an adapter name overrides fields; new adapter = `command` without `extends`; install status via `shutil.which` on the command head; an `install_command` accessor plus an execution helper (S10 wires the `install` verb to it). Unit tests cover: inheritance, provenance, override/new-adapter/variant trichotomy, preset overrides via `[presets]`, malformed TOML → clean error.
 - **Forbidden beyond ground rules:** nothing extra.
 - **Dependencies:** none.
 
@@ -93,7 +110,7 @@ Tier `fast` = Luna (`acpc run codex --model fast` equivalent per Stage 2 setup);
 
 - **Scope:** SPEC *State on disk* (session dirs, meta, rotation, no torn reads, owner-only), *Session states* (verified liveness, persisted transitions, 30s grace, who-accepts-what), `rm`/`prune` primitives (not the CLI verbs), `--name` aliases (`last` resolution TTY-gated at CLI level, storage here).
 - **Modules:** `src/acpc/sessions.py`, `tests/test_sessions.py`.
-- **DoD:** id allocation (pinned alphabet, collision re-roll); create/read/update `meta.json` per the wire contract (atomic, 0600, under a per-session lock); state transitions enforced (vocab verbatim); liveness check via `proc.process_liveness` with start-time token; orphan detection persisted on read, 30s startup grace; turn rotation renames `prompt.md`/`answer.md` → `.<n>` exactly once per file at next-turn start; name → id resolution with rebind-warning/hard-error-on-running semantics; delete/prune primitives (age from `finished_at`, running never touched). Mutation-tested: killing the process behind a `running` session must flip every reader to `orphaned`.
+- **DoD:** id allocation (pinned alphabet, collision re-roll); create/read/update `meta.json` per the wire contract (atomic, 0600, under a per-session lock); state transitions enforced (vocab verbatim); liveness check via `proc.process_liveness` with start-time token; orphan detection persisted on read — the 30s startup grace applies **only while `meta.json` has no recorded `pid`**; once a pid exists, liveness decides immediately (smoke kills a freshly started session and expects `orphaned` within seconds); detection also writes the one-line placeholder `answer.md` naming what died (the advertised path always exists); turn rotation renames `prompt.md`/`answer.md` → `.<n>` exactly once per file at next-turn start; name → id resolution with rebind-warning/hard-error-on-running semantics; delete/prune primitives (age from `finished_at`, running never touched). Mutation-tested: killing the process behind a `running` session must flip every reader to `orphaned`.
 - **Dependencies:** none (uses frozen `paths`/`proc`/`vocab`).
 
 ### S03 — transcript (tier: fast)
@@ -107,35 +124,35 @@ Tier `fast` = Luna (`acpc run codex --model fast` equivalent per Stage 2 setup);
 
 - **Scope:** SPEC *Output contract* ("the answer" definition), *Permissions* (runtime answering incl. bypass-mode switch guard), `log` event source. The ACP `Client` implementation the runner and daemon share.
 - **Modules:** `src/acpc/client.py`, `tests/test_client.py` (drive it against `tests/mock_agent.py` via frozen `spawn`, like `tests/test_mock_agent.py` does).
-- **DoD:** session updates → transcript events (msg/thought/tool/permission/error/usage) with correct condensable payloads; answer assembly = agent-message chunks concatenated in stream order (thoughts/tool output excluded, interleaved narration kept); `request_permission` answered via frozen `permissions` with the adapter's bypass list applied to `switch_mode` targets; denials recorded as transcript `permission`+`error` events; tokens/cost accumulated from usage updates; never prompts on stdin (the `prompt` policy's TTY ask is a callback the CLI injects — non-TTY callers reject `prompt` before this layer).
+- **DoD:** session updates → transcript events (msg/thought/tool/permission/error/usage) with correct condensable payloads; answer assembly = agent-message chunks concatenated in stream order (thoughts/tool output excluded, interleaved narration kept); `request_permission` answered via frozen `permissions` with the adapter's bypass list applied to `switch_mode` targets; denials recorded as transcript `permission`+`error` events; tokens/cost accumulated from usage updates; the adapter's advertised modes/models/commands (announced at initialize/session-new) captured and exposed on the client object — S06 hands them to the cache seam, S10 renders them; never prompts on stdin (the `prompt` policy's TTY ask is a callback the CLI injects — non-TTY callers reject `prompt` before this layer).
 - **Dependencies:** S03.
 
 ### S05 — output + render (tier: fast)
 
 - **Scope:** SPEC *Output contract* (stdout discipline, stderr summary, `--json` shapes, `--max-output`), `log`/`status` view rendering.
 - **Modules:** `src/acpc/output.py`, `src/acpc/render.py`, `tests/test_output.py`, `tests/test_render.py`.
-- **DoD:** truncation keeps the head, cuts on a UTF-8 boundary, appends the marker naming the answer path (test with the mock's straddling emoji: cap 2000 must not split it into invalid bytes); `log` truncation at event granularity with the cursor covering only printed events, `--json` truncation as a typed `truncated` event; footers per the pinned stream rules; JSON envelopes per the wire contract; condensed event lines (tool + args summary + status + duration; msg 200-char snippet + length; errors never filtered, never truncated except by the budget); `--prose` renders messages untruncated with error lines kept.
+- **DoD:** truncation keeps the head, cuts on a UTF-8 boundary, appends the marker naming the answer path (test with the mock's straddling emoji: cap 2000 must not split it into invalid bytes); `log` truncation at event granularity with the cursor covering only printed events, `--json` truncation as a typed `truncated` event; footers per the pinned stream rules, including the finished variant (exit code, tokens, answer path instead of event count) and the failed/timeout/orphaned variant that prints the last agent message in full (S08 only wires and asserts these — the rendering lands here); JSON envelopes per the wire contract; condensed event lines (tool + args summary + status + duration; msg 200-char snippet + length; errors never filtered, never truncated except by the budget); `--prose` renders messages untruncated with error lines kept.
 - **Dependencies:** S03 (event shapes).
 
 ### S06 — runner: sync run on the direct path (tier: **max**)
 
-- **Scope:** SPEC `run` (sync semantics, all flags except `--bg`), *Output contract* (exit codes, SIGINT/SIGTERM behavior on the direct path), `wait`-style finalization. The daemon seam is stubbed: routing tries `daemon_client.ensure()` if present, else direct child — in this slice, always direct, with the visible fallback note on stderr.
-- **Modules:** `src/acpc/runner.py`, `src/acpc/cli.py` (the `run` verb wiring only), `tests/test_runner.py`, `tests/test_cli_run.py`.
-- **DoD:** full sync path against the mock: resolve (S01) → session create (S02) → spawn (frozen) → client (S04) → answer/meta finalization → output (S05); exit codes 0/1/2/124/130 + 141 exact; `--timeout` cancels (state `timeout`); SIGINT cancels gracefully (ACP `session/cancel`, bounded ack wait); SIGTERM on the direct path cancels too (detach is S07); prompt source rules (exactly one of arg/`-`/`--prompt-file`); `--dry-run` prints the resolution with provenance and touches no state; `--mode` bypass guard (reject at parse unless `--permissions all`); non-TTY permission default `read`, `prompt` rejected non-TTY (exit 2); auto-prune hook (opportunistic, from config retention). **Smoke:** flip `S06-run` — the section must pass.
+- **Scope:** SPEC `run` (sync semantics, all flags except `--bg`), *Output contract* (exit codes, SIGINT/SIGTERM behavior on the direct path), `wait`-style finalization. The daemon seam is real but stubbed: S06 ships `src/acpc/daemon_client.py` as a stub whose ensure-function always reports "daemon unavailable" with a reason, so the runner's routing code (try daemon → visible fallback note on stderr → direct child) is final in this slice; S07 later replaces the stub's internals without touching `runner.py`. The cache seam gets the same treatment: S06 ships `src/acpc/cache.py` as a no-op `refresh_advertised(agent, advertised)` stub the runner calls after every successful turn (with S04's captured data); S10 takes the stub over.
+- **Modules:** `src/acpc/runner.py`, `src/acpc/daemon_client.py` (stub only), `src/acpc/cache.py` (stub only), `src/acpc/cli.py` (the `run` verb wiring only), `tests/test_runner.py`, `tests/test_cli_run.py`.
+- **DoD:** full sync path against the mock: resolve (S01) → session create (S02) → spawn (frozen) → client (S04) → answer/meta finalization → output (S05); exit codes 0/1/2/124/130/141/143 exact; `--timeout` cancels (state `timeout`); SIGINT cancels gracefully (ACP `session/cancel`, bounded ack wait) and exits 130; SIGTERM on the direct path cancels too but exits 143 (detach is S07); prompt source rules (exactly one of arg/`-`/`--prompt-file`); `--dry-run` prints the resolution with provenance (text and `--json`) and touches no state; `--mode` bypass guard (reject at parse unless `--permissions all`) **and** `--mode` actually applied via ACP `session/set_mode` (the mock advertises modes); the direct-path fallback note is folded into the single `--` stderr summary line, never a second `--` line (smoke counts them); turn machinery appends the `state` transcript events per the wire contract; a missing adapter command → one-line actionable error naming `acpc install <agent>`, exit 1 (the `phantom` entry); auto-prune hook (opportunistic, from config retention). **Smoke:** flip `S06-run` — the section must pass.
 - **Dependencies:** S01–S05.
 
 ### S07 — daemon: warm adapters, --bg, detach (tier: **max**)
 
 - **Scope:** SPEC `daemon` (auto-start, TTL, `daemon_max_concurrent` + queueing note, per-target logs, stop-fails-sessions-never-orphans, version-skew restart, fallback), `run --bg`, `wait`, SIGTERM detach, `daemon status|stop`.
-- **Modules:** `src/acpc/daemon.py`, `src/acpc/daemon_client.py`, `src/acpc/cli.py` (`wait`, `daemon` verbs + `--bg` wiring), `tests/test_daemon.py`, `tests/test_daemon_client.py`.
-- **DoD:** daemon spawn race-safe (lock via frozen `ipc.lock_path_for_target`); one daemon per target serves multiple sessions; turn slots per `daemon_max_concurrent`, queueing noted on stderr; idle TTL expiry (idle = no active sessions; detached sessions keep it alive); `daemon stop` transitions active sessions to `failed` with reason in meta; version skew self-restarts on connect; `--bg` returns id + dir immediately, session runs under the daemon; SIGTERM on a daemon-routed client detaches (client exits 143, session keeps running, id printed to stderr); `wait` blocks/returns per spec (timeout 124 leaves the session running; mirrors the session result incl. 130 for cancelled); adapter stderr goes to the per-target `daemon/<target>.log`. Daemon-side coverage must be proven by mutation (break daemon code, watch the test fail) — a client-view-only assertion does not count. **Smoke:** flip `S07-daemon-bg`.
+- **Modules:** `src/acpc/daemon.py`, `src/acpc/daemon_client.py` (takes over the S06 stub — the one sanctioned cross-slice file takeover; the ensure-function's signature and fallback contract stay), `src/acpc/cli.py` (`wait`, `daemon` verbs + `--bg` wiring), `tests/test_daemon.py`, `tests/test_daemon_client.py`.
+- **DoD:** daemon spawn race-safe (lock via frozen `ipc.lock_path_for_target`); one daemon per target serves multiple sessions; turn slots per `daemon_max_concurrent`, queueing noted on stderr; idle TTL expiry (idle = no active sessions; detached sessions keep it alive); `daemon stop` transitions active sessions to `failed` with reason in meta; version skew self-restarts on connect; `--bg` returns id + dir immediately, session runs under the daemon; SIGTERM on a daemon-routed client detaches (client exits 143, session keeps running, id printed to stderr); `wait` blocks/returns per spec (timeout 124 leaves the session running; mirrors the session result incl. 130 for cancelled); the daemon protocol serves a client-initiated cancel for its sessions (S11's `stop` verb rides it — build the transport here); `daemon status`/`wait` honor `--json` per the Output contract; adapter stderr goes to the per-target `daemon/<target>.log`. Daemon-side coverage must be proven by mutation (break daemon code, watch the test fail) — a client-view-only assertion does not count. **Smoke:** flip `S07-daemon-bg`.
 - **Dependencies:** S06.
 
 ### S08 — status + log verbs (tier: fast)
 
 - **Scope:** SPEC `status`, `log` (all flags), footer contracts.
 - **Modules:** `src/acpc/cli.py` (`status`, `log` verbs), `tests/test_cli_views.py`.
-- **DoD:** `status` list (running + 5 recent, `--all`, one line per session with id/entry/state/runtime/name/snippet) and detail views; every state read verifies liveness (S02 API); `log` default/`--since`/`--tail`/`--prose`/`--json`/`--wait-new [--timeout]` (124 on expiry)/`--max-output`/`--quiet`; footers on stderr with cursor; finished-footer variant (exit code, tokens, answer path); failed/timeout/orphaned print the last agent message in full; `--prose --json` usage error. **Smoke:** flip `S08-views` and `S13-permissions` (the latter also exercises S04/S06 behavior; it flips here because this slice completes the observability it asserts through).
+- **DoD:** `status` list (running + 5 recent, `--all`, one line per session with id/entry/state/runtime/name/snippet) and detail views; every state read verifies liveness (S02 API); `log` default/`--since`/`--tail`/`--prose`/`--json`/`--wait-new [--timeout]` (124 on expiry)/`--max-output`/`--quiet`; footers on stderr with cursor; the finished and failed/timeout/orphaned footer variants wired through S05's `render` API (the rendering itself landed in S05); `--prose --json` usage error. **Smoke:** flip `S08-views` and `S13-permissions` (the latter also exercises S04/S06 behavior; it flips here because this slice completes the observability it asserts through).
 - **Dependencies:** S02, S03, S05 (+S06 landed so there are sessions to view).
 
 ### S09 — continue (tier: fast)
@@ -148,15 +165,15 @@ Tier `fast` = Luna (`acpc run codex --model fast` equivalent per Stage 2 setup);
 ### S10 — agents family + cache + install (tier: fast)
 
 - **Scope:** SPEC `agents` (list/detail/`--models`/`--commands`/`--check`/`init`), `install`, advertised-data cache.
-- **Modules:** `src/acpc/cache.py`, `src/acpc/cli.py` (`agents`, `install` verbs), `tests/test_cache.py`, `tests/test_cli_agents.py`.
-- **DoD:** list view (aligned rows, variants indented with deltas, `missing → acpc install X`); detail views with provenance; variant view ends with the pointer, no catalog repeat; advertised data cached under `cache/<agent>/`, refreshed on every real run (S06 hook), auto-probed on cache miss; capped lists (first 3 + count) in detail view; `--models` full (presets + models), cross-agent overview; `--commands` first-sentence truncation + full text in `cache/<agent>/commands.md`; single cache-age footer exactly on the views that show advertised data; `--check` live probe (with name: one adapter incl. missing ones; without: every installed; any failure → exit 1); `agents init` scaffolds a variant TOML; `install` runs the definition's `install_command` (exit 1 on failure, 2 on unknown agent). **Smoke:** flip `S10-agents`.
+- **Modules:** `src/acpc/cache.py` (takes over the S06 stub — sanctioned takeover; `refresh_advertised`'s signature stays), `src/acpc/cli.py` (`agents`, `install` verbs), `tests/test_cache.py`, `tests/test_cli_agents.py`.
+- **DoD:** list view (aligned rows, variants indented with deltas, `missing → acpc install X`); detail views with provenance; variant view ends with the pointer, no catalog repeat; advertised data cached under `cache/<agent>/`, refreshed on every real run (S06 hook), auto-probed on cache miss; capped lists (first 3 + count) in detail view; `--models` full (presets + models), cross-agent overview; `--commands` first-sentence truncation + full text in `cache/<agent>/commands.md`; single cache-age footer exactly on the views that show advertised data; `--check` live probe (with name: one adapter incl. missing ones; without: every installed; any failure → exit 1); `agents init` scaffolds a variant TOML; `install` runs the definition's `install_command` via S01's executor (exit 1 on failure, 2 on unknown agent); `agents`/`install` honor `--json` per the Output contract. **Smoke:** flip `S10-agents`.
 - **Dependencies:** S01, S04 (probe), S06 (refresh hook).
 
 ### S11 — stop, rm, prune verbs (tier: fast)
 
 - **Scope:** SPEC `stop` (graceful cancel, 10s ack bound, no-op on finished, `--force` reserved), `rm`, `prune` (+auto-prune already hooked in S06).
 - **Modules:** `src/acpc/cli.py` (verbs), `tests/test_cli_maintenance.py`.
-- **DoD:** per SPEC's who-accepts-what table exactly; `stop` on starting/running cancels via daemon (or process kill on direct/orphan edge), transcript+meta+partial answer preserved; `rm` errors on active; `prune --older-than/--dry-run`, age from `finished_at`. **Smoke:** flip `S11-maintenance`.
+- **DoD:** per SPEC's who-accepts-what table exactly; `stop` on starting/running cancels through the daemon protocol's cancel request (built in S07; process kill only on the direct/orphan edge), transcript+meta+partial answer preserved; `rm` errors on active; `prune --older-than/--dry-run`, age from `finished_at`; `stop`/`rm`/`prune` honor `--json` per the Output contract. **Smoke:** flip `S11-maintenance`.
 - **Dependencies:** S02, S06, S07.
 
 ### S12 — help, TTY rules, CLI hardening (tier: fast)
@@ -174,7 +191,7 @@ S01 → S02 → S03 → S04 → S05 → S06 → S08 → S09 → S07 → S10 → 
 
 (S07 after S09: the daemon slice is the riskiest; everything except bg/detach/wait works on the direct path, so the fast slices land and stabilize the surface first. S06 must build the routing seam so S07 plugs in without touching S06's files.)
 
-**Gate rule (every slice):** Opus reviews the diff against SPEC.md + this file's DoD, runs `uv run pytest` + ruff + pyright, and runs the smoke sections the slice claims (plus all previously green sections — no regressions). Only then is the next slice dispatched. Two failed review rounds on one slice → that slice escalates to `max` tier for the rework dispatch.
+**Gate rule (every slice):** Opus reviews the diff against SPEC.md + this file's DoD, runs `uv run pytest` + ruff + pyright, and runs the smoke sections the slice claims (plus all previously green sections — no regressions). Only then is the next slice dispatched. Two failed review rounds on one slice → rerun at `builder --effort max`; if that round fails review too, Opus takes the slice over.
 
 **Slice prompts must include:** the slice entry from this file, the wire contracts section, the frozen-files list, and the ground rules. Nothing else from this file is needed in-context; SPEC.md and ARCHITECTURE.md ship whole.
 

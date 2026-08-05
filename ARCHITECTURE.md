@@ -22,6 +22,7 @@ cli.py                          argument parsing, verbs, help, exit codes, TTY d
   ├── output.py                 output contract: stdout modes, stderr summary, --json
   ├── cache.py                  advertised models/modes/commands cache under cache/<agent>/
   └── config.py                 config.toml (retention, daemon_ttl, daemon_max_concurrent)
+  └── help.py (optional)        S12 may split the help text out of cli.py if it warrants it
 
 paths.py (frozen)               ~/.acpc layout, ACPC_HOME, atomic_write, 0700/0600
 proc.py (frozen)                process identity/liveness, kill_process_tree, pidfd
