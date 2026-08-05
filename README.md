@@ -1,396 +1,146 @@
 # acpc
 
-Thin Python CLI client for the Agent Client Protocol (ACP).
+Dispatch coding agents (codex, claude, gemini) over the Agent Client Protocol, from the command line.
 
-<!-- Badges: PyPI version, Python 3.12+, License MIT -->
+acpc is built for a specific primary user: **another agent calling it through a shell tool**. Everything follows from that — blocking calls that print the answer once, plain text with no spinners or ANSI, state on disk that can be grepped, and exit codes that mean something. A human at a terminal is the secondary audience and still gets an honest tool.
 
-> **Status: alpha.** Eligible prompt calls use a persistent per-agent daemon to avoid repeatedly starting an ACP adapter. See [Daemon and sessions](#daemon-and-sessions).
+`SPEC.md` is the normative contract; this README is the tour.
 
-## What is acpc?
+> **Status: 0.3, local install.** Not on PyPI. Requires Python ≥ 3.13.
 
-acpc is a headless Python CLI for ACP, built on top of the official [agent-client-protocol](https://pypi.org/project/agent-client-protocol/) SDK.
-Output is plain text with no ANSI escapes, so it composes cleanly with pipes, files, and other agents.
+## The whole mental model
 
-## Install
-
-```bash
-pip install acpc
-# or
-uv tool install acpc
-```
-
-Requires Python 3.12+.
-
-## Quick start
+*`run` blocks and prints the answer; `--bg` returns an ID; `status`/`log`/`wait`/`continue`/`stop` operate on that ID; everything is on disk under a predictable path.*
 
 ```bash
-# Send a prompt to Codex
-acpc prompt codex "fix the tests"
+# 90% of usage is this:
+acpc run codex "fix the failing test in tests/test_auth.py" --cwd ~/repo --permissions write
 
-# Use a model preset
-acpc prompt claude "analyze this repo" --model fast
+# Background + collect later:
+id="$(acpc run codex "run the full suite and summarize" --bg | head -n1)"
+acpc wait "$id"
 
-# Pipe a prompt from stdin
-echo "explain the architecture" | acpc prompt codex -
+# Follow up in the same session, context preserved:
+acpc continue "$id" "now apply the same fix to the v2 API"
 
-# Read prompt from file, write output to file
-acpc prompt codex --input-file task.md -o result.md
+# Long prompts via heredoc:
+acpc run claude - --permissions write <<'PROMPT'
+Review the implementation against SPEC.md and make the required edits.
+PROMPT
 ```
 
-## Commands
-
-| Command | Description |
-|---------|-------------|
-| `prompt <agent> [text]` | Send a prompt to an ACP agent |
-| `run <agent> [text]` | Alias for `prompt` |
-| `models [agent]` | Show available models and presets |
-| `agents` | List registered agents and install status |
-| `sessions <agent>` | Not implemented yet; errors out. Use `daemon status` to see sessions a daemon holds |
-| `install <agent>` | Run the agent's install command |
-| `stop <agent>` | Stop running sessions for an agent |
-| `stop -s <id>` | Stop a specific session by ID |
-| `status` | Show all running sessions |
-| `daemon status [target]` | Show daemon status, hosted sessions, and its log path |
-| `daemon stop [target]` | Stop one daemon, or all running daemons when no target is given |
-| `generate-completion` | Generate or install shell completions |
-
-## Options reference
-
-All options for the `prompt` command:
-
-| Flag | Description | ACP mapping |
-|------|-------------|-------------|
-| `--last` | Resume the last session | `session/load` |
-| `-c, --continue` | Alias for `--last` | `session/load` |
-| `-s, --session ID` | Resume session by ID | `session/load` |
-| `--model MODEL` | Model ID or preset (fast/standard/max) | session model config option |
-| `--mode MODE` | Set mode for the session | `session/set_mode` |
-| `--permissions LEVEL` | Permission policy (see below) | `request_permission` |
-| `--cwd DIR` | Working directory for the agent | `session/new` (cwd) |
-| `--json` | NDJSON output (ACP events) | local |
-| `--quiet` | Final text only (no streaming) | local |
-| `-o, --output FILE` | Write output to file | local |
-| `--input-file FILE` | Read prompt from file | local |
-| `--timeout SECS` | Timeout in seconds | local |
-| `--dry-run` | Resolve config and exit without running | local |
-| `--no-daemon` | Use the direct adapter path | local |
-
-## Model presets
-
-Instead of memorizing vendor-specific model IDs, use one of three tier names:
-
-```bash
-acpc prompt claude --model fast       # cheapest, fastest
-acpc prompt claude --model standard   # default
-acpc prompt codex --model max         # most capable
-```
-
-Run `acpc models` to see what each preset resolves to for a given agent.
-
-Presets live in `config.toml` in acpc's config directory, which on Linux is
-`~/.config/acpc/config.toml`, alongside the `agents/` directory holding agent definitions.
-Set `ACPC_CONFIG_DIR` to put it elsewhere. If the file doesn't exist, built-in defaults are used:
-
-```toml
-[models.claude]
-fast = "haiku"
-standard = "sonnet"
-max = "opus"
-
-[models.codex]
-fast = "..."
-standard = "..."
-max = "..."
-```
-
-Use `--dry-run` to verify what model will be used without running:
-
-```bash
-acpc prompt codex --model standard "task" --dry-run
-```
-
-### Discovering models
-
-```bash
-acpc models           # show presets and available models for all agents
-acpc models claude    # show for a specific agent
-```
-
-Available models are cached from ACP responses (TTL 7 days).
-Each `acpc prompt` call refreshes the cache as a side effect, so it stays fresh without an extra round-trip.
-If the cache is stale, `acpc models <agent>` fetches live from the adapter.
-
-## Permissions
-
-The `--permissions` flag controls how acpc responds to ACP permission requests.
-Tool calls are classified by their `kind` field into three categories.
-
-
-| Level | read-like | edit/execute | delete/move |
-|-------|-----------|--------------|-------------|
-| `all` | allow | allow | allow |
-| `write` | allow | allow | deny |
-| `read` | allow | deny | deny |
-| `none` | deny | deny | deny |
-| `prompt` | allow | ask user | ask user |
-
-Read-like tool kinds: `read`, `search`, `think`, `fetch`, `switch_mode`, `other`.
-
-Default: `prompt` when stdin is a TTY, `read` when piped (non-TTY).
-
-### This is not a sandbox
-
-`--permissions` decides how acpc **answers** an ACP permission request. It cannot stop an
-adapter that never asks. The adapter is a separate process with the filesystem access of
-whoever ran acpc, and it enforces its own policy, which acpc does not configure.
-
-Measured against a real adapter on 2026-08-02: with `--permissions none`, in an empty
-directory, an agent asked to create a file created it. No permission request reached acpc,
-so no decision was made or reported, and the exit code was 0.
-
-Treat `--permissions` as a policy you express to a cooperating adapter, not as a boundary
-you enforce on an uncooperative one. If you need a real boundary, confine the adapter
-itself: a container, a dedicated user, or the adapter's own sandbox settings.
-
-A decision acpc does make is printed to stderr as
-`[acpc] permission: <kind> <title> -> allow|deny`. The absence of that line means nobody
-asked, not that nothing happened.
-
-## Output modes
-
-stdout carries agent output only. stderr carries `[acpc]`-prefixed diagnostics.
-
-**text** (default): Agent text streams to stdout as it arrives.
-Tool calls appear on stderr as `[acpc] tool: edit:src/main.py`.
-
-```bash
-acpc prompt codex "fix the bug" > fix.md
-```
-
-**json**: Every ACP `session_update` event passes through as NDJSON.
-The stream is wrapped by `session_started`, `session_ended`, and `session_error` meta-events.
-
-```bash
-acpc prompt codex "fix the bug" --json | jq 'select(.sessionUpdate == "agent_message_chunk")'
-```
-
-**quiet**: Collects all text, emits only the final result when the session ends.
-The `-o` flag writes to a file (not written on crash).
-
-
-```bash
-acpc prompt codex "summarize" --quiet -o summary.md
-```
-
-## Daemon and sessions
-
-The daemon is on by default for eligible calls. It starts automatically on the first eligible prompt for an agent and keeps that agent's ACP adapter warm. The daemon is a performance cache, not implicit conversation reuse: each prompt without a continuation flag starts a fresh session, just as in v0.1 and the native CLIs.
-
-There is one easily missed exception. Whether stdin is a terminal controls both the default permission policy and daemon routing:
-
-| stdin | Default permissions | Daemon routing |
-|-------|---------------------|----------------|
-| Terminal (TTY) | `prompt` | Direct adapter path |
-| Pipe, script, or agent (non-TTY) | `read` | Daemon path, unless another bypass applies |
-
-This means that typing `acpc prompt codex "..."` in a terminal normally does not reach the daemon. Interactive `prompt` permissions require a direct connection so acpc can ask you for approval. To use the daemon from a terminal, deliberately choose a non-interactive policy such as `--permissions read` or `--permissions all` only when that policy is appropriate for the request.
-
-acpc also uses the direct adapter path in these cases:
-
-- You opt out with `--no-daemon` or `ACPC_NO_DAEMON=1`.
-- The platform is Windows, where daemon transport is not available.
-- The daemon cannot start, connect, or speak its protocol correctly. acpc prints a warning and retries the request directly.
-- The daemon is at its memory capacity for a new session. Existing sessions it already hosts can still resume through it.
-
-### Continuation is explicit
-
-Every completed session saves its ID per agent. Use `--last` or its `-c` / `--continue` alias to resume the locally recorded last session:
-
-```bash
-acpc prompt codex "remember: the password is hunter2"
-acpc prompt codex --last "what was the password?"
-```
-
-Resume a specific session by ID:
-
-```bash
-acpc prompt codex -s 019cf2ca-b50f-7a13-ad67-14fe4db0e0ac "follow up"
-```
-
-`--last` and `-c` resolve a local last-session record, while `-s` resumes the exact ID. If the daemon still hosts that session, the continuation is live; after a daemon restart, acpc loads it through the adapter. For orchestrated calls, prefer `-s` over `--last`, because last-session tracking is scoped by parent process.
-
-A session stays in the directory where it was created. A continuation may repeat `--cwd` only when it resolves to that same directory. A mismatch fails with, for example, `error: session cwd is /a, --cwd says /b`, rather than silently running in a different worktree.
-
-`--model` is applied when creating a new session. A continuation without `--model` keeps its current model. Passing a different `--model` while resuming deliberately requests a mid-session model switch.
-
-### Lifetime, timeouts, and management
-
-The daemon exits after 300 seconds of idleness by default (`ACPC_DAEMON_TTL`). This is an idle timer, not a fixed daemon lifetime: it starts only when there is no active prompt or connected client and resets whenever the daemon is used.
-
-`--timeout` returns exit code 124 after cancelling the turn, but cancellation does not necessarily stop the adapter's underlying generation immediately. The session remains busy until that generation finishes, so do not expect a large cancelled response to free the session at once. In testing, a cancelled 5 000-word request kept a session busy for 151 seconds.
-
-```bash
-acpc daemon status          # every running daemon
-acpc daemon status codex    # one target
-acpc daemon stop codex      # stop one daemon and its adapter tree
-acpc daemon stop            # stop every running daemon
-```
-
-`acpc daemon status` prints each target's PID, uptime, hosted sessions, and the log location in this form:
+## Command surface
 
 ```
-codex: pid 1234, uptime 42s, log /path/to/acpc-state/log/codex.log
+run <agent> (prompt | - | --prompt-file) [options]   # default: block, stdout = final answer
+continue <id> (prompt | - | --prompt-file)           # follow-up in the same session context
+status [id]                # no id: active + recent; with id: one session's vitals
+log <id> [--since CURSOR] [--tail N] [--prose] [--wait-new]   # incremental transcript access
+wait <id> [--timeout S]    # block until done, print the answer
+stop <id>
+rm <id> | prune [--older-than D] [--dry-run]
+agents [name] [--models|--commands|--check]   # adapters + variants; resolved definitions
+agents init <name> --extends <agent>          # scaffold a variant
+install <agent>
+daemon status|stop [target]   # plumbing escape hatch — never needed in the happy path
 ```
 
-The log is `{state directory}/log/{target}.log`, normally `~/.local/state/acpc/log/{target}.log` on Linux unless `ACPC_STATE_DIR` overrides the state directory. It is truncated when that target daemon starts and contains daemon events plus adapter stderr, which is otherwise not shown in daemon mode. Check the path reported by `daemon status` first when a daemon-routed call misbehaves. The direct `--no-daemon` path instead leaves adapter stderr on the terminal.
+`acpc --help` is a self-contained cheat sheet; `acpc <cmd> --help` is that command's full reference. `<id>` accepts a session id or a `--name` alias; `last` works on a TTY only.
 
-Session IDs and resume commands appear on stderr:
+## Reading a run
+
+- **stdout carries exactly one thing**: the answer (default), a confirmation (`-o`), a JSON envelope (`--json`), or id + session dir (`--bg`). Never spinners, logs, or diagnostics.
+- **stderr carries acpc's own metadata**, every line prefixed `--`: the end-of-run summary (duration, tokens, exit, session id, dir) and `log`/`status` footers. Harnesses that merge streams can still separate the two mechanically.
+- **`log <id>`** is the progress view — condensed one-liners, tool calls and prose interleaved. **`log <id> --prose`** is the content view — clean markdown of what the agent wrote. `--since CURSOR` never re-emits events, so polling is cheap and stateless.
 
 ```
-[acpc] session: 019cf2ca-b50f-7a13-ad67-14fe4db0e0ac
-[acpc] resume: acpc prompt codex -s 019cf2ca-b50f-7a13-ad67-14fe4db0e0ac "follow up"
+$ acpc log x7k2 --since 42
+[12:01:05] tool  Bash "pytest -x" → exit 1 (2.3s)
+[12:01:20] msg   "Tests fail because the fixture assumes..." (280 chars)
+-- running 3m12s | 45 events | cursor: 45
 ```
-
-Last-session tracking is scoped per PPID to avoid race conditions in concurrent use.
-
-### What the daemon actually saves
-
-Measured 2026-08-02 on one machine, cheapest model per agent, one-word answers.
-
-| Agent | Path | Wall | CPU (user+sys) |
-|-------|------|------|----------------|
-| codex | direct | 6,46 s | **6,15 s** |
-| codex | daemon | 3,51 s | **0,44 s** |
-| claude | direct | 4,19 s | **1,24 s** |
-| claude | daemon | 4,50 s | **0,50 s** |
-
-**Read the CPU column, not the wall column.** What the daemon removes is adapter startup;
-what dominates the wall clock is waiting on the model, which the daemon cannot help with
-and which varies by seconds between identical calls. One of the runs above has the daemon
-path finishing slower in wall time while using a third of the CPU. If you call acpc once
-and wait, expect little. If you call it in a loop, the CPU column is your saving, and it is
-much larger for the adapter that is expensive to start.
-
-Adapter memory over ten consecutive sessions on one daemon:
-
-| Agent | Resident set | Behaviour |
-|-------|--------------|-----------|
-| codex | 298 → 323 MB | grows steadily, releases nothing |
-| claude | swings 381 ↔ 645 MB | closes idle sessions and reclaims |
-
-Neither approaches the default ceiling in ordinary use. The daemon samples the adapter
-process tree before admitting a new session and, above the ceiling, first closes idle
-sessions where the adapter supports it, then refuses the session and recycles itself.
-Refused calls fall back to the direct path rather than failing.
-
-## Agent registry
-
-Agents are defined in TOML files. Three agents ship built-in (codex, claude, gemini).
-Run `acpc agents` to see the current list and install status.
-
-### TOML format
-
-```toml
-identity = "my-agent"
-name = "My Agent"
-author = "Me"
-run_command = "my-agent-acp"
-install_command = "npm install -g my-agent-acp"
-```
-
-### User overrides
-
-Place `.toml` files in the platform config directory to add or override agents:
-
-- Linux: `~/.config/acpc/agents/`
-- macOS: `~/Library/Application Support/acpc/agents/`
-- Windows: `%APPDATA%\acpc\agents\`
-
-User overrides take priority over built-in agents with the same identity.
-
-### Installing adapters
-
-```bash
-acpc install codex    # runs the install_command from the TOML file
-acpc agents           # shows install status for all agents
-```
-
-## Process management
-
-Running direct sessions and reachable daemon-hosted sessions are shown by `acpc status`.
-
-```bash
-acpc status                              # list running sessions
-acpc stop codex                          # stop all sessions for codex
-acpc stop -s 019cf2ca-b50f-7a13-ad67     # stop a specific session
-```
-
-For direct sessions, Ctrl+C sends `session/cancel`, waits briefly for the agent to exit cleanly, then terminates its process group. For daemon-routed sessions, Ctrl+C and `--timeout` cancel only the affected turn so sibling sessions can continue.
 
 ## Exit codes
 
 | Code | Meaning |
 |------|---------|
-| 0 | Success (`end_turn`) |
-| 1 | Agent error (`max_tokens`, `max_turn_requests`, ACP error) |
-| 2 | Usage error (unknown agent, missing prompt) |
-| 3 | Permission denied (non-interactive) |
-| 124 | Timeout (`--timeout` exceeded) |
-| 130 | SIGINT (Ctrl+C) |
-| 141 | SIGPIPE |
-| 143 | SIGTERM |
+| 0 | success (`end_turn`) |
+| 1 | agent error — crash, refusal, missing auth |
+| 2 | usage error — bad flags, unknown session, rejected mode/permissions combination |
+| 124 | timeout (`run`: session cancelled; `wait`/`log --wait-new`: gave up waiting, session runs on) |
+| 130 | cancelled — SIGINT or `stop` |
+| 141 / 143 | SIGPIPE / SIGTERM |
+
+**Client death ≠ session death.** SIGINT cancels the session. SIGTERM — a harness killing the tool call on its own timeout, the normal case for an agent caller — *detaches*: the session keeps running under the daemon, the client prints the session id to stderr on the way out, and `wait <id>` collects the answer later.
+
+## Permissions
+
+`--permissions all|write|read|none|prompt` decides how acpc answers ACP permission requests, classified by tool-call kind. Default: `prompt` on a TTY, `read` otherwise (`--bg` counts as non-TTY).
+
+Two edges worth internalizing:
+
+- **The non-TTY default is a silent read-only trap.** A caller that passes no `--permissions` gets a read-only callee — write requests are denied without an error and the turn exits 0. Pass `--permissions write` whenever the task should modify anything.
+- **This is an approval policy, not a sandbox.** It answers the requests the adapter emits; it cannot stop an adapter that never asks. Concretely: codex's default `agent` mode auto-allows edits inside the workspace without asking, so a policy below `all` only bites in its `read-only` mode. A vendor mode that suppresses requests entirely (`agent-full-access`) is rejected at parse time unless `--permissions all`. A real boundary means confining the adapter itself: a container, a dedicated user, or the vendor's own sandbox.
+
+## Agent variants
+
+A named TOML entry bundles model, effort, permissions, home and environment, so `run builder "task"` replaces four flags:
+
+```toml
+# ~/.acpc/agents/builder.toml — hand-editable; `agents init` scaffolds this
+extends = "codex"
+model = "gpt-5.6-luna"
+effort = "xhigh"
+permissions = "write"
+home = "~/.codex-openrouter"
+env_passthrough = ["OPENROUTER_API_KEY"]   # names read from the caller's env, never stored
+
+[env]
+MODEL_PROVIDER = "openrouter"
+```
+
+The `home` field is the provider switch: OpenAI vs OpenRouter vs a local endpoint is just a different vendor home. Resolution stays fully inspectable — `acpc agents builder` shows what the entry resolves to with per-field provenance, `run --dry-run` shows one concrete call.
+
+`--model fast|standard|max` resolves through the adapter's preset table (overridable per adapter in `agents/`). The adapter's environment is **constructed, not inherited**: a base system set, capability variables (ssh agent, proxies, CA bundles), and the entry's declared env — the rest of your ambient environment never reaches the adapter.
+
+## State on disk
+
+```
+~/.acpc/                     # ACPC_HOME overrides it — the only env var acpc reads for itself
+  config.toml                # retention, daemon_ttl, daemon_max_concurrent — the whole file
+  agents/<name>.toml         # variants, adapter overrides, new adapters
+  cache/<agent>/             # advertised models, modes, commands
+  daemon/<target>.log        # adapter stderr per target
+  sessions/<id>/
+    meta.json                # full resolved invocation + state, timing, tokens, exit code
+    prompt.md                # the prompt as sent (earlier turns: prompt.<n>.md)
+    transcript.ndjson        # full event stream, versioned public format
+    answer.md                # final answer (earlier turns: answer.<n>.md)
+```
+
+File-based state is a feature: grep it, read fragments selectively, depend on nothing but the filesystem. `answer.md` exists whatever the final state — partial answers for failed or cancelled turns, a placeholder naming what died for orphaned ones. Session states are verified, not trusted: a `running` session whose process is gone reports `orphaned`, never a stale `running`.
+
+## The daemon
+
+A performance cache, nothing more: it keeps adapters warm so the next turn starts in ~2 s instead of a cold start. Auto-managed — starts on first use, expires after 30 min idle, restarts itself on version skew, heals itself if its adapter dies. One daemon per *target* (agent + home + declared env), so different providers or credentials never share a process. If a daemon cannot start at all, `run` falls back to a direct child and says so on stderr.
+
+```bash
+acpc daemon status          # pid, uptime, per-target log path
+acpc daemon stop codex      # controlled nuke; beats pkill, which kills mid-task dispatches
+```
 
 ## Trust model
 
-TOML agent files define `run_command` and `install_command`, which acpc executes as shell commands.
-This is the same trust level as shell aliases or PATH entries.
-Only place TOML files you trust in the config directory.
+Entry TOMLs are trusted at the level of shell config: an adapter definition names the command acpc executes and the env delivered to it. Only place files you trust in `agents/`. State dirs are owner-only (0700/0600) — prompts and transcripts routinely carry sensitive material. Secrets travel via `env_passthrough` names read at call time; values are never written to disk.
 
-The spawned adapter process inherits your full environment (env vars, PATH, credentials).
-Environment filtering (`--env`) is planned for v0.2.
-As a workaround, use `env -i` to strip the environment:
+## Development
 
 ```bash
-env -i HOME="$HOME" PATH="$PATH" acpc prompt codex "task"
+uv run pytest && uv run ruff check && uv run ruff format --check && uv run pyright
+./smoke.sh        # end-to-end acceptance against the ACP mock agent
 ```
 
-## CI usage
-
-In non-TTY environments (CI, scripts, pipes), permissions default to `read`.
-Use `--permissions all` to allow writes, or `--permissions none` for dry runs.
-
-```bash
-# CI: run agent, capture JSON output, check exit code
-acpc prompt codex "run the test suite and fix failures" \
-    --permissions all \
-    --json \
-    --timeout 300 \
-    > agent-output.ndjson
-
-if [ $? -eq 0 ]; then
-    echo "Agent completed successfully"
-elif [ $? -eq 124 ]; then
-    echo "Agent timed out"
-else
-    echo "Agent failed with exit code $?"
-fi
-```
-
-```bash
-# Parse agent text from NDJSON
-acpc prompt codex "summarize changes" --json \
-    | jq -r 'select(.sessionUpdate == "agent_message_chunk") | .content.text' \
-    | tr -d '\n'
-```
-
-## Known limitations
-
-Current rough edges to be aware of:
-
-- **Unix-only.** Linux and macOS work. Windows is planned for v0.3 (needs named pipes instead of Unix sockets, and `taskkill` instead of `killpg`).
-- **`--last` is not orchestration-safe.** Last-session tracking is scoped per parent PID. That works for a human in a terminal, but breaks when one orchestrator agent spawns several `acpc` calls. For programmatic use, grab the session ID from stderr and pass it back with `-s SESSION_ID`. acpc warns when `--last` is used.
-- **Gemini needs `GEMINI_API_KEY` in env.** OAuth reuse in ACP subprocess mode is broken upstream (gemini-cli [#7549](https://github.com/google-gemini/gemini-cli/issues/7549), [#12042](https://github.com/google-gemini/gemini-cli/issues/12042)). API key is the only reliable auth path right now.
-- **No env filtering.** The spawned adapter inherits your full environment (see [Trust model](#trust-model)).
+`docs/live-test-plan.md` is the checklist for verifying against real adapters.
 
 ## License
 
