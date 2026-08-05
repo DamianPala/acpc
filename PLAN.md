@@ -186,14 +186,18 @@ Tier `fast` = Luna via the `builder` variant (see AGENTS.md *Dispatching agents*
 ## Dispatch order and gates
 
 ```
-S01 → S02 → S03 → S04 → S05 → S06 → S08 → S09 → S07 → S10 → S11 → S12
+Wave 1:  S01 ∥ S03  (two Luna workers)  +  S02 (Opus implements it itself meanwhile)
+Wave 2:  S04 ∥ S05  (two Luna workers — after S03's gate)
+Serial:  S06 → S08 → S09 → S07 → S10 → S11 → S12
 ```
 
-(S07 after S09: the daemon slice is the riskiest; everything except bg/detach/wait works on the direct path, so the fast slices land and stabilize the surface first. S06 must build the routing seam so S07 plugs in without touching S06's files.)
+Parallel only where the module sets — sources *and* tests — are disjoint; that is exactly waves 1 and 2. The serial tail is inherent: S06–S12 all touch the shared `cli.py` or depend on the daemon. (S07 after S09: the daemon slice is the riskiest; everything except bg/detach/wait works on the direct path, so the fast slices land and stabilize the surface first. S06 must build the routing seam so S07 plugs in without touching S06's files.)
+
+**Parallel dispatch rules (waves 1–2):** each concurrent worker gets its own worktree, branched off the current tip (`git worktree add ../acpc.rewrite-0.3-sXX -b slice/sXX`), and is dispatched with `--cwd` pointing there — full isolation, so the standard green bar applies unchanged inside the worker's worktree. The orchestrator reviews the slice diff on its branch, merges it back into `rewrite/0.3` (disjoint module sets → conflict-free; a real conflict means someone left their lane — reject the slice), reruns the full green bar on the merged tree as the gate, then removes the worktree and branch. One commit per slice survives the merge. A wave starts only when every gate it depends on has passed; a failed slice reruns in its own worktree without blocking the sibling. Opus implements S02 in the main worktree meanwhile.
 
 **Gate rule (every slice):** Opus reviews the diff against SPEC.md + this file's DoD, runs `uv run pytest` + ruff + pyright, and runs the smoke sections the slice claims (plus all previously green sections — no regressions). Only then is the next slice dispatched. Two failed review rounds on one slice → rerun at `builder --effort max`; if that round fails review too, Opus takes the slice over.
 
-**Slice prompts must include:** the slice entry from this file, the wire contracts section, the frozen-files list, and the ground rules. Nothing else from this file is needed in-context; SPEC.md and ARCHITECTURE.md ship whole.
+**Slice prompts must include:** the slice entry from this file, the wire contracts section, the frozen-files list, and the ground rules — for wave workers, plus their worktree path and the instruction to commit the slice on its branch when green. Nothing else from this file is needed in-context; SPEC.md and ARCHITECTURE.md ship whole.
 
 ## Spec gaps
 
