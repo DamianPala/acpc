@@ -187,38 +187,43 @@ async def _drive_turn(
         permission_prompt=request.permission_prompt,
     )
 
-    async with spawn_adapter(
-        client,
-        command,
-        *args,
-        env=env,
-        cwd=request.cwd,
-        drain_stderr=True,
-    ) as (conn, _process):
-        initialize = await conn.initialize(protocol_version=PROTOCOL_VERSION)
+    try:
+        async with spawn_adapter(
+            client,
+            command,
+            *args,
+            env=env,
+            cwd=request.cwd,
+            drain_stderr=True,
+        ) as (conn, _process):
+            initialize = await conn.initialize(protocol_version=PROTOCOL_VERSION)
 
-        if request.resume_adapter_session is not None:
-            require_load_session_capability(getattr(initialize, "agent_capabilities", None))
-            adapter_session_id = request.resume_adapter_session
-            await conn.load_session(
-                session_id=adapter_session_id,
-                cwd=request.cwd or ".",
-                mcp_servers=[],
+            if request.resume_adapter_session is not None:
+                require_load_session_capability(getattr(initialize, "agent_capabilities", None))
+                adapter_session_id = request.resume_adapter_session
+                await conn.load_session(
+                    session_id=adapter_session_id,
+                    cwd=request.cwd or ".",
+                    mcp_servers=[],
+                )
+            else:
+                session = await conn.new_session(cwd=request.cwd or ".", mcp_servers=[])
+                adapter_session_id = session.session_id
+                client.capture_advertised(session)
+
+            await _apply_call_options(conn, adapter_session_id, request)
+
+            prompt_task = asyncio.create_task(
+                conn.prompt(
+                    session_id=adapter_session_id,
+                    prompt=[text_block(request.prompt)],
+                )
             )
-        else:
-            session = await conn.new_session(cwd=request.cwd or ".", mcp_servers=[])
-            adapter_session_id = session.session_id
-            client.capture_advertised(session)
-
-        await _apply_call_options(conn, adapter_session_id, request)
-
-        prompt_task = asyncio.create_task(
-            conn.prompt(
-                session_id=adapter_session_id,
-                prompt=[text_block(request.prompt)],
+            stop_reason = await _await_prompt(
+                conn, adapter_session_id, prompt_task, request, cancel
             )
-        )
-        stop_reason = await _await_prompt(conn, adapter_session_id, prompt_task, request, cancel)
+    finally:
+        client.flush()
 
     state = cancel.state if cancel.state is not None else _state_for_stop_reason(stop_reason)
     return TurnOutcome(

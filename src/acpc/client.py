@@ -38,6 +38,16 @@ from acpc.transcript import Transcript
 _Clock = Callable[[], float]
 _PermissionPrompt = Callable[[str, str], bool | Awaitable[bool]]
 
+# Real adapters stream word-sized message chunks; one transcript event per
+# chunk turns `log` into a per-fragment view and the cursor into a fragment
+# counter. Consecutive same-type chunks therefore coalesce into one event, cut
+# by whatever comes first: a different event type (the causal narrative keeps
+# its interleaving), a pause in the stream, a bounded age so a long
+# uninterrupted message still surfaces while running, or a size bound.
+_CHUNK_GAP_SECONDS = 1.0
+_CHUNK_MAX_AGE_SECONDS = 2.0
+_CHUNK_MAX_CHARS = 4096
+
 
 @dataclass(slots=True)
 class _ToolCall:
@@ -47,6 +57,15 @@ class _ToolCall:
     started_at: float
     status: str | None = None
     finished: bool = False
+
+
+@dataclass(slots=True)
+class _PendingChunks:
+    event_type: str
+    parts: list[str]
+    chars: int
+    started_at: float
+    last_at: float
 
 
 class AcpcClient:
@@ -72,6 +91,7 @@ class AcpcClient:
         self.bypass_modes = frozenset(bypass_modes)
         self.permission_prompt = permission_prompt
         self._clock = time.monotonic if clock is None else clock
+        self._pending: _PendingChunks | None = None
         self._answer_parts: list[str] = []
         self._tool_calls: dict[str, _ToolCall] = {}
         self._tokens = 0
@@ -118,6 +138,37 @@ class AcpcClient:
         """Satisfy the ACP connection hook; no client-side setup is needed."""
         del conn
 
+    def flush(self) -> None:
+        """Write buffered agent prose to the transcript as one event.
+
+        Called before any non-chunk event lands and at the end of a turn, so
+        message text always precedes the event that interrupted it.
+        """
+        pending = self._pending
+        if pending is None:
+            return
+        self._pending = None
+        self.transcript.append(pending.event_type, text="".join(pending.parts))
+
+    def _buffer_chunk(self, event_type: str, text: str) -> None:
+        now = self._clock()
+        pending = self._pending
+        if pending is not None and (
+            pending.event_type != event_type or now - pending.last_at >= _CHUNK_GAP_SECONDS
+        ):
+            self.flush()
+            pending = None
+        if pending is None:
+            pending = _PendingChunks(
+                event_type=event_type, parts=[], chars=0, started_at=now, last_at=now
+            )
+            self._pending = pending
+        pending.parts.append(text)
+        pending.chars += len(text)
+        pending.last_at = now
+        if now - pending.started_at >= _CHUNK_MAX_AGE_SECONDS or pending.chars >= _CHUNK_MAX_CHARS:
+            self.flush()
+
     async def session_update(self, session_id: str, update: Any, **kwargs: Any) -> None:
         """Record one ACP session update in the public transcript format."""
         del session_id, kwargs
@@ -127,14 +178,19 @@ class AcpcClient:
             text = getattr(update.content, "text", None)
             if isinstance(text, str):
                 self._answer_parts.append(text)
-                self.transcript.append("msg", text=text)
+                self._buffer_chunk("msg", text)
             return
 
         if update_type == "agent_thought_chunk" and isinstance(update, AgentThoughtChunk):
             text = getattr(update.content, "text", None)
             if isinstance(text, str):
-                self.transcript.append("thought", text=text)
+                self._buffer_chunk("thought", text)
             return
+
+        # Every non-chunk update cuts the buffered prose, even one that writes
+        # nothing itself (a tool start): the boundary is where the narrative
+        # forked, not where the interrupting event was finally recorded.
+        self.flush()
 
         if update_type == "tool_call" and isinstance(update, ToolCallStart):
             self._start_tool(update)
@@ -175,6 +231,7 @@ class AcpcClient:
     ) -> RequestPermissionResponse:
         """Answer an ACP permission request and record the policy decision."""
         del session_id, kwargs
+        self.flush()
         kind = getattr(tool_call, "kind", None) or "unknown"
         title = getattr(tool_call, "title", None) or ""
         raw_input = getattr(tool_call, "raw_input", None)

@@ -585,6 +585,7 @@ class Daemon:
             )
         finally:
             self.host.mux.release(adapter_session_id)
+            client.flush()
 
         state = (
             cancel.state if cancel.state is not None else runner._state_for_stop_reason(stop_reason)

@@ -90,13 +90,16 @@ def test_answer_is_only_agent_messages_and_transcript_keeps_stream_order(
                 session_id=session.session_id, prompt=[text_block("burst:first|second")]
             )
             await _drain_updates(lambda: client.answer == "firstsecond")
+            client.flush()
 
     asyncio.run(scenario())
 
     events = transcript.read().events
     assert client.answer == "firstsecond"
-    assert [event["type"] for event in events] == ["thought", "msg", "msg"]
+    # The two burst chunks are one message, so they land as one event.
+    assert [event["type"] for event in events] == ["thought", "msg"]
     assert events[0]["text"] == "private thought"
+    assert events[1]["text"] == "firstsecond"
     assert "private thought" not in client.answer
 
 
@@ -145,6 +148,7 @@ def test_answer_keeps_interleaved_narration_and_excludes_tool_events(
             "adapter-session",
             AgentMessageChunk(content=text_block("after"), session_update="agent_message_chunk"),
         )
+        client.flush()
 
     asyncio.run(scenario())
 
@@ -163,6 +167,70 @@ def test_answer_keeps_interleaved_narration_and_excludes_tool_events(
     }
     assert "hidden tool output" not in client.answer
     assert "another private thought" not in client.answer
+
+
+def _make_ticking_client(tmp_path: Path, times: list[float]) -> tuple[AcpcClient, Transcript]:
+    """A client whose clock pops the next value from ``times`` on every read."""
+    state_root = tmp_path / "acpc-state"
+    transcript = Transcript(
+        state_root / "sessions" / "abcd" / "transcript.ndjson",
+        clock=lambda: 100.0,
+    )
+    client = AcpcClient(
+        transcript,
+        PermissionLevel.READ,
+        clock=lambda: times.pop(0),
+    )
+    return client, transcript
+
+
+def _send_msg(client: AcpcClient, text: str) -> None:
+    asyncio.run(
+        client.session_update(
+            "adapter-session",
+            AgentMessageChunk(content=text_block(text), session_update="agent_message_chunk"),
+        )
+    )
+
+
+def test_a_stream_pause_cuts_the_coalesced_message(tmp_path: Path, monkeypatch: Any) -> None:
+    monkeypatch.setenv("ACPC_HOME", str(tmp_path / "acpc-state"))
+    client, transcript = _make_ticking_client(tmp_path, [0.0, 0.2, 1.5, 1.6])
+
+    _send_msg(client, "first ")
+    _send_msg(client, "part")
+    _send_msg(client, "second ")  # 1.3s after the last chunk: a pause
+    _send_msg(client, "part")
+    client.flush()
+
+    events = transcript.read().events
+    assert [event["text"] for event in events] == ["first part", "second part"]
+    assert client.answer == "first partsecond part"
+
+
+def test_a_long_uninterrupted_message_surfaces_while_running(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    monkeypatch.setenv("ACPC_HOME", str(tmp_path / "acpc-state"))
+    client, transcript = _make_ticking_client(tmp_path, [0.0, 0.9, 1.7, 2.5])
+
+    for text in ("a", "b", "c", "d"):  # gaps below the pause cut-off
+        _send_msg(client, text)
+
+    # No flush call: the age bound alone must have written the event.
+    events = transcript.read().events
+    assert [event["text"] for event in events] == ["abcd"]
+
+
+def test_an_oversized_message_buffer_flushes_on_size(tmp_path: Path, monkeypatch: Any) -> None:
+    monkeypatch.setenv("ACPC_HOME", str(tmp_path / "acpc-state"))
+    client, transcript = _make_client(tmp_path, PermissionLevel.READ)
+
+    _send_msg(client, "x" * 5000)
+
+    events = transcript.read().events
+    assert len(events) == 1
+    assert events[0]["text"] == "x" * 5000
 
 
 def test_prompt_policy_without_callback_denies_without_reading_stdin(
