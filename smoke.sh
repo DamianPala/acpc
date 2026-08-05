@@ -273,6 +273,16 @@ effort = "low"
 permissions = "read"
 EOF
 
+# loner: same adapter, different home => different daemon target. The orphan
+# test kill -9s the process behind its session; on the daemon path that is the
+# daemon serving the whole target, so the victim must not share a target with
+# the other long-lived sessions.
+cat >"${ACPC_HOME}/agents/loner.toml" <<EOF
+extends = "mock"
+description = "Isolated target for the orphan test."
+home = "~/.mock-loner"
+EOF
+
 cat >"${ACPC_HOME}/agents/phantom.toml" <<EOF
 name = "Phantom Agent"
 author = "acpc tests"
@@ -318,7 +328,10 @@ poll_slow1() {
     done <<<"$LAST_OUT"
 }
 
-if section_ready S07-daemon-bg && section_ready S08-views; then
+# Guarded on every slice this block asserts through: bg/wait (S07), views
+# (S08), continue-while-running (S09), rm/stop semantics (S11).
+if section_ready S07-daemon-bg && section_ready S08-views \
+    && section_ready S09-continue && section_ready S11-maintenance; then
     SLOW_MACHINERY=1
     progress "dispatching SLOW1/SLOW2/SLOW3 (mock 'slow' scenario, ~64s each)"
 
@@ -330,10 +343,12 @@ if section_ready S07-daemon-bg && section_ready S08-views; then
     run_acpc run mock "run the slow scenario for SLOW2" --bg --name smoke-slow2 --quiet
     SLOW2_ID="$(head -n1 <<<"$LAST_OUT")"
 
-    run_acpc run mock "run the slow scenario for SLOW3" --bg --name smoke-slow3 --quiet
+    run_acpc run loner "run the slow scenario for SLOW3" --bg --name smoke-slow3 --quiet
     SLOW3_ID="$(head -n1 <<<"$LAST_OUT")"
 
-    # --- SLOW3: orphaned detection (kill -9 the process behind the session) --
+    # --- SLOW3: orphaned detection (kill -9 the process behind the session).
+    # SLOW3 runs on the isolated `loner` target so the kill cannot take the
+    # daemon serving SLOW1/SLOW2 with it. -------------------------------------
     progress "SLOW3: orphaned detection (kill -9 the recorded pid)"
     sleep 2
     run_acpc status "$SLOW3_ID" --json
@@ -639,9 +654,11 @@ if begin_section S08-views "status list/detail, log default/--since/--tail/--pro
     # status list: defaults to running + 5 most recent finished; footer in view
     run_acpc status
     assert_eq "status exits 0" "0" "$LAST_RC"
-    assert_contains "status list shows a prompt snippet" "$LAST_OUT" "concurrent smoke task"
     run_acpc status --all
     assert_eq "status --all exits 0" "0" "$LAST_RC"
+    # Asserted via --all: at the S08 gate the S07 sessions don't exist yet, and
+    # in the full run the S07 burst pushes S06's sessions out of the recent 5.
+    assert_contains "status list shows prompt snippets" "$LAST_OUT" "smoke test sync run"
     run_acpc status "$UTIL_ID"
     assert_contains "status <id> shows the session dir" "$LAST_OUT" \
         "${ACPC_HOME}/sessions/${UTIL_ID}"
