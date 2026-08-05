@@ -187,3 +187,47 @@ def test_malformed_entry_is_a_clean_registry_error(tmp_path: Path) -> None:
     with pytest.raises(RegistryError, match="invalid TOML") as error:
         AgentRegistry(agents)
     assert "Traceback" not in str(error.value)
+
+
+def test_the_standard_preset_is_the_adapter_default_when_no_model_is_given(
+    tmp_path: Path,
+) -> None:
+    # SPEC's `agents claude` view prints `model claude-sonnet-5 (adapter default)`
+    # and claude's standard preset is claude-sonnet-5/high: the standard preset
+    # *is* what "adapter default" names.
+    call = AgentRegistry(tmp_path / "agents").resolve_call("claude")
+
+    assert call.model == "claude-sonnet-5"
+    assert call.effort == "high"
+    assert call.provenance["model"].kind == "adapter-default"
+    assert call.provenance["effort"].kind == "adapter-default"
+    assert call.provenance["model"].path is not None
+
+
+def test_an_entry_model_beats_the_adapter_default(tmp_path: Path) -> None:
+    agents = tmp_path / "agents"
+    write_entry(agents, "variant", 'extends = "claude"\nmodel = "claude-opus-5"\n')
+
+    call = AgentRegistry(agents).resolve_call("variant")
+
+    assert call.model == "claude-opus-5"
+    assert call.provenance["model"].kind == "entry"
+    # effort was not set on the variant, so it still falls back independently
+    assert call.effort == "high"
+    assert call.provenance["effort"].kind == "adapter-default"
+
+
+def test_an_explicit_effort_overrides_the_adapter_default(tmp_path: Path) -> None:
+    call = AgentRegistry(tmp_path / "agents").resolve_call("claude", effort="low")
+
+    assert call.effort == "low"
+    assert call.provenance["effort"].kind == "call"
+    assert call.model == "claude-sonnet-5"
+
+
+def test_a_presetless_adapter_has_no_default_model(tmp_path: Path) -> None:
+    call = AgentRegistry(tmp_path / "agents").resolve_call("gemini")
+
+    assert call.model is None
+    assert call.effort is None
+    assert call.provenance["model"].kind == "unset"

@@ -218,12 +218,25 @@ class ResolvedEntry:
             if resolved_effort is not None:
                 sources["effort"] = self.source_for("effort")
         else:
+            # No --model: the entry's own value wins, and where it is silent the
+            # adapter's `standard` preset *is* the adapter default. SPEC's
+            # `agents claude` view shows exactly that pairing —
+            # `model claude-sonnet-5 (adapter default)` with claude's standard
+            # preset being claude-sonnet-5. Model and effort fall back
+            # independently: --effort is orthogonal to --model.
+            default = self.presets.get("standard")
             resolved_model = self.model
             resolved_effort = self.effort
             if resolved_model is not None:
                 sources["model"] = self.source_for("model")
+            elif default is not None:
+                resolved_model = default.model
+                sources["model"] = FieldSource("adapter-default", default.source)
             if resolved_effort is not None:
                 sources["effort"] = self.source_for("effort")
+            elif default is not None:
+                resolved_effort = default.effort
+                sources["effort"] = FieldSource("adapter-default", default.source)
 
         if effort is not None:
             resolved_effort = effort
