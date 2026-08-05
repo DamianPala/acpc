@@ -26,6 +26,7 @@ at `daemon/<target>.log`, which is where adapter stderr lands too.
 
 import asyncio
 import contextlib
+import functools
 import os
 import sys
 import time
@@ -247,15 +248,19 @@ class Daemon:
         self._endpoint = _endpoint_identity(self._transport.path)
         idle = asyncio.create_task(self._expire_when_idle(), name="acpc.daemon.idle")
         accepting = asyncio.create_task(self._accept_forever(), name="acpc.daemon.accept")
+        idle.add_done_callback(functools.partial(self._lifecycle_task_ended, "idle"))
+        accepting.add_done_callback(functools.partial(self._lifecycle_task_ended, "accept"))
         try:
             await self._shutdown.wait()
         finally:
+            reason = self._stop_reason or "the daemon stopped"
+            print(f"acpc daemon {self.target}: {reason}", file=sys.stderr, flush=True)
             accepting.cancel()
             idle.cancel()
             for task in (accepting, idle):
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
-            await self._shut_down_sessions(self._stop_reason or "the daemon stopped")
+            await self._shut_down_sessions(reason)
             await self.host.close()
             with contextlib.suppress(Exception):
                 await self._transport.cleanup()
@@ -273,12 +278,32 @@ class Daemon:
             self._clients.add(task)
             task.add_done_callback(self._clients.discard)
 
+    def _lifecycle_task_ended(self, name: str, task: asyncio.Task[None]) -> None:
+        """Retire the daemon when a loop that should never finish, finishes.
+
+        Neither loop returns while the daemon is serving, and nothing awaits
+        them until shutdown, so on its own a death in here is silent and
+        leaves a daemon that nothing can ever retire: unreachable, still
+        holding an adapter, and immune to `daemon stop`. Whatever the cause,
+        the outcome is now a recorded shutdown rather than an immortal
+        process.
+        """
+        if self._shutdown.is_set() or task.cancelled():
+            return
+        error = task.exception()
+        detail = f": {error!r}" if error is not None else ""
+        self._stop_reason = f"the daemon's {name} loop ended unexpectedly{detail}"
+        self._shutdown.set()
+
     async def _expire_when_idle(self) -> None:
         """Exit after a whole TTL with nothing to keep the adapter warm.
 
-        Idle means no turn is in flight *and* no session this daemon owns is
-        still active — a detached session is running work nobody is watching,
-        and killing its adapter would orphan it.
+        Idle means no turn is in flight and no session this daemon owns is
+        still active. One check covers both: a turn stays in `self.turns`
+        from dispatch until it finishes, whether or not a client is still
+        watching it, so a detached session — work nobody is waiting on, whose
+        adapter must not be killed under it — keeps the daemon busy for as
+        long as it runs.
         """
         while True:
             try:

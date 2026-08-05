@@ -1,11 +1,14 @@
 """Behavioral tests for stop, rm, prune, and daemon idle retirement."""
 
 import asyncio
+import contextlib
+import functools
 import json
 import os
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 from click.testing import CliRunner
@@ -252,3 +255,57 @@ def test_idle_sweep_survives_a_check_failure_and_retires(
 
     assert checks == 2
     assert instance._shutdown.is_set()
+
+
+def test_a_dead_lifecycle_task_retires_the_daemon() -> None:
+    """A loop that should never finish, finishing, must not be survivable.
+
+    The guard inside the idle sweep only covers what it can catch. This is
+    the backstop for everything else, so the immortal-daemon failure class
+    is impossible regardless of what killed the task.
+    """
+    instance = daemon.Daemon("maintenance-dead-task-test", ttl=3600.0)
+
+    async def die() -> None:
+        raise RuntimeError("injected lifecycle failure")
+
+    async def drive() -> None:
+        task = asyncio.ensure_future(die())
+        task.add_done_callback(functools.partial(instance._lifecycle_task_ended, "idle"))
+        await asyncio.wait_for(instance._shutdown.wait(), timeout=1.0)
+
+    asyncio.run(drive())
+
+    assert instance._stop_reason is not None
+    assert "ended unexpectedly" in instance._stop_reason
+    assert "injected lifecycle failure" in instance._stop_reason
+
+
+def test_a_cancelled_lifecycle_task_reports_nothing_to_the_event_loop() -> None:
+    """Shutdown cancels both loops; that is the normal path, not a fault.
+
+    Asserting only that no stop reason is recorded would pass either way:
+    `task.exception()` on a cancelled task raises inside the callback, and
+    asyncio hands that to the loop's exception handler rather than to
+    anyone waiting. The observable difference is whether the handler fires,
+    so that is what this checks — otherwise every clean shutdown would
+    write a spurious traceback into the per-target daemon log.
+    """
+    instance = daemon.Daemon("maintenance-cancelled-task-test", ttl=3600.0)
+    reported: list[dict[str, Any]] = []
+
+    async def drive() -> None:
+        asyncio.get_running_loop().set_exception_handler(
+            lambda _loop, context: reported.append(context)
+        )
+        task = asyncio.ensure_future(asyncio.sleep(60))
+        task.add_done_callback(functools.partial(instance._lifecycle_task_ended, "accept"))
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    asyncio.run(drive())
+
+    assert reported == []
+    assert instance._stop_reason is None
+    assert not instance._shutdown.is_set()
