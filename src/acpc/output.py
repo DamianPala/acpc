@@ -207,7 +207,7 @@ def emit_result(
     return result
 
 
-def _format_duration(seconds: float) -> str:
+def format_duration(seconds: float) -> str:
     total = max(0, int(seconds))
     hours, remainder = divmod(total, 3600)
     minutes, secs = divmod(remainder, 60)
@@ -216,7 +216,7 @@ def _format_duration(seconds: float) -> str:
     return f"{minutes}m{secs:02d}s"
 
 
-def _format_tokens(tokens: int) -> str:
+def format_tokens(tokens: int) -> str:
     if tokens >= 1000:
         value = tokens / 1000
         rendered = f"{value:.1f}".rstrip("0").rstrip(".")
@@ -232,7 +232,7 @@ def format_summary(
 ) -> str:
     """Format the single ``--`` summary line for a completed run."""
     duration = sessions.runtime_seconds(meta) if runtime is None else runtime
-    parts = [meta.state, _format_duration(duration), _format_tokens(meta.tokens)]
+    parts = [meta.state, format_duration(duration), format_tokens(meta.tokens)]
     if meta.cost is not None:
         parts.append(f"cost ${meta.cost:.2f}")
     if meta.exit_code is not None:

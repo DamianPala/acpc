@@ -681,7 +681,9 @@ def claim_name(name: str, *, clock: Clock | None = None) -> str | None:
     """
     resolved_clock = _resolve_clock(clock)
     if name == RESERVED_NAME:
-        raise SessionNameError(f"`{RESERVED_NAME}` is reserved as a selector — pick another --name")
+        raise SessionNameError(
+            f"`{RESERVED_NAME}` is reserved as a selector — pick another name for --name"
+        )
     if not name.strip():
         raise SessionNameError("--name cannot be empty")
     holders = [
@@ -721,7 +723,7 @@ def delete_session(session_id: str, *, clock: Clock | None = None) -> None:
     resolved_clock = _resolve_clock(clock)
     meta = load(session_id, clock=resolved_clock)
     if meta.is_active:
-        raise SessionStateError(f"session {session_id} is {meta.state} — stop it first, then rm it")
+        raise SessionStateError(f"session {session_id} is {meta.state} — stop it before rm")
     _remove_tree(session_dir(session_id))
 
 

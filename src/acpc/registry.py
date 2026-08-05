@@ -153,7 +153,8 @@ class ResolvedEntry:
             args = tuple(shlex.split(self.command))
         except ValueError as exc:
             raise RegistryError(
-                f"agent '{self.entry}': invalid command quoting in {self.source_for('command')}: {exc}"
+                f"agent '{self.entry}': invalid command quoting in "
+                f"{self.source_for('command')}: {exc}"
             ) from None
         if not args:
             raise RegistryError(f"agent '{self.entry}': command must not be empty")

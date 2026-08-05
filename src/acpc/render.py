@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from acpc import sessions
-from acpc.output import _format_duration, _format_tokens
+from acpc.output import format_duration, format_tokens
 
 Clock = Callable[[], float]
 DEFAULT_LOG_MAX_OUTPUT = 128 * 1024
@@ -274,13 +274,13 @@ def format_log_footer(
         qualifier = f" exit {meta.exit_code}" if meta.exit_code is not None else ""
         parts = [
             f"{meta.state}{qualifier}",
-            _format_duration(runtime),
-            _format_tokens(meta.tokens),
+            format_duration(runtime),
+            format_tokens(meta.tokens),
             f"answer: {sessions.answer_path(meta.session_id)}",
         ]
     else:
         parts = [
-            f"{meta.state} {_format_duration(runtime)}",
+            f"{meta.state} {format_duration(runtime)}",
             f"{event_count} events",
         ]
     parts.append(f"cursor: {cursor}")
@@ -298,7 +298,7 @@ def _status_selection(
 
 
 def _status_row(meta: sessions.SessionMeta, *, clock: Clock | None) -> str:
-    runtime = _format_duration(sessions.runtime_seconds(meta, clock=clock))
+    runtime = format_duration(sessions.runtime_seconds(meta, clock=clock))
     name = meta.name or "·"
     snippet = json.dumps(meta.prompt_snippet, ensure_ascii=False)
     return (
@@ -343,9 +343,9 @@ def render_status_detail(
     clock: Clock | None = None,
 ) -> str:
     """Render one session's status detail view."""
-    runtime = _format_duration(sessions.runtime_seconds(meta, clock=clock))
+    runtime = format_duration(sessions.runtime_seconds(meta, clock=clock))
     exit_text = f"exit {meta.exit_code}" if meta.exit_code is not None else "exit ·"
-    tokens = _format_tokens(meta.tokens)
+    tokens = format_tokens(meta.tokens)
     name = meta.name or "·"
     directory = _display_path(sessions.session_dir(meta.session_id))
     lines = [

@@ -638,7 +638,7 @@ class TestDeletion:
             process_start_time=proc.process_start_time(),
             clock=at(1.0),
         )
-        with pytest.raises(sessions.SessionStateError, match="stop it first"):
+        with pytest.raises(sessions.SessionStateError, match="stop it before rm"):
             sessions.delete_session(meta.session_id, clock=at(2.0))
         assert sessions.session_dir(meta.session_id).exists()
 
