@@ -278,11 +278,14 @@ EOF
 
 Unknown kinds are denied under everything but `all`; denials appear in `log`. `read` and `write` answer with `allow_once` only — `allow_always` is reserved to `all`. Where the model's edges are:
 
+- **The non-TTY default is a silent read-only trap**: a caller that neither passes `--permissions` nor runs an entry with a permission default gets a read-only callee — writes are denied without an error, the turn ends normally, exit 0, nothing changed. Pass `--permissions write` (or `all`) whenever the task is supposed to modify anything.
 - **`execute` subsumes `delete`/`move`** in practice — excluding those kinds only constrains adapters that classify honestly.
 - **`fetch` is network egress** — under the non-TTY default a callee processing untrusted input can reach the network; use `none` when that matters.
-- **An approval policy, not a sandbox**: it answers the requests the adapter emits, so a `--mode` that stops the callee from asking (vendor bypass modes) would evade it — such combinations are rejected at parse time unless `--permissions all`.
+- **An approval policy, not a sandbox**: it answers the requests the adapter emits, so a `--mode` that stops the callee from asking (vendor bypass modes) would evade it — such combinations are rejected at parse time unless `--permissions all`. A real boundary means confining the adapter itself: a container, a dedicated user, or the vendor's own sandbox.
 - **The same door exists at runtime**: a callee can *request* a mode switch (kind `switch_mode`), so a switch into a bypass mode is treated like an unknown kind — denied below `all`, asked under `prompt` — while switches between ordinary modes (e.g. plan → default) stay in the read tier.
 - **Bypass lists are adapter-declared**: ACP does not mark modes as bypass; a vendor mode absent from the adapter definition's list passes both guards until the definition is updated.
+
+**Slash commands, skills and prompt-defined agents** need no flag: the callee resolves them from the prompt body — `run claude "/commit"` just works. They resolve against the vendor home the callee runs with (`--home`/entry), not against `--cwd`. The flip side: an unknown command comes back as ordinary agent output ("Unknown command: /x") with exit 0 — the exit code cannot tell the caller it never existed; `agents <name> --commands` shows what's advertised.
 
 Not needed: file-attachment flags (paths in the prompt suffice), system-prompt injection.
 
@@ -367,7 +370,11 @@ $ acpc run builder "implement the parser per SPEC.md"
 
 The `home` field is also the provider dimension: OpenAI vs OpenRouter vs a local endpoint is just a different vendor home (own config, own credentials). A variant is the named, permanent form; `--home` on `run` the one-off form.
 
-Environment is part of the entry, in two fields. An `[env]` table holds literal values declared in the entry (e.g. the vendor home path). `env_passthrough` lists variable *names* read from the caller's environment at call time — values are never stored on disk, which is how API keys travel. Both are part of the daemon target key ("declared env"), so two entries with different env are two targets that cannot serve each other's traffic; ambient environment not named in the entry never reaches the adapter.
+Environment is part of the entry, in two fields. An `[env]` table holds literal values declared in the entry (e.g. the vendor home path). `env_passthrough` lists variable *names* read from the caller's environment at call time — values are never stored on disk, which is how API keys travel. Both are part of the daemon target key ("declared env"), so two entries with different env are two targets that cannot serve each other's traffic.
+
+The adapter's environment is constructed, not inherited — but not paranoid-empty either. Three layers reach it: a base system set (`HOME`, `PATH`, `USER`, `SHELL`, …), capability variables passed through from the caller (`SSH_AUTH_SOCK`, proxy and CA-certificate vars) so tools on PATH, proxies and ssh keep working, and the entry's declared env on top. The rest of the ambient environment never reaches the adapter. Capability variables are passed but not part of the target key — a long-lived daemon may hold the first caller's proxy or agent socket; stop the daemon when that must change.
+
+Entry TOMLs are trusted at the level of shell config: an adapter definition names the command acpc executes and the env delivered to it. Only place files you trust in `agents/`.
 
 ## Output contract
 
