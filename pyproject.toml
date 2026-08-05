@@ -1,0 +1,96 @@
+[project]
+name = "acpc"
+version = "0.3.0.dev2"
+description = "Thin Python CLI client for the Agent Client Protocol (ACP)"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Damian Pala", email = "noreply@damianpala.com" },
+]
+requires-python = ">=3.13"
+keywords = ["acp", "agent-client-protocol", "ai-agents", "claude", "codex", "gemini", "cli", "llm"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development",
+    "Topic :: Utilities",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+]
+dependencies = [
+    "agent-client-protocol>=0.11,<0.12",
+    "click>=8.1",
+]
+
+[project.urls]
+Repository = "https://github.com/DamianPala/acpc"
+Issues = "https://github.com/DamianPala/acpc/issues"
+
+[project.scripts]
+acpc = "acpc.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.10.10,<0.11.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "ruff",
+    "pyright",
+    "pytest>=8.0",
+    "pytest-timeout",
+    "pytest-xdist",
+]
+
+[tool.ruff]
+line-length = 100
+
+[tool.pyright]
+pythonVersion = "3.13"
+typeCheckingMode = "standard"
+venvPath = "."
+venv = ".venv"
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+timeout = 30
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+    "--tb=short",
+    "--capture=fd",
+    "-n", "4",
+]
+
+norecursedirs = [
+    ".git",
+    ".venv",
+    "__pycache__",
+    "build",
+    "dist",
+]
+
+[tool.bumpversion]
+current_version = "0.3.0.dev2"
+commit = true
+tag = true
+tag_name = "v{new_version}"
+commit_args = ""
+message = "chore(release): bump version {current_version} → {new_version}"
+
+[[tool.bumpversion.files]]
+filename = "pyproject.toml"
+search = '''name = "acpc"
+version = "{current_version}"'''
+replace = '''name = "acpc"
+version = "{new_version}"'''
