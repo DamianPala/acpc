@@ -1,0 +1,24 @@
+name = "Codex CLI"
+author = "OpenAI"
+command = "codex-acp"
+install_command = "npm install -g @agentclientprotocol/codex-acp"
+home = "~/.codex"
+home_env = "CODEX_HOME"
+env_passthrough = [
+    "CODEX_HOME",
+    "CODEX_PATH",
+    "CODEX_CONFIG",
+    "MODEL_PROVIDER",
+    "CODEX_API_KEY",
+    "OPENAI_API_KEY",
+    "INITIAL_AGENT_MODE",
+]
+# TODO(stage3): verify live bypass-mode support with the adapter.
+bypass_modes = []
+# TODO(stage3): verify live effort support with the adapter.
+efforts = []
+
+[presets]
+fast = { model = "gpt-5.6-luna", effort = "high" }
+standard = { model = "gpt-5.6-terra", effort = "xhigh" }
+max = { model = "gpt-5.6-sol", effort = "xhigh" }

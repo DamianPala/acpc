@@ -1,0 +1,29 @@
+name = "Claude Code"
+author = "Anthropic"
+command = "claude-agent-acp"
+install_command = "npm install -g @agentclientprotocol/claude-agent-acp"
+home = "~/.claude"
+home_env = "CLAUDE_CONFIG_DIR"
+env_passthrough = [
+    "CLAUDE_CONFIG_DIR",
+    "CLAUDE_CODE_EXECUTABLE",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_MODEL",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+    "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_GATEWAY",
+    "CLAUDE_CODE_USE_MANTLE",
+    "CLAUDE_CODE_USE_VERTEX",
+]
+bypass_modes = ["bypassPermissions"]
+# TODO(stage3): verify live effort support with the adapter.
+efforts = ["low", "medium", "high", "max"]
+
+[presets]
+fast = { model = "claude-haiku-4-5", effort = "high" }
+standard = { model = "claude-sonnet-5", effort = "high" }
+max = { model = "claude-opus-5", effort = "max" }
