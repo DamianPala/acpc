@@ -36,6 +36,14 @@ _PROBE_UPDATE_WAIT = 0.2
 _SENTENCE_END = re.compile(r"[.!?](?:\s|$)")
 
 
+Clock = Callable[[], float]
+
+
+def _resolve_clock(clock: Clock | None) -> Clock:
+    """Every time-dependent entry point takes a `clock`; this is its default."""
+    return time.time if clock is None else clock
+
+
 class ProbeError(RuntimeError):
     """A live adapter probe could not launch or authenticate."""
 
@@ -65,7 +73,7 @@ def refresh_advertised(
     agent: str,
     advertised: Mapping[str, Any],
     *,
-    now: float | Callable[[], float] | None = None,
+    clock: Clock | None = None,
 ) -> None:
     """Atomically publish an adapter's advertised modes, models and commands.
 
@@ -93,8 +101,7 @@ def refresh_advertised(
             return
 
         cache_root = paths.ensure_private_dir(_cache_path(agent))
-        cached_at = (time.time() if now is None else now()) if callable(now) or now is None else now
-        payload = {"cached_at": cached_at, "advertised": merged}
+        payload = {"cached_at": _resolve_clock(clock)(), "advertised": merged}
         paths.atomic_write(cache_root / _CACHE_FILE, payload)
 
         commands = payload["advertised"]["commands"]
@@ -139,10 +146,9 @@ def read_advertised(agent: str) -> CachedAdvertised | None:
         return None
 
 
-def cache_age(cached_at: float, *, now: float | Callable[[], float] | None = None) -> str:
-    """Format a human-readable cache age; ``now`` is injectable for tests."""
-    current = (time.time() if now is None else now()) if callable(now) or now is None else now
-    seconds = max(0, int(current - cached_at))
+def cache_age(cached_at: float, *, clock: Clock | None = None) -> str:
+    """Format a human-readable cache age; the clock is injectable for tests."""
+    seconds = max(0, int(_resolve_clock(clock)() - cached_at))
     if seconds < 60:
         return "now"
     if seconds < 3600:

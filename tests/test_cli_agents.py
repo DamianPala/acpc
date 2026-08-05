@@ -137,7 +137,7 @@ def test_models_overview_lists_variants(cli: CliRunner) -> None:
 
 
 def test_variant_models_view_delegates_to_parent_catalog(cli: CliRunner) -> None:
-    cache.refresh_advertised("mock", {"models": ["parent-model"]}, now=100.0)
+    cache.refresh_advertised("mock", {"models": ["parent-model"]}, clock=lambda: 100.0)
 
     result = invoke(cli, "agents", "builder", "--models")
 
@@ -149,7 +149,7 @@ def test_variant_commands_view_reads_parent_cache(cli: CliRunner) -> None:
     cache.refresh_advertised(
         "mock",
         {"commands": [{"name": "parent-command", "description": "From the parent."}]},
-        now=100.0,
+        clock=lambda: 100.0,
     )
 
     result = invoke(cli, "agents", "builder", "--commands")
@@ -171,7 +171,7 @@ def test_adapter_detail_caps_catalogs_at_three_items(cli: CliRunner) -> None:
                 {"name": "command-4", "description": "Four."},
             ],
         },
-        now=100.0,
+        clock=lambda: 100.0,
     )
 
     result = invoke(cli, "agents", "mock")

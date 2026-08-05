@@ -53,7 +53,7 @@ def test_refresh_writes_full_command_descriptions(state_root: Path) -> None:
 
 
 def test_cache_age_uses_the_injected_clock() -> None:
-    assert cache.cache_age(100.0, now=lambda: 7_300.0) == "2h"
+    assert cache.cache_age(100.0, clock=lambda: 7_300.0) == "2h"
 
 
 def test_empty_warm_turn_data_preserves_the_last_catalogs() -> None:
@@ -67,13 +67,13 @@ def test_empty_warm_turn_data_preserves_the_last_catalogs() -> None:
 
 def test_refresh_keeps_cached_at_when_advertised_data_is_unchanged(state_root: Path) -> None:
     advertised = {"models": ["same-model"]}
-    cache.refresh_advertised("mock", advertised, now=100.0)
+    cache.refresh_advertised("mock", advertised, clock=lambda: 100.0)
     first = cache.read_advertised("mock")
     assert first is not None
     cache_file = state_root / "cache" / "mock" / "advertised.json"
     first_bytes = cache_file.read_bytes()
 
-    cache.refresh_advertised("mock", advertised, now=200.0)
+    cache.refresh_advertised("mock", advertised, clock=lambda: 200.0)
 
     second = cache.read_advertised("mock")
     assert second is not None
