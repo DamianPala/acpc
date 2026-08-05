@@ -61,7 +61,12 @@ def commands_path(agent: str) -> Path:
     return _cache_path(agent) / "commands.md"
 
 
-def refresh_advertised(agent: str, advertised: Mapping[str, Any]) -> None:
+def refresh_advertised(
+    agent: str,
+    advertised: Mapping[str, Any],
+    *,
+    now: float | Callable[[], float] | None = None,
+) -> None:
     """Atomically publish an adapter's advertised modes, models and commands.
 
     This is called on the happy path of every turn.  The broad exception
@@ -69,8 +74,6 @@ def refresh_advertised(agent: str, advertised: Mapping[str, Any]) -> None:
     successful adapter answer into a failed session.
     """
     try:
-        cache_root = paths.ensure_private_dir(_cache_path(agent))
-        cached_at = time.time()
         previous = read_advertised(agent)
         previous_data = previous.advertised if previous is not None else {}
 
@@ -81,14 +84,17 @@ def refresh_advertised(agent: str, advertised: Mapping[str, Any]) -> None:
             saved = previous_data.get(name, [])
             return list(saved) if isinstance(saved, list) else []
 
-        payload = {
-            "cached_at": cached_at,
-            "advertised": {
-                "modes": catalog("modes"),
-                "models": catalog("models"),
-                "commands": catalog("commands"),
-            },
+        merged = {
+            "modes": catalog("modes"),
+            "models": catalog("models"),
+            "commands": catalog("commands"),
         }
+        if previous is not None and merged == previous.advertised:
+            return
+
+        cache_root = paths.ensure_private_dir(_cache_path(agent))
+        cached_at = (time.time() if now is None else now()) if callable(now) or now is None else now
+        payload = {"cached_at": cached_at, "advertised": merged}
         paths.atomic_write(cache_root / _CACHE_FILE, payload)
 
         commands = payload["advertised"]["commands"]

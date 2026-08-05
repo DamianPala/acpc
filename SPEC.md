@@ -56,7 +56,7 @@ Advertised data — modes, models, slash commands — is adapter-level (variants
 - It appears in the adapter's detail view only; a variant's view ends with a pointer instead of repeating the catalogs.
 - Advertised lists are capped in the adapter view (first 3 + count). Model lists are short and curated, so `--models` prints them in full. Commands can be 50+ with paragraph-length descriptions, so each truncates to its first sentence; complete text lives in the cache file the footer names.
 - `agents --models` without a name: cross-agent overview, variants collapsed to one line each.
-- All of it is cached and refreshed on every real run (ACP announces it only after session creation); on a cache miss — `agents <name>` before the first ever run — the live probe runs automatically instead of printing empty fields.
+- All of it is cached and refreshed on every real run (ACP announces it only after session creation); a run whose merged catalogs are unchanged leaves the cache file and its age untouched. On a cache miss — `agents <name>` before the first ever run — the live probe runs automatically instead of printing empty fields.
 - Every view that prints advertised data ends with one cache-age footer; views built from live state alone (the bare list, a variant's resolution) have none.
 
 ```

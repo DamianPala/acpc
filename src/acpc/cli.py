@@ -448,13 +448,13 @@ class _AgentsGroup(click.Group):
     ) -> tuple[str | None, click.Command | None, list[str]]:
         if args and not args[0].startswith("-") and args[0] not in self.commands:
             forwarded = list(args)
-            for parameter, flag in (
-                ("models", "--models"),
-                ("commands", "--commands"),
-                ("check_live", "--check"),
-                ("json_mode", "--json"),
-            ):
-                if ctx.params.get(parameter):
+            for parameter in self.params:
+                if not isinstance(parameter, click.Option) or not parameter.is_flag:
+                    continue
+                if parameter.name is None or not ctx.params.get(parameter.name):
+                    continue
+                flag = next((option for option in parameter.opts if option.startswith("--")), None)
+                if flag is not None:
                     forwarded.append(flag)
             return args[0], _agent_view_command, forwarded
         return super().resolve_command(ctx, args)
@@ -534,8 +534,6 @@ def _run_agents_view(
                     _write_stdout(text)
             else:
                 entry = registry.resolve(name)
-                if entry.is_variant:
-                    entry = registry.resolve(entry.base_adapter)
                 record = _ensure_cache(entry)
                 text, payload = _render_models(entry, record)
                 if json_mode:
@@ -547,8 +545,6 @@ def _run_agents_view(
             if name is None:
                 raise UsageProblem("--commands requires an agent name")
             entry = registry.resolve(name)
-            if entry.is_variant:
-                entry = registry.resolve(entry.base_adapter)
             record = _ensure_cache(entry)
             text, payload = _render_commands(entry, record)
             if json_mode:
