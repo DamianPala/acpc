@@ -154,7 +154,7 @@ acpc continue last "now apply the same fix to the v2 API"   # TTY only
 Plumbing, deliberately minimal. The daemon is a performance cache — it keeps adapters warm, nothing more.
 
 - **Auto-managed**: starts on first use, expires after an idle TTL (default `30m`, `daemon_ttl` in the global config; idle = no active sessions, so a detached session keeps its daemon alive). No `start`/`restart` verbs — `daemon stop <target>` plus the next run *is* the restart.
-- **Keyed per target** (agent + home + declared env — see *Agent variants*): one daemon serves any number of concurrent sessions on its target; different homes/providers are separate targets, so fan-out never serializes.
+- **Keyed per target** (agent + home + declared env — see *Agent variants*): one daemon serves its target's concurrent sessions up to `daemon_max_concurrent` (default 8; further runs queue and start when a slot opens, noted on stderr); different homes/providers are separate targets, so fan-out never serializes.
 - **Two uses**: a wedged or stale daemon (`daemon stop`), and debugging (`daemon status` prints PID, uptime and the per-target log path — the only place adapter stderr goes in daemon mode).
 - **`daemon stop` with active sessions** transitions them to `failed` with the reason recorded in meta — never orphans.
 - **Version skew self-heals**: a daemon that doesn't match the client version restarts itself on connect.
@@ -255,7 +255,7 @@ EOF
 |--------|---------|
 | prompt as arg, `-` (stdin), or `--prompt-file` | Heredoc/stdin for long prompts with quotes and backticks. Exactly one source — zero or two is a usage error naming the options; stdin is never read implicitly |
 | `--cwd <dir>` | Working directory of the callee. Long flag on purpose: `-C`/`-c` invites confusion with `continue` |
-| `--model <tier\|id>` | A tier (`fast`/`standard`/`max`, resolved through the preset table — presets are (model, effort) pairs) or a raw model ID from `agents <name> --models`. Explicit `--effort` overrides the preset's effort |
+| `--model <tier\|id>` | A tier (`fast`/`standard`/`max`, resolved through the adapter's preset table — see *Agent variants*) or a raw model ID from `agents <name> --models`. Explicit `--effort` overrides the preset's effort |
 | `--effort <level>` | Reasoning effort, orthogonal to `--model`. Superset scale (none/minimal/low/medium/high/xhigh/max/ultra) mapped per adapter; a level the resolved model doesn't support is a hard usage error listing the supported levels — never a silent fallback |
 | `--permissions all\|write\|read\|none\|prompt` | Approval policy for ACP permission requests (defined below). Default: agent entry if set, else `prompt` on a TTY and `read` otherwise; `--bg` counts as non-TTY here (see *TTY vs non-TTY*) |
 | `--mode <name>` | Callee's operating mode (ACP `session/set_mode`), vendor pass-through, adapter default if omitted. Behavioral hint; a mode that suppresses permission requests is rejected unless `--permissions all` (see below). Values via `agents` |
@@ -370,6 +370,15 @@ $ acpc run builder "implement the parser per SPEC.md"
 
 The `home` field is also the provider dimension: OpenAI vs OpenRouter vs a local endpoint is just a different vendor home (own config, own credentials). A variant is the named, permanent form; `--home` on `run` the one-off form.
 
+Presets are adapter-level: each adapter definition ships its `fast`/`standard`/`max` table of (model, effort) pairs — what `--model <tier>` resolves through and `agents <name> --models` prints. Overriding what a tier means uses the same mechanism as everything else — a `[presets]` table in a file under `agents/` for that adapter — never `config.toml`, so resolution stays inspectable with provenance like every other field. Tiers left out keep the adapter's shipped pair.
+
+```toml
+# ~/.acpc/agents/codex.toml — same override mechanism, aimed at the base adapter
+[presets]
+fast = { model = "gpt-5.6-luna", effort = "high" }
+max  = { model = "gpt-5.6-sol",  effort = "xhigh" }
+```
+
 Environment is part of the entry, in two fields. An `[env]` table holds literal values declared in the entry (e.g. the vendor home path). `env_passthrough` lists variable *names* read from the caller's environment at call time — values are never stored on disk, which is how API keys travel. Both are part of the daemon target key ("declared env"), so two entries with different env are two targets that cannot serve each other's traffic.
 
 The adapter's environment is constructed, not inherited — but not paranoid-empty either. Three layers reach it: a base system set (`HOME`, `PATH`, `USER`, `SHELL`, …), capability variables passed through from the caller (`SSH_AUTH_SOCK`, proxy and CA-certificate vars) so tools on PATH, proxies and ssh keep working, and the entry's declared env on top. The rest of the ambient environment never reaches the adapter. Capability variables are passed but not part of the target key — a long-lived daemon may hold the first caller's proxy or agent socket; stop the daemon when that must change.
@@ -418,7 +427,7 @@ File-based state is a feature: the agent can grep it, read fragments selectively
 
 ```
 ~/.acpc/                     # root; ACPC_HOME overrides it — deliberately the only env var acpc reads
-  config.toml                # the few global knobs (retention = "90d", daemon_ttl = "30m")
+  config.toml                # global knobs — the complete file just below
   agents/<name>.toml         # variant definitions — hand-editable; `agents init` is just a scaffold
   cache/<agent>/             # advertised models, modes, commands
   daemon/<target>.log        # adapter stderr, per target
@@ -428,6 +437,15 @@ File-based state is a feature: the agent can grep it, read fragments selectively
     transcript.ndjson        # full event stream (this is where "streaming" lives)
     answer.md                # final answer, latest turn; earlier turns: answer.<n>.md
 ```
+
+```toml
+# ~/.acpc/config.toml — the complete configuration surface, deliberately
+retention = "90d"           # auto-prune finished sessions older than this
+daemon_ttl = "30m"          # idle daemon lifetime
+daemon_max_concurrent = 8   # concurrent turns per daemon target
+```
+
+That is the whole file. Anything that changes a call's behavior lives in flags or agent entries (see *Anti-features*) — in particular, the adapter env pass-through list is not configurable here: extensions go through an entry's `env_passthrough`.
 
 - **`ACPC_HOME` ≠ `--home`**: the state root vs the vendor config dir a callee runs against — they share a word, nothing else.
 - **Owner-only**: 0700 dirs, 0600 files — prompts and transcripts routinely carry sensitive material.
