@@ -199,6 +199,47 @@ def test_continue_keeps_the_run_prompt_source_rules(cli: CliRunner) -> None:
     assert "exactly one prompt source" in result.stderr
 
 
+def test_run_stores_the_tty_resolved_permission_policy(cli: CliRunner) -> None:
+    session_id = start_session(cli)
+
+    stored = sessions.load(session_id).resolution["resolved"]["permissions"]["value"]
+
+    assert stored == "read"
+
+
+def _store_prompt_policy(session_id: str) -> None:
+    meta = sessions.load(session_id)
+    meta.resolution["resolved"]["permissions"]["value"] = "prompt"
+    with sessions.session_lock(session_id):
+        sessions.write_meta(meta)
+
+
+def test_continue_of_a_prompt_session_needs_a_terminal(cli: CliRunner) -> None:
+    session_id = start_session(cli)
+    _store_prompt_policy(session_id)
+
+    result = invoke(cli, "continue", session_id, "turn two")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert "needs a terminal to ask on" in result.stderr
+    assert "--bg" not in result.stderr
+
+
+def test_continue_of_a_prompt_session_rejects_bg_by_name(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from acpc import cli as cli_module
+
+    monkeypatch.setattr(cli_module, "_stdout_is_tty", lambda: True)
+    session_id = start_session(cli)
+    _store_prompt_policy(session_id)
+
+    result = invoke(cli, "continue", session_id, "turn two", "--bg")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert "--bg" in result.stderr
+
+
 def test_continue_last_is_rejected_without_a_tty(cli: CliRunner) -> None:
     start_session(cli)
 

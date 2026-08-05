@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -1212,11 +1213,13 @@ def run_command(
 
     policy = _resolve_permissions(permissions, resolution, tty=tty, background=background)
     _guard_bypass_mode(mode, policy, resolution)
+    # The TTY-resolved policy is part of the resolved invocation: meta.json
+    # stores everything --dry-run shows, and `continue` reuses it verbatim.
+    resolution = replace(resolution, permissions=policy)
     resolved_cwd = str(Path(cwd).expanduser().resolve()) if cwd else None
 
     if dry_run:
         payload = runner.resolution_payload(resolution, cwd=resolved_cwd)
-        payload["resolved"]["permissions"]["value"] = policy
         _emit_dry_run(payload, json_mode=json_mode)
         return
 
@@ -1256,8 +1259,6 @@ def run_command(
         timeout=timeout,
         permission_prompt=_tty_permission_prompt if policy == "prompt" else None,
     )
-    # The policy the TTY rules produced is what the client must enforce.
-    request = _with_policy(request, policy)
 
     if background:
         _dispatch_background(meta.session_id, request, json_mode=json_mode)
@@ -1325,16 +1326,6 @@ def _dispatch_background(session_id: str, request: runner.TurnRequest, *, json_m
         _write_stdout(json.dumps(payload, ensure_ascii=False) + "\n")
         return
     _write_stdout(f"{session_id}\n{sessions.session_dir(session_id)}\n")
-
-
-def _with_policy(request: runner.TurnRequest, policy: str) -> runner.TurnRequest:
-    """Return the request with the TTY-resolved permission policy applied."""
-    from dataclasses import replace
-
-    from acpc.registry import CallResolution as _CallResolution
-
-    resolution: _CallResolution = replace(request.resolution, permissions=policy)
-    return replace(request, resolution=resolution)
 
 
 @main.command(name="continue")
@@ -1408,11 +1399,18 @@ def continue_command(
             f"session {meta.session_id} is {meta.state} — wait for the current turn to finish"
         )
     stored_policy = meta.resolution.get("resolved", {}).get("permissions", {}).get("value")
-    continue_tty = _stdout_is_tty() and not background
-    if stored_policy == "prompt" and not continue_tty:
+    interactive = _stdout_is_tty() and not background
+    if stored_policy == "prompt" and not interactive:
+        # Same split as `run`: the two causes are different situations and
+        # "needs a terminal" is baffling advice to someone sitting at one.
+        cause = (
+            "cannot be continued with --bg, which returns before a request could be answered"
+            if background
+            else "needs a terminal to ask on"
+        )
         raise UsageProblem(
-            "this session uses --permissions prompt, which needs a TTY and cannot be used "
-            "with --bg; continue it from a terminal or start a read/write session"
+            f"this session uses --permissions prompt, which {cause}; "
+            "continue it from a terminal or start a new session with another policy"
         )
     try:
         request = runner.continue_request(
@@ -1420,12 +1418,7 @@ def continue_command(
             prompt,
             timeout=timeout,
             permission_prompt=(
-                _tty_permission_prompt
-                if meta.resolution.get("resolved", {}).get("permissions", {}).get("value")
-                == "prompt"
-                and _stdout_is_tty()
-                and continue_tty
-                else None
+                _tty_permission_prompt if stored_policy == "prompt" and interactive else None
             ),
         )
         rotated = sessions.rotate_turn(meta.session_id)
