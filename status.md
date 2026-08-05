@@ -2,9 +2,16 @@
 
 ## Now
 
-Stage 2 ready to launch: PLAN.md hardened after a fresh Opus review (4 blockers + 13 majors fixed), HANDOFF.md rewritten as the Stage 2 orchestrator boot doc. Next action: start the fresh Opus orchestrator session with HANDOFF.md.
+Stage 2, wave 2 in flight. Wave 1 (S01, S02, S03) is landed on `rewrite/0.3` and gated green: 211 tests, ruff + pyright clean, `./smoke.sh` exit 0 with all sections still pending (no slice in wave 1 owns a smoke section). S04 and S05 are dispatched in their own worktrees.
 
 ## Done
+
+- **Stage 2 wave 1 (2026-08-05):**
+  - **S02 — session store** (`11f6151`, Opus, tier max): `src/acpc/sessions.py` + 81 tests. Session dirs, `meta.json` under a per-session file lock, pinned id alphabet with collision re-roll via `mkdir` as the claim, turn rotation, name aliases with rebind/hard-error semantics, rm/prune primitives. Orphan detection persists on read and writes the placeholder `answer.md`; the 30 s grace covers only the window before a pid is recorded. Mutation-checked: disabling liveness verification (12 tests red), making the lock a no-op (1), gating orphan detection behind the grace (10), letting rotation clobber an earlier turn (1 — that guard was untested until a test was added to reach it).
+  - **S01 — config + registry** (`35a2fab`, Luna, 2 rounds): strict `config.toml` loader, `parse_duration` + `retention_seconds`/`daemon_ttl_seconds`, registry with nearest-wins inheritance, cycle/missing-base diagnostics, presets, effort validation, install status/executor, and the three shipped adapter TOMLs. Vendor facts copied verbatim from the donor; presets match SPEC's `agents --models` examples exactly; gemini ships presetless; `TODO(stage3)` on every guessed value.
+  - **S03 — transcript** (`b26be12`, Luna, 2 rounds): `Transcript` with `append`/`read`, versioned header, global index, torn-tail tolerance and repair, `since`/`tail` selection with `next_cursor`.
+  - **Review rounds:** both Luna slices were sent back once, for the same two problems. (1) Speculative API surface — S01 shipped 8 unused aliases/entry points, S03 shipped 9 names for 4 operations; the ground rules forbid this and both were cut to one name per operation. (2) A real defect each: S01 typed provenance as `Mapping[str, Path]` and used a fake `Path("<call>")` to mean "came from a flag" (replaced with `FieldSource(kind, path)`, which is what `--dry-run` and `agents <name>` actually need); S03's `append` re-read and re-parsed the whole transcript per event (O(N²) on the streaming path — restructured to scan once at open and track the index). Both fixed in round 2; no escalation to `--effort max` was needed.
+  - One reviewer fix applied directly rather than spending a third round: S01's duration error said "must be greater than zero" for any malformed value; it now names the actual value and the accepted syntax.
 
 - **Stage 2 prep (2026-08-05):**
   - Fresh Opus review of PLAN/HANDOFF/AGENTS vs SPEC/ARCHITECTURE. All findings fixed: smoke gates now passable in dispatch order (S08 snippet assertion via `--all`, long-lived prelude guarded on S09/S11 too, orphan kill isolated on the `loner` target), HANDOFF uses the dev1 CLI's real verbs (`run -s`, `status -s --tail`; no `continue`/`log`).
@@ -25,7 +32,7 @@ Stage 2 ready to launch: PLAN.md hardened after a fresh Opus review (4 blockers 
 
 ## Next
 
-- Stage 2: fresh Opus orchestrator session booted from HANDOFF.md; dispatch S01 per PLAN.md's order and gate rule.
+- Stage 2: wave 2 (S04 ∥ S05) through the gate, then the serial tail S06 → S08 → S09 → S07 → S10 → S11 → S12. S06 and S07 are Opus (tier max).
 - Stage 3: Fable — full smoke green, real-agent test, final review, landing (reset main, tag, reinstall, drop archive branch; nothing pushed).
 
 ## Decisions
@@ -34,3 +41,6 @@ Stage 2 ready to launch: PLAN.md hardened after a fresh Opus review (4 blockers 
 - 2026-08-05: daemon sockets/locks live in `daemon/` next to the per-target logs (spec names only the logs).
 - 2026-08-05: adapter definitions deliver `home` via a `home_env` field (delivery mechanism, not spec surface).
 - 2026-08-05: S07 (daemon) dispatches after S08/S09 — riskiest slice last among the core, everything else works on the direct path.
+- 2026-08-05: field provenance is `FieldSource(kind, path)` with `kind` ∈ `entry | adapter-default | call | default | unset`, not a bare file path. SPEC's own `agents <name>` examples label sources that have no file behind them (`(adapter default)`, `(default)`, `(unset)`) and `--dry-run` must name call-site flags, so a `Path` cannot carry the contract. Views render the label; the registry only supplies the data.
+- 2026-08-05: the transcript assumes a single writing process per session, which the per-session lock in `sessions.py` already guarantees (ARCHITECTURE decision 4). That is what lets `append` track the index in memory instead of re-parsing the file per event; readers still parse from disk, so another process's writes are always visible.
+- 2026-08-05: slices land on `rewrite/0.3` by cherry-pick, not merge — one commit per slice, no merge commits (the repo's commitlint hook rejects merge subjects anyway).
