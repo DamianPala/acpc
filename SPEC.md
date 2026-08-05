@@ -15,22 +15,22 @@ Small verb set. The whole mental model in one sentence:
 *"`run` blocks and prints the answer; `--bg` returns an ID; `status`/`log`/`wait`/`continue`/`stop` operate on that ID; everything is on disk under a predictable path."*
 
 ```
-run <agent> [prompt | -] [options]    # default: block, stdout = final answer
-continue <id> [prompt | -]            # follow-up in the same session context
+run <agent> (prompt | - | --prompt-file) [options]   # default: block, stdout = final answer
+continue <id> (prompt | - | --prompt-file)           # follow-up in the same session context
 status [id]                           # no id: list active + recent; with id: one session's vitals
 log <id> [--since CURSOR] [--tail N] [--wait-new]  # incremental transcript access
 wait <id> [--timeout S]               # block until done, print the answer
 stop <id>
-rm <id> | prune [--older-than D]      # session cleanup (auto-prune per config retention)
+rm <id> | prune [--older-than D] [--dry-run]   # session cleanup (auto-prune per config retention)
 agents [name] [--models|--commands|--check]   # adapters + variants; with name: resolved definition (cached)
 agents init <name> --extends <agent>  # scaffold a variant
 install <agent>                       # one-step fix for "not installed"
 daemon status|stop [target]           # plumbing escape hatch — never needed in the happy path
 ```
 
-`<id>` everywhere accepts a session id or a `--name` alias; `last` works too, but only on a TTY (see *TTY vs non-TTY*). Session ids are 4 lowercase characters from an alphabet without ambiguous glyphs (no `0`/`o`, `1`/`l`), re-rolled on collision — a local handle; the adapter's own long session id stays internal, mapped in `meta.json`.
+`<id>` everywhere accepts a session id or a `--name` alias; `last` works too, but only on a TTY (see *TTY vs non-TTY*). Session ids are 4 characters from a 32-glyph alphabet — lowercase letters and digits minus the ambiguous `0`/`o` and `1`/`l` — re-rolled on collision — a local handle; the adapter's own long session id stays internal, mapped in `meta.json`.
 
-90% of usage is `run codex "do X" --cwd /path/to/repo` and reading stdout. That path must be trivial; everything else is optional.
+90% of usage is `run codex "do X" --cwd /path/to/repo --permissions write` and reading stdout. That path must be trivial; everything else is optional.
 
 Command reference below is alphabetical. Sections open with their synopsis; `--json` applies uniformly (see *Output contract*) and is listed only where its semantics differ (`log`).
 
@@ -66,15 +66,18 @@ codex    Codex CLI (OpenAI)        installed
   builder    gpt-5.6-luna   xhigh  write  ~/.codex-openrouter
   explorer   gpt-5.6-luna   low    read   ~/.codex-openrouter
   planner    gpt-5.6-sol    xhigh  write  ~/.codex-openrouter
+  reviewer   gpt-5.6-sol    xhigh  read   ~/.codex-openrouter
 gemini   Gemini CLI (Google)       missing → acpc install gemini
 
 $ acpc agents builder           # what this entry resolves to
 extends      codex
+description  Implements a task against a plan; writes code and runs commands.
 model        gpt-5.6-luna (entry)
 effort       xhigh (entry)
 permissions  write (entry)
 home         ~/.codex-openrouter (entry)
-cwd          . (default)
+env          MODEL_PROVIDER=openrouter (entry) · passthrough: OPENROUTER_API_KEY
+-- modes/models/commands: acpc agents codex
 
 $ acpc agents codex --commands
 /init            Create an AGENTS.md file with instructions for Codex
@@ -91,8 +94,8 @@ effort       high (adapter default)
 permissions  prompt on TTY, read otherwise (unset)
 home         ~/.claude (default)
 modes        default · acceptEdits · plan · bypassPermissions
-models       9 · claude-opus-5 claude-sonnet-5 claude-haiku-4-5 …   (--models for all)
-commands     52 · /review /init /compact …          (--commands for all)
+models       4 · claude-opus-5 · claude-sonnet-5 · claude-haiku-4-5 · …   (--models for all)
+commands     52 · /review · /init · /compact · …          (--commands for all)
 variants     none
 -- cached 30m ago
 
@@ -115,6 +118,7 @@ codex
   variants  builder   gpt-5.6-luna    xhigh
             explorer  gpt-5.6-luna    low
             planner   gpt-5.6-sol     xhigh
+            reviewer  gpt-5.6-sol     xhigh
 claude
   presets   fast      claude-haiku-4-5   high
             standard  claude-sonnet-5    high
@@ -122,19 +126,19 @@ claude
   models    claude-opus-5 · claude-sonnet-5 · claude-haiku-4-5 · claude-opus-4-8
 -- cached: codex 2h ago · claude 30m ago
 
-$ acpc agents init builder --extends codex --model gpt-5.6 --effort xhigh
+$ acpc agents init builder --extends codex --model gpt-5.6-luna --effort xhigh
 ```
 
 ### `continue`
 
 ```
-continue <id> [prompt | -] [--prompt-file F] [-o FILE] [--bg] [--timeout S] [--max-output BYTES]
+continue <id> (prompt | - | --prompt-file F) [-o FILE] [--bg] [--timeout S] [--max-output BYTES] [--quiet]
 ```
 
 | Option | Purpose |
 |--------|---------|
 | prompt as arg, `-` (stdin), or `--prompt-file` | Exactly one source, as in `run` |
-| `-o` / `--bg` / `--timeout` / `--max-output` | As in `run` — same machinery, same semantics |
+| `-o` / `--bg` / `--timeout` / `--max-output` / `--quiet` | As in `run` — same machinery, same semantics |
 
 Follow-up turn in an existing session, full context preserved. The caller can send feedback on the callee's own work instead of restarting from scratch.
 
@@ -154,7 +158,8 @@ acpc continue last "now apply the same fix to the v2 API"   # TTY only
 Plumbing, deliberately minimal. The daemon is a performance cache — it keeps adapters warm, nothing more.
 
 - **Auto-managed**: starts on first use, expires after an idle TTL (default `30m`, `daemon_ttl` in the global config; idle = no active sessions, so a detached session keeps its daemon alive). No `start`/`restart` verbs — `daemon stop <target>` plus the next run *is* the restart.
-- **Keyed per target** (agent + home + declared env — see *Agent variants*): one daemon serves its target's concurrent sessions up to `daemon_max_concurrent` (default 8; further runs queue and start when a slot opens, noted on stderr); different homes/providers are separate targets, so fan-out never serializes.
+- **Keyed per target** (agent + home + declared env — see *Agent variants*): one daemon serves any number of sessions on its target; concurrent *turns* run up to `daemon_max_concurrent` (default 8; further turns queue and start when a slot opens, noted on stderr) — an idle or detached session holds no slot. Different homes/providers are separate targets, so fan-out never serializes.
+- **The `[target]` argument** to `daemon status`/`stop` is an agent or variant name and addresses every target under it; `daemon status` lists each concrete target with its log path.
 - **Two uses**: a wedged or stale daemon (`daemon stop`), and debugging (`daemon status` prints PID, uptime and the per-target log path — the only place adapter stderr goes in daemon mode).
 - **`daemon stop` with active sessions** transitions them to `failed` with the reason recorded in meta — never orphans.
 - **Version skew self-heals**: a daemon that doesn't match the client version restarts itself on connect.
@@ -186,18 +191,18 @@ log <id> [--since CURSOR] [--tail N] [--prose] [--json] [--max-output BYTES] [--
 | (default) | Last 20 events, condensed — the progress view: "what is it doing" |
 | `--since CURSOR` | Only events after the cursor, never re-emitted; combinable with `--tail` |
 | `--tail N` | Just the last N of the selected events |
-| `--prose` | The content view: "what is it thinking/writing" — agent messages only, untruncated, no tool lines; agents write markdown natively, so this reads as clean markdown. The event window (`--since`/`--tail`, default last 20) selects; `--prose` only renders — a full-history dump is always an explicit `--since 0` |
+| `--prose` | The content view: "what is it thinking/writing" — agent messages only, untruncated, no tool lines; agents write markdown natively, so this reads as clean markdown. The event window (`--since`/`--tail`) selects; `--prose` only renders — a full-history dump is always an explicit `--since 0` |
 | `--json` | Raw transcript events for `jq`, each carrying its index; not for reading — lossless inspection is `transcript.ndjson` itself. With `--prose` a usage error — one view per call |
-| `--max-output <bytes>` | As in `run` (default 128 KiB, 0 disables), but applied at event granularity: whole events until the budget, then a marker line naming `transcript.ndjson`. The footer cursor covers only what was printed, so a poller never skips content; a single over-budget event is the exception — head + marker, cursor advances past it |
+| `--max-output <bytes>` | As in `run` (default 128 KiB, 0 disables), but applied at event granularity: whole events until the budget, then a marker line naming `transcript.ndjson`. The footer cursor covers only what was printed, so a poller never skips content; a single over-budget event is the exception — head + marker, cursor advances past it. With `--json` the stream stays valid NDJSON: truncation appears as a final typed `truncated` event naming `transcript.ndjson`, never a bare marker line |
 | `--wait-new [--timeout S]` | Long-poll: block until new events appear or the timeout expires (exit 124); without `--timeout` it blocks indefinitely. Waits for *activity* (vs `wait` for completion) — enables mid-run intervention, e.g. `stop` an agent that drifted off task |
 | `--quiet` | Suppress the stderr footer, as in `run` |
 
-One chronological stream, tool calls and agent prose interleaved — the sequence is the causal narrative. Events are condensed one-liners: tool call with arg summary, result status, duration; agent message as a 200-char snippet + length; permission requests; errors; state changes. Errors are never filtered and never truncated — in every view, including `--prose`. Full content stays in `transcript.ndjson`.
+One chronological stream, tool calls and agent prose interleaved — the sequence is the causal narrative. Events are condensed one-liners: tool call with arg summary, result status, duration; agent message as a 200-char snippet + length; permission requests; errors; state changes. Errors are never filtered — in every view; in `--prose` they keep their condensed `[time] error …` line form amid the markdown. Nor are they truncated, with one exception: `--max-output` may head-truncate a single over-budget event, errors included — the budget wins. Full content stays in `transcript.ndjson`.
 
 ```
 $ acpc log x7k2 --since 42
 [12:01:05] tool  Bash "pytest -x" → exit 1 (2.3s)
-[12:01:20] msg   "Tests fail because the fixture assumes..." (1 240 chars)
+[12:01:20] msg   "Tests fail because the fixture assumes..." (280 chars)
 [12:02:10] error permission denied: write outside cwd
 -- running 3m12s | 45 events | cursor: 45
 
@@ -208,10 +213,12 @@ Tests fail because the fixture assumes a clean database. Two options:
 2. Wrap each test in a transaction and roll back.
 
 Going with 2; `test_auth` needs its own fixture either way.
+
+[12:02:10] error permission denied: write outside cwd
 -- running 3m12s | 45 events | cursor: 45
 ```
 
-- **Footer doubles as status**: state, runtime, event count, new cursor. It goes to **stderr** (prefixed `--`, like the run summary): stdout stays pure transcript content, so `log --prose > file.md` yields clean markdown, while an agent caller still sees the cursor — harnesses merge the streams. Agent prose can itself contain `--`-prefixed lines, so stream, not prefix, is what separates content from metadata.
+- **Footer doubles as status**: state and runtime, event count, new cursor; a finished footer swaps the event count for exit code, tokens and the answer path. Footers separate unlike segments with `|`, peer items with `·`. It goes to **stderr** (prefixed `--`, like the run summary): stdout stays pure transcript content, so `log --prose > file.md` yields clean markdown, while an agent caller still sees the cursor — harnesses merge the streams. Agent prose can itself contain `--`-prefixed lines, so stream, not prefix, is what separates content from metadata.
 - **Cursor = event number, stateless.** The caller carries the cursor; two pollers on one session cannot corrupt each other. The index is global across views — `--prose` and the default share one cursor space.
 - **Finished session**: same output, footer becomes `-- done exit 0 | 3m12s | 41k tok | answer: <path> | cursor: 45` — duration and tokens/cost included, because a `--bg` caller never sees the stderr summary; the cursor stays, so a poller's final call needs no special casing. When the state is `failed`, `timeout` or `orphaned`, the last agent message prints in full — it usually contains the reason.
 
@@ -245,7 +252,13 @@ acpc rm x7k2
 Dispatch one agent. Blocks, prints the final answer on stdout, exits with a meaningful code. `--bg` returns a session ID immediately instead.
 
 ```
-acpc run codex "fix the failing test in tests/test_auth.py" --cwd ~/repo
+run <agent> (prompt | - | --prompt-file F) [--cwd DIR] [--model M] [--effort E] [--permissions P]
+    [--mode M] [--home DIR] [-o FILE] [--bg] [--timeout S] [--name ALIAS] [--dry-run]
+    [--max-output BYTES] [--quiet] [--json]
+```
+
+```
+acpc run codex "fix the failing test in tests/test_auth.py" --cwd ~/repo --permissions write
 acpc run claude - --bg --name researcher --effort high <<'EOF'
 Research X. Write findings to ./findings.md.
 EOF
@@ -264,7 +277,7 @@ EOF
 | `--bg` | Return immediately with session ID + session dir path. With `-o`, the file is written when the session finishes |
 | `--timeout <s>` | Cancels the session on expiry (state `timeout`, exit 124). No default — wall-clock limits belong to the calling harness |
 | `--name <alias>` | Human-typeable handle for `continue`/`status`/`log`. Reusing a name rebinds it to the new session with a warning — hard error while the old session is `running`. `last` is reserved |
-| `--dry-run` | Print what this call would resolve to (model, effort, permissions, cwd — and where each value came from), then exit |
+| `--dry-run` | Print what this call would resolve to (model, effort, permissions, home, declared env, cwd — and where each value came from), then exit |
 | `--max-output <bytes>` | Cap on stdout bytes (default 128 KiB, 0 disables). Truncation keeps the head, cuts on a UTF-8 boundary, and ends with a marker line naming the full answer path. The marker sits at the tail, which some harness previews clip — the stderr summary repeats the session dir, so the path always survives. Shapes stdout only: `-o` files and `answer.md` are always complete. With `--json`, truncation applies to the `answer` field and sets `truncated: true`; the envelope is always valid JSON |
 | `--quiet` | Suppress the stderr summary line (see *Output contract*) |
 
@@ -276,7 +289,7 @@ EOF
 - `none` — deny every request
 - `prompt` — read kinds auto-allowed; everything else asks the human on `/dev/tty`
 
-Unknown kinds are denied under everything but `all`; denials appear in `log`. `read` and `write` answer with `allow_once` only — `allow_always` is reserved to `all`. Where the model's edges are:
+Unknown kinds are denied under `read`, `write` and `none`, asked under `prompt`, allowed under `all`; denials appear in `log`. `read` and `write` answer with `allow_once` only — `allow_always` is reserved to `all`. Where the model's edges are:
 
 - **The non-TTY default is a silent read-only trap**: a caller that neither passes `--permissions` nor runs an entry with a permission default gets a read-only callee — writes are denied without an error, the turn ends normally, exit 0, nothing changed. Pass `--permissions write` (or `all`) whenever the task is supposed to modify anything.
 - **`execute` subsumes `delete`/`move`** in practice — excluding those kinds only constrains adapters that classify honestly.
@@ -299,7 +312,7 @@ status [id] [--all]
 |--------|---------|
 | `--all` | Every session, not just running + the 5 most recent finished; with an id it's a usage error |
 
-Without id: one line per session — id, the entry it ran on (variant or adapter), state, runtime, name, prompt snippet (five backgrounded codex runs must not look identical). Defaults to all running + the 5 most recent finished; `--all` for everything.
+Without id: one line per session — id, the entry it ran on (variant or adapter), state, runtime, name, prompt snippet (five backgrounded codex runs must not look identical). Defaults to all running + the 5 most recent finished.
 
 With id: one session's vitals — state (exit code once finished), runtime, tokens/cost so far (cumulative across the session's turns), the entry with its base adapter, name, session dir and answer path.
 
@@ -307,16 +320,16 @@ A pulse, not a dump: reads `meta.json` + process liveness, never the transcript 
 
 ```
 $ acpc status
-x7k2  codex     running  3m12s   researcher   "Research X and write findings to ./findings…"
-p9d4  claude    running  0m41s   ·            "Fix the failing test in tests/test_auth.py"
-kq81  reviewer  done     12m40s  spec-review  "Review the diff against the spec and report…"
+x7k2  codex     running  3m12s   ·            "Fix the failing test in tests/test_auth.py"
+p9d4  claude    running  0m41s   researcher   "Research X and write findings to ./findings…"
+kq8w  reviewer  done     12m40s  spec-review  "Review the diff against the spec and report…"
 b3nn  codex     failed   2m05s   ·            "Summarize the repository changes"
 m2w7  claude    done     8m19s   docs         "Update the README quick-start for the new CLI"
-ze1a  codex     timeout  30m00s  ·            "Migrate the config loader to TOML and run the…"
+ze6a  codex     timeout  30m00s  ·            "Migrate the config loader to TOML and run the…"
 q4hf  builder   done     22m03s  ·            "Implement the session lock and its tests per…"
 -- 2 running · 5 recent · --all for all 17
 
-$ acpc status kq81
+$ acpc status kq8w
 state    done · exit 0 · 12m40s · 41k tok
 agent    reviewer (codex) · name: spec-review
 dir      ~/.acpc/sessions/kq81 · answer: answer.md
@@ -333,13 +346,13 @@ acpc stop x7k2
 ### `wait`
 
 ```
-wait <id> [--timeout S] [-o FILE] [--max-output BYTES]
+wait <id> [--timeout S] [-o FILE] [--max-output BYTES] [--quiet]
 ```
 
 | Option | Purpose |
 |--------|---------|
 | `--timeout <s>` | Stops *waiting* only (exit 124): the session keeps running, unlike `run --timeout`, which cancels it |
-| `-o` / `--max-output` | As in `run` — `wait` prints an answer, so it shapes it the same way |
+| `-o` / `--max-output` / `--quiet` | As in `run` — `wait` prints an answer, so it shapes it the same way |
 
 Block until a background session finishes, then print its answer; exit code mirrors the session result. On an already-finished session it returns immediately — the free way to reprint an answer.
 
@@ -359,7 +372,7 @@ model = "gpt-5.6-luna"
 effort = "xhigh"
 permissions = "write"
 home = "~/.codex-openrouter"
-env_passthrough = ["OPENROUTER_API_KEY"]   # names read from the caller's env at call time, never stored
+env_passthrough = ["OPENROUTER_API_KEY"]   # names read from the caller's env at call time
 
 [env]                                      # literal values declared in the entry
 MODEL_PROVIDER = "openrouter"
@@ -379,16 +392,16 @@ fast = { model = "gpt-5.6-luna", effort = "high" }
 max  = { model = "gpt-5.6-sol",  effort = "xhigh" }
 ```
 
-Environment is part of the entry, in two fields. An `[env]` table holds literal values declared in the entry (e.g. the vendor home path). `env_passthrough` lists variable *names* read from the caller's environment at call time — values are never stored on disk, which is how API keys travel. Both are part of the daemon target key ("declared env"), so two entries with different env are two targets that cannot serve each other's traffic.
+Environment is part of the entry, in two fields. An `[env]` table holds literal values declared in the entry (e.g. the vendor home path). `env_passthrough` lists variable *names* read from the caller's environment at call time — values are never stored on disk, which is how API keys travel. Both feed the daemon target key ("declared env"): `[env]` by name and value, `env_passthrough` by name *and the value read at call time* — hashed into the key, still never stored — so two entries with different env, or two callers holding different credentials, are separate targets that cannot serve each other's traffic (nobody silently rides on the first caller's API key).
 
-The adapter's environment is constructed, not inherited — but not paranoid-empty either. Three layers reach it: a base system set (`HOME`, `PATH`, `USER`, `SHELL`, …), capability variables passed through from the caller (`SSH_AUTH_SOCK`, proxy and CA-certificate vars) so tools on PATH, proxies and ssh keep working, and the entry's declared env on top. The rest of the ambient environment never reaches the adapter. Capability variables are passed but not part of the target key — a long-lived daemon may hold the first caller's proxy or agent socket; stop the daemon when that must change.
+The adapter's environment is constructed, not inherited — but not paranoid-empty either. Three layers reach it: a base system set (`HOME`, `PATH`, `USER`, `LOGNAME`, `SHELL`), capability variables passed through from the caller (`SSH_AUTH_SOCK`; `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` in both cases; `SSL_CERT_FILE`, `SSL_CERT_DIR`, `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`) so tools on PATH, proxies and ssh keep working, and the entry's declared env on top. The rest of the ambient environment never reaches the adapter. Capability variables are passed but not part of the target key — a long-lived daemon may hold the first caller's proxy or agent socket; stop the daemon when that must change.
 
 Entry TOMLs are trusted at the level of shell config: an adapter definition names the command acpc executes and the env delivered to it. Only place files you trust in `agents/`.
 
 ## Output contract
 
 - **stdout carries exactly one thing, chosen by flags**: the answer (default), a short confirmation (`-o`), a JSON envelope (`--json`), a session ID + dir path (`--bg`). Never spinners, ANSI, logs or diagnostics — those go to stderr or the session log file.
-- **"The answer" is defined**: the turn's ACP agent-message content, chunks concatenated in stream order; thought chunks and tool output excluded; markdown passed through verbatim. Narration interleaved between tool calls is part of it — never silently dropped. stdout and `answer.md` carry identical bytes; per turn, it equals what `log --prose` shows.
+- **"The answer" is defined**: the turn's ACP agent-message content, chunks concatenated in stream order; thought chunks and tool output excluded; markdown passed through verbatim. Narration interleaved between tool calls is part of it — never silently dropped. stdout and `answer.md` carry identical bytes; for a single-turn session, `log --prose --since 0` renders the same content.
 - **Fixed exit codes** (Unix conventions; finer-grained ACP `stop_reason` lives in `meta.json` and the `--json` envelope):
 
   | Code | Meaning |
@@ -411,12 +424,12 @@ Entry TOMLs are trusted at the level of shell config: an adapter definition name
 
 ## TTY vs non-TTY
 
-Behavior differs between a human at a terminal and an agent behind a shell tool in exactly these places. "TTY" means `isatty` on stdout.
+Behavior differs between a human at a terminal and an agent behind a shell tool in exactly these places. "TTY" means `isatty` on stdout. Redirection flips it: a human running `acpc run … > out.md` is non-TTY and gets the `read` default.
 
 | | TTY (human) | non-TTY (agent) |
 |---|-------------|-----------------|
 | `--permissions` default | `prompt` | `read` |
-| Permission prompting | asks on `/dev/tty` | never; out-of-policy → denied. Explicit `--permissions prompt` is a usage error (exit 2), not a silent downgrade |
+| Permission prompting | asks on `/dev/tty` | never; out-of-policy → denied. A `prompt` policy — from the explicit flag or an entry's `permissions` — is a usage error (exit 2), not a silent downgrade |
 | `last` selector | works | rejected — a stale "last" misleads an agent; name sessions explicitly |
 
 `--bg` counts as non-TTY for permissions regardless of the terminal: once the client has returned, a prompt could never be answered — so the default is `read`, and explicit `--permissions prompt --bg` is the same usage error.
@@ -426,11 +439,11 @@ Behavior differs between a human at a terminal and an agent behind a shell tool 
 File-based state is a feature: the agent can grep it, read fragments selectively, and doesn't depend on the tool's own commands to inspect anything.
 
 ```
-~/.acpc/                     # root; ACPC_HOME overrides it — deliberately the only env var acpc reads
+~/.acpc/                     # root; ACPC_HOME overrides it — the only env var that configures acpc itself
   config.toml                # global knobs — the complete file just below
-  agents/<name>.toml         # variant definitions — hand-editable; `agents init` is just a scaffold
+  agents/<name>.toml         # variants, adapter overrides, new adapters — hand-editable; `agents init` is just a scaffold
   cache/<agent>/             # advertised models, modes, commands
-  daemon/<target>.log        # adapter stderr, per target
+  daemon/<entry>-<hash>.log  # adapter stderr, one file per concrete target
   sessions/<id>/
     meta.json                # full resolved invocation (everything --dry-run shows) + state, timing, tokens/cost, exit code, stop_reason, prompt snippet, adapter session id
     prompt.md                # the prompt as sent, latest turn; earlier turns: prompt.<n>.md
@@ -447,6 +460,7 @@ daemon_max_concurrent = 8   # concurrent turns per daemon target
 
 That is the whole file. Anything that changes a call's behavior lives in flags or agent entries (see *Anti-features*) — in particular, the adapter env pass-through list is not configurable here: extensions go through an entry's `env_passthrough`.
 
+- **Adapter definitions are TOMLs shipped in the package**, one per adapter — the full contract: `command`, `install_command`, default `home`, the bypass-mode list, `[presets]`, supported effort levels, `env_passthrough`. A user file in `agents/` with `extends` is a variant; under an adapter's own name it overrides that adapter's fields (e.g. `[presets]`); with a `command` and no `extends` it defines a new adapter. All at the trust level *Agent variants* states.
 - **`ACPC_HOME` ≠ `--home`**: the state root vs the vendor config dir a callee runs against — they share a word, nothing else.
 - **Owner-only**: 0700 dirs, 0600 files — prompts and transcripts routinely carry sensitive material.
 - **No torn reads**: `meta.json` is replaced atomically, `transcript.ndjson` grows by whole lines only, `cache/` files and `-o` targets are written atomically too — a mid-write reader never sees garbage. A per-session lock serializes turns, so `run`, `continue` and `stop` on one session never interleave.
@@ -466,14 +480,14 @@ running → orphaned              # process behind it died; detected on any stat
 - **Detected transitions are persisted**: whichever command observes the dead process writes `orphaned` back to `meta.json` (atomic replace, under the session lock), so later readers agree without re-probing.
 - **30s startup grace** from `started_at`: below it, a session with no live process still counts as `starting` — the process may not have recorded its pid yet — never a false `orphaned`.
 - **`orphaned` counts as finished**: `continue` resumes it through `session/load`, `rm` and `prune` delete it, `wait` returns immediately with exit 1 and the reason.
-- **Who accepts what**: `stop` acts on `starting`/`running`, is a no-op on finished states, errors on unknown IDs. `continue` accepts any finished state, errors on `running`. `wait`/`log`/`status` accept everything.
+- **Who accepts what**: `stop` acts on `starting`/`running`, is a no-op on finished states, errors on unknown IDs. `continue` accepts any finished state, errors on `running`. `rm` errors on `starting`/`running`; `prune` never touches them. `wait`/`log`/`status` accept everything.
 
 ## `--help` as first-contact documentation
 
 The recommended primary channel for usage docs is a short snippet in the caller's own context (AGENTS.md or a skill) — but the tool cannot assume it's there, so `--help` is the self-contained fallback. Two levels, one source:
 
-- **`acpc --help`** — the cheat sheet, ≤100 lines: canonical examples grouped by task (sync run, bg run + wait, continue, status/log polling, heredoc prompt), complete for the 90% path on its own; ends with a flag → ACP mapping table, 3-4 lines (`--mode` → `session/set_mode`, `--permissions` → `request_permission`, …).
-- **`acpc <cmd> --help`** — progressive disclosure: that command's full reference — synopsis, options table, semantics, one example. Generated from this spec's command section, one source, so help and contract cannot drift.
+- **`acpc --help`** — the cheat sheet, ≤100 lines: canonical examples grouped by task (sync run, bg run + wait, continue, status/log polling, heredoc prompt; write-task examples carry `--permissions write`), complete for the 90% path on its own; ends with a flag → ACP mapping table, 3-4 lines (`--mode` → `session/set_mode`, `--permissions` → `request_permission`, …).
+- **`acpc <cmd> --help`** — progressive disclosure: that command's full reference — synopsis, options table, semantics, one example.
 - **No stub pages**: a command whose full reference wouldn't exceed its cheat-sheet entry (`stop`, `rm`, `install`) prints the root page instead.
 - `--help`/`-h` and `--version`/`-V` both accepted.
 
@@ -484,5 +498,5 @@ Out of scope — none of these deliver value to an agent caller:
 - **TUI, colors, spinners.** The caller never sees them.
 - **Built-in orchestration** (pipelines, DAGs, agent teams). The caller *is* the orchestrator; loops, retries and fan-out happen in its shell.
 - **Terminal streaming as a primary mode.** Append to the transcript file; the terminal shows the final answer.
-- **Rich configuration system.** Anything important is a flag — flags are visible in `--help`, config state is not. `config.toml` holds housekeeping knobs only (retention), never anything that changes a call's behavior.
+- **Rich configuration system.** Anything important is a flag — flags are visible in `--help`, config state is not. `config.toml` holds housekeeping knobs only (retention, daemon TTL and capacity), never anything that changes a call's behavior.
 - **MCP server wrapping.** A plain CLI via shell is cheaper in context, standard, composable.
