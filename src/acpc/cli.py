@@ -5,10 +5,13 @@ parsing, usage errors (exit 2), the TTY rules and the fixed exit codes, and
 delegates everything else to the layer that owns it.
 """
 
+import asyncio
 import json
 import os
+import subprocess
 import sys
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -16,16 +19,18 @@ import click
 
 from acpc import (
     __version__,
+    cache,
     config,
     daemon_client,
     output,
+    paths,
     render,
     runner,
     sessions,
     transcript,
     vocab,
 )
-from acpc.registry import AgentRegistry, CallResolution, RegistryError
+from acpc.registry import AgentRegistry, CallResolution, FieldSource, RegistryError, ResolvedEntry
 
 
 class UsageProblem(click.ClickException):
@@ -157,6 +162,613 @@ def _write_stdout(text: str) -> None:
         devnull = os.open(os.devnull, os.O_WRONLY)
         os.dup2(devnull, sys.stdout.fileno())
         sys.exit(vocab.EXIT_SIGPIPE)
+
+
+def _display_home(value: str | None) -> str:
+    """Render a vendor home in the copy-pastable form used by ``agents``."""
+    if value is None:
+        return "·"
+    expanded = Path(value).expanduser()
+    try:
+        relative = expanded.relative_to(Path.home())
+    except ValueError:
+        return value
+    return "~" if not relative.parts else str(Path("~") / relative)
+
+
+def _display_path(value: Path) -> str:
+    try:
+        relative = value.expanduser().relative_to(Path.home())
+    except ValueError:
+        return str(value)
+    return "~" if not relative.parts else str(Path("~") / relative)
+
+
+def _source_text(source: FieldSource | None) -> str:
+    if source is None:
+        return "unset"
+    if source.kind == "adapter-default":
+        return "adapter default"
+    if source.kind == "default":
+        return "default"
+    if source.kind == "unset":
+        return "unset"
+    if source.kind == "call":
+        return "call"
+    return "entry"
+
+
+def _local_variant_value(entry: ResolvedEntry, field: str) -> str | None:
+    """Return a variant field only when that variant directly defines it."""
+    source = entry.provenance.get(field)
+    if source is None or source.kind != "entry" or source.path is None:
+        return None
+    if source.path.stem != entry.entry:
+        return None
+    value = getattr(entry, field)
+    if value is None:
+        return None
+    return _display_home(value) if field == "home" else str(value)
+
+
+def _agent_row(entry: ResolvedEntry) -> str:
+    status = entry.install_status
+    if status == "missing":
+        status = f"missing → acpc install {entry.entry}"
+    return f"{entry.entry:<12} {entry.name:<28} {status}"
+
+
+def _variant_row(entry: ResolvedEntry) -> str:
+    values = {
+        field: _local_variant_value(entry, field)
+        for field in ("model", "effort", "permissions", "home")
+    }
+    return (
+        f"  {entry.entry:<12} {values['model'] or '·':<20} "
+        f"{values['effort'] or '·':<8} {values['permissions'] or '·':<12} "
+        f"{values['home'] or '·'}"
+    )
+
+
+def _agent_list_payload(registry: AgentRegistry) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    for adapter in registry.adapters:
+        rows.append(
+            {
+                "name": adapter.entry,
+                "kind": "adapter",
+                "display_name": adapter.name,
+                "status": adapter.install_status,
+            }
+        )
+        for variant in registry.variants:
+            if variant.base_adapter != adapter.entry:
+                continue
+            rows.append(
+                {
+                    "name": variant.entry,
+                    "kind": "variant",
+                    "base_adapter": variant.base_adapter,
+                    "model": _local_variant_value(variant, "model"),
+                    "effort": _local_variant_value(variant, "effort"),
+                    "permissions": _local_variant_value(variant, "permissions"),
+                    "home": _local_variant_value(variant, "home"),
+                }
+            )
+    return {"agents": rows}
+
+
+def _cache_footer(record: cache.CachedAdvertised | None) -> str:
+    if record is None:
+        return "-- cached never"
+    age = cache.cache_age(record.cached_at)
+    return "-- cached now" if age == "now" else f"-- cached {age} ago"
+
+
+def _commands_footer(
+    adapter: str, commands: list[Mapping[str, Any]], record: cache.CachedAdvertised | None
+) -> str:
+    age = "never" if record is None else cache.cache_age(record.cached_at)
+    age_text = "now" if age == "now" else f"{age} ago"
+    command_file = _display_path(cache.commands_path(adapter))
+    return f"-- {len(commands)} commands (cached {age_text}) | full descriptions: {command_file}"
+
+
+def _command_name(value: Mapping[str, Any]) -> str:
+    name = value.get("name", "")
+    return f"/{name.lstrip('/')}" if isinstance(name, str) else "/"
+
+
+def _mode_name(value: Any) -> str:
+    if isinstance(value, Mapping):
+        candidate = value.get("id", value.get("name", ""))
+    else:
+        candidate = value
+    return str(candidate)
+
+
+def _advertised_payload(record: cache.CachedAdvertised | None) -> dict[str, Any]:
+    if record is None:
+        return {"modes": [], "models": [], "commands": []}
+    return record.advertised
+
+
+def _ensure_cache(entry: ResolvedEntry) -> cache.CachedAdvertised:
+    """Return an adapter cache, probing installed adapters on a miss."""
+    record = cache.read_advertised(entry.base_adapter)
+    if record is not None:
+        return record
+    if not entry.installed:
+        raise cache.ProbeError(
+            f"{entry.entry}: '{entry.command_head}' is not installed — "
+            f"run 'acpc install {entry.base_adapter}'"
+        )
+    advertised = asyncio.run(cache.probe_advertised(entry.resolve_call()))
+    refreshed = cache.read_advertised(entry.base_adapter)
+    return refreshed or cache.CachedAdvertised(advertised=advertised, cached_at=time.time())
+
+
+def _render_advertised_detail(
+    entry: ResolvedEntry, record: cache.CachedAdvertised | None
+) -> tuple[str, dict[str, Any]]:
+    advertised = _advertised_payload(record)
+    modes = [_mode_name(item) for item in advertised.get("modes", [])]
+    models = [str(item) for item in advertised.get("models", [])]
+    commands = [item for item in advertised.get("commands", []) if isinstance(item, Mapping)]
+    visible_modes = modes if len(modes) <= 4 else [*modes[:3], "…"]
+    visible_models = models[:3] + (["…"] if len(models) > 3 else [])
+    visible_commands = [_command_name(item) for item in commands[:3]]
+    if len(commands) > 3:
+        visible_commands.append("…")
+    lines = [
+        f"modes        {len(modes)} · {' · '.join(visible_modes) if visible_modes else '·'}",
+        f"models       {len(models)} · {' · '.join(visible_models) if visible_models else '·'}",
+        f"commands     {len(commands)} · {' · '.join(visible_commands) if visible_commands else '·'}",
+        _cache_footer(record),
+    ]
+    payload = {
+        "advertised": {
+            "modes": modes,
+            "models": models,
+            "commands": [dict(item) for item in commands],
+        }
+    }
+    return "\n".join(lines) + "\n", payload
+
+
+def _render_entry_detail(
+    registry: AgentRegistry, entry: ResolvedEntry
+) -> tuple[str, dict[str, Any], str | None]:
+    resolution = registry.resolve_call(entry.entry)
+    lines: list[str] = []
+    if entry.is_variant:
+        lines.append(f"extends      {entry.extends}")
+    else:
+        lines.append(f"adapter      {entry.name} · {entry.install_status} · {entry.command_head}")
+    if entry.description is not None:
+        lines.append(f"description  {entry.description}")
+
+    resolved_values = {
+        "model": resolution.model,
+        "effort": resolution.effort,
+        "permissions": resolution.permissions,
+        "home": resolution.home,
+    }
+    for field, value in resolved_values.items():
+        if field == "home":
+            rendered = _display_home(value)
+        elif field == "permissions" and value is None:
+            rendered = "prompt on TTY, read otherwise"
+        else:
+            rendered = "·" if value is None else str(value)
+        rendered_source = _source_text(resolution.provenance.get(field))
+        lines.append(f"{field:<12} {rendered} ({rendered_source})")
+
+    declared = [f"{key}={value}" for key, value in entry.env.items()]
+    env_text = " · ".join(declared) if declared else "·"
+    env_source = _source_text(entry.provenance.get("env"))
+    if entry.env_passthrough:
+        env_text += f" ({env_source}) · passthrough: {' · '.join(entry.env_passthrough)}"
+    else:
+        env_text += f" ({env_source})"
+    lines.append(f"env          {env_text}")
+    if not entry.is_variant:
+        variants = [item.entry for item in registry.variants if item.base_adapter == entry.entry]
+        lines.append(f"variants     {' · '.join(variants) if variants else 'none'}")
+
+    payload = {
+        "agent": entry.entry,
+        "base_adapter": entry.base_adapter,
+        "resolved": {
+            field: {
+                "value": value,
+                "source": _source_text(resolution.provenance.get(field)),
+            }
+            for field, value in resolved_values.items()
+        },
+        "env": dict(entry.env),
+        "env_passthrough": list(entry.env_passthrough),
+    }
+    if entry.is_variant:
+        lines.append(f"-- modes/models/commands: acpc agents {entry.base_adapter}")
+        return "\n".join(lines) + "\n", payload, None
+    return "\n".join(lines) + "\n", payload, entry.base_adapter
+
+
+def _render_models(
+    entry: ResolvedEntry, record: cache.CachedAdvertised | None
+) -> tuple[str, dict[str, Any]]:
+    advertised = _advertised_payload(record)
+    lines: list[str] = []
+    for index, (tier, preset) in enumerate(entry.presets.items()):
+        prefix = "          " if index else "presets   "
+        lines.append(f"{prefix}{tier:<10} {preset.model:<24} {preset.effort}")
+    if not entry.presets:
+        lines.append("presets    ·")
+    models = [str(item) for item in advertised.get("models", [])]
+    lines.append("models    " + ("\n          ".join(models) if models else "·"))
+    lines.append(_cache_footer(record))
+    return "\n".join(lines) + "\n", {
+        "agent": entry.entry,
+        "presets": {
+            tier: {"model": preset.model, "effort": preset.effort}
+            for tier, preset in entry.presets.items()
+        },
+        "models": models,
+    }
+
+
+def _render_commands(
+    entry: ResolvedEntry, record: cache.CachedAdvertised | None
+) -> tuple[str, dict[str, Any]]:
+    advertised = _advertised_payload(record)
+    commands = [item for item in advertised.get("commands", []) if isinstance(item, Mapping)]
+    lines = []
+    for command in commands:
+        description = command.get("description", "")
+        text = cache.first_sentence(description) if isinstance(description, str) else ""
+        if isinstance(description, str) and text != description:
+            text += "…"
+        lines.append(f"{_command_name(command):<18} {text}")
+    lines.append(_commands_footer(entry.base_adapter, commands, record))
+    return "\n".join(lines) + "\n", {
+        "agent": entry.entry,
+        "commands": [
+            {"name": _command_name(item), "description": item.get("description", "")}
+            for item in commands
+        ],
+    }
+
+
+class _AgentsGroup(click.Group):
+    """Treat an unknown first word as the optional agent view name."""
+
+    def resolve_command(
+        self, ctx: click.Context, args: list[str]
+    ) -> tuple[str | None, click.Command | None, list[str]]:
+        if args and not args[0].startswith("-") and args[0] not in self.commands:
+            forwarded = list(args)
+            for parameter, flag in (
+                ("models", "--models"),
+                ("commands", "--commands"),
+                ("check_live", "--check"),
+                ("json_mode", "--json"),
+            ):
+                if ctx.params.get(parameter):
+                    forwarded.append(flag)
+            return args[0], _agent_view_command, forwarded
+        return super().resolve_command(ctx, args)
+
+
+def _models_overview(registry: AgentRegistry) -> tuple[str, dict[str, Any], list[str]]:
+    lines: list[str] = []
+    payload: dict[str, Any] = {"agents": []}
+    footer_agents: list[str] = []
+    for entry in registry.adapters:
+        record = cache.read_advertised(entry.entry)
+        advertised = _advertised_payload(record)
+        models = [str(item) for item in advertised.get("models", [])]
+        lines.append(entry.entry)
+        for index, (tier, preset) in enumerate(entry.presets.items()):
+            prefix = "  presets " if index == 0 else "          "
+            lines.append(f"{prefix}{tier:<10} {preset.model:<24} {preset.effort}")
+        lines.append("  models    " + (" · ".join(models) if models else "·"))
+        variants = [item for item in registry.variants if item.base_adapter == entry.entry]
+        for variant in variants:
+            model = _local_variant_value(variant, "model") or "·"
+            effort = _local_variant_value(variant, "effort") or "·"
+            lines.append(f"  variant   {variant.entry:<12} {model:<24} {effort}")
+        payload["agents"].append(
+            {
+                "name": entry.entry,
+                "presets": {
+                    tier: {"model": item.model, "effort": item.effort}
+                    for tier, item in entry.presets.items()
+                },
+                "models": models,
+                "variants": [
+                    {
+                        "name": variant.entry,
+                        "model": _local_variant_value(variant, "model"),
+                        "effort": _local_variant_value(variant, "effort"),
+                    }
+                    for variant in variants
+                ],
+            }
+        )
+        if record is not None:
+            footer_agents.append(
+                f"{entry.entry} {cache.cache_age(record.cached_at)}"
+                if cache.cache_age(record.cached_at) == "now"
+                else f"{entry.entry} {cache.cache_age(record.cached_at)} ago"
+            )
+    lines.append("-- cached: " + " · ".join(footer_agents))
+    return "\n".join(lines) + "\n", payload, footer_agents
+
+
+def _emit_json(payload: Mapping[str, Any]) -> None:
+    _write_stdout(json.dumps(dict(payload), ensure_ascii=False) + "\n")
+
+
+def _run_agents_view(
+    name: str | None,
+    models: bool,
+    commands: bool,
+    check_live: bool,
+    json_mode: bool,
+) -> None:
+    """List adapters and variants, or inspect advertised adapter data."""
+    if models and commands:
+        raise UsageProblem("--models and --commands are mutually exclusive views")
+    try:
+        registry = AgentRegistry()
+        if check_live:
+            _agents_check(registry, name, json_mode=json_mode)
+        elif models:
+            if name is None:
+                text, payload, footer = _models_overview(registry)
+                if json_mode:
+                    _emit_json(payload)
+                    click.echo("-- cached: " + " · ".join(footer), err=True)
+                else:
+                    _write_stdout(text)
+            else:
+                entry = registry.resolve(name)
+                if entry.is_variant:
+                    entry = registry.resolve(entry.base_adapter)
+                record = _ensure_cache(entry)
+                text, payload = _render_models(entry, record)
+                if json_mode:
+                    _emit_json(payload)
+                    click.echo(_cache_footer(record), err=True)
+                else:
+                    _write_stdout(text)
+        elif commands:
+            if name is None:
+                raise UsageProblem("--commands requires an agent name")
+            entry = registry.resolve(name)
+            if entry.is_variant:
+                entry = registry.resolve(entry.base_adapter)
+            record = _ensure_cache(entry)
+            text, payload = _render_commands(entry, record)
+            if json_mode:
+                _emit_json(payload)
+                click.echo(
+                    _commands_footer(entry.base_adapter, list(payload["commands"]), record),
+                    err=True,
+                )
+            else:
+                _write_stdout(text)
+        elif name is None:
+            payload = _agent_list_payload(registry)
+            if json_mode:
+                _emit_json(payload)
+            else:
+                variants = {
+                    adapter.entry: [
+                        item for item in registry.variants if item.base_adapter == adapter.entry
+                    ]
+                    for adapter in registry.adapters
+                }
+                lines: list[str] = []
+                for adapter in registry.adapters:
+                    lines.append(_agent_row(adapter))
+                    lines.extend(_variant_row(item) for item in variants[adapter.entry])
+                _write_stdout("\n".join(lines) + "\n")
+        else:
+            entry = registry.resolve(name)
+            if entry.is_variant:
+                text, payload, _ = _render_entry_detail(registry, entry)
+                if json_mode:
+                    _emit_json(payload)
+                else:
+                    _write_stdout(text)
+            else:
+                text, payload, _ = _render_entry_detail(registry, entry)
+                record = _ensure_cache(entry)
+                advertised_text, advertised_payload = _render_advertised_detail(entry, record)
+                payload.update(advertised_payload)
+                if json_mode:
+                    _emit_json(payload)
+                    click.echo(_cache_footer(record), err=True)
+                else:
+                    _write_stdout(text + advertised_text)
+    except cache.ProbeError as error:
+        if json_mode:
+            _emit_json({"error": str(error)})
+            raise SystemExit(vocab.EXIT_AGENT_ERROR) from None
+        raise AgentProblem(str(error)) from None
+    except RegistryError as error:
+        if json_mode:
+            _emit_json({"error": str(error)})
+            raise SystemExit(vocab.EXIT_USAGE) from None
+        raise UsageProblem(str(error)) from None
+
+
+@main.group(name="agents", cls=_AgentsGroup, invoke_without_command=True)
+@click.option("--models", is_flag=True, help="Show full advertised presets and models.")
+@click.option("--commands", is_flag=True, help="Show advertised slash commands.")
+@click.option("--check", "check_live", is_flag=True, help="Launch and authenticate the adapter.")
+@click.option("--json", "json_mode", is_flag=True, help="Emit this view as JSON.")
+@click.pass_context
+def agents_group(
+    ctx: click.Context,
+    models: bool,
+    commands: bool,
+    check_live: bool,
+    json_mode: bool,
+) -> None:
+    """List adapters and variants, or inspect advertised adapter data."""
+    if ctx.invoked_subcommand is None:
+        _run_agents_view(None, models, commands, check_live, json_mode)
+
+
+@click.command(name="agent-view")
+@click.argument("name")
+@click.option("--models", is_flag=True, help="Show full advertised presets and models.")
+@click.option("--commands", is_flag=True, help="Show advertised slash commands.")
+@click.option("--check", "check_live", is_flag=True, help="Launch and authenticate the adapter.")
+@click.option("--json", "json_mode", is_flag=True, help="Emit this view as JSON.")
+def _agent_view_command(
+    name: str, models: bool, commands: bool, check_live: bool, json_mode: bool
+) -> None:
+    """Render one named adapter or variant."""
+    _run_agents_view(name, models, commands, check_live, json_mode)
+
+
+def _agents_check(registry: AgentRegistry, name: str | None, *, json_mode: bool) -> None:
+    if name is None:
+        entries = [entry for entry in registry.adapters if entry.installed]
+    else:
+        selected = registry.resolve(name)
+        entries = [registry.resolve(selected.base_adapter)]
+    results: list[dict[str, Any]] = []
+    for entry in entries:
+        try:
+            advertised = asyncio.run(cache.probe_advertised(registry.resolve_call(entry.entry)))
+            result = {"agent": entry.entry, "ok": True, "models": len(advertised["models"])}
+        except cache.ProbeError as error:
+            result = {"agent": entry.entry, "ok": False, "error": str(error)}
+        results.append(result)
+    if json_mode:
+        _emit_json({"checks": results})
+    else:
+        for result in results:
+            if result["ok"]:
+                _write_stdout(f"{result['agent']} ok\n")
+            else:
+                _write_stdout(f"{result['agent']} failed: {result['error']}\n")
+    if any(not result["ok"] for result in results):
+        raise SystemExit(vocab.EXIT_AGENT_ERROR)
+
+
+@agents_group.command(name="init")
+@click.argument("name")
+@click.option("--extends", "parent", required=True, metavar="AGENT")
+@click.option("--model", metavar="M")
+@click.option("--effort", metavar="E")
+@click.option("--permissions", type=click.Choice(vocab.PERMISSION_VALUES), metavar="P")
+@click.option("--home", metavar="DIR")
+@click.option("--json", "json_mode", is_flag=True, help="Emit the created entry as JSON.")
+@click.help_option("-h", "--help")
+def agents_init_command(
+    name: str,
+    parent: str,
+    model: str | None,
+    effort: str | None,
+    permissions: str | None,
+    home: str | None,
+    json_mode: bool,
+) -> None:
+    """Scaffold a variant entry."""
+    try:
+        registry = AgentRegistry()
+        registry.resolve(parent)
+        if effort is not None:
+            registry.resolve_call(parent, effort=effort)
+    except RegistryError as error:
+        if json_mode:
+            _emit_json({"error": str(error)})
+            raise SystemExit(vocab.EXIT_USAGE) from None
+        raise UsageProblem(str(error)) from None
+    if not name or "/" in name or "\\" in name or name in {".", ".."}:
+        raise UsageProblem(f"invalid agent name '{name}'")
+    target = paths.agents_dir() / f"{name}.toml"
+    if target.exists():
+        raise UsageProblem(f"agent entry already exists: {target}")
+    fields = [
+        ("extends", parent),
+        ("model", model),
+        ("effort", effort),
+        ("permissions", permissions),
+        ("home", home),
+    ]
+    contents = (
+        "\n".join(
+            f"{key} = {json.dumps(value, ensure_ascii=False)}"
+            for key, value in fields
+            if value is not None
+        )
+        + "\n"
+    )
+    try:
+        paths.ensure_private_dir(paths.agents_dir())
+        paths.atomic_write(target, contents)
+    except OSError as error:
+        raise UsageProblem(f"cannot write {target}: {error}") from None
+    payload = {"name": name, "extends": parent, "path": str(target)}
+    if json_mode:
+        _emit_json(payload)
+    else:
+        _write_stdout(f"created {target}\n")
+
+
+@main.command(name="install")
+@click.argument("agent")
+@click.option("--json", "json_mode", is_flag=True, help="Emit the install result as JSON.")
+@click.help_option("-h", "--help")
+def install_command(agent: str, json_mode: bool) -> None:
+    """Run an adapter definition's install command."""
+    try:
+        registry = AgentRegistry()
+        registry.resolve(agent)
+
+        def run_installer(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                args,
+                cwd=kwargs.get("cwd"),
+                env=kwargs.get("env"),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        result = registry.execute_install(agent, runner=run_installer)
+    except RegistryError as error:
+        if json_mode:
+            _emit_json({"agent": agent, "ok": False, "error": str(error)})
+            raise SystemExit(vocab.EXIT_USAGE) from None
+        raise UsageProblem(str(error)) from None
+    except OSError as error:
+        message = f"install {agent} failed: {error}"
+        if json_mode:
+            _emit_json({"agent": agent, "ok": False, "error": message})
+            raise SystemExit(vocab.EXIT_AGENT_ERROR) from None
+        raise AgentProblem(message) from None
+
+    for stream in (getattr(result, "stdout", None), getattr(result, "stderr", None)):
+        if stream:
+            click.echo(stream.rstrip("\n"), err=True)
+    return_code = getattr(result, "returncode", 1)
+    payload = {"agent": agent, "ok": return_code == 0, "returncode": return_code}
+    if json_mode:
+        _emit_json(payload)
+    elif return_code == 0:
+        _write_stdout(f"installed {agent}\n")
+    else:
+        raise AgentProblem(f"install {agent} failed (exit {return_code})")
+    if return_code != 0:
+        raise SystemExit(vocab.EXIT_AGENT_ERROR)
 
 
 def _load_view_session(selector: str) -> sessions.SessionMeta:
