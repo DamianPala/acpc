@@ -154,6 +154,7 @@ class AdapterHost:
         self._stack: contextlib.AsyncExitStack | None = None
         self._conn: Any = None
         self._command: tuple[str, tuple[str, ...]] | None = None
+        self.agent_capabilities: Any = None
         self._starting = asyncio.Lock()
         # acpc session id -> the adapter session id it is bound to, for as long
         # as this adapter process lives. Presence here *is* "warm".
@@ -189,10 +190,11 @@ class AdapterHost:
                 drain_stderr=True,
             )
         )
-        await conn.initialize(protocol_version=PROTOCOL_VERSION)
+        initialize = await conn.initialize(protocol_version=PROTOCOL_VERSION)
         self._stack = stack
         self._conn = conn
         self._command = (command, args)
+        self.agent_capabilities = getattr(initialize, "agent_capabilities", None)
         return conn
 
     async def close(self) -> None:
@@ -201,6 +203,7 @@ class AdapterHost:
                 await self._stack.aclose()
         self._stack = None
         self._conn = None
+        self.agent_capabilities = None
         self.adapter_sessions.clear()
 
 
@@ -489,18 +492,20 @@ class Daemon:
         async with self._slots:
             events = transcript.Transcript(sessions.transcript_path(session_id))
             outcome = runner.TurnOutcome(state="failed", stop_reason="error", answer="")
+            error: BaseException | None = None
             try:
                 sessions.mark_running(session_id, pid=os.getpid())
                 events.append("state", **{"from": "starting", "to": "running"})
                 outcome = await self._drive(session_id, request, events, cancel)
-            except Exception as error:  # noqa: BLE001
+            except Exception as caught:  # noqa: BLE001
                 # Same reasoning as the direct path: a crash must still leave a
                 # finished session, never a meta.json stuck on `running`.
+                error = caught
                 runner._finalize(session_id, outcome, error=error)
             else:
                 runner._finalize(session_id, outcome)
             finally:
-                self._finish(session_id, outcome)
+                self._finish(session_id, outcome, error=error)
             return outcome
 
     async def _drive(
@@ -526,6 +531,7 @@ class Daemon:
             # adapter treat the turn as a resume and lose that continuity.
             adapter_session_id = warm
         elif request.resume_adapter_session is not None:
+            runner.require_load_session_capability(self.host.agent_capabilities)
             adapter_session_id = request.resume_adapter_session
             await conn.load_session(
                 session_id=adapter_session_id, cwd=request.cwd or ".", mcp_servers=[]
@@ -561,7 +567,9 @@ class Daemon:
             advertised=client.advertised,
         )
 
-    def _finish(self, session_id: str, outcome: runner.TurnOutcome) -> None:
+    def _finish(
+        self, session_id: str, outcome: runner.TurnOutcome, *, error: BaseException | None = None
+    ) -> None:
         turn = self.turns.pop(session_id, None)
         self._last_busy = time.monotonic()
         if turn is None:
@@ -574,6 +582,8 @@ class Daemon:
             "exit_code": outcome.exit_code,
             "stop_reason": outcome.stop_reason,
         }
+        if error is not None:
+            payload["error"] = str(error)
         turn.result = payload
         self._resolve_waiters(turn, payload)
 

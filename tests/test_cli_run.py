@@ -150,6 +150,7 @@ def test_dry_run_json_is_machine_readable(cli: CliRunner) -> None:
     payload = json.loads(result.stdout)
     assert payload["entry"] == "mock"
     assert payload["resolved"]["model"]["value"] == "mock-sonnet-5"
+    assert "entry_definition" not in payload
 
 
 def test_dry_run_reports_the_permission_policy_it_would_use(cli: CliRunner) -> None:

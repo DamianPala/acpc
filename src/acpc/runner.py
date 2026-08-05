@@ -39,7 +39,7 @@ from acpc import (
 )
 from acpc.client import AcpcClient
 from acpc.permissions import PermissionLevel
-from acpc.registry import CallResolution, RegistryError
+from acpc.registry import CallResolution, RegistryError, ResolvedEntry
 from acpc.spawn import spawn_adapter
 
 # SPEC.md `stop`: graceful cancel with a bounded wait for the ack (10s) — if
@@ -52,6 +52,17 @@ _FAILURE_STOP_REASONS = frozenset({"refusal", "max_tokens", "max_turn_requests"}
 
 class RunnerError(Exception):
     """A turn could not be started; the message is one actionable line."""
+
+
+LOAD_SESSION_CAPABILITY_ERROR = (
+    "continue requires an adapter with the loadSession capability (ACP session/load)"
+)
+
+
+def require_load_session_capability(capabilities: Any) -> None:
+    """Raise the user-facing error when an adapter cannot resume a session."""
+    if not getattr(capabilities, "load_session", False):
+        raise RunnerError(LOAD_SESSION_CAPABILITY_ERROR)
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,9 +195,10 @@ async def _drive_turn(
         cwd=request.cwd,
         drain_stderr=True,
     ) as (conn, _process):
-        await conn.initialize(protocol_version=PROTOCOL_VERSION)
+        initialize = await conn.initialize(protocol_version=PROTOCOL_VERSION)
 
         if request.resume_adapter_session is not None:
+            require_load_session_capability(getattr(initialize, "agent_capabilities", None))
             adapter_session_id = request.resume_adapter_session
             await conn.load_session(
                 session_id=adapter_session_id,
@@ -412,6 +424,8 @@ async def _execute_via_daemon(
         signalled.cancel()
         reply = await waiting
         outcome = reply.get("outcome") or {}
+        if error := outcome.get("error"):
+            raise RunnerError(str(error))
         return TurnOutcome(
             state=str(outcome.get("state", "failed")),
             stop_reason=outcome.get("stop_reason"),
@@ -563,6 +577,117 @@ def resolution_payload(resolution: CallResolution, *, cwd: str | None) -> dict[s
             for name, value in fields.items()
         },
     }
+
+
+def session_resolution(resolution: CallResolution, *, cwd: str | None) -> dict[str, Any]:
+    """The persisted session shape, distinct from the printed dry-run view."""
+    payload = resolution_payload(resolution, cwd=cwd)
+    payload["adapter"] = {
+        "home_env": resolution.entry.home_env,
+        "bypass_modes": list(resolution.entry.bypass_modes),
+    }
+    return payload
+
+
+def _stored_value(payload: Mapping[str, Any], field: str) -> Any:
+    resolved = payload.get("resolved")
+    if not isinstance(resolved, Mapping):
+        return None
+    value = resolved.get(field)
+    if not isinstance(value, Mapping):
+        return None
+    return value.get("value")
+
+
+def resolution_from_session(meta: sessions.SessionMeta) -> CallResolution:
+    """Rebuild a call resolution exclusively from a session's stored data."""
+    payload = meta.resolution
+    adapter = payload.get("adapter")
+    if not isinstance(adapter, Mapping):
+        raise RunnerError(
+            f"session {meta.session_id} has no complete stored adapter resolution; "
+            "it cannot be continued"
+        )
+
+    command = payload.get("command")
+    if not isinstance(command, str) or not command:
+        raise RunnerError(f"session {meta.session_id} has no stored adapter command")
+
+    def stored_strings(name: str, source: Mapping[str, Any]) -> tuple[str, ...]:
+        value = source.get(name, ())
+        if not isinstance(value, (list, tuple)) or any(not isinstance(item, str) for item in value):
+            raise RunnerError(f"session {meta.session_id} has invalid stored {name}")
+        return tuple(value)
+
+    declared_env = payload.get("env", {})
+    if not isinstance(declared_env, Mapping) or any(
+        not isinstance(key, str) or not isinstance(value, str)
+        for key, value in declared_env.items()
+    ):
+        raise RunnerError(f"session {meta.session_id} has invalid stored adapter environment")
+    home_env = adapter.get("home_env")
+    if home_env is not None and not isinstance(home_env, str):
+        raise RunnerError(f"session {meta.session_id} has invalid stored home environment name")
+    bypass_modes = stored_strings("bypass_modes", adapter)
+    env_passthrough = stored_strings("env_passthrough", payload)
+
+    entry = ResolvedEntry(
+        entry=meta.entry,
+        base_adapter=meta.base_adapter,
+        name=meta.entry,
+        author=None,
+        command=command,
+        install_command=None,
+        home=None,
+        home_env=home_env,
+        bypass_modes=bypass_modes,
+        efforts=(),
+        env_passthrough=env_passthrough,
+        description=None,
+        model=None,
+        effort=None,
+        permissions=None,
+        env=dict(declared_env),
+        presets={},
+        extends=None,
+        provenance={},
+    )
+    return CallResolution(
+        entry=entry,
+        model=_stored_value(payload, "model"),
+        effort=_stored_value(payload, "effort"),
+        permissions=_stored_value(payload, "permissions"),
+        home=_stored_value(payload, "home"),
+        declared_env=dict(declared_env),
+        env_passthrough=env_passthrough,
+        provenance={},
+    )
+
+
+def continue_request(
+    meta: sessions.SessionMeta,
+    prompt: str,
+    *,
+    timeout: float | None = None,
+    permission_prompt: Callable[[str, str], bool] | None = None,
+) -> TurnRequest:
+    """Build a follow-up turn from the session's persisted resolution."""
+    if meta.adapter_session_id is None:
+        raise RunnerError(
+            f"session {meta.session_id} has no stored adapter session id; it cannot be continued"
+        )
+    payload = meta.resolution
+    cwd = payload.get("cwd")
+    if cwd is not None and not isinstance(cwd, str):
+        raise RunnerError(f"session {meta.session_id} has an invalid stored working directory")
+    return TurnRequest(
+        resolution=resolution_from_session(meta),
+        prompt=prompt,
+        cwd=cwd,
+        timeout=timeout,
+        permission_prompt=permission_prompt,
+        resume_adapter_session=meta.adapter_session_id,
+    )
 
 
 def _source_label(source: Any) -> str:

@@ -397,7 +397,7 @@ def run_command(
         entry=resolution.entry.entry,
         base_adapter=resolution.entry.base_adapter,
         prompt=prompt,
-        resolution=runner.resolution_payload(resolution, cwd=resolved_cwd),
+        resolution=runner.session_resolution(resolution, cwd=resolved_cwd),
         target=runner.call_target(resolution),
         name=alias,
     )
@@ -489,6 +489,120 @@ def _with_policy(request: runner.TurnRequest, policy: str) -> runner.TurnRequest
 
     resolution: _CallResolution = replace(request.resolution, permissions=policy)
     return replace(request, resolution=resolution)
+
+
+@main.command(name="continue")
+@click.argument("selector")
+@click.argument("prompt_text", required=False)
+@click.option("--prompt-file", "prompt_file", metavar="FILE", help="Read the prompt from a file.")
+@click.option("-o", "--output", "output_file", metavar="FILE", help="Write the answer to a file.")
+@click.option("--bg", "background", is_flag=True, help="Dispatch and return the session id.")
+@click.option("--timeout", type=float, metavar="S", help="Cancel the session after S seconds.")
+@click.option(
+    "--max-output",
+    type=click.IntRange(min=0),
+    default=output.DEFAULT_MAX_OUTPUT,
+    show_default=True,
+    metavar="BYTES",
+    help="Cap on stdout bytes; 0 disables the cap.",
+)
+@click.option("--quiet", is_flag=True, help="Suppress the stderr summary line.")
+@click.option("--json", "json_mode", is_flag=True, help="Emit this command's output as JSON.")
+@click.option("--permissions", metavar="P", hidden=True)
+@click.option("--model", metavar="M", hidden=True)
+@click.option("--effort", metavar="E", hidden=True)
+@click.option("--mode", metavar="M", hidden=True)
+@click.option("--cwd", metavar="DIR", hidden=True)
+@click.option("--home", metavar="DIR", hidden=True)
+@click.option("--name", "alias", metavar="ALIAS", hidden=True)
+@click.option("--dry-run", is_flag=True, hidden=True)
+@click.help_option("-h", "--help")
+def continue_command(
+    selector: str,
+    prompt_text: str | None,
+    prompt_file: str | None,
+    output_file: str | None,
+    background: bool,
+    timeout: float | None,
+    max_output: int,
+    quiet: bool,
+    json_mode: bool,
+    permissions: str | None,
+    model: str | None,
+    effort: str | None,
+    mode: str | None,
+    cwd: str | None,
+    home: str | None,
+    alias: str | None,
+    dry_run: bool,
+) -> None:
+    """Continue a finished session using its stored adapter resolution."""
+    run_only = {
+        "--permissions": permissions,
+        "--model": model,
+        "--effort": effort,
+        "--mode": mode,
+        "--cwd": cwd,
+        "--home": home,
+        "--name": alias,
+        "--dry-run": dry_run,
+    }
+    for flag, value in run_only.items():
+        if value not in (None, False):
+            rule = "continue reuses the session's permissions — drop --permissions"
+            raise UsageProblem(f"{rule} (run-only flag: {flag})")
+
+    prompt = _read_prompt(prompt_text, prompt_file)
+    meta = _load_view_session(selector)
+    if meta.is_active:
+        raise UsageProblem(
+            f"session {meta.session_id} is {meta.state} — wait for the current turn to finish"
+        )
+    try:
+        request = runner.continue_request(
+            meta,
+            prompt,
+            timeout=timeout,
+            permission_prompt=(
+                _tty_permission_prompt
+                if meta.resolution.get("resolved", {}).get("permissions", {}).get("value")
+                == "prompt"
+                and _stdout_is_tty()
+                else None
+            ),
+        )
+        rotated = sessions.rotate_turn(meta.session_id)
+        sessions.write_prompt(rotated.session_id, prompt)
+    except (runner.RunnerError, sessions.SessionError) as error:
+        raise UsageProblem(str(error)) from None
+
+    if background:
+        _dispatch_background(meta.session_id, request, json_mode=json_mode)
+        return
+
+    try:
+        outcome = runner.execute_turn(meta.session_id, request)
+    except runner.RunnerError as error:
+        raise AgentProblem(str(error)) from None
+
+    final = sessions.read_meta(meta.session_id)
+    if output_file is not None:
+        output.write_output_file(output_file, outcome.answer)
+
+    result = output.render_result(
+        final,
+        outcome.answer,
+        json_mode=json_mode,
+        output_file=output_file,
+        max_output=max_output,
+    )
+    _write_stdout(result.text)
+    if outcome.state == "detached":
+        click.echo(f"-- {meta.session_id} detached · still running", err=True)
+        raise SystemExit(outcome.exit_code)
+    if not quiet:
+        output.emit_summary(final, route_note=_route_note(outcome))
+    raise SystemExit(outcome.exit_code)
 
 
 @main.command(name="wait")
