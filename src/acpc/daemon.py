@@ -154,6 +154,7 @@ class AdapterHost:
         self.mux = _MultiplexClient()
         self._stack: contextlib.AsyncExitStack | None = None
         self._conn: Any = None
+        self._process: Any = None
         self._command: tuple[str, tuple[str, ...]] | None = None
         self.agent_capabilities: Any = None
         self._starting = asyncio.Lock()
@@ -165,6 +166,9 @@ class AdapterHost:
     def started(self) -> bool:
         return self._conn is not None
 
+    def _adapter_died(self) -> bool:
+        return self._process is not None and self._process.returncode is not None
+
     async def ensure(self, resolution: Any) -> Any:
         """Start the adapter once; later turns reuse the same process.
 
@@ -172,17 +176,30 @@ class AdapterHost:
         without it both would see no connection, both would spawn, and the
         loser's process would be orphaned with a session already bound to it.
         """
-        if self._conn is not None:
+        if self._conn is not None and not self._adapter_died():
             return self._conn
         async with self._starting:
             if self._conn is not None:
-                return self._conn
+                if not self._adapter_died():
+                    return self._conn
+                # The adapter process died under this daemon. Drop the dead
+                # connection so the target heals with a fresh adapter instead
+                # of failing every turn until someone runs `daemon stop`.
+                # Warm sessions go with it: the memory they relied on lived in
+                # the dead process, so their next turn honestly resumes cold.
+                await self.close()
             return await self._start(resolution)
+
+    async def reset_if_dead(self) -> None:
+        """Drop the connection to an adapter whose process is gone."""
+        async with self._starting:
+            if self._conn is not None and self._adapter_died():
+                await self.close()
 
     async def _start(self, resolution: Any) -> Any:
         command, args = runner.adapter_command(resolution)
         stack = contextlib.AsyncExitStack()
-        conn, _process = await stack.enter_async_context(
+        conn, process = await stack.enter_async_context(
             spawn_adapter(
                 self.mux,
                 command,
@@ -194,6 +211,7 @@ class AdapterHost:
         initialize = await conn.initialize(protocol_version=PROTOCOL_VERSION)
         self._stack = stack
         self._conn = conn
+        self._process = process
         self._command = (command, args)
         self.agent_capabilities = getattr(initialize, "agent_capabilities", None)
         return conn
@@ -204,6 +222,7 @@ class AdapterHost:
                 await self._stack.aclose()
         self._stack = None
         self._conn = None
+        self._process = None
         self.agent_capabilities = None
         self.adapter_sessions.clear()
 
@@ -534,6 +553,10 @@ class Daemon:
                 # finished session, never a meta.json stuck on `running`.
                 error = caught
                 runner._finalize(session_id, outcome, error=error)
+                # If the crash was the adapter dying, heal the target now
+                # rather than on the next turn's ensure().
+                with contextlib.suppress(Exception):
+                    await self.host.reset_if_dead()
             else:
                 runner._finalize(session_id, outcome)
             finally:

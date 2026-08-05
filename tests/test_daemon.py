@@ -199,6 +199,35 @@ async def _stop_target() -> None:
         await connection.close()
 
 
+def test_the_target_heals_after_its_adapter_dies(state_root: Path, live_daemon: None) -> None:
+    import os
+    import signal
+
+    first = new_session("warm the adapter")
+    assert run_turn(first, "warm the adapter").state == "done"
+
+    daemon_pid = asyncio.run(_daemon_pid())
+    children_path = Path(f"/proc/{daemon_pid}/task/{daemon_pid}/children")
+    if not children_path.exists():  # pragma: no cover - non-Linux
+        pytest.skip("requires /proc/<pid>/children")
+    adapters = [int(pid) for pid in children_path.read_text().split()]
+    assert len(adapters) == 1
+    os.kill(adapters[0], signal.SIGKILL)
+
+    # The daemon must recover the target with a fresh adapter; without the
+    # heal every turn fails with a dead connection until `daemon stop`.
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        session_id = new_session("after the crash")
+        try:
+            if run_turn(session_id, "after the crash").state == "done":
+                return
+        except runner.RunnerError:
+            pass  # the daemon may still be tearing the dead turn down
+        time.sleep(0.2)
+    pytest.fail("the target never recovered after its adapter died")
+
+
 # --- idle expiry ------------------------------------------------------------
 
 
