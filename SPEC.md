@@ -194,7 +194,7 @@ log <id> [--since CURSOR] [--tail N] [--prose] [--json] [--max-output BYTES] [--
 | `--prose` | The content view: "what is it thinking/writing" — agent messages only, untruncated, no tool lines; agents write markdown natively, so this reads as clean markdown. The event window (`--since`/`--tail`) selects; `--prose` only renders — a full-history dump is always an explicit `--since 0` |
 | `--json` | Raw transcript events for `jq`, each carrying its index; not for reading — lossless inspection is `transcript.ndjson` itself. With `--prose` a usage error — one view per call |
 | `--max-output <bytes>` | As in `run` (default 128 KiB, 0 disables), but applied at event granularity: whole events until the budget, then a marker line naming `transcript.ndjson`. The footer cursor covers only what was printed, so a poller never skips content; a single over-budget event is the exception — head + marker, cursor advances past it. With `--json` the stream stays valid NDJSON: truncation appears as a final typed `truncated` event naming `transcript.ndjson`, never a bare marker line |
-| `--wait-new [--timeout S]` | Long-poll: block until new events appear or the timeout expires (exit 124); without `--timeout` it blocks indefinitely. Waits for *activity* (vs `wait` for completion) — enables mid-run intervention, e.g. `stop` an agent that drifted off task |
+| `--wait-new [--timeout S]` | Long-poll: block until new events appear or the timeout expires (exit 124); without `--timeout` it blocks indefinitely. Waits for *activity* (vs `wait` for completion) — enables mid-run intervention, e.g. `stop` an agent that drifted off task. After waking, the normal selection applies to the new events: `--since`, then `--tail` |
 | `--quiet` | Suppress the stderr footer, as in `run` |
 
 One chronological stream, tool calls and agent prose interleaved — the sequence is the causal narrative. Events are condensed one-liners: tool call with arg summary, result status, duration; agent message as a 200-char snippet + length; permission requests; errors; state changes. Errors are never filtered — in every view; in `--prose` they keep their condensed `[time] error …` line form amid the markdown. Nor are they truncated, with one exception: `--max-output` may head-truncate a single over-budget event, errors included — the budget wins. Full content stays in `transcript.ndjson`.
@@ -332,7 +332,7 @@ q4hf  builder   done     22m03s  ·            "Implement the session lock and i
 $ acpc status kq8w
 state    done · exit 0 · 12m40s · 41k tok
 agent    reviewer (codex) · name: spec-review
-dir      ~/.acpc/sessions/kq81 · answer: answer.md
+dir      ~/.acpc/sessions/kq8w · answer: answer.md
 ```
 
 ### `stop`
@@ -419,7 +419,7 @@ Entry TOMLs are trusted at the level of shell config: an adapter definition name
   - **Everything else** (`status`, `agents`, `daemon status`, `stop`, `rm`, `prune`, `install`, `--dry-run`): the same data the text view shows, as JSON.
   - **The one exception**: `log --json` emits raw transcript events (see `log`), not an envelope.
 - **End-of-run summary, one line, on stderr, prefixed `--`**: duration, tokens/cost, exit status, session ID, session dir. Harnesses merge stderr into the same blob as the answer — the fixed prefix keeps it mechanically separable. `--quiet` suppresses it. A `--bg` dispatch prints none — nothing has finished; the finished `log` footer carries the same data. `log` footers follow the same rule — stderr, `--` prefix — the general principle being: when stdout carries agent content, acpc's own metadata goes to stderr; when stdout is acpc's own view (`status`, `agents`), the footer is part of the view and stays there.
-- **Errors are one line and actionable**: not a stack trace, but `codex: not authenticated, run 'codex login'`.
+- **Errors are one line and actionable**: not a stack trace, but `codex: not authenticated, run 'codex login'`. Damaged state gets the same treatment — an unparseable `meta.json` or transcript produces one line naming the file and a non-zero exit, never a traceback.
 - **Never prompt interactively on stdin.** If something is missing, fail with instructions.
 
 ## TTY vs non-TTY
@@ -443,7 +443,7 @@ File-based state is a feature: the agent can grep it, read fragments selectively
   config.toml                # global knobs — the complete file just below
   agents/<name>.toml         # variants, adapter overrides, new adapters — hand-editable; `agents init` is just a scaffold
   cache/<agent>/             # advertised models, modes, commands
-  daemon/<entry>-<hash>.log  # adapter stderr, one file per concrete target
+  daemon/<entry>-<hash>.log  # adapter stderr per concrete target; daemon sockets and locks live here too
   sessions/<id>/
     meta.json                # full resolved invocation (everything --dry-run shows) + state, timing, tokens/cost, exit code, stop_reason, prompt snippet, adapter session id
     prompt.md                # the prompt as sent, latest turn; earlier turns: prompt.<n>.md
@@ -460,13 +460,13 @@ daemon_max_concurrent = 8   # concurrent turns per daemon target
 
 That is the whole file. Anything that changes a call's behavior lives in flags or agent entries (see *Anti-features*) — in particular, the adapter env pass-through list is not configurable here: extensions go through an entry's `env_passthrough`.
 
-- **Adapter definitions are TOMLs shipped in the package**, one per adapter — the full contract: `command`, `install_command`, default `home`, the bypass-mode list, `[presets]`, supported effort levels, `env_passthrough`. A user file in `agents/` with `extends` is a variant; under an adapter's own name it overrides that adapter's fields (e.g. `[presets]`); with a `command` and no `extends` it defines a new adapter. All at the trust level *Agent variants* states.
+- **Adapter definitions are TOMLs shipped in the package**, one per adapter — the full contract: `command`, `install_command`, default `home`, `home_env` (the vendor variable the resolved home is exported as, e.g. `CODEX_HOME`), the bypass-mode list, `[presets]`, supported effort levels, `env_passthrough`. A user file in `agents/` with `extends` is a variant; under an adapter's own name it overrides that adapter's fields (e.g. `[presets]`); with a `command` and no `extends` it defines a new adapter. All at the trust level *Agent variants* states.
 - **`ACPC_HOME` ≠ `--home`**: the state root vs the vendor config dir a callee runs against — they share a word, nothing else.
 - **Owner-only**: 0700 dirs, 0600 files — prompts and transcripts routinely carry sensitive material.
 - **No torn reads**: `meta.json` is replaced atomically, `transcript.ndjson` grows by whole lines only, `cache/` files and `-o` targets are written atomically too — a mid-write reader never sees garbage. A per-session lock serializes turns, so `run`, `continue` and `stop` on one session never interleave.
 - **`answer.md` is written whatever the final state**: for `failed`/`timeout`/`cancelled` it holds the partial answer; for `orphaned`, where the dead process wrote nothing, detection writes a one-line placeholder naming what died — the advertised path always exists and explains itself.
 - **Turn rotation happens at the *start* of the next turn**: `continue` renames the previous `prompt.md`/`answer.md` to their `.<n>` names, then writes the new `prompt.md` — one rename per file, ever (turn numbers are fixed, no logrotate-style cascade), so a mid-turn session has no `answer.md` until the turn produces one.
-- **The transcript is a public, versioned format**: a header line names the schema version, consumers ignore unknown fields. It is the programmatic layer, not the reading path — for reading, `log`, `log --prose` and `answer.md` are markdown; raw JSON costs several times more tokens than the content it carries. The markdown views are rendered on demand from the transcript, never materialized as a second on-disk copy: the only per-turn artifacts are the answers (`acpc log <id> --prose > file.md` if a file is wanted).
+- **The transcript is a public, versioned format**: a header line names the schema version (`acpc.transcript/1`); every event line carries a global 1-based index `i` (continuous across turns — this is the `log` cursor), a timestamp, and a `type` from `msg | thought | tool | permission | error | state | usage` plus type-specific fields; consumers ignore unknown fields. It is the programmatic layer, not the reading path — for reading, `log`, `log --prose` and `answer.md` are markdown; raw JSON costs several times more tokens than the content it carries. The markdown views are rendered on demand from the transcript, never materialized as a second on-disk copy: the only per-turn artifacts are the answers (`acpc log <id> --prose > file.md` if a file is wanted).
 - **Relative paths** in flags (`--cwd`, `--prompt-file`, `-o`) resolve against the caller's working directory; `~` is expanded by acpc.
 
 **Session states** — one vocabulary, used verbatim by `status`, `log` footers and `meta.json`:
