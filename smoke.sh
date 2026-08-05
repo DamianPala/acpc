@@ -25,12 +25,12 @@ export SCRIPT_DIR
 declare -A SECTION_READY=(
     [S06-run]=ready         # sync run, session dir layout, -o/--quiet/--max-output/--json, exit codes
     [S07-daemon-bg]=pending # --bg, wait, SIGTERM detach, daemon status/stop, concurrency, orphans
-    [S08-views]=pending     # status views, log views + footers + cursors
+    [S08-views]=ready       # status views, log views + footers + cursors
     [S09-continue]=pending  # continue: context, rotation, cross-turn cursor space, errors
     [S10-agents]=pending    # agents list/detail/--models/--commands/--check/init, install
     [S11-maintenance]=pending # stop semantics, rm, prune
     [S12-cli]=pending       # help contract, -V, TTY rules, hostile inputs
-    [S13-permissions]=pending # permission tiers visible in log, bypass-mode guard (needs S06+S08)
+    [S13-permissions]=ready # permission tiers visible in log, bypass-mode guard (needs S06+S08)
 )
 
 section_ready() {

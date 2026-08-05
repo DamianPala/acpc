@@ -5,14 +5,16 @@ parsing, usage errors (exit 2), the TTY rules and the fixed exit codes, and
 delegates everything else to the layer that owns it.
 """
 
+import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
 import click
 
-from acpc import __version__, config, output, runner, sessions, vocab
+from acpc import __version__, config, output, render, runner, sessions, transcript, vocab
 from acpc.registry import AgentRegistry, CallResolution, RegistryError
 
 
@@ -145,6 +147,151 @@ def _write_stdout(text: str) -> None:
         devnull = os.open(os.devnull, os.O_WRONLY)
         os.dup2(devnull, sys.stdout.fileno())
         sys.exit(vocab.EXIT_SIGPIPE)
+
+
+def _load_view_session(selector: str) -> sessions.SessionMeta:
+    """Verify liveness before a targeted view reports a session."""
+    try:
+        session_id = sessions.resolve_selector(selector, allow_last=_stdout_is_tty())
+        return sessions.load(session_id)
+    except sessions.SessionError as error:
+        raise UsageProblem(str(error)) from None
+
+
+_LOG_DEFAULT_TAIL = 20
+_LOG_WAIT_POLL_INTERVAL = 0.05
+
+
+def _wait_for_new_events(
+    transcript_file: transcript.Transcript,
+    *,
+    since: int,
+    tail: int | None,
+    timeout: float | None,
+) -> transcript.TranscriptPage | None:
+    """Wait for transcript activity at the module's fixed polling interval."""
+    deadline = None if timeout is None else time.monotonic() + timeout
+
+    while True:
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            time.sleep(min(_LOG_WAIT_POLL_INTERVAL, remaining))
+        else:
+            time.sleep(_LOG_WAIT_POLL_INTERVAL)
+
+        available = transcript_file.read(since=since)
+        if available.events:
+            return transcript_file.read(since=since, tail=tail)
+
+
+@main.command(name="status")
+@click.argument("selector", required=False)
+@click.option("--all", "all_sessions", is_flag=True, help="Show every session.")
+@click.option("--json", "json_mode", is_flag=True, help="Emit a JSON status object.")
+@click.help_option("-h", "--help")
+def status_command(selector: str | None, all_sessions: bool, json_mode: bool) -> None:
+    """Show liveness-verified session metadata without reading transcripts."""
+    if selector is not None and all_sessions:
+        raise UsageProblem("--all cannot be used with a session id")
+
+    if selector is not None:
+        meta = _load_view_session(selector)
+        if json_mode:
+            _write_stdout(json.dumps(render.status_detail_json(meta), ensure_ascii=False) + "\n")
+        else:
+            _write_stdout(render.render_status_detail(meta))
+        return
+
+    metas = sessions.list_sessions()
+    if json_mode:
+        _write_stdout(
+            json.dumps(
+                render.status_list_json(metas, all_sessions=all_sessions), ensure_ascii=False
+            )
+            + "\n"
+        )
+    else:
+        _write_stdout(render.render_status_list(metas, all_sessions=all_sessions))
+
+
+@main.command(name="log")
+@click.argument("selector")
+@click.option("--since", type=click.IntRange(min=0), default=None, metavar="N")
+@click.option("--tail", type=click.IntRange(min=0), default=None, metavar="N")
+@click.option("--prose", is_flag=True, help="Render full agent messages.")
+@click.option("--json", "json_mode", is_flag=True, help="Emit raw transcript events as NDJSON.")
+@click.option(
+    "--max-output",
+    type=click.IntRange(min=0),
+    default=render.DEFAULT_LOG_MAX_OUTPUT,
+    show_default=True,
+    metavar="BYTES",
+)
+@click.option("--wait-new", is_flag=True, help="Wait for new transcript events.")
+@click.option("--timeout", type=click.FloatRange(min=0), default=None, metavar="S")
+@click.option("--quiet", is_flag=True, help="Suppress the stderr footer.")
+@click.help_option("-h", "--help")
+def log_command(
+    selector: str,
+    since: int | None,
+    tail: int | None,
+    prose: bool,
+    json_mode: bool,
+    max_output: int,
+    wait_new: bool,
+    timeout: float | None,
+    quiet: bool,
+) -> None:
+    """Render selected transcript events and keep metadata on stderr."""
+    if prose and json_mode:
+        raise UsageProblem("--prose and --json are mutually exclusive views")
+    if timeout is not None and not wait_new:
+        raise UsageProblem("--timeout requires --wait-new")
+
+    meta = _load_view_session(selector)
+    transcript_file = transcript.Transcript(sessions.transcript_path(meta.session_id))
+    explicit_since = since is not None
+    cursor = 0 if since is None else since
+    selection_tail = tail
+    if selection_tail is None and not explicit_since:
+        selection_tail = _LOG_DEFAULT_TAIL
+
+    if wait_new and not explicit_since:
+        cursor = transcript_file.read(since=0).next_cursor
+    page = transcript_file.read(since=cursor, tail=selection_tail)
+    if wait_new and not page.events:
+        page = _wait_for_new_events(
+            transcript_file,
+            since=cursor,
+            tail=selection_tail,
+            timeout=timeout,
+        )
+        if page is None:
+            raise SystemExit(vocab.EXIT_TIMEOUT)
+
+    full_last_message = meta.state in {"failed", "timeout", "orphaned"}
+    rendered = render.render_events(
+        page.events,
+        prose=prose,
+        json_mode=json_mode,
+        max_output=max_output,
+        transcript_path=sessions.transcript_path(meta.session_id),
+        cursor=cursor,
+        full_last_message=full_last_message,
+    )
+    _write_stdout(rendered.text)
+    if not quiet:
+        # The cursor is a global transcript index, not an event count.  Read
+        # the actual end so an empty page after a large --since stays honest.
+        event_count = transcript_file.read(since=0).next_cursor
+        footer = render.format_log_footer(
+            meta,
+            cursor=rendered.next_cursor,
+            event_count=event_count,
+        )
+        click.echo(footer, err=True)
 
 
 @main.command(name="run")
