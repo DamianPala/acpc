@@ -29,6 +29,17 @@ acpc run builder --input-file <task-prompt.md> --cwd <this worktree>
 - Pass specs and long prompts with `--input-file`, never as a positional argument. Argv is visible in `ps`/`/proc/*/cmdline`; on 2026-08-04 a dispatch was SIGKILLed because the spec text in argv matched a cleanup helper's `pgrep -f` pattern.
 - Select provider/home by naming a registry variant; never export `CODEX_HOME`/`CLAUDE_CONFIG_DIR` around a dispatch. Daemons are keyed on the entry's declared environment, not ambient env — exporting the home binds the wrong provider into a shared daemon.
 
+## Docs contract
+
+Updated in the same change as the code, never after the fact:
+
+- `SPEC.md` — any behavior change. Normative; never edited by dispatched implementers.
+- `ARCHITECTURE.md` — any structural change (modules, seams, ownership).
+- `README.md` + `--help` text — any user-facing surface change.
+- `status.md` — breakpoints, decisions, backlog.
+
+Dispatched implementers get target doc wording verbatim in their spec; the orchestrating agent authors the doc text and folds it into the implementation commit.
+
 ## Commit rules
 
 - `docs/plans/` is local-only working documentation. Never commit files from this directory.
@@ -37,7 +48,7 @@ acpc run builder --input-file <task-prompt.md> --cwd <this worktree>
 
 ## Project
 
-- Python >= 3.12, cross-platform (Linux, macOS, Windows)
+- Python >= 3.13, cross-platform (Linux, macOS, Windows)
 - Toolchain: uv (build, deps, run); `src/` layout, `uv_build` backend
 - Lint/format: `uv run ruff check && uv run ruff format`
 - Type check: `uv run pyright`

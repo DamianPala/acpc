@@ -135,6 +135,8 @@ Entry TOMLs are trusted at the level of shell config: an adapter definition name
 
 ## Development
 
+Python ≥ 3.13; uv drives everything:
+
 ```bash
 uv run pytest && uv run ruff check && uv run ruff format --check && uv run pyright
 ./smoke.sh        # end-to-end acceptance against the ACP mock agent

@@ -1,6 +1,8 @@
 # Architecture — acpc 0.3
 
-Module map for the 0.3 rewrite, derived from SPEC.md's contract (state on disk, session lifecycle, daemon targets, stream discipline). Not a mirror of the 0.3.0.dev1 layout: modules exist because the spec's contract needs them.
+Module map derived from SPEC.md's contract (state on disk, session lifecycle, daemon targets, stream discipline): modules exist because the spec's contract needs them.
+
+Structural changes — new modules, moved seams, changed ownership — update this file in the same change as the code.
 
 ## Layers
 
@@ -22,7 +24,6 @@ cli.py                          argument parsing, verbs, help, exit codes, TTY d
   ├── output.py                 output contract: stdout modes, stderr summary, --json
   ├── cache.py                  advertised models/modes/commands cache under cache/<agent>/
   └── config.py                 config.toml (retention, daemon_ttl, daemon_max_concurrent)
-  └── help.py (optional)        S12 may split the help text out of cli.py if it warrants it
 
 paths.py (frozen)               ~/.acpc layout, ACPC_HOME, atomic_write, 0700/0600
 proc.py (frozen)                process identity/liveness, kill_process_tree, pidfd
@@ -30,7 +31,7 @@ permissions.py (frozen)         kind classification + approval policy
 vocab.py (frozen)               efforts, permission values, session states, exit codes
 ```
 
-"(frozen)" = Stage 1 harvested foundation, kept read-only for the Stage 2 implementer agents (the build history is in status.md).
+"(frozen)" = harvested from 0.2 verbatim with their tests; the marker records provenance, not an edit restriction (build history in status.md).
 
 ## Module ownership
 
@@ -59,7 +60,7 @@ vocab.py (frozen)               efforts, permission values, session states, exit
 
 **Streams:** stdout carries exactly one thing per the output contract; everything acpc says about itself goes to stderr with the `--` prefix; adapter stderr goes to the per-target daemon log (or acpc's stderr on the direct path). The transcript file is the only streaming channel.
 
-## Key decisions (fixed for Stage 2)
+## Key decisions
 
 1. **Entry names come from filenames**: `agents/<name>.toml`, no `identity` field (spec shows `builder.toml` without one). A user file under an adapter's own name overrides that adapter's fields; with `command` and no `extends` it defines a new adapter.
 2. **Adapter TOML schema** (shipped and user, same parser): `name`, `author`, `command`, `install_command`, `home` (default vendor home), `home_env` (the env var that delivers `home` to the adapter process — delivery mechanism, not spec surface), `bypass_modes`, `efforts` (supported superset levels), `env_passthrough`, `[presets]` (`tier = { model, effort }`), and for variants `extends`, `description`, `model`, `effort`, `permissions`, `[env]`.
