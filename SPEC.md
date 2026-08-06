@@ -17,6 +17,7 @@ Small verb set. The whole mental model in one sentence:
 ```
 run <agent> (prompt | - | --prompt-file) [options]   # default: block, stdout = final answer
 continue <id> (prompt | - | --prompt-file)           # follow-up in the same session context
+steer <id> (instruction | - | --prompt-file)         # interrupt the running turn and redirect it
 status [id]                           # no id: list active + recent; with id: one session's vitals
 log <id> [--since CURSOR] [--tail N] [--wait-new | --follow]   # incremental transcript access
 wait <id> [--timeout S]               # block until done, print the answer
@@ -345,6 +346,45 @@ $ acpc status kq8w
 state    done · exit 0 · 12m40s · 41k tok
 agent    reviewer (codex) · name: spec-review
 dir      ~/.acpc/sessions/kq8w · answer: answer.md
+```
+
+### `steer`
+
+```
+steer <id> (instruction | - | --prompt-file F) [-o FILE] [--bg] [--timeout S] [--max-output BYTES] [--quiet]
+```
+
+| Option | Purpose |
+|--------|---------|
+| instruction as arg, `-` (stdin), or `--prompt-file` | Exactly one source, as in `run` |
+| `-o` / `--bg` / `--timeout` / `--max-output` / `--quiet` | As in `continue` — same machinery, same semantics |
+
+Interrupt the turn a session is running and redirect it, as one verb: `session/cancel`, wait for the `cancelled` ack, then start the next turn carrying the instruction. A caller watching a callee drift off task would otherwise have to `stop` it, notice that it stopped, and `continue` it by hand — three calls with a race in the middle.
+
+- **Interrupt-based, because ACP has no mid-turn channel.** Turns are sequential and only `session/cancel` reaches a running one; `session/prompt` mid-turn is protocol-undefined. Vendor engines do support mid-task input internally, but adapters cannot expose it over ACP. Should ACP grow such a channel, `steer` keeps its name and swaps the composite for injection.
+- **The instruction is wrapped in a fixed preamble** naming the interruption, so the callee reads a redirect as a redirect and not as a fresh unrelated task:
+
+  ```
+  Your previous turn was interrupted by the operator; this instruction takes precedence:
+
+  <instruction>
+  ```
+
+  The wrapped text is what `prompt.md` stores, verbatim — what was sent is what is on disk.
+- **Nothing is lost**: the transcript keeps everything, and the interrupted turn's partial answer is parked as that turn's `answer.<n>.md` by the normal rotation. The session's stored resolution is reused, exactly as `continue` reuses it.
+- **A finished session is a usage error** naming `continue` — there is no turn to interrupt.
+- **Race with a natural finish**: a turn that ends on its own before the cancel lands degrades to a plain `continue` — no preamble, because nothing was interrupted — and says so on stderr.
+
+**Checkpoint is a recipe, not a verb.** "Tell me where you are" needs no new surface:
+
+```
+acpc steer x7k2 "Summarize: done / hypothesis / next step / blockers — then stop"
+```
+
+A dedicated verb would be speculative API, and the name would oversell: "checkpoint" sounds free while the mechanics still cancel work in flight. The zero-cost, read-only alternative is `log <id> --prose`, which asks the callee for nothing at all.
+
+```
+acpc steer x7k2 "Stop editing; diagnose only and report what you found"
 ```
 
 ### `stop`

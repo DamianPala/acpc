@@ -844,7 +844,7 @@ fi
 # ==============================================================================
 # S09-continue: context retention, rotation, cross-turn cursor space
 # ==============================================================================
-if begin_section S09-continue "continue: context, turn rotation, cursor space"; then
+if begin_section S09-continue "continue + steer: context, turn rotation, cursor space"; then
     run_acpc run mock "turn one of the conversation" --quiet --json
     CONVO_ID="$(json_field "$LAST_OUT" '.session_id')"
 
@@ -877,6 +877,23 @@ if begin_section S09-continue "continue: context, turn rotation, cursor space"; 
     run_acpc run mock "named session turn one" --quiet --name smoke-named --json
     run_acpc continue smoke-named "named session turn two" --quiet
     assert_eq "continue by name works" "0" "$LAST_RC"
+
+    # steer: cancel the turn in flight and redirect the session, one verb.
+    run_acpc run mock "chunkslow:30 steer victim" --bg --quiet
+    STEER_ID="$(head -n1 <<<"$LAST_OUT")"
+    wait_for_state "$STEER_ID" "running" 20 || fail "the steer victim never started running"
+    run_acpc steer "$STEER_ID" "stop what you are doing and summarize instead"
+    assert_eq "steer exits 0" "0" "$LAST_RC"
+    assert_contains "the redirected turn answers the instruction" "$LAST_OUT" \
+        "stop what you are doing and summarize instead"
+    assert_contains "the stored prompt carries the interruption preamble" \
+        "$(cat "${ACPC_HOME}/sessions/${STEER_ID}/prompt.md")" \
+        "Your previous turn was interrupted by the operator"
+    assert_file "the interrupted turn's answer is parked" \
+        "${ACPC_HOME}/sessions/${STEER_ID}/answer.1.md"
+    run_acpc steer "$STEER_ID" "and once more"
+    assert_eq "steer on a finished session is a usage error" "2" "$LAST_RC"
+    assert_contains "the finished-session error names continue" "$LAST_ERR" "acpc continue"
 
     end_section S09-continue
 fi
@@ -1082,6 +1099,9 @@ if begin_section S12-cli "help contract, -V, TTY rules, hostile inputs"; then
     assert_contains "log --help documents --wait-new" "$LAST_OUT" "--wait-new"
     assert_contains "log --help documents --follow" "$LAST_OUT" "--follow"
     assert_contains "log --help documents the follow exit codes" "$LAST_OUT" "exit 124"
+    run_acpc steer --help
+    assert_contains "steer --help documents the interruption" "$LAST_OUT" "Interrupt"
+    assert_contains "steer --help documents --prompt-file" "$LAST_OUT" "--prompt-file"
     for verb in stop rm install; do
         run_acpc "$verb" --help
         assert_true "'$verb --help' is its own reference page" \

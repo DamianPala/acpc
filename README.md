@@ -36,6 +36,7 @@ An agent caller reads the session id straight from the `--bg` output — shell v
 ```
 run <agent> (prompt | - | --prompt-file) [options]   # default: block, stdout = final answer
 continue <id> (prompt | - | --prompt-file)           # follow-up in the same session context
+steer <id> (instruction | - | --prompt-file)         # interrupt the running turn and redirect it
 status [id]                # no id: active + recent; with id: one session's vitals
 log <id> [--since CURSOR] [--tail N] [--prose] [--wait-new | --follow]   # incremental transcript access
 wait <id> [--timeout S]    # block until done, print the answer
@@ -48,6 +49,8 @@ daemon status|stop [target] [--force]   # plumbing escape hatch — never needed
 ```
 
 `acpc --help` is a self-contained cheat sheet; `acpc <cmd> --help` is that command's full reference. `<id>` accepts a session id or a `--name` alias; `last` works on a TTY only.
+
+`steer <id> "…"` interrupts the turn in flight and redirects the session in one call — `stop` plus `continue` without the race in the middle. The instruction reaches the callee under a fixed preamble naming the interruption, and the interrupted turn's partial answer is kept as that turn's answer file.
 
 ## Reading a run
 

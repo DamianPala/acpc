@@ -86,7 +86,8 @@ Maintenance and setup:
   Killing acpc does not stop the session — acpc stop does.
 
 Common commands:
-  run, continue, wait, status, log, agents, daemon, stop, rm, prune, install
+  run, continue, steer, wait, status, log, agents, daemon, stop, rm, prune,
+  install
   Use `acpc <command> --help` for the command's full reference.
 
 Flag → ACP
@@ -962,6 +963,34 @@ def _wait_for_stop(session_id: str) -> sessions.SessionMeta:
         time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
 
 
+def _cancel_session(meta: sessions.SessionMeta) -> sessions.SessionMeta:
+    """Cancel an active session and return the state it settled into.
+
+    SPEC `stop`: graceful `session/cancel` with a bounded wait for the ack,
+    torn down anyway if the callee will not wind down in time. `steer` puts
+    the same cancel in front of a follow-up turn, so it lives here rather
+    than inside `stop`.
+    """
+    cancelled = False
+    if meta.target is not None:
+        cancelled = asyncio.run(_cancel_with_daemon(meta.target, meta.session_id))
+    if cancelled is True:
+        return _wait_for_stop(meta.session_id)
+    if cancelled is None:
+        return sessions.load(meta.session_id)
+    if meta.pid is None:
+        return sessions.transition(
+            meta.session_id,
+            "cancelled",
+            exit_code=vocab.EXIT_CANCELLED,
+            stop_reason="stopped by user",
+        )
+    result = proc.kill_process_tree(meta.pid, meta.process_start_time)
+    if result == "refused":
+        raise UsageProblem(f"could not stop session {meta.session_id}: refused to signal it")
+    return _wait_for_stop(meta.session_id)
+
+
 def _maintenance_json(payload: Mapping[str, Any]) -> None:
     _write_stdout(json.dumps(dict(payload), ensure_ascii=False) + "\n")
 
@@ -980,27 +1009,7 @@ def stop_command(selector: str, json_mode: bool) -> None:
     """
     meta = _load_view_session(selector)
     if meta.is_active:
-        cancelled = False
-        if meta.target is not None:
-            cancelled = asyncio.run(_cancel_with_daemon(meta.target, meta.session_id))
-        if cancelled is True:
-            meta = _wait_for_stop(meta.session_id)
-        elif cancelled is None:
-            meta = sessions.load(meta.session_id)
-        elif meta.pid is None:
-            meta = sessions.transition(
-                meta.session_id,
-                "cancelled",
-                exit_code=vocab.EXIT_CANCELLED,
-                stop_reason="stopped by user",
-            )
-        else:
-            result = proc.kill_process_tree(meta.pid, meta.process_start_time)
-            if result == "refused":
-                raise UsageProblem(
-                    f"could not stop session {meta.session_id}: refused to signal it"
-                )
-            meta = _wait_for_stop(meta.session_id)
+        meta = _cancel_session(meta)
 
     payload = {
         "session_id": meta.session_id,
@@ -1715,6 +1724,34 @@ def continue_command(
         raise UsageProblem(
             f"session {meta.session_id} is {meta.state} — wait for the current turn to finish"
         )
+    _dispatch_follow_up(
+        meta,
+        prompt,
+        output_file=output_file,
+        background=background,
+        timeout=timeout,
+        max_output=max_output,
+        quiet=quiet,
+        json_mode=json_mode,
+    )
+
+
+def _dispatch_follow_up(
+    meta: sessions.SessionMeta,
+    prompt: str,
+    *,
+    output_file: str | None,
+    background: bool,
+    timeout: float | None,
+    max_output: int,
+    quiet: bool,
+    json_mode: bool,
+) -> None:
+    """Run the next turn on a finished session — `continue`'s machinery.
+
+    `steer` is `continue` with a cancel in front of it, so both verbs end
+    here: one turn on the session's stored resolution, one output contract.
+    """
     stored_policy = meta.resolution.get("resolved", {}).get("permissions", {}).get("value")
     interactive = _stdout_is_tty() and not background
     if stored_policy == "prompt" and not interactive:
@@ -1776,6 +1813,90 @@ def continue_command(
     if not quiet:
         _echo_metadata(output.format_summary(final, route_note=_route_note(outcome)))
     raise SystemExit(outcome.exit_code)
+
+
+# SPEC `steer`: the preamble is fixed text, so the callee reads the redirect
+# as a redirect rather than as a fresh unrelated task.
+STEER_PREAMBLE = (
+    "Your previous turn was interrupted by the operator; this instruction takes precedence:"
+)
+
+
+def _steer_prompt(instruction: str) -> str:
+    return f"{STEER_PREAMBLE}\n\n{instruction}"
+
+
+@main.command(name="steer")
+@click.argument("selector")
+@click.argument("instruction_text", required=False)
+@click.option(
+    "--prompt-file", "prompt_file", metavar="FILE", help="Read the instruction from a file."
+)
+@click.option("-o", "--output", "output_file", metavar="FILE", help="Write the answer to a file.")
+@click.option("--bg", "background", is_flag=True, help="Dispatch and return the session id.")
+@click.option(
+    "--timeout",
+    type=float,
+    metavar="S",
+    help="Cancel the redirected turn after S seconds; absent means no limit.",
+)
+@click.option(
+    "--max-output",
+    type=click.IntRange(min=0),
+    default=output.DEFAULT_MAX_OUTPUT,
+    show_default=True,
+    metavar="BYTES",
+    help="Cap on stdout bytes; 0 disables the cap.",
+)
+@click.option("--quiet", is_flag=True, help="Suppress the stderr summary line.")
+@click.option("--json", "json_mode", is_flag=True, help="Emit this command's output as JSON.")
+@click.help_option("-h", "--help")
+def steer_command(
+    selector: str,
+    instruction_text: str | None,
+    prompt_file: str | None,
+    output_file: str | None,
+    background: bool,
+    timeout: float | None,
+    max_output: int,
+    quiet: bool,
+    json_mode: bool,
+) -> None:
+    """Interrupt the running turn and redirect the session in one verb.
+
+    Cancels the turn in flight (ACP session/cancel), waits for the ack, then
+    starts the next turn with the instruction under a fixed preamble. The
+    interrupted turn's partial answer is kept as that turn's answer file.
+
+    Example: ``acpc steer x7k2 "Stop editing; diagnose only"``
+    """
+    instruction = _read_prompt(instruction_text, prompt_file)
+    meta = _load_view_session(selector)
+    if not meta.is_active:
+        raise UsageProblem(
+            f"session {meta.session_id} is {meta.state} — there is no turn to interrupt; "
+            f"the follow-up verb for a finished session is: acpc continue {meta.session_id}"
+        )
+
+    meta = _cancel_session(meta)
+    interrupted = meta.state == "cancelled"
+    if not interrupted and not quiet:
+        # SPEC `steer`: nothing was interrupted, so the preamble would lie.
+        _echo_metadata(
+            "-- the turn finished on its own before the cancel landed; "
+            "continuing as a plain follow-up"
+        )
+
+    _dispatch_follow_up(
+        meta,
+        _steer_prompt(instruction) if interrupted else instruction,
+        output_file=output_file,
+        background=background,
+        timeout=timeout,
+        max_output=max_output,
+        quiet=quiet,
+        json_mode=json_mode,
+    )
 
 
 @main.command(name="wait")
