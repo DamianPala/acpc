@@ -35,7 +35,7 @@ An agent caller reads the session id straight from the `--bg` output — shell v
 run <agent> (prompt | - | --prompt-file) [options]   # default: block, stdout = final answer
 continue <id> (prompt | - | --prompt-file)           # follow-up in the same session context
 status [id]                # no id: active + recent; with id: one session's vitals
-log <id> [--since CURSOR] [--tail N] [--prose] [--wait-new]   # incremental transcript access
+log <id> [--since CURSOR] [--tail N] [--prose] [--wait-new | --follow]   # incremental transcript access
 wait <id> [--timeout S]    # block until done, print the answer
 stop <id>
 rm <id> | prune [--older-than D] [--dry-run]
@@ -67,7 +67,8 @@ $ acpc log x7k2 --since 42
 | 0 | success (`end_turn`) |
 | 1 | agent error — crash, refusal, missing auth |
 | 2 | usage error — bad flags, unknown session, rejected mode/permissions combination |
-| 124 | timeout (`run`: session cancelled; `wait`/`log --wait-new`: gave up waiting, session runs on) |
+| 4 | output budget exhausted — `log --follow` stopped because `--max-output` ran out before the session ended |
+| 124 | timeout (`run`: session cancelled; `wait`/`log --wait-new`/`log --follow`: gave up waiting, session runs on) |
 | 130 | cancelled — SIGINT or `stop` |
 | 141 / 143 | SIGPIPE / SIGTERM |
 

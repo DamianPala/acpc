@@ -451,3 +451,229 @@ def test_failed_log_expands_the_last_agent_message(cli: CliRunner) -> None:
     result = invoke(cli, "log", session_id, "--since", "0")
 
     assert "outside what the mock adapter will attempt" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# `log --follow` (SPEC `log`): one bounded call in place of a polling loop.
+# ---------------------------------------------------------------------------
+
+
+def test_follow_replays_the_last_ten_events_by_default(cli: CliRunner) -> None:
+    """SPEC --follow: the start point is a bounded replay, for orientation."""
+    meta = session_with_messages(25)
+
+    result = invoke(cli, "log", meta.session_id, "--follow")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert len(result.stdout.splitlines()) == 10
+    assert '"event-15"' in result.stdout
+    assert '"event-14"' not in result.stdout
+
+
+def test_follow_tail_zero_replays_nothing(cli: CliRunner) -> None:
+    """--tail 0 is the new-events-only start point."""
+    meta = session_with_messages(5)
+
+    result = invoke(cli, "log", meta.session_id, "--follow", "--tail", "0")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert result.stdout == ""
+
+
+def test_follow_since_resumes_without_a_replay(cli: CliRunner) -> None:
+    """An explicit --since resumes exactly: the replay default never applies."""
+    meta = session_with_messages(25)
+
+    result = invoke(cli, "log", meta.session_id, "--follow", "--since", "20")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert len(result.stdout.splitlines()) == 5
+    assert '"event-20"' in result.stdout
+    assert '"event-19"' not in result.stdout
+
+
+def test_follow_on_a_finished_session_returns_at_once(cli: CliRunner) -> None:
+    """Following a stopped stream ends, and that ending is success — unlike
+    --wait-new, whose question is 'has anything new happened'."""
+    meta = session_with_messages(3)
+
+    started = time.monotonic()
+    result = invoke(cli, "log", meta.session_id, "--follow", "--timeout", "30")
+
+    assert time.monotonic() - started < 5
+    assert result.exit_code == vocab.EXIT_OK
+    assert result.stderr.lstrip().startswith("-- done")
+
+
+def test_follow_ends_when_the_session_finishes(cli: CliRunner) -> None:
+    """The stream collects what arrives during the wait and ends on the
+    session's end, with the state it reached."""
+    meta = running_session("finishing under follow")
+    transcript_file = transcript.Transcript(sessions.transcript_path(meta.session_id))
+
+    def finish() -> None:
+        time.sleep(0.05)
+        transcript_file.append("msg", text="mid-follow event")
+        time.sleep(0.05)
+        transcript_file.append("msg", text="the last word")
+        sessions.transition(meta.session_id, "done", exit_code=0, stop_reason="end_turn")
+
+    writer = threading.Thread(target=finish)
+    writer.start()
+    try:
+        result = invoke(cli, "log", meta.session_id, "--follow", "--timeout", "5")
+    finally:
+        writer.join(timeout=5)
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert "mid-follow event" in result.stdout
+    assert "the last word" in result.stdout
+    assert result.stderr.lstrip().startswith("-- done")
+
+
+def test_follow_timeout_exits_124_and_leaves_the_session_alone(cli: CliRunner) -> None:
+    """The 124 exit never touches the session; the note says so, and the
+    footer's cursor is what the caller resumes from."""
+    meta = running_session("still going")
+
+    result = invoke(cli, "log", meta.session_id, "--follow", "--timeout", "0.2")
+
+    assert result.exit_code == vocab.EXIT_TIMEOUT
+    assert "still running (gave up waiting after 0.2s)" in result.stderr
+    assert f"acpc stop {meta.session_id} to cancel" in result.stderr
+    assert "cursor:" in result.stderr
+    assert sessions.load(meta.session_id).state == "running"
+
+
+def test_follow_budget_exhaustion_exits_four_and_says_how_to_resume(cli: CliRunner) -> None:
+    """SPEC exit codes: a cut stream is not a completed follow, so it gets its
+    own code and a way back into the stream."""
+    meta = session_with_messages(25)
+
+    result = invoke(cli, "log", meta.session_id, "--follow", "--since", "0", "--max-output", "300")
+
+    assert result.exit_code == vocab.EXIT_BUDGET
+    assert "output truncated" in result.stdout
+    assert "--max-output 300 exhausted" in result.stderr
+    assert f"acpc log {meta.session_id} --follow --since" in result.stderr
+
+
+def test_follow_cursor_covers_exactly_what_was_printed(cli: CliRunner) -> None:
+    """A caller resuming at the footer's cursor sees no gap and no repeat."""
+    meta = session_with_messages(25)
+
+    cut = invoke(cli, "log", meta.session_id, "--follow", "--since", "0", "--max-output", "300")
+    assert cut.exit_code == vocab.EXIT_BUDGET
+    cursor = int(cut.stderr.rsplit("cursor:", 1)[1].strip())
+    printed = [
+        line
+        for line in cut.stdout.splitlines()
+        if line.startswith("[") and "output truncated" not in line
+    ]
+    assert f'"event-{cursor - 1}"' in printed[-1]
+
+    rest = invoke(cli, "log", meta.session_id, "--follow", "--since", str(cursor))
+    assert rest.exit_code == vocab.EXIT_OK
+    assert f'"event-{cursor - 1}"' not in rest.stdout
+    assert f'"event-{cursor}"' in rest.stdout
+
+
+def test_follow_budget_spans_the_whole_stream(cli: CliRunner) -> None:
+    """--max-output budgets the follow, not each page it happens to read.
+
+    Events arrive slower than the poll interval, so every page here is one
+    event and sits far inside the budget on its own: only a budget carried
+    across pages can ever cut this stream.
+    """
+    meta = running_session("streaming")
+    transcript_file = transcript.Transcript(sessions.transcript_path(meta.session_id))
+
+    def write_events() -> None:
+        for index in range(20):
+            transcript_file.append("msg", text=f"chunk-{index}")
+            time.sleep(0.08)
+
+    writer = threading.Thread(target=write_events, daemon=True)
+    writer.start()
+    try:
+        result = invoke(
+            cli,
+            "log",
+            meta.session_id,
+            "--follow",
+            "--tail",
+            "0",
+            "--max-output",
+            "200",
+            "--timeout",
+            "3",
+        )
+    finally:
+        writer.join(timeout=5)
+
+    assert result.exit_code == vocab.EXIT_BUDGET
+    printed = [line for line in result.stdout.splitlines() if "chunk-" in line]
+    assert 0 < len(printed) < 20
+
+
+def test_follow_json_stays_valid_ndjson_under_the_budget(cli: CliRunner) -> None:
+    """The cut appears as the typed `truncated` event, never a bare marker."""
+    meta = session_with_messages(25)
+
+    result = invoke(
+        cli,
+        "log",
+        meta.session_id,
+        "--follow",
+        "--since",
+        "0",
+        "--json",
+        "--max-output",
+        "400",
+    )
+
+    assert result.exit_code == vocab.EXIT_BUDGET
+    events = [json.loads(line) for line in result.stdout.splitlines()]
+    assert all(isinstance(event, dict) for event in events)
+    assert events[-1]["type"] == "truncated"
+
+
+def test_follow_prose_renders_full_messages(cli: CliRunner) -> None:
+    """--prose --follow is allowed, and renders the content view."""
+    long_text = "x" * 400
+    meta = session_with_texts(long_text)
+
+    result = invoke(cli, "log", meta.session_id, "--follow", "--prose")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert long_text in result.stdout
+
+
+def test_follow_and_wait_new_are_mutually_exclusive(cli: CliRunner) -> None:
+    """One waiting mode per call."""
+    meta = session_with_messages(1)
+
+    result = invoke(cli, "log", meta.session_id, "--follow", "--wait-new")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert "mutually exclusive" in result.stderr
+
+
+def test_follow_accepts_the_short_flag(cli: CliRunner) -> None:
+    """-f is a real flag on `log` now, not an alias hint."""
+    meta = session_with_messages(3)
+
+    result = invoke(cli, "log", meta.session_id, "-f")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert '"event-2"' in result.stdout
+
+
+def test_follow_quiet_suppresses_the_footer(cli: CliRunner) -> None:
+    """--quiet keeps stderr empty, as everywhere else."""
+    meta = session_with_messages(3)
+
+    result = invoke(cli, "log", meta.session_id, "--follow", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert result.stderr == ""

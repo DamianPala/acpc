@@ -678,7 +678,7 @@ poll_slow1
 # ==============================================================================
 # S08-views: status views, log views, footers, cursors
 # ==============================================================================
-if begin_section S08-views "status list/detail, log default/--since/--tail/--prose/--wait-new"; then
+if begin_section S08-views "status list/detail, log default/--since/--tail/--prose/--wait-new/--follow"; then
     # status list: defaults to running + 5 most recent finished; footer in view
     run_acpc status
     assert_eq "status exits 0" "0" "$LAST_RC"
@@ -735,6 +735,39 @@ if begin_section S08-views "status list/detail, log default/--since/--tail/--pro
     run_acpc log "$UTIL_ID" --wait-new --timeout 30
     assert_eq "log --wait-new returns 124 at once on a finished session" "124" "$LAST_RC"
     assert_contains "the immediate 124 carries the finished footer" "$LAST_ERR" "done"
+
+    # --follow: the bounded call that replaces a hand-rolled --wait-new loop.
+    # A finished session ends the stream at once and that ending is success --
+    # the `logs -f` convention -- unlike --wait-new's "nothing new" 124.
+    run_acpc log "$UTIL_ID" --follow --timeout 30
+    assert_eq "log --follow returns 0 at once on a finished session" "0" "$LAST_RC"
+    assert_contains "the follow ending carries the finished footer" "$LAST_ERR" "done"
+    assert_contains "the follow footer carries the resume cursor" "$LAST_ERR" "cursor:"
+
+    run_acpc log "$UTIL_ID" -f --tail 0
+    assert_eq "-f is a real short flag on log" "0" "$LAST_RC"
+    assert_eq "--tail 0 starts the follow at the transcript's end" "" "$LAST_OUT"
+
+    run_acpc log "$UTIL_ID" --follow --since 0 --max-output 1
+    assert_eq "an exhausted --max-output ends the follow with exit 4" "4" "$LAST_RC"
+    assert_contains "the cut names the transcript on stdout" "$LAST_OUT" "output truncated"
+    assert_contains "the cut says how to resume" "$LAST_ERR" "--follow --since"
+
+    run_acpc log "$UTIL_ID" --follow --wait-new
+    assert_eq "--follow with --wait-new is a usage error" "2" "$LAST_RC"
+
+    # The timeout ending needs a session that is certainly still running.
+    # SLOW1's remaining time depends on how long the assertions above took, so
+    # this dispatches its own victim rather than racing a shared one.
+    run_acpc run mock "slow:20 follow timeout probe" --bg --quiet
+    FOLLOW_ID="$(head -n1 <<<"$LAST_OUT")"
+    run_acpc log "$FOLLOW_ID" --follow --tail 0 --timeout 3
+    assert_eq "log --follow times out with 124 on a running session" "124" "$LAST_RC"
+    assert_contains "the follow timeout says the session continues" "$LAST_ERR" \
+        "still running (gave up waiting"
+    assert_contains "the follow timeout carries the resume cursor" "$LAST_ERR" "cursor:"
+    run_acpc stop "$FOLLOW_ID"
+    assert_eq "the follow probe stops cleanly" "0" "$LAST_RC"
 
     if [[ $SLOW_MACHINERY -eq 1 ]]; then
         # Live long-poll against SLOW1 (still running: ~64s of ~2s-apart events)
@@ -1014,6 +1047,8 @@ if begin_section S12-cli "help contract, -V, TTY rules, hostile inputs"; then
     assert_contains "run --help explains write permissions" "$LAST_OUT" "write (= edit + execute)"
     run_acpc log --help
     assert_contains "log --help documents --wait-new" "$LAST_OUT" "--wait-new"
+    assert_contains "log --help documents --follow" "$LAST_OUT" "--follow"
+    assert_contains "log --help documents the follow exit codes" "$LAST_OUT" "exit 124"
     for verb in stop rm install; do
         run_acpc "$verb" --help
         assert_true "'$verb --help' is its own reference page" \

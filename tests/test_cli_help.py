@@ -117,15 +117,15 @@ def test_no_command_redirects_to_root_help_and_root_keeps_verb_one_liners(
         (
             ("--follow",),
             (
-                "Error: --follow is not an acpc flag — live-follow is: acpc log <id> "
-                "--wait-new [--timeout S]"
+                "Error: --follow is not a flag on this command — following a session "
+                "is: acpc log <id> --follow [--timeout S]"
             ),
         ),
         (
             ("-f",),
             (
-                "Error: --follow is not an acpc flag — live-follow is: acpc log <id> "
-                "--wait-new [--timeout S]"
+                "Error: --follow is not a flag on this command — following a session "
+                "is: acpc log <id> --follow [--timeout S]"
             ),
         ),
         (

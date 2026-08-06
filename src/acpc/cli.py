@@ -11,7 +11,7 @@ import os
 import subprocess
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -122,7 +122,8 @@ class _CheatSheetGroup(click.Group):
 def _friendly_usage_message(message: str) -> str:
     """Replace known neighboring-tool spellings with their acpc equivalents."""
     follow_hint = (
-        "--follow is not an acpc flag — live-follow is: acpc log <id> --wait-new [--timeout S]"
+        "--follow is not a flag on this command — following a session is: "
+        "acpc log <id> --follow [--timeout S]"
     )
     detach_hint = (
         '--detach is not an acpc flag — background dispatch is: acpc run <agent> "<prompt>" --bg'
@@ -1086,6 +1087,8 @@ def _load_view_session(selector: str) -> sessions.SessionMeta:
 
 
 _LOG_DEFAULT_TAIL = 20
+# SPEC `log --follow`: a bounded replay for orientation, the `tail -f` prior.
+_FOLLOW_DEFAULT_TAIL = 10
 _LOG_WAIT_POLL_INTERVAL = 0.05
 
 
@@ -1173,7 +1176,19 @@ def status_command(selector: str | None, all_sessions: bool, json_mode: bool) ->
     metavar="BYTES",
 )
 @click.option("--wait-new", is_flag=True, help="Wait for new transcript events.")
-@click.option("--timeout", type=click.FloatRange(min=0), default=None, metavar="S")
+@click.option(
+    "-f",
+    "--follow",
+    is_flag=True,
+    help="Collect events until the session ends; exit 124 on --timeout, 4 on --max-output.",
+)
+@click.option(
+    "--timeout",
+    type=click.FloatRange(min=0),
+    default=None,
+    metavar="S",
+    help="Give up waiting after S seconds (exit 124); requires --wait-new or --follow.",
+)
 @click.option("--quiet", is_flag=True, help="Suppress the stderr footer.")
 @click.help_option("-h", "--help")
 def log_command(
@@ -1184,17 +1199,24 @@ def log_command(
     json_mode: bool,
     max_output: int,
     wait_new: bool,
+    follow: bool,
     timeout: float | None,
     quiet: bool,
 ) -> None:
     """Render selected transcript events and keep metadata on stderr.
 
+    Without --since or --tail this shows the last 20 events.
+
     Example: ``acpc log <session-id> --prose --since 0``
     """
     if prose and json_mode:
         raise UsageProblem("--prose and --json are mutually exclusive views")
-    if timeout is not None and not wait_new:
-        raise UsageProblem("--timeout requires --wait-new")
+    if wait_new and follow:
+        raise UsageProblem(
+            "--wait-new and --follow are mutually exclusive — --follow already waits"
+        )
+    if timeout is not None and not (wait_new or follow):
+        raise UsageProblem("--timeout requires --wait-new or --follow")
 
     meta = _load_view_session(selector)
     try:
@@ -1205,7 +1227,21 @@ def log_command(
     cursor = 0 if since is None else since
     selection_tail = tail
     if selection_tail is None and not explicit_since:
-        selection_tail = _LOG_DEFAULT_TAIL
+        selection_tail = _FOLLOW_DEFAULT_TAIL if follow else _LOG_DEFAULT_TAIL
+
+    if follow:
+        _follow_log(
+            meta,
+            transcript_file,
+            cursor=cursor,
+            tail=selection_tail,
+            prose=prose,
+            json_mode=json_mode,
+            max_output=max_output,
+            timeout=timeout,
+            quiet=quiet,
+        )
+        return
 
     if wait_new and not explicit_since:
         cursor = _read_transcript_page(transcript_file).next_cursor
@@ -1265,6 +1301,136 @@ def log_command(
         _echo_metadata(footer)
     if timed_out:
         raise SystemExit(vocab.EXIT_TIMEOUT)
+
+
+def _sleep_until(deadline: float | None) -> None:
+    """Sleep one poll interval, never past the deadline."""
+    if deadline is None:
+        time.sleep(_LOG_WAIT_POLL_INTERVAL)
+        return
+    time.sleep(min(_LOG_WAIT_POLL_INTERVAL, max(0.0, deadline - time.monotonic())))
+
+
+def _emit_follow_page(
+    events: Sequence[Mapping[str, Any]],
+    *,
+    prose: bool,
+    json_mode: bool,
+    max_output: int,
+    used: int,
+    transcript_path: Path,
+    cursor: int,
+) -> tuple[int, int, bool]:
+    """Render one page inside the follow budget.
+
+    SPEC `log --follow`: `--max-output` budgets the whole stream, so each page
+    is rendered against what is left of it.  A budget with nothing left still
+    renders one byte's worth, which is how the marker naming the transcript
+    reaches stdout instead of a silent stop.
+    """
+    budget = 0 if max_output == 0 else max(1, max_output - used)
+    rendered = render.render_events(
+        events,
+        prose=prose,
+        json_mode=json_mode,
+        max_output=budget,
+        transcript_path=transcript_path,
+        cursor=cursor,
+    )
+    _write_stdout(rendered.text)
+    return rendered.next_cursor, used + len(rendered.text.encode("utf-8")), rendered.truncated
+
+
+def _follow_start_cursor(
+    transcript_file: transcript.Transcript,
+    *,
+    since: int,
+    tail: int | None,
+) -> int:
+    """Turn the replay depth into the cursor the follow starts from.
+
+    SPEC `log --follow`: the replay is a start point, not a filter on the
+    stream — `--tail 0` means "from here on", so with nothing to replay the
+    cursor moves to the transcript's current end rather than staying put and
+    letting the first page hand back the whole history.
+    """
+    replay = _read_transcript_page(transcript_file, since=since, tail=tail)
+    if replay.events:
+        return int(replay.events[0]["i"]) - 1
+    return _read_transcript_page(transcript_file, since=since).next_cursor
+
+
+def _follow_log(
+    meta: sessions.SessionMeta,
+    transcript_file: transcript.Transcript,
+    *,
+    cursor: int,
+    tail: int | None,
+    prose: bool,
+    json_mode: bool,
+    max_output: int,
+    timeout: float | None,
+    quiet: bool,
+) -> None:
+    """Collect events until the session ends, the timeout expires, or the
+    budget runs out — SPEC `log --follow`'s three endings, one exit code each."""
+    transcript_path = sessions.transcript_path(meta.session_id)
+    deadline = None if timeout is None else time.monotonic() + timeout
+    cursor = _follow_start_cursor(transcript_file, since=cursor, tail=tail)
+    used = 0
+    exhausted = False
+    timed_out = False
+
+    while True:
+        page = _read_transcript_page(transcript_file, since=cursor)
+        if page.events:
+            cursor, used, exhausted = _emit_follow_page(
+                page.events,
+                prose=prose,
+                json_mode=json_mode,
+                max_output=max_output,
+                used=used,
+                transcript_path=transcript_path,
+                cursor=cursor,
+            )
+            if exhausted:
+                break
+            continue
+        meta = _load_view_session(meta.session_id)
+        if meta.state in vocab.FINISHED_STATES:
+            # Events are appended before the final state is recorded, so a page
+            # read after observing that state is the complete remainder.
+            if _read_transcript_page(transcript_file, since=cursor).events:
+                continue
+            break
+        if deadline is not None and time.monotonic() >= deadline:
+            timed_out = True
+            break
+        _sleep_until(deadline)
+
+    # The follow outlived the state it started with; the footer is the caller's
+    # termination signal, so it has to be current.
+    meta = _load_view_session(meta.session_id)
+    if not quiet:
+        if timed_out and meta.state not in vocab.FINISHED_STATES:
+            _echo_metadata(_still_running_note(meta.session_id, timeout))
+        if exhausted:
+            _echo_metadata(_budget_exhausted_note(meta.session_id, max_output, cursor))
+        event_count = _read_transcript_page(transcript_file).next_cursor
+        _echo_metadata(render.format_log_footer(meta, cursor=cursor, event_count=event_count))
+    if exhausted:
+        raise SystemExit(vocab.EXIT_BUDGET)
+    if timed_out:
+        raise SystemExit(vocab.EXIT_TIMEOUT)
+
+
+def _budget_exhausted_note(session_id: str, max_output: int, cursor: int) -> str:
+    """SPEC exit codes: a cut stream is not a completed follow, so the way out
+    says what stopped it and how to pick the stream back up."""
+    return (
+        f"-- stopped: --max-output {max_output} exhausted — resume with: "
+        f"acpc log {session_id} --follow --since {cursor}"
+    )
 
 
 def _still_running_note(session_id: str, timeout: float | None) -> str:
