@@ -1147,15 +1147,25 @@ def log_command(
     if wait_new and not explicit_since:
         cursor = _read_transcript_page(transcript_file).next_cursor
     page = _read_transcript_page(transcript_file, since=cursor, tail=selection_tail)
+    timed_out = False
     if wait_new and not page.events:
-        page = _wait_for_new_events(
+        waited = _wait_for_new_events(
             transcript_file,
             since=cursor,
             tail=selection_tail,
             timeout=timeout,
         )
-        if page is None:
-            raise SystemExit(vocab.EXIT_TIMEOUT)
+        if waited is None:
+            # SPEC `--wait-new`: the timeout exit still prints the footer.  A
+            # bare 124 with zero bytes is indistinguishable from a hang, and
+            # the footer is what tells a poller the session already finished.
+            timed_out = True
+            waited = transcript.TranscriptPage([], cursor)
+        page = waited
+    if wait_new:
+        # The wait may have outlived the state this command started with; the
+        # footer is the caller's termination signal, so it must be current.
+        meta = _load_view_session(meta.session_id)
 
     full_last_message = meta.state in {"failed", "timeout", "orphaned"}
     rendered = render.render_events(
@@ -1178,6 +1188,8 @@ def log_command(
             event_count=event_count,
         )
         _echo_metadata(footer)
+    if timed_out:
+        raise SystemExit(vocab.EXIT_TIMEOUT)
 
 
 @main.command(name="run")

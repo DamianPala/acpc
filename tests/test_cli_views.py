@@ -328,8 +328,9 @@ def test_log_rejects_an_unknown_session(cli: CliRunner) -> None:
     assert result.exit_code == vocab.EXIT_USAGE
 
 
-def test_log_wait_new_timeout_exits_without_output(cli: CliRunner) -> None:
-    """An expired log long-poll returns timeout without transcript or footer output."""
+def test_log_wait_new_timeout_prints_the_footer(cli: CliRunner) -> None:
+    """SPEC --wait-new: the timeout exit still prints the footer — a bare 124
+    with zero bytes is indistinguishable from a hang."""
     session_id = run_mock(cli)
 
     result = invoke(
@@ -343,7 +344,35 @@ def test_log_wait_new_timeout_exits_without_output(cli: CliRunner) -> None:
         "0",
     )
 
-    assert result.exit_code == vocab.EXIT_TIMEOUT and result.stdout == "" and result.stderr == ""
+    assert result.exit_code == vocab.EXIT_TIMEOUT
+    assert result.stdout == ""
+    assert result.stderr.lstrip().startswith("-- done")
+    assert "cursor:" in result.stderr
+
+
+def test_wait_new_footer_reports_the_state_reached_during_the_wait(cli: CliRunner) -> None:
+    """The footer is the caller's termination signal, so it must reflect the
+    state after the wait, not the one the command started with."""
+    meta = sessions.create_session(entry="mock", base_adapter="mock", prompt="finishing mid-wait")
+    sessions.mark_running(meta.session_id, pid=os.getpid())
+    transcript_file = transcript.Transcript(sessions.transcript_path(meta.session_id))
+
+    def finish_session() -> None:
+        time.sleep(0.05)
+        sessions.transition(meta.session_id, "done", exit_code=0, stop_reason="end_turn")
+        transcript_file.append("msg", text="the last word")
+
+    writer = threading.Thread(target=finish_session)
+    writer.start()
+    try:
+        result = invoke(
+            cli, "log", meta.session_id, "--since", "0", "--wait-new", "--timeout", "2"
+        )
+    finally:
+        writer.join(timeout=2)
+
+    assert "the last word" in result.stdout
+    assert result.stderr.lstrip().startswith("-- done")
 
 
 def test_log_rejects_timeout_without_wait_new(cli: CliRunner) -> None:
