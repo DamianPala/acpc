@@ -1158,20 +1158,30 @@ def log_command(
         cursor = _read_transcript_page(transcript_file).next_cursor
     page = _read_transcript_page(transcript_file, since=cursor, tail=selection_tail)
     timed_out = False
+    gave_up_waiting = False
     if wait_new and not page.events:
-        waited = _wait_for_new_events(
-            transcript_file,
-            since=cursor,
-            tail=selection_tail,
-            timeout=timeout,
-        )
-        if waited is None:
+        if meta.state in vocab.FINISHED_STATES:
+            # SPEC `--wait-new`: a finished session cannot produce new
+            # activity, so the call returns at once (the `logs -f`
+            # convention: following a stopped stream ends).
+            timed_out = True
+        else:
+            waited = _wait_for_new_events(
+                transcript_file,
+                since=cursor,
+                tail=selection_tail,
+                timeout=timeout,
+            )
+            if waited is None:
+                timed_out = True
+                gave_up_waiting = True
+            else:
+                page = waited
+        if timed_out:
             # SPEC `--wait-new`: the timeout exit still prints the footer.  A
             # bare 124 with zero bytes is indistinguishable from a hang, and
             # the footer is what tells a poller the session already finished.
-            timed_out = True
-            waited = transcript.TranscriptPage([], cursor)
-        page = waited
+            page = transcript.TranscriptPage([], cursor)
     if wait_new:
         # The wait may have outlived the state this command started with; the
         # footer is the caller's termination signal, so it must be current.
@@ -1189,6 +1199,8 @@ def log_command(
     )
     _write_stdout(rendered.text)
     if not quiet:
+        if gave_up_waiting and meta.state not in vocab.FINISHED_STATES:
+            _echo_metadata(_still_running_note(meta.session_id, timeout))
         # The cursor is a global transcript index, not an event count.  Read
         # the actual end so an empty page after a large --since stays honest.
         event_count = _read_transcript_page(transcript_file).next_cursor
@@ -1200,6 +1212,16 @@ def log_command(
         _echo_metadata(footer)
     if timed_out:
         raise SystemExit(vocab.EXIT_TIMEOUT)
+
+
+def _still_running_note(session_id: str, timeout: float | None) -> str:
+    """SPEC exit codes: a wait timeout never touches the session, and the
+    caller deciding what to do next needs both halves said out loud."""
+    waited = "" if timeout is None else f" after {timeout:g}s"
+    return (
+        f"-- still running (gave up waiting{waited}) — session continues; "
+        f"acpc stop {session_id} to cancel"
+    )
 
 
 @main.command(name="run")
@@ -1546,6 +1568,8 @@ def wait_command(
     state = runner.wait_for_session(meta.session_id, timeout=timeout)
     if state is None:
         # SPEC `wait`: the timeout stops waiting only — the session runs on.
+        if not quiet:
+            _echo_metadata(_still_running_note(meta.session_id, timeout))
         raise SystemExit(vocab.EXIT_TIMEOUT)
 
     final = sessions.read_meta(meta.session_id)

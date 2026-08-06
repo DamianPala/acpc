@@ -723,11 +723,12 @@ if begin_section S08-views "status list/detail, log default/--since/--tail/--pro
 
     # "Nothing new" has to come from a session that cannot produce anything
     # new: SLOW1 emits every ~2s, so any timeout short enough to keep the suite
-    # quick is a coin flip against its cadence. A finished session blocks the
-    # full timeout and exits 124 -- SPEC's `--wait-new` row -- because activity
-    # is what is waited on; completion is `wait`'s job.
-    run_acpc log "$UTIL_ID" --wait-new --timeout 0.5
-    assert_eq "log --wait-new times out (124) with nothing new" "124" "$LAST_RC"
+    # quick is a coin flip against its cadence. A finished session returns
+    # immediately with 124 and the finished footer -- SPEC's `--wait-new` row,
+    # the `logs -f` convention; completion is `wait`'s job.
+    run_acpc log "$UTIL_ID" --wait-new --timeout 30
+    assert_eq "log --wait-new returns 124 at once on a finished session" "124" "$LAST_RC"
+    assert_contains "the immediate 124 carries the finished footer" "$LAST_ERR" "done"
 
     if [[ $SLOW_MACHINERY -eq 1 ]]; then
         # Live long-poll against SLOW1 (still running: ~64s of ~2s-apart events)

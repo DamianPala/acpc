@@ -194,7 +194,7 @@ log <id> [--since CURSOR] [--tail N] [--prose] [--json] [--max-output BYTES] [--
 | `--prose` | The content view: "what is it thinking/writing" — agent messages only, untruncated, no tool lines; agents write markdown natively, so this reads as clean markdown. The event window (`--since`/`--tail`) selects; `--prose` only renders — a full-history dump is always an explicit `--since 0` |
 | `--json` | Raw transcript events for `jq`, each carrying its index; not for reading — lossless inspection is `transcript.ndjson` itself. With `--prose` a usage error — one view per call |
 | `--max-output <bytes>` | As in `run` (default 128 KiB, 0 disables), but applied at event granularity: whole events until the budget, then a marker line naming `transcript.ndjson`. The footer cursor covers only what was printed, so a poller never skips content; a single over-budget event is the exception — head + marker, cursor advances past it. With `--json` the stream stays valid NDJSON: truncation appears as a final typed `truncated` event naming `transcript.ndjson`, never a bare marker line |
-| `--wait-new [--timeout S]` | Long-poll: block until new events appear or the timeout expires (exit 124); without `--timeout` it blocks indefinitely. Waits for *activity* (vs `wait` for completion) — enables mid-run intervention, e.g. `stop` an agent that drifted off task. After waking, the normal selection applies to the new events: `--since`, then `--tail`. On a finished session there is no new activity to wait for — the call still blocks its full timeout and exits 124, still printing the footer (a silent exit is indistinguishable from a hang); the footer names the finished state, and completion is `wait`'s job |
+| `--wait-new [--timeout S]` | Long-poll: block until new events appear or the timeout expires (exit 124); without `--timeout` it blocks indefinitely. Waits for *activity* (vs `wait` for completion) — enables mid-run intervention, e.g. `stop` an agent that drifted off task. After waking, the normal selection applies to the new events: `--since`, then `--tail`. On a finished session it returns immediately, the `logs -f` convention — following a stopped stream ends: anything past the cursor prints as usual, and with nothing new it exits 124 with the finished footer naming the state (a silent exit is indistinguishable from a hang); completion is `wait`'s job. A timeout on a *running* session says so on stderr — `-- still running (gave up waiting after Ns) — session continues; acpc stop <id> to cancel` |
 | `--quiet` | Suppress the stderr footer, as in `run` |
 
 One chronological stream, tool calls and agent prose interleaved — the sequence is the causal narrative. Events are condensed one-liners: tool call with arg summary, result status, duration; agent message as a 200-char snippet + length; permission requests; errors; state changes. Errors are never filtered — in every view; in `--prose` they keep their condensed `[time] error …` line form amid the markdown. Nor are they truncated, with one exception: `--max-output` may head-truncate a single over-budget event, errors included — the budget wins. Full content stays in `transcript.ndjson`.
@@ -351,7 +351,7 @@ wait <id> [--timeout S] [-o FILE] [--max-output BYTES] [--quiet]
 
 | Option | Purpose |
 |--------|---------|
-| `--timeout <s>` | Stops *waiting* only (exit 124): the session keeps running, unlike `run --timeout`, which cancels it |
+| `--timeout <s>` | Stops *waiting* only (exit 124): the session keeps running, unlike `run --timeout`, which cancels it — and the exit says so on stderr (`-- still running (gave up waiting after Ns) — session continues; acpc stop <id> to cancel`) |
 | `-o` / `--max-output` / `--quiet` | As in `run` — `wait` prints an answer, so it shapes it the same way |
 
 Block until a background session finishes, then print its answer; exit code mirrors the session result. On an already-finished session it returns immediately — the free way to reprint an answer.
@@ -409,7 +409,7 @@ Entry TOMLs are trusted at the level of shell config: an adapter definition name
   | 0 | success (`end_turn`) |
   | 1 | agent error — crash, `refusal`, `max_tokens`, missing auth |
   | 2 | usage error — bad flags, unknown session, rejected mode/permissions combination |
-  | 124 | timeout (`run`: session cancelled; `wait`/`log --wait-new`: gave up waiting — on a running session it keeps running) |
+  | 124 | timeout (`run`: session cancelled; `wait`/`log --wait-new`: nothing new within the window — a running session keeps running and the exit says so on stderr; a finished session returns at once) |
   | 130 | cancelled — SIGINT or `stop`. Answer-printing commands mirror the session result, so `wait` on a cancelled session also exits 130, whoever cancelled it and whenever; the finer distinction lives in `stop_reason` |
   | 141 / 143 | SIGPIPE / SIGTERM (SIGTERM detaches — see below) |
 

@@ -380,9 +380,45 @@ def test_log_rejects_timeout_without_wait_new(cli: CliRunner) -> None:
     assert result.exit_code == vocab.EXIT_USAGE
 
 
+def test_wait_new_on_a_finished_session_returns_at_once(cli: CliRunner) -> None:
+    """SPEC --wait-new, the `logs -f` convention: following a stopped stream
+    ends — the full-timeout block would read as a hang."""
+    session_id = run_mock(cli)
+
+    started = time.monotonic()
+    result = invoke(cli, "log", session_id, "--since", "999999", "--wait-new", "--timeout", "30")
+
+    assert time.monotonic() - started < 5
+    assert result.exit_code == vocab.EXIT_TIMEOUT
+    assert result.stderr.lstrip().startswith("-- done")
+
+
+def test_wait_new_timeout_on_a_running_session_says_it_still_runs(cli: CliRunner) -> None:
+    """The 124 exit never touches the session; the stderr note says so and
+    names the cancel verb."""
+    meta = running_session("still going")
+
+    result = invoke(cli, "log", meta.session_id, "--wait-new", "--timeout", "0.2")
+
+    assert result.exit_code == vocab.EXIT_TIMEOUT
+    assert "still running (gave up waiting after 0.2s)" in result.stderr
+    assert f"acpc stop {meta.session_id} to cancel" in result.stderr
+
+
+def test_wait_timeout_on_a_running_session_says_it_still_runs(cli: CliRunner) -> None:
+    """The wait verb's timeout gets the same still-running note."""
+    meta = running_session("still going")
+
+    result = invoke(cli, "wait", meta.session_id, "--timeout", "0.1")
+
+    assert result.exit_code == vocab.EXIT_TIMEOUT
+    assert "still running (gave up waiting after 0.1s)" in result.stderr
+    assert f"acpc stop {meta.session_id} to cancel" in result.stderr
+
+
 def test_log_wait_new_returns_after_the_transcript_grows(cli: CliRunner) -> None:
     """A waiting log call wakes when a new event is appended."""
-    meta = finished_session("wait for activity")
+    meta = running_session("wait for activity")
     transcript_file = transcript.Transcript(sessions.transcript_path(meta.session_id))
 
     def append_event() -> None:
