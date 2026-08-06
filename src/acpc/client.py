@@ -96,6 +96,7 @@ class AcpcClient:
         self._tool_calls: dict[str, _ToolCall] = {}
         self._tokens = 0
         self._cost: float | None = None
+        self._denied: dict[str, int] = {}
         self._advertised: dict[str, Any] = {
             "modes": [],
             "models": [],
@@ -116,6 +117,11 @@ class AcpcClient:
     def cost(self) -> float | None:
         """Return the cumulative cost reported by the adapter."""
         return self._cost
+
+    @property
+    def denied(self) -> dict[str, int]:
+        """Return this turn's permission-denial counts by category."""
+        return dict(self._denied)
 
     @property
     def advertised(self) -> dict[str, Any]:
@@ -246,6 +252,7 @@ class AcpcClient:
         allowed = bool(decision and option_id is not None)
         self.transcript.append("permission", kind=kind, decision="allow" if allowed else "deny")
         if not allowed:
+            self._denied[category] = self._denied.get(category, 0) + 1
             reason = f"permission denied: {kind}"
             if decision and option_id is None:
                 reason += " (no matching allow option)"

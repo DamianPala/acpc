@@ -619,6 +619,7 @@ class Daemon:
             answer=client.answer,
             tokens=client.tokens,
             cost=client.cost,
+            denied=client.denied,
             adapter_session_id=adapter_session_id,
             advertised=client.advertised,
         )

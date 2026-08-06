@@ -228,6 +228,46 @@ def test_prune_uses_configured_retention_by_default(cli: CliRunner, state_root: 
     assert not sessions.session_dir(session_id).exists()
 
 
+def test_bare_prune_zero_retention_is_safe_but_explicit_zero_deletes(
+    cli: CliRunner, state_root: Path
+) -> None:
+    (state_root / "config.toml").write_text('retention = "0d"\n', encoding="utf-8")
+    session_id = _finished_session()
+
+    result = invoke(cli, "prune")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert result.stderr == (
+        "Error: config retention '0d' resolves to zero — bare prune would delete every finished "
+        "session; pass --older-than 0d to do that explicitly\n"
+    )
+    assert sessions.session_dir(session_id).exists()
+
+    explicit = invoke(cli, "prune", "--older-than", "0d")
+
+    assert explicit.exit_code == vocab.EXIT_OK
+    assert not sessions.session_dir(session_id).exists()
+
+
+def test_zero_retention_disables_the_auto_prune_sweep(cli: CliRunner, state_root: Path) -> None:
+    (state_root / "config.toml").write_text('retention = "0d"\n', encoding="utf-8")
+    session_id = _finished_session()
+
+    result = invoke(cli, "run", "mock", "echo:hello", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert sessions.session_dir(session_id).exists()
+
+
+def test_bare_prune_default_retention_keeps_a_fresh_finished_session(cli: CliRunner) -> None:
+    session_id = _finished_session()
+
+    result = invoke(cli, "prune")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert sessions.session_dir(session_id).exists()
+
+
 def test_prune_json_is_one_object_on_stdout(cli: CliRunner, state_root: Path) -> None:
     session_id = _finished_session()
     _backdate(state_root, session_id, finished=200 * 86400)

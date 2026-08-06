@@ -1051,8 +1051,16 @@ def prune_command(older_than: str | None, dry_run: bool, json_mode: bool) -> Non
     """
     try:
         settings = config.load_config()
-        duration = config.parse_duration(older_than or settings.retention)
+        raw_duration = older_than if older_than is not None else settings.retention
+        duration = config.parse_duration(raw_duration, allow_zero=True)
+        if older_than is None and duration <= 0:
+            raise UsageProblem(
+                f"config retention '{settings.retention}' resolves to zero — bare prune would "
+                "delete every finished session; pass --older-than 0d to do that explicitly"
+            )
         candidates = sessions.prune_sessions(older_than=duration, dry_run=dry_run)
+    except UsageProblem:
+        raise
     except (config.ConfigError, ValueError, sessions.SessionError) as error:
         raise UsageProblem(str(error)) from None
 
@@ -1339,6 +1347,7 @@ def run_command(
     except RegistryError as error:
         raise UsageProblem(str(error)) from None
 
+    defaulted_permissions = permissions is None and resolution.permissions is None
     policy = _resolve_permissions(permissions, resolution, tty=tty, background=background)
     _guard_bypass_mode(mode, policy, resolution)
     # The TTY-resolved policy is part of the resolved invocation: meta.json
@@ -1378,7 +1387,11 @@ def run_command(
         entry=resolution.entry.entry,
         base_adapter=resolution.entry.base_adapter,
         prompt=prompt,
-        resolution=runner.session_resolution(resolution, cwd=resolved_cwd),
+        resolution=runner.session_resolution(
+            resolution,
+            cwd=resolved_cwd,
+            permissions_source="default" if defaulted_permissions else None,
+        ),
         target=runner.call_target(resolution),
         name=alias,
     )

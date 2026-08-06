@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO
 
-from acpc import paths, sessions
+from acpc import paths, permissions, sessions
 
 DEFAULT_MAX_OUTPUT = 128 * 1024
 
@@ -224,6 +224,22 @@ def format_tokens(tokens: int) -> str:
     return f"{tokens} tok"
 
 
+def _denied_summary(meta: sessions.SessionMeta) -> str | None:
+    denied = {category: count for category, count in meta.denied.items() if count}
+    if not denied or meta.resolution.get("permissions_source") != "default":
+        return None
+    resolved = meta.resolution.get("resolved", {})
+    permission = resolved.get("permissions", {}) if isinstance(resolved, dict) else {}
+    default_policy = permission.get("value") if isinstance(permission, dict) else None
+    if not isinstance(default_policy, str):
+        return None
+    requirements = [permissions.minimum_policy(category) for category in denied]
+    policy_order = {"read": 0, "write": 1, "all": 2}
+    remedy = max(requirements, key=policy_order.__getitem__)
+    counts = " · ".join(f"{count} {category}" for category, count in denied.items())
+    return f"denied: {counts} (default {default_policy} policy — pass --permissions {remedy})"
+
+
 def format_summary(
     meta: sessions.SessionMeta,
     *,
@@ -237,6 +253,8 @@ def format_summary(
         parts.append(f"cost ${meta.cost:.2f}")
     if meta.exit_code is not None:
         parts.append(f"exit {meta.exit_code}")
+    if denied := _denied_summary(meta):
+        parts.append(denied)
     parts.extend(
         (
             f"session {meta.session_id}",

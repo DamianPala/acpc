@@ -207,6 +207,21 @@ def test_run_stores_the_tty_resolved_permission_policy(cli: CliRunner) -> None:
     assert stored == "read"
 
 
+def test_denial_tally_is_replaced_by_the_following_turn(cli: CliRunner, state_root: Path) -> None:
+    first = invoke(cli, "run", "mock", "write-file:first.md", "--json")
+    session_id = json.loads(first.stdout)["session_id"]
+
+    second = invoke(cli, "continue", session_id, "tool:read")
+
+    assert second.exit_code == vocab.EXIT_OK
+    assert "denied:" not in second.stderr
+    payload = json.loads(
+        (state_root / "sessions" / session_id / "meta.json").read_text(encoding="utf-8")
+    )
+    assert payload["denied"] == {}
+    assert payload["resolution"]["permissions_source"] == "default"
+
+
 def _store_prompt_policy(session_id: str) -> None:
     meta = sessions.load(session_id)
     meta.resolution["resolved"]["permissions"]["value"] = "prompt"

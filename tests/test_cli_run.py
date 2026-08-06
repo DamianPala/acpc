@@ -187,6 +187,69 @@ def test_permissions_prompt_without_a_terminal_is_a_usage_error(cli: CliRunner) 
     assert "terminal" in result.stderr
 
 
+def test_default_policy_denials_are_visible_and_persisted(cli: CliRunner, state_root: Path) -> None:
+    result = invoke(cli, "run", "mock", "write-file:blocked.md", "--json")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert "denied: 1 write (default read policy — pass --permissions write)" in result.stderr
+    session_id = json.loads(result.stdout)["session_id"]
+    denied_meta = json.loads(
+        (state_root / "sessions" / session_id / "meta.json").read_text(encoding="utf-8")
+    )
+    assert denied_meta["denied"] == {"write": 1}
+    assert denied_meta["resolution"]["permissions_source"] == "default"
+
+
+def test_explicit_read_denials_stay_out_of_the_summary(cli: CliRunner, state_root: Path) -> None:
+    result = invoke(cli, "run", "mock", "write-file:blocked.md", "--permissions", "read", "--json")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert "denied:" not in result.stderr
+    session_id = json.loads(result.stdout)["session_id"]
+    denied_meta = json.loads(
+        (state_root / "sessions" / session_id / "meta.json").read_text(encoding="utf-8")
+    )
+    assert denied_meta["resolution"].get("permissions_source") is None
+
+
+def test_default_policy_without_denials_has_no_summary_segment(
+    cli: CliRunner, state_root: Path
+) -> None:
+    result = invoke(cli, "run", "mock", "tool:read", "--json")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert "denied:" not in result.stderr
+    session_id = json.loads(result.stdout)["session_id"]
+    meta = json.loads(
+        (state_root / "sessions" / session_id / "meta.json").read_text(encoding="utf-8")
+    )
+    assert meta["denied"] == {}
+    assert meta["resolution"]["permissions_source"] == "default"
+
+
+def test_default_policy_summary_uses_the_strongest_remedy_for_all_categories(
+    cli: CliRunner,
+) -> None:
+    result = invoke(cli, "run", "mock", "perm scenario")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert (
+        "denied: 2 write · 1 delete · 1 unknown (default read policy — pass --permissions all)"
+    ) in result.stderr
+
+
+def test_wait_shows_default_policy_denials_from_disk(cli: CliRunner, live_daemon: None) -> None:
+    started = invoke(cli, "run", "mock", "write-file:background.md", "--bg", "--json")
+
+    assert started.exit_code == vocab.EXIT_OK
+    session_id = json.loads(started.stdout)["session_id"]
+
+    waited = invoke(cli, "wait", session_id)
+
+    assert waited.exit_code == vocab.EXIT_OK
+    assert "denied: 1 write (default read policy — pass --permissions write)" in waited.stderr
+
+
 def test_an_unknown_permission_value_is_a_usage_error(cli: CliRunner) -> None:
     result = invoke(cli, "run", "mock", "probe", "--permissions", "sudo-everything")
 

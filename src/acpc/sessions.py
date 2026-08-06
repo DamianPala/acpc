@@ -111,6 +111,7 @@ class SessionMeta:
     stop_reason: str | None = None
     tokens: int = 0
     cost: float | None = None
+    denied: dict[str, int] = field(default_factory=dict)
     prompt_snippet: str = ""
     resolution: dict[str, Any] = field(default_factory=dict)
     adapter_session_id: str | None = None
@@ -265,6 +266,21 @@ def _coerce_str(value: Any, key: str, path: Path) -> str | None:
     return value
 
 
+def _coerce_denied(value: Any, key: str, path: Path) -> dict[str, int]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise CorruptSessionError(f"{path}: {key} is not an object")
+    denied: dict[str, int] = {}
+    for category, count in value.items():
+        if not isinstance(category, str) or not category:
+            raise CorruptSessionError(f"{path}: {key} has an invalid category")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise CorruptSessionError(f"{path}: {key}.{category} is not a non-negative integer")
+        denied[category] = count
+    return denied
+
+
 def meta_from_dict(data: Mapping[str, Any], *, path: Path) -> SessionMeta:
     """Build a `SessionMeta` from parsed JSON, rejecting damaged state.
 
@@ -303,6 +319,7 @@ def meta_from_dict(data: Mapping[str, Any], *, path: Path) -> SessionMeta:
         stop_reason=_coerce_str(known.get("stop_reason"), "stop_reason", path),
         tokens=_coerce_int(known.get("tokens"), "tokens", path) or 0,
         cost=_coerce_float(known.get("cost"), "cost", path),
+        denied=_coerce_denied(known.get("denied"), "denied", path),
         prompt_snippet=_coerce_str(known.get("prompt_snippet"), "prompt_snippet", path) or "",
         resolution=dict(resolution),
         adapter_session_id=_coerce_str(known.get("adapter_session_id"), "adapter_session_id", path),
@@ -594,6 +611,7 @@ def rotate_turn(session_id: str, *, clock: Clock | None = None) -> SessionMeta:
         meta.finished_at = None
         meta.exit_code = None
         meta.stop_reason = None
+        meta.denied = {}
         write_meta(meta)
     return meta
 

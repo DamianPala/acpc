@@ -108,6 +108,7 @@ class TurnOutcome:
     answer: str
     tokens: int = 0
     cost: float | None = None
+    denied: dict[str, int] = field(default_factory=dict)
     adapter_session_id: str | None = None
     advertised: dict[str, Any] = field(default_factory=dict)
     route_note: str | None = None
@@ -253,6 +254,7 @@ async def _drive_turn(
         answer=client.answer,
         tokens=client.tokens,
         cost=client.cost,
+        denied=client.denied,
         adapter_session_id=adapter_session_id,
         advertised=client.advertised,
     )
@@ -604,6 +606,7 @@ def _finalize(
             stop_reason=outcome.stop_reason,
             tokens=outcome.tokens,
             cost=outcome.cost,
+            denied=outcome.denied,
             adapter_session_id=outcome.adapter_session_id,
         )
 
@@ -620,6 +623,10 @@ def _agent_of(session_id: str) -> str:
 
 def auto_prune(retention_seconds: float) -> None:
     """Opportunistic retention sweep; never fails a run (SPEC.md `prune`)."""
+    if retention_seconds <= 0:
+        # A zero retention would silently delete every finished session on
+        # the next run; deleting everything takes an explicit `--older-than`.
+        return
     with contextlib.suppress(Exception):
         sessions.prune_sessions(older_than=retention_seconds)
 
@@ -651,9 +658,16 @@ def resolution_payload(resolution: CallResolution, *, cwd: str | None) -> dict[s
     }
 
 
-def session_resolution(resolution: CallResolution, *, cwd: str | None) -> dict[str, Any]:
+def session_resolution(
+    resolution: CallResolution,
+    *,
+    cwd: str | None,
+    permissions_source: str | None = None,
+) -> dict[str, Any]:
     """The persisted session shape, distinct from the printed dry-run view."""
     payload = resolution_payload(resolution, cwd=cwd)
+    if permissions_source is not None:
+        payload["permissions_source"] = permissions_source
     payload["adapter"] = {
         "home_env": resolution.entry.home_env,
         "bypass_modes": list(resolution.entry.bypass_modes),

@@ -31,7 +31,7 @@ class Config:
 
     @property
     def retention_seconds(self) -> float:
-        return parse_duration(self.retention)
+        return parse_duration(self.retention, allow_zero=True)
 
     @property
     def daemon_ttl_seconds(self) -> float:
@@ -41,7 +41,7 @@ class Config:
 DEFAULT_CONFIG = Config()
 
 
-def parse_duration(text: str) -> float:
+def parse_duration(text: str, *, allow_zero: bool = False) -> float:
     """Parse a compound duration such as ``1h30m`` into seconds."""
     if not isinstance(text, str) or not _DURATION_RE.fullmatch(text):
         raise ValueError(f"invalid duration: {text!r}")
@@ -49,19 +49,19 @@ def parse_duration(text: str) -> float:
         float(match.group(1)) * _DURATION_UNITS[match.group(2)]
         for match in re.finditer(r"(\d+)([smhdw])", text)
     )
-    if seconds <= 0:
+    if seconds < 0 or (seconds == 0 and not allow_zero):
         raise ValueError(f"duration must be greater than zero: {text!r}")
     return seconds
 
 
-def _validate_duration(path: Path, key: str, value: object) -> str:
+def _validate_duration(path: Path, key: str, value: object, *, allow_zero: bool = False) -> str:
     if not isinstance(value, str):
         raise ConfigError(
             f"{path}: key '{key}' must be a positive duration such as '90d'; "
             "edit the config file and try again"
         )
     try:
-        parse_duration(value)
+        parse_duration(value, allow_zero=allow_zero)
     except ValueError as error:
         raise ConfigError(
             f"{path}: key '{key}' is {value!r}: {error}; "
@@ -81,7 +81,10 @@ def _validate(path: Path, values: dict[str, object]) -> Config:
         )
 
     retention = _validate_duration(
-        path, "retention", values.get("retention", DEFAULT_CONFIG.retention)
+        path,
+        "retention",
+        values.get("retention", DEFAULT_CONFIG.retention),
+        allow_zero=True,
     )
     daemon_ttl = _validate_duration(
         path, "daemon_ttl", values.get("daemon_ttl", DEFAULT_CONFIG.daemon_ttl)
