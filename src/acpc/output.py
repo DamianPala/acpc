@@ -240,6 +240,18 @@ def _denied_summary(meta: sessions.SessionMeta) -> str | None:
     return f"denied: {counts} (default {default_policy} policy — pass --permissions {remedy})"
 
 
+def _session_segments(meta: sessions.SessionMeta) -> tuple[str, str]:
+    return (
+        f"session {meta.session_id}",
+        f"dir {sessions.session_dir(meta.session_id)}",
+    )
+
+
+def format_session_line(meta: sessions.SessionMeta) -> str:
+    """Format the session id and directory line printed at blocking dispatch."""
+    return "-- " + " | ".join(_session_segments(meta))
+
+
 def format_summary(
     meta: sessions.SessionMeta,
     *,
@@ -255,12 +267,7 @@ def format_summary(
         parts.append(f"exit {meta.exit_code}")
     if denied := _denied_summary(meta):
         parts.append(denied)
-    parts.extend(
-        (
-            f"session {meta.session_id}",
-            f"dir {sessions.session_dir(meta.session_id)}",
-        )
-    )
+    parts.extend(_session_segments(meta))
     if route_note:
         parts.append(route_note)
     return "-- " + " | ".join(parts)

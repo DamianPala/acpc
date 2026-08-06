@@ -434,8 +434,20 @@ if begin_section S06-run "run sync + session dir layout + output contract + exit
     assert_contains "stderr summary carries the exit status" "$LAST_ERR" "exit 0"
     assert_contains "stderr summary carries the session dir" "$LAST_ERR" \
         "${ACPC_HOME}/sessions/"
-    SUMMARY_LINES="$(grep -c '^-- ' <<<"$LAST_ERR" || true)"
+    # A blocking dispatch now writes two `--` lines: the early session line and
+    # the summary. They share the prefix by design (identical segments), so the
+    # summary's own one-line rule is checked by excluding the early line.
+    SUMMARY_LINES="$(grep '^-- ' <<<"$LAST_ERR" | grep -vc '^-- session ' || true)"
     assert_eq "the summary is exactly one -- line" "1" "$SUMMARY_LINES"
+    EARLY_ONCE="$(grep -c '^-- session ' <<<"$LAST_ERR" || true)"
+    assert_eq "dispatch adds exactly one more -- line, the early one" "1" "$EARLY_ONCE"
+
+    run_acpc run mock "slow:2 smoke early dispatch"
+    assert_eq "blocking run with early session line exits 0" "0" "$LAST_RC"
+    assert_contains "early session line names the session" "$LAST_ERR" "-- session "
+    EARLY_LINES="$(grep -c '^-- session ' <<<"$LAST_ERR" || true)"
+    assert_eq "the early session line is emitted once" "1" "$EARLY_LINES"
+    assert_contains "early session line names the session dir" "$LAST_ERR" " | dir ${ACPC_HOME}/sessions/"
 
     run_acpc run mock "layout check" --quiet --json
     assert_json_valid "run --json envelope is valid JSON" "$LAST_OUT"
@@ -573,6 +585,7 @@ if begin_section S07-daemon-bg "bg dispatch, wait, detach, daemon plumbing, conc
     run_acpc run mock "smoke test bg run" --bg
     assert_eq "bg run exits 0" "0" "$LAST_RC"
     assert_eq "bg dispatch prints no stderr summary" "" "$LAST_ERR"
+    assert_not_contains "bg dispatch prints no early session line" "$LAST_ERR" "-- session "
     BG1_ID="$(sed -n '1p' <<<"$LAST_OUT")"
     BG1_DIR="$(sed -n '2p' <<<"$LAST_OUT")"
     assert_session_id "bg id shape" "$BG1_ID"

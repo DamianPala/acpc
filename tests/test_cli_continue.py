@@ -2,7 +2,11 @@
 
 import asyncio
 import json
+import os
+import queue
+import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -51,6 +55,43 @@ def invoke(cli: CliRunner, *args: str, stdin: str | None = None):
     return cli.invoke(main, list(args), input=stdin, catch_exceptions=False)
 
 
+def run_cli_until_early_line(*args: str) -> tuple[int, str, str, str, bool]:
+    process = subprocess.Popen(
+        [sys.executable, "-c", "from acpc.cli import main; main()", *args],
+        env=os.environ.copy(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert process.stdout is not None
+    assert process.stderr is not None
+
+    early_line_queue: queue.Queue[str] = queue.Queue()
+
+    def read_early_line() -> None:
+        assert process.stderr is not None
+        early_line_queue.put(process.stderr.readline())
+
+    threading.Thread(target=read_early_line, daemon=True).start()
+    try:
+        early_line = early_line_queue.get(timeout=5)
+    except queue.Empty:
+        process.kill()
+        process.wait()
+        pytest.fail("blocking CLI did not emit the early session line")
+
+    still_running = process.poll() is None
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+        raise
+    stdout = process.stdout.read()
+    stderr = early_line + process.stderr.read()
+    return process.returncode, early_line, stdout, stderr, still_running
+
+
 def start_session(cli: CliRunner, prompt: str = "turn one") -> str:
     result = invoke(cli, "run", "mock", prompt, "--quiet", "--json")
     assert result.exit_code == vocab.EXIT_OK
@@ -67,6 +108,30 @@ def test_continue_rotates_the_previous_turn_artifacts(cli: CliRunner) -> None:
     assert sessions.turn_path(session_id, "answer", 1).is_file()
     assert sessions.prompt_path(session_id).read_text(encoding="utf-8") == "turn two"
     assert sessions.answer_path(session_id).is_file()
+
+
+def test_blocking_continue_emits_the_early_line_before_a_slow_turn_finishes(
+    cli: CliRunner, live_daemon: None
+) -> None:
+    session_id = start_session(cli)
+
+    returncode, early_line, stdout, _stderr, still_running = run_cli_until_early_line(
+        "continue", session_id, "slow:2 early continue probe"
+    )
+
+    assert still_running
+    assert returncode == vocab.EXIT_OK
+    assert early_line.startswith("-- session ")
+    assert "waited 2s" in stdout
+
+
+def test_quiet_continue_suppresses_the_early_line(cli: CliRunner) -> None:
+    session_id = start_session(cli)
+
+    result = invoke(cli, "continue", session_id, "turn two", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert result.stderr == ""
 
 
 def test_continue_uses_the_stored_resolution_after_entry_changes(

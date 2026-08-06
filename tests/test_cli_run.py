@@ -1,7 +1,11 @@
 """Behavioral tests for the `run` verb: flags, usage errors, TTY rules."""
 
 import json
+import os
+import queue
+import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -54,6 +58,43 @@ def cli() -> CliRunner:
 
 def invoke(cli: CliRunner, *args: str, stdin: str | None = None):
     return cli.invoke(main, list(args), input=stdin, catch_exceptions=False)
+
+
+def run_cli_until_early_line(*args: str) -> tuple[int, str, str, str, bool]:
+    process = subprocess.Popen(
+        [sys.executable, "-c", "from acpc.cli import main; main()", *args],
+        env=os.environ.copy(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert process.stdout is not None
+    assert process.stderr is not None
+
+    early_line_queue: queue.Queue[str] = queue.Queue()
+
+    def read_early_line() -> None:
+        assert process.stderr is not None
+        early_line_queue.put(process.stderr.readline())
+
+    threading.Thread(target=read_early_line, daemon=True).start()
+    try:
+        early_line = early_line_queue.get(timeout=5)
+    except queue.Empty:
+        process.kill()
+        process.wait()
+        pytest.fail("blocking CLI did not emit the early session line")
+
+    still_running = process.poll() is None
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+        raise
+    stdout = process.stdout.read()
+    stderr = early_line + process.stderr.read()
+    return process.returncode, early_line, stdout, stderr, still_running
 
 
 # --- prompt sources ---------------------------------------------------------
@@ -285,6 +326,26 @@ def test_a_non_bypass_mode_needs_no_special_permissions(cli: CliRunner) -> None:
 # --- output contract --------------------------------------------------------
 
 
+def test_blocking_run_emits_the_early_line_before_a_slow_turn_finishes(
+    live_daemon: None,
+) -> None:
+    returncode, early_line, stdout, _stderr, still_running = run_cli_until_early_line(
+        "run", "mock", "slow:2 early dispatch probe"
+    )
+
+    assert still_running
+    assert returncode == vocab.EXIT_OK
+    assert early_line.startswith("-- session ")
+    assert "waited 2s" in stdout
+
+
+def test_background_run_does_not_emit_the_early_line(cli: CliRunner, live_daemon: None) -> None:
+    result = invoke(cli, "run", "mock", "echo:background", "--bg")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert "-- session " not in result.stderr
+
+
 def test_quiet_suppresses_the_stderr_summary(cli: CliRunner) -> None:
     result = invoke(cli, "run", "mock", "echo:quiet please", "--quiet")
 
@@ -294,9 +355,28 @@ def test_quiet_suppresses_the_stderr_summary(cli: CliRunner) -> None:
 def test_without_quiet_the_summary_is_exactly_one_stderr_line(cli: CliRunner) -> None:
     result = invoke(cli, "run", "mock", "echo:summarize me")
 
-    summary_lines = [line for line in result.stderr.splitlines() if line.startswith("-- ")]
+    metadata_lines = [line for line in result.stderr.splitlines() if line.startswith("-- ")]
+    summary_lines = [line for line in metadata_lines if "exit 0" in line]
     assert len(summary_lines) == 1
-    assert "exit 0" in summary_lines[0]
+    assert len(metadata_lines) == 2
+
+
+def test_early_line_segments_match_the_summary_and_stdout_matches_answer_file(
+    cli: CliRunner,
+) -> None:
+    result = invoke(cli, "run", "mock", "echo:format and bytes")
+
+    metadata_lines = [line for line in result.stderr.splitlines() if line.startswith("-- ")]
+    early_line = next(line for line in metadata_lines if line.startswith("-- session "))
+    summary_line = next(line for line in metadata_lines if "exit 0" in line)
+    early_segments = early_line.removeprefix("-- ").split(" | ")
+    summary_segments = summary_line.removeprefix("-- ").split(" | ")
+
+    assert early_segments == [
+        segment for segment in summary_segments if segment.startswith(("session ", "dir "))
+    ]
+    session_id = early_segments[0].removeprefix("session ")
+    assert result.stdout == sessions.answer_path(session_id).read_text(encoding="utf-8")
 
 
 def test_the_summary_starts_on_a_fresh_line_after_an_unterminated_answer(cli: CliRunner) -> None:
@@ -306,7 +386,12 @@ def test_the_summary_starts_on_a_fresh_line_after_an_unterminated_answer(cli: Cl
     result = invoke(cli, "run", "mock", "echo:no trailing newline")
 
     assert result.stdout == "no trailing newline"
-    assert result.stderr.startswith("\n-- ")
+    # The early session line precedes the answer, so the compensating newline
+    # is no longer stderr's first byte — it is the blank line that separates
+    # the unterminated answer from the summary in the merged blob.
+    lines = result.stderr.split("\n")
+    summary_index = next(index for index, line in enumerate(lines) if "exit 0" in line)
+    assert lines[summary_index - 1] == ""
 
 
 def test_a_terminated_answer_gets_no_blank_line_before_the_summary(cli: CliRunner) -> None:
@@ -320,8 +405,9 @@ def test_the_direct_child_note_rides_the_one_summary_line(cli: CliRunner) -> Non
     result = invoke(cli, "run", "mock", "echo:route me")
 
     summary_lines = [line for line in result.stderr.splitlines() if line.startswith("-- ")]
-    assert len(summary_lines) == 1
-    assert "direct child" in summary_lines[0]
+    assert len(summary_lines) == 2
+    assert any("direct child" in line for line in summary_lines)
+    assert any(line.startswith("-- session ") for line in summary_lines)
 
 
 def test_a_default_cwd_resolves_to_the_callers_absolute_directory(

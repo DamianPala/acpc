@@ -1575,6 +1575,9 @@ def run_command(
         _dispatch_background(meta.session_id, request, json_mode=json_mode)
         return
 
+    if not quiet:
+        _echo_metadata(output.format_session_line(meta))
+
     try:
         outcome = runner.execute_turn(meta.session_id, request)
     except runner.RunnerError as error:
@@ -1743,6 +1746,9 @@ def continue_command(
     if background:
         _dispatch_background(meta.session_id, request, json_mode=json_mode)
         return
+
+    if not quiet:
+        _echo_metadata(output.format_session_line(rotated))
 
     try:
         outcome = runner.execute_turn(meta.session_id, request)
