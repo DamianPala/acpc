@@ -2,7 +2,7 @@
 
 ## Now
 
-**Stage 3 is complete through section 4; the branch is ready to land.** Acceptance review, full green bar (**432 tests**, ruff + format + pyright + shellcheck clean, `./smoke.sh` 417/417), and live testing against OpenRouter-backed and real codex found and fixed **four product defects** — transcript chunk fragmentation (`c46b41f`), variant inheritance dropping adapter contract lists incl. the bypass-mode guard (`dc729de`), a dead adapter poisoning its daemon target (`487a2fe`), and meta.json storing the pre-TTY-resolution permission policy (`b799dc4`). Guessed codex vendor facts were verified live and corrected (`1057164`), the SPEC catalog-cap discrepancy settled (`5dc157c`), README rewritten for the 0.3 surface (`ea5e54b`) and the standing live-test plan committed (`6e629ea`). Zero leaked processes after every run.
+**Stage 3 is complete through section 4; the branch is ready to land.** Acceptance review, full green bar (**432 tests**, ruff + format + pyright + shellcheck clean, `./smoke.sh` 417/417), and live testing against OpenRouter-backed and real codex found and fixed **four product defects** — transcript chunk fragmentation (`c46b41f`), variant inheritance dropping adapter contract lists incl. the bypass-mode guard (`dc729de`), a dead adapter poisoning its daemon target (`487a2fe`), and meta.json storing the pre-TTY-resolution permission policy (`b799dc4`). Guessed codex vendor facts were verified live and corrected (`1057164`), the SPEC catalog-cap discrepancy settled (`5dc157c`), README rewritten for the 0.3 surface (`ea5e54b`) and the standing live-test plan committed (`6e629ea`). Zero leaked processes after every run. Post-report, one more defect from Damian's manual testing was fixed at the gate (`62f5c8e`, the new branch tip): an answer without a trailing newline glued the stderr `--` summary to its last line in a merged blob — the CLI now leads the next stderr metadata line with a newline (on stderr only, stdout stays byte-identical to `answer.md`), across run/continue/wait summaries, detach notices and log footers; SPEC's output contract states the rule.
 
 **Next: section 5 — landing** (reset donor `main`, bump to 0.3.0, tag, `uv tool install --force`, drop `archive/0.3-dev1`, remove the worktree). **Gated on Damian's explicit go, item by item.** Nothing has been pushed, nothing installed globally. The full live-test report is local-only at `docs/plans/stage3/live-test-report.md`.
 
@@ -84,6 +84,10 @@
 
 - **Section 5 — landing, gated on Damian's explicit go item by item:** reset donor `main` to this branch, bump version to 0.3.0, tag `v0.3.0`, `uv tool install --force` from the donor, delete `archive/0.3-dev1`, remove this worktree. Then section 6 post-landing sanity.
 - Open after landing: claude and gemini TOMLs still carry `TODO(stage3)` vendor-fact markers — verify live when those adapters are in scope (the standing checklist is `docs/live-test-plan.md`).
+
+## Backlog (post-0.3)
+
+- **`log <id> --follow`** (0.3.1 candidate, approved by Damian 2026-08-06): TTY convenience wrapping the `--wait-new` + cursor polling loop until the final-state footer, so a human watching a session doesn't parse cursors from stderr; agents keep using the loop. Deliberately not in 0.3 — SPEC is frozen at the gate. Open design points: interaction with `--prose`/`--json`/`--max-output`, and non-TTY behavior (error vs works).
 
 ## Decisions
 
