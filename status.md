@@ -1,18 +1,35 @@
-# Status — acpc 0.3 rewrite (worktree `rewrite/0.3`)
+# Status — acpc
 
 ## Now
 
-- **2026-08-06 — S4 status idle age:** active status views now derive `idle <age>` from a bounded, read-only transcript-tail read; finished or damaged/unavailable transcripts render `·`/`null`. The age is threaded through the existing render clock so slow-versus-hung comparisons are deterministic in tests.
+**0.4 is built and accepted on `feat/0.4`; landing is Damian's gate.** Eight slices, one commit each, tip `1ae69b6`. Nothing pushed, nothing tagged, the installed tool is still 0.3.0.
 
-**Stage 3 is complete through section 4; the branch is ready to land.** Acceptance review, full green bar (**432 tests**, ruff + format + pyright + shellcheck clean, `./smoke.sh` 417/417), and live testing against OpenRouter-backed and real codex found and fixed **four product defects** — transcript chunk fragmentation (`c46b41f`), variant inheritance dropping adapter contract lists incl. the bypass-mode guard (`dc729de`), a dead adapter poisoning its daemon target (`487a2fe`), and meta.json storing the pre-TTY-resolution permission policy (`b799dc4`). Guessed codex vendor facts were verified live and corrected (`1057164`), the SPEC catalog-cap discrepancy settled (`5dc157c`), README rewritten for the 0.3 surface (`ea5e54b`) and the standing live-test plan committed (`6e629ea`). Zero leaked processes after every run. Post-report, one more defect from Damian's manual testing was fixed at the gate (`62f5c8e`, the new branch tip): an answer without a trailing newline glued the stderr `--` summary to its last line in a merged blob — the CLI now leads the next stderr metadata line with a newline (on stderr only, stdout stays byte-identical to `answer.md`), across run/continue/wait summaries, detach notices and log footers; SPEC's output contract states the rule.
+The surface 0.4 adds: `log --follow` (a bounded stream replacing the `--wait-new` + cursor loop, with three endings — session end 0, timeout 124, output budget 4); `steer <id> <instruction>` (cancel-and-redirect as one verb, pinned preamble stored verbatim in `prompt.md`); an early `-- session <id> | dir <path>` line on blocking dispatch so the id is usable mid-run; `status` idle age plus a resolved-model column; a `daemon stop` guard for targets with active sessions (`--force` bypasses); a stderr note when `--since` runs past the transcript's end; duration suffixes on every `--timeout`; and a root `--help` regrouped by the caller's decision rather than by command name.
+
+Acceptance: full bar twice back-to-back, both green (535 pytest, ruff check + format, pyright 0 errors, shellcheck, smoke 495/495), zero leaked processes after each. Live tier 1 (Luna over OpenRouter) covered all three follow endings with exact cursor resume, early-line timing (t+1s versus t+11s for the summary), and steer end to end. Live tier 2 (real codex) covered steer — the cancel landed in about a second — and one follow smoke. Every new guard was mutation-checked red before landing.
+
+**Next: landing, gated on Damian's explicit go item by item** — bump to 0.4.0, tag, `uv tool install --force`. The plan and slice contract are local-only under `docs/plans/0.4/`.
+
+## Done
+
+- **0.4 (2026-08-06, Fable orchestrating, Luna implementing):** eight slices on `feat/0.4`, one commit each, SPEC edit and implementation and tests together in every commit.
+  - `62e7789` **S1 `log --follow`** — the largest slice, implemented by the orchestrator. The tail replay is a *start point, not a filter* (a review fix: `--tail 0` originally replayed the whole transcript), and `--max-output` budgets the whole stream rather than each page. New exit code 4 for budget exhaustion, with a footer naming the exact resume cursor.
+  - `7eaa060` **S2 early session line** — `format_session_line` and `format_summary` share one segment builder, so the early line and the end summary cannot drift.
+  - `46e5203` **S3 `daemon stop` guard** — refuses a target holding `running` or `starting` sessions; `--force` keeps the old behavior. Review fix: the guard duplicated the state vocabulary instead of using `meta.is_active`.
+  - `35ed8fe` **S4 `status` idle age + resolved model** — needed a new read primitive, `transcript.last_event_time()`, because `Transcript.__init__` truncates a torn trailing line and `status` must stay read-only; a byte-identity test pins that.
+  - `5083cae` **S5 `steer`** — composed from the existing cancel and continue paths. The race branch (turn finishes before the cancel lands) degrades to a plain follow-up with a stderr note, tested by stubbing the `cancel_turn` IPC boundary since timing-based tests would flake.
+  - `4742930` **S6 `--since` beyond-max note** — review fix: the max cursor was computed on every `log` call, a third full transcript parse; now lazy.
+  - `82ccd17` **S7 duration suffixes + the help sweep** — one shared Click `ParamType` for all five `--timeout` options, global `show_default`, and a sweep test that walks the Click tree and fails on any option without help text. Found and fixed a real bug: `acpc agents -h` did not work.
+  - `1ae69b6` **S8 cheat sheet** — root `--help` regrouped by the caller's decision, 64 lines.
+  - Also fixed: a latent smoke race where the `--wait-new` long-poll reused the shared ~64s mock session; on a loaded machine the section reached it at t+90s, after that session was already done. It now dispatches its own victim.
+
+**0.3 — landed as `v0.3.0`, the globally installed tool.** Its full live-test report is local-only at `docs/plans/stage3/live-test-report.md`.
+
+Stage 3 was complete through section 4 when the branch went to the gate. Acceptance review, full green bar (**432 tests**, ruff + format + pyright + shellcheck clean, `./smoke.sh` 417/417), and live testing against OpenRouter-backed and real codex found and fixed **four product defects** — transcript chunk fragmentation (`c46b41f`), variant inheritance dropping adapter contract lists incl. the bypass-mode guard (`dc729de`), a dead adapter poisoning its daemon target (`487a2fe`), and meta.json storing the pre-TTY-resolution permission policy (`b799dc4`). Guessed codex vendor facts were verified live and corrected (`1057164`), the SPEC catalog-cap discrepancy settled (`5dc157c`), README rewritten for the 0.3 surface (`ea5e54b`) and the standing live-test plan committed (`6e629ea`). Zero leaked processes after every run. Post-report, one more defect from Damian's manual testing was fixed at the gate (`62f5c8e`, the new branch tip): an answer without a trailing newline glued the stderr `--` summary to its last line in a merged blob — the CLI now leads the next stderr metadata line with a newline (on stderr only, stdout stays byte-identical to `answer.md`), across run/continue/wait summaries, detach notices and log footers; SPEC's output contract states the rule.
 
 **A cold-start UX test round (2026-08-06, uninstructed Sonnet, --help-only, real adapters) landed five more fixes at the gate** — see the Stage 3 UX round entry under *Done*.
 
 **The Damian-approved convention-friction package is landed (2026-08-06)** — see the convention package entry under *Done*. New tip: `5ee3797`.
-
-**Next: section 5 — landing** (reset donor `main`, bump to 0.3.0, tag, `uv tool install --force`, drop `archive/0.3-dev1`, remove the worktree). **Gated on Damian's explicit go, item by item.** Nothing has been pushed, nothing installed globally. The full live-test report is local-only at `docs/plans/stage3/live-test-report.md`.
-
-## Done
 
 - **Stage 3 (2026-08-06, Fable):**
   - **Section 1 — acceptance review:** whole tree read against SPEC. Frozen-file check: all seven sanctioned Stage 2 harness edits verified as plumbing, none changes an assertion or SPEC behavior. The catalog-cap discrepancy settled the other way from the prose: **modes always print in full** (`5dc157c`) — adapter detail is the only place legal `--mode` values appear, so capping them would hide the contract; models and commands keep first-3-plus-count. SPEC prose narrowed, `cli.py` aligned, test extended to assert all five mock modes.
@@ -97,8 +114,8 @@
 
 ## Next
 
-- **Section 5 — landing, gated on Damian's explicit go item by item:** reset donor `main` to this branch, bump version to 0.3.0, tag `v0.3.0`, `uv tool install --force` from the donor, delete `archive/0.3-dev1`, remove this worktree. Then section 6 post-landing sanity.
-- Open after landing: claude and gemini TOMLs still carry `TODO(stage3)` vendor-fact markers — verify live when those adapters are in scope (the standing checklist is `docs/live-test-plan.md`).
+- **0.4 landing, gated on Damian's explicit go item by item:** merge `feat/0.4`, bump version to 0.4.0, tag `v0.4.0`, `uv tool install --force`. Nothing pushed, nothing tagged, the installed tool untouched.
+- Open: claude and gemini TOMLs still carry `TODO(stage3)` vendor-fact markers — verify live when those adapters are in scope (the standing checklist is `docs/live-test-plan.md`).
 
 - **Convention-friction package (2026-08-06, approved by Damian):** conventions agents carry in from neighboring tools, made to work or answered with a pointer. Implementation dispatched to the `builder` variant (Luna) from pinned-wording specs under `docs/plans/stage3/`; SPEC/doc wording authored by the orchestrator, folded into each implementation commit per the AGENTS.md docs contract.
   - **H3+M1** (`7fa332f`): `log --wait-new` on a finished session returns immediately (the `logs -f` convention — following a stopped stream ends) with 124 and the finished footer; a timeout on a *running* session says so on stderr (`-- still running (gave up waiting after Ns) — session continues; acpc stop <id> to cancel`), for `wait` too.
@@ -107,14 +124,19 @@
   - **Docs de-staging** (`09efc08`): ARCHITECTURE.md stripped of build-era framing + same-change maintenance rule; AGENTS.md docs contract (which doc moves with which change; dispatched implementers get doc wording verbatim, the orchestrator authors it); README finished-product sweep, Python floor corrected to 3.13.
   - Full bar per batch: pytest (446 → 453 → 462), smoke (418 → 424/424), ruff + format + pyright clean, every new guard mutation-checked red.
 
-## Backlog (post-0.3)
+## Backlog (post-0.4)
 
-- **`log <id> --follow`** (0.3.1 candidate, approved by Damian 2026-08-06): TTY convenience wrapping the `--wait-new` + cursor polling loop until the final-state footer, so a human watching a session doesn't parse cursors from stderr; agents keep using the loop. Deliberately not in 0.3 — SPEC is frozen at the gate. Open design points: interaction with `--prose`/`--json`/`--max-output`, and non-TTY behavior (error vs works). Note: since the alias-hint batch, `-f`/`--follow` is a usage error pointing at `--wait-new` — implementing `--follow` replaces that hint.
-- **`--since` beyond-max-cursor guard**: a cursor past the transcript's end currently returns an empty page indistinguishable from "no new events"; a one-line stderr note (or usage error) naming the max cursor would catch stale-cursor bugs in pollers.
-- **Duration suffixes for `--timeout`**: `--timeout 90` is seconds; accepting `90s`/`5m`/`1h` (the `parse_duration` vocabulary `prune` already uses) removes a unit-guessing trap. Applies to `run`, `wait`, `log --wait-new`.
+- Every 0.3 backlog item (`log --follow`, the `--since` beyond-max guard, `--timeout` duration suffixes) shipped in 0.4.
+- **`daemon status` shows uptime, not idle time** (found during the 0.4 zero-leak check): a daemon reported `up 1h48m` against a 30 m TTL, which reads as a leak until you check the session mtimes and find it was 28 min idle. Uptime cannot tell you how close a daemon is to being reaped; idle age can. S4 added exactly this to session `status` — the daemon view should get the same column.
+- **Two adjacent assistant messages are concatenated without a separator in `answer.md`** (observed live 2026-08-06, pre-existing in 0.3): a preamble message and the final answer render as `...from those documents.acpc's primary user is...`. stdout stays byte-identical to `answer.md`, so the output contract holds; it is the joining that reads wrong. Needs a decision on whether `answer.md` is every assistant message or only the final one.
 
 ## Decisions
 
+- 2026-08-06 (0.4): exit code **4** is pinned to output-budget exhaustion. `log --follow` needed an ending distinguishable from both a clean session end (0) and a timeout (124), because the caller's next move differs: resume from the cursor rather than wait or give up.
+- 2026-08-06 (0.4): `--follow`'s `--tail` replay is a **start point, not a filter** — it picks the cursor the stream begins at, and everything after it streams. Read as a filter, `--tail 0` replayed the whole transcript.
+- 2026-08-06 (0.4): `--max-output` budgets the **whole follow stream**, not each page. A per-page budget would let an unbounded stream past an explicitly bounded call.
+- 2026-08-06 (0.4): `steer` is **interrupt-based**, because ACP has no mid-turn injection — only `session/cancel` touches a running turn, and `session/prompt` mid-turn is protocol-undefined. The preamble is pinned in SPEC and stored verbatim in `prompt.md` so the interruption is visible on disk rather than inferred.
+- 2026-08-06 (0.4): the root `--help` groups by **the decision the caller is making** (task length, then checking, supervising, steering, continuing), not by command name. A list of commands assumes the reader already knows which one their situation calls for.
 - 2026-08-06: `daemon stop` guards `running` and `starting` sessions across every addressed target; one active session refuses the whole stop, while `--force` preserves the existing failed-session shutdown.
 - 2026-08-05: `requires-python >= 3.13` kept from the donor (harvested `ipc.py` uses `asyncio.Server.close_clients`, a 3.13+ API); skill's 3.12 floor waived deliberately.
 - 2026-08-05: daemon sockets/locks live in `daemon/` next to the per-target logs (spec names only the logs).
