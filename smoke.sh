@@ -803,10 +803,18 @@ if begin_section S08-views "status list/detail, log default/--since/--tail/--pro
     assert_eq "the follow probe stops cleanly" "0" "$LAST_RC"
 
     if [[ $SLOW_MACHINERY -eq 1 ]]; then
-        # Live long-poll against SLOW1 (still running: ~64s of ~2s-apart events)
-        run_acpc log "$SLOW1_ID" --since "$SLOW1_CURSOR" --wait-new --timeout 6
+        # Live long-poll. SLOW1 only lives ~64s, and this section reaches here
+        # later than that on a loaded machine, so the poll gets its own victim
+        # rather than racing SLOW1's completion.
+        run_acpc run mock "run the slow scenario for the wait-new probe" --bg --quiet
+        WAITNEW_ID="$(head -n1 <<<"$LAST_OUT")"
+        run_acpc log "$WAITNEW_ID" --json
+        WAITNEW_CURSOR="$(jq -r '.i' <<<"$LAST_OUT" | tail -n1)"
+        run_acpc log "$WAITNEW_ID" --since "${WAITNEW_CURSOR:-0}" --wait-new --timeout 10
         assert_eq "log --wait-new returns once new events arrive" "0" "$LAST_RC"
         assert_true "--wait-new produced output" "$([[ -n "$LAST_OUT" ]] && echo 0 || echo 1)"
+        run_acpc stop "$WAITNEW_ID"
+        assert_eq "the wait-new probe stops cleanly" "0" "$LAST_RC"
         poll_slow1
 
         # Snippet vs prose on the long (>200 chars) mid-run message
@@ -1098,6 +1106,15 @@ if begin_section S12-cli "help contract, -V, TTY rules, hostile inputs"; then
         "$HELP_MAIN" "--permissions write"
     assert_contains "cheat sheet ends with a flag -> ACP mapping" "$HELP_MAIN" "request_permission"
     assert_contains "cheat sheet explains write permissions" "$HELP_MAIN" "write (= edit + execute)"
+    for group in "Short task" "Long or uncertain task" "Checking on a run" \
+        "Steering a running session" "Context care" "Maintenance and setup" "Common commands"; do
+        assert_contains "cheat sheet groups by task: '$group'" "$HELP_MAIN" "$group"
+    done
+    assert_contains "cheat sheet says content is read from disk" "$HELP_MAIN" "answer.md from disk"
+    assert_contains "cheat sheet warns that killing acpc leaves the session running" \
+        "$HELP_MAIN" "acpc stop does."
+    assert_contains "cheat sheet frames --follow as the supervision case" \
+        "$HELP_MAIN" "case for --follow"
     run_acpc -h
     assert_eq "-h matches --help" "$HELP_MAIN" "$LAST_OUT"
 

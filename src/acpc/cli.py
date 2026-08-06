@@ -85,28 +85,49 @@ _ROOT_HELP = """acpc — dispatch coding agents over ACP.
 
 Quick reference
 
-Sync run:
+Short task (fits your tool-call window — blocks, answer on stdout):
   acpc run <agent> "Explain this code"
   acpc run <agent> "Implement the fix" --permissions write
+  Dispatch prints `-- session <id> | dir <path>` on stderr right away:
+  the id works mid-run with log / stop / steer.
 
-Background run + wait (--bg prints the session id, then its dir):
-  acpc run <agent> "Run the tests" --bg
-  acpc wait <id>
-  Scripts chaining in one shell: --bg --json, id from `jq -r .session_id`.
+Long or uncertain task (background):
+  acpc run <agent> "Run the tests" --bg --json    # {"session_id": ..., "paths": ...}
+  acpc wait <id> --quiet                          # block until done
+  Content: read <dir>/answer.md from disk, selectively — always complete.
+  In a shell that can background calls, `wait` becomes a completion push.
 
-Continue:
-  acpc continue <id> "Now summarize the result"
+Checking on a run:
+  acpc log <id>                    # the default: instant snapshot, condensed
+  Need only the result? wait <id>. Don't block on a run you won't act on.
 
-Status and log polling:
-  acpc status
-  acpc log <id> --wait-new --timeout 30
+Supervising a risky run you intend to steer/stop mid-flight — the one
+case for --follow (a bounded digest, not a live view):
+  acpc log <id> --follow --timeout 60 --max-output 16384
+  Ends at session end (exit 0), the timeout (124) or the cap (4); resume
+  with --since <cursor> from the footer.
+
+Steering a running session:
+  acpc steer <id> "Stop editing; diagnose only"   # cancel + redirect, history kept
+
+Continue (next turn on a finished session):
+  acpc continue <id> "Now fix what you found"
 
 Heredoc prompt:
   acpc run <agent> - --permissions write <<'PROMPT'
   Review the implementation and make the required edits.
   PROMPT
 
+Context care (agent callers):
+  log's default view is condensed one-liners, last 20 events; full via --prose.
+  --json = this command's output as a machine envelope, any command. On
+  run/wait it embeds the answer; add -o FILE to keep the answer out of it.
+  Content reads best as markdown: answer.md, log --prose.
+  Tight context: lower the cap, e.g. --max-output 16384.
+  Every --timeout takes seconds (90) or a duration (90s, 5m, 1h).
+
 Maintenance and setup:
+  status            all sessions
   stop <id>         cancel a running session
   rm <id>           delete a finished session's on-disk state
   prune             delete finished sessions older than retention (--older-than D)
@@ -114,8 +135,8 @@ Maintenance and setup:
   Killing acpc does not stop the session — acpc stop does.
 
 Common commands:
-  run, continue, steer, wait, status, log, agents, daemon, stop, rm, prune,
-  install
+  run, continue, steer, wait, status, log, agents, daemon,
+  stop, rm, prune, install
   Use `acpc <command> --help` for the command's full reference.
 
 Flag → ACP
