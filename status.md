@@ -108,12 +108,12 @@
 ## Backlog (post-0.3)
 
 - **`log <id> --follow`** (0.3.1 candidate, approved by Damian 2026-08-06): TTY convenience wrapping the `--wait-new` + cursor polling loop until the final-state footer, so a human watching a session doesn't parse cursors from stderr; agents keep using the loop. Deliberately not in 0.3 — SPEC is frozen at the gate. Open design points: interaction with `--prose`/`--json`/`--max-output`, and non-TTY behavior (error vs works). Note: since the alias-hint batch, `-f`/`--follow` is a usage error pointing at `--wait-new` — implementing `--follow` replaces that hint.
-- **`daemon stop` refuses a target with active sessions unless `--force`**: today it stops the daemon regardless, orphaning running turns; a guard would make the destructive path explicit. Needs a decision on what "active" covers (running only, or starting too).
 - **`--since` beyond-max-cursor guard**: a cursor past the transcript's end currently returns an empty page indistinguishable from "no new events"; a one-line stderr note (or usage error) naming the max cursor would catch stale-cursor bugs in pollers.
 - **Duration suffixes for `--timeout`**: `--timeout 90` is seconds; accepting `90s`/`5m`/`1h` (the `parse_duration` vocabulary `prune` already uses) removes a unit-guessing trap. Applies to `run`, `wait`, `log --wait-new`.
 
 ## Decisions
 
+- 2026-08-06: `daemon stop` guards `running` and `starting` sessions across every addressed target; one active session refuses the whole stop, while `--force` preserves the existing failed-session shutdown.
 - 2026-08-05: `requires-python >= 3.13` kept from the donor (harvested `ipc.py` uses `asyncio.Server.close_clients`, a 3.13+ API); skill's 3.12 floor waived deliberately.
 - 2026-08-05: daemon sockets/locks live in `daemon/` next to the per-target logs (spec names only the logs).
 - 2026-08-05: adapter definitions deliver `home` via a `home_env` field (delivery mechanism, not spec surface).

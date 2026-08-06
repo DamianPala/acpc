@@ -42,7 +42,7 @@ rm <id> | prune [--older-than D] [--dry-run]
 agents [name] [--models|--commands|--check]   # adapters + variants; resolved definitions
 agents init <name> --extends <agent>          # scaffold a variant
 install <agent>
-daemon status|stop [target]   # plumbing escape hatch — never needed in the happy path
+daemon status|stop [target] [--force]   # plumbing escape hatch — never needed in the happy path
 ```
 
 `acpc --help` is a self-contained cheat sheet; `acpc <cmd> --help` is that command's full reference. `<id>` accepts a session id or a `--name` alias; `last` works on a TTY only.
@@ -128,6 +128,7 @@ A performance cache, nothing more: it keeps adapters warm so the next turn start
 ```bash
 acpc daemon status          # pid, uptime, per-target log path
 acpc daemon stop codex      # controlled nuke; beats pkill, which kills mid-task dispatches
+acpc daemon stop codex --force  # ... and take its running sessions down with it
 ```
 
 ## Trust model

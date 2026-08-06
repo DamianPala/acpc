@@ -25,7 +25,7 @@ rm <id> | prune [--older-than D] [--dry-run]   # session cleanup (auto-prune per
 agents [name] [--models|--commands|--check]   # adapters + variants; with name: resolved definition (cached)
 agents init <name> --extends <agent>  # scaffold a variant
 install <agent>                       # one-step fix for "not installed"
-daemon status|stop [target]           # plumbing escape hatch — never needed in the happy path
+daemon status|stop [target] [--force]   # plumbing escape hatch — never needed in the happy path
 ```
 
 `<id>` everywhere accepts a session id or a `--name` alias; `last` works too, but only on a TTY (see *TTY vs non-TTY*). Session ids are 4 characters from a 32-glyph alphabet — lowercase letters and digits minus the ambiguous `0`/`o` and `1`/`l` — re-rolled on collision — a local handle; the adapter's own long session id stays internal, mapped in `meta.json`.
@@ -162,13 +162,14 @@ Plumbing, deliberately minimal. The daemon is a performance cache — it keeps a
 - **Keyed per target** (agent + home + declared env — see *Agent variants*): one daemon serves any number of sessions on its target; concurrent *turns* run up to `daemon_max_concurrent` (default 8; further turns queue and start when a slot opens, noted on stderr) — an idle or detached session holds no slot. Different homes/providers are separate targets, so fan-out never serializes.
 - **The `[target]` argument** to `daemon status`/`stop` is an agent or variant name and addresses every target under it; `daemon status` lists each concrete target with its log path.
 - **Two uses**: a wedged or stale daemon (`daemon stop`), and debugging (`daemon status` prints PID, uptime and the per-target log path — the only place adapter stderr goes in daemon mode).
-- **`daemon stop` with active sessions** transitions them to `failed` with the reason recorded in meta — never orphans.
+- **`daemon stop` refuses a target with active sessions.** A target serving sessions in state `running` or `starting` is not stopped: one error line naming the count and the ids, exit 2, nothing signalled — stopping a daemon under a live dispatch is nearly always a mistake, and the ids are exactly what the caller needs in order to `wait` or `stop` them first. Liveness is verified as everywhere else, so a session whose process is already gone reads `orphaned` and does not block the stop. When the argument addresses several targets, the guard is evaluated across all of them before anything is stopped: one blocking session refuses the whole command, because a partial stop would leave the caller guessing which half happened. `--force` stops anyway, and the sessions it takes down transition to `failed` with the reason recorded in meta — never orphaned.
 - **Version skew self-heals**: a daemon that doesn't match the client version restarts itself on connect.
 - **Fallback**: if the daemon cannot start at all (restricted sandboxes), `run` spawns the adapter as a direct child — visibly: the stderr summary says so, and SIGTERM then cancels instead of detaching.
 
 ```
 acpc daemon status
 acpc daemon stop codex          # controlled nuke; beats pkill, which kills mid-task dispatches
+acpc daemon stop codex --force  # ... and take its running sessions down with it
 ```
 
 ### `install`

@@ -5,6 +5,7 @@ import contextlib
 import functools
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -13,8 +14,9 @@ from typing import Any
 import pytest
 from click.testing import CliRunner
 
-from acpc import daemon, proc, sessions, vocab
+from acpc import daemon, daemon_client, proc, runner, sessions, vocab
 from acpc.cli import main
+from acpc.registry import AgentRegistry
 
 MOCK_AGENT_SCRIPT = str(Path(__file__).with_name("mock_agent.py"))
 
@@ -79,6 +81,49 @@ def _wait_until_running(cli: CliRunner, session_id: str) -> None:
     pytest.fail(f"session {session_id} never became running")
 
 
+def _wait_until_state(session_id: str, state: str) -> None:
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if sessions.load(session_id).state == state:
+            return
+        time.sleep(0.05)
+    pytest.fail(f"session {session_id} never became {state}")
+
+
+def _target(agent: str = "mock") -> str:
+    return runner.call_target(AgentRegistry().resolve_call(agent))
+
+
+def _start_daemon(target: str) -> None:
+    async def start() -> None:
+        connection = await daemon_client.ensure_daemon(target)
+        assert not isinstance(connection, daemon_client.DaemonUnavailable)
+        await connection.close()
+
+    asyncio.run(start())
+
+
+def _daemon_is_reachable(target: str) -> bool:
+    async def check() -> bool:
+        connection = await daemon_client.connect(target)
+        if connection is None:
+            return False
+        try:
+            return bool((await connection.status()).get("ok"))
+        finally:
+            await connection.close()
+
+    return asyncio.run(check())
+
+
+def _start_slow_session(cli: CliRunner, prompt: str = "slow:5 daemon stop probe") -> str:
+    result = invoke(cli, "run", "mock", prompt, "--bg", "--quiet")
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    session_id = result.stdout.strip().splitlines()[0]
+    _wait_until_running(cli, session_id)
+    return session_id
+
+
 @pytest.mark.parametrize("state", sorted(vocab.FINISHED_STATES))
 def test_stop_is_a_successful_noop_for_every_finished_state(cli: CliRunner, state: str) -> None:
     session_id = _finished_session(state)
@@ -103,6 +148,142 @@ def test_daemon_status_with_no_daemons_is_a_successful_empty_report(cli: CliRunn
     assert result.exit_code == vocab.EXIT_OK
     assert result.stdout == ""
     assert "no daemons running" in result.stderr
+
+
+def test_daemon_stop_help_describes_force(cli: CliRunner) -> None:
+    result = invoke(cli, "daemon", "stop", "--help")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert "--force" in result.stdout
+    assert (
+        "Stop even when the target has running or starting sessions; they are failed, not orphaned."
+        in " ".join(result.stdout.split())
+    )
+
+
+def test_daemon_stop_refuses_a_running_session_and_leaves_daemon_alive(
+    cli: CliRunner, live_daemon: None
+) -> None:
+    session_id = _start_slow_session(cli)
+
+    result = invoke(cli, "daemon", "stop", "mock")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert result.stdout == ""
+    assert result.stderr == (
+        f"Error: daemon stop mock: 1 active session ({session_id}) — wait or stop them first, "
+        f"or pass --force\n"
+    )
+    assert sessions.load(session_id).state == "running"
+    assert _daemon_is_reachable(_target())
+
+
+def test_daemon_stop_refuses_a_starting_session(cli: CliRunner, live_daemon: None) -> None:
+    target = _target()
+    _start_daemon(target)
+    session = sessions.create_session(
+        entry="mock", base_adapter="mock", prompt="still starting", target=target
+    )
+
+    result = invoke(cli, "daemon", "stop", "mock")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert result.stderr == (
+        f"Error: daemon stop mock: 1 active session ({session.session_id}) — wait or stop them "
+        f"first, or pass --force\n"
+    )
+    assert sessions.read_meta(session.session_id).state == "starting"
+    assert _daemon_is_reachable(target)
+
+
+def test_daemon_stop_force_fails_active_sessions_with_the_existing_reason(
+    cli: CliRunner, live_daemon: None
+) -> None:
+    session_id = _start_slow_session(cli)
+
+    result = invoke(cli, "daemon", "stop", "mock", "--force")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert result.stdout == ""
+    assert result.stderr == "-- stopped 1 daemon(s)\n"
+    _wait_until_state(session_id, "failed")
+    meta = sessions.read_meta(session_id)
+    assert meta.state == "failed"
+    assert meta.stop_reason == "the daemon was stopped"
+
+
+def test_idle_daemon_stop_keeps_its_existing_output(cli: CliRunner, live_daemon: None) -> None:
+    _start_daemon(_target())
+
+    result = invoke(cli, "daemon", "stop", "mock")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert result.stdout == ""
+    assert result.stderr == "-- stopped 1 daemon(s)\n"
+
+
+def test_orphaned_session_does_not_block_daemon_stop(cli: CliRunner, live_daemon: None) -> None:
+    target = _target()
+    _start_daemon(target)
+    session = sessions.create_session(
+        entry="mock", base_adapter="mock", prompt="orphan me", target=target
+    )
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        sessions.mark_running(
+            session.session_id,
+            pid=child.pid,
+            process_start_time=proc.process_start_time(child.pid),
+        )
+    finally:
+        child.terminate()
+        child.wait(timeout=5)
+
+    assert sessions.load(session.session_id).state == "orphaned"
+    result = invoke(cli, "daemon", "stop", "mock")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert result.stderr == "-- stopped 1 daemon(s)\n"
+    assert sessions.read_meta(session.session_id).state == "orphaned"
+
+
+def test_multi_target_daemon_stop_refuses_before_stopping_any_target(
+    cli: CliRunner, state_root: Path, live_daemon: None
+) -> None:
+    other_entry = state_root / "agents" / "other.toml"
+    other_entry.write_text(MOCK_ENTRY.replace('home = "~/.mock"', 'home = "~/.mock-other"'))
+    other_target = _target("other")
+    _start_daemon(other_target)
+    session_id = _start_slow_session(cli)
+
+    result = invoke(cli, "daemon", "stop")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert result.stderr == (
+        f"Error: daemon stop: 1 active session ({session_id}) — wait or stop them first, "
+        f"or pass --force\n"
+    )
+    assert _daemon_is_reachable(_target())
+    assert _daemon_is_reachable(other_target)
+
+
+def test_daemon_stop_uses_singular_and_plural_active_session_wording(
+    cli: CliRunner, live_daemon: None
+) -> None:
+    first = _start_slow_session(cli, "slow:5 first daemon stop session")
+    second = _start_slow_session(cli, "slow:5 second daemon stop session")
+    listed_ids = [
+        meta.session_id
+        for meta in sessions.list_sessions()
+        if meta.target == _target() and meta.state in {"running", "starting"}
+    ]
+
+    result = invoke(cli, "daemon", "stop", "mock")
+
+    assert listed_ids == [second, first]
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert f"daemon stop mock: 2 active sessions ({second}, {first})" in result.stderr
+    assert "1 active session" not in result.stderr
 
 
 def test_stop_running_session_cancels_daemon_and_preserves_artifacts(

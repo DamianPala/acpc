@@ -1891,21 +1891,42 @@ async def _collect_daemon_status(agent: str | None) -> list[dict[str, Any]]:
 
 @daemon_group.command(name="stop")
 @click.argument("agent", required=False)
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Stop even when the target has running or starting sessions; they are failed, not orphaned.",
+)
 @click.help_option("-h", "--help")
-def daemon_stop_command(agent: str | None) -> None:
-    """Stop daemons; their sessions are failed with a reason, never orphaned.
+def daemon_stop_command(agent: str | None, force: bool) -> None:
+    """Stop daemons; active sessions refuse the stop unless ``--force``.
 
     Example: ``acpc daemon stop mock``
     """
     import asyncio
 
-    stopped = asyncio.run(_stop_daemons(agent))
+    stopped = asyncio.run(_stop_daemons(agent, force=force))
     click.echo(f"-- stopped {stopped} daemon(s)", err=True)
 
 
-async def _stop_daemons(agent: str | None) -> int:
+async def _stop_daemons(agent: str | None, *, force: bool = False) -> int:
+    targets = runner.daemon_targets_for(agent) if agent else runner.all_daemon_targets()
+    if not force:
+        addressed = set(targets)
+        active = [
+            meta for meta in sessions.list_sessions() if meta.target in addressed and meta.is_active
+        ]
+        if active:
+            count = len(active)
+            noun = "session" if count == 1 else "sessions"
+            scope = f" {agent}" if agent else ""
+            ids = ", ".join(meta.session_id for meta in active)
+            raise UsageProblem(
+                f"daemon stop{scope}: {count} active {noun} ({ids}) — wait or stop them first, "
+                "or pass --force"
+            )
+
     stopped = 0
-    for target in runner.daemon_targets_for(agent) if agent else runner.all_daemon_targets():
+    for target in targets:
         daemon = await daemon_client.connect(target)
         if daemon is None:
             continue

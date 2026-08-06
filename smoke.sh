@@ -644,13 +644,28 @@ ${BG1_DIR}" "$LAST_OUT"
     run_acpc run stopper "slow:30 daemon stop victim" --bg --quiet
     DSTOP_ID="$(head -n1 <<<"$LAST_OUT")"
     sleep 1
-    run_acpc daemon stop stopper
+    run_acpc daemon stop stopper --force
     assert_eq "daemon stop exits 0" "0" "$LAST_RC"
     run_acpc status "$DSTOP_ID" --json
     assert_eq "daemon stop fails its active sessions, never orphans" "failed" \
         "$(json_field "$LAST_OUT" '.state')"
     RECORDED_REASON="$(jq -r '.state' "${ACPC_HOME}/sessions/${DSTOP_ID}/meta.json")"
     assert_eq "the failure is recorded in meta" "failed" "$RECORDED_REASON"
+
+    run_acpc run stopper "slow:30 daemon stop guard" --bg --quiet
+    DSTOP_GUARD_ID="$(head -n1 <<<"$LAST_OUT")"
+    sleep 1
+    run_acpc daemon stop stopper
+    assert_eq "daemon stop refuses its active session" "2" "$LAST_RC"
+    assert_contains "daemon stop refusal names the active session" "$LAST_ERR" \
+        "1 active session (${DSTOP_GUARD_ID})"
+    run_acpc status "$DSTOP_GUARD_ID" --json
+    assert_eq "guard leaves the session running" "running" \
+        "$(json_field "$LAST_OUT" '.state')"
+    run_acpc daemon status
+    assert_contains "guard leaves the stopper daemon alive" "$LAST_OUT" "stopper"
+    run_acpc daemon stop stopper --force
+    assert_eq "forced cleanup of the guarded session exits 0" "0" "$LAST_RC"
 
     # Concurrency: parallel bg dispatches, clean transcripts, no false orphans
     for i in 1 2 3 4 5 6; do
