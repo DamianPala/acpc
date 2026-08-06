@@ -84,6 +84,24 @@ def test_short_verbs_reuse_the_root_help_page(runner: CliRunner, verb: str) -> N
     assert command_help.stdout == root_help.stdout
 
 
+def test_the_root_page_describes_every_verb_that_redirects_to_it(runner: CliRunner) -> None:
+    """The no-stub-pages rule's premise: a redirected `--help` is only not a
+    dead end if the cheat sheet itself says what the verb does."""
+    root_help = invoke(runner, "--help").stdout
+    redirected = [
+        name for name in main.commands if invoke(runner, name, "--help").stdout == root_help
+    ]
+
+    assert redirected  # the rule is in force; an empty list would test nothing
+    for name in redirected:
+        described = [
+            line
+            for line in root_help.splitlines()
+            if line.strip().startswith(name) and len(line.split()) >= 3
+        ]
+        assert described, f"the root page never says what `{name}` does"
+
+
 def test_short_version_matches_long_version(runner: CliRunner) -> None:
     short_version = invoke(runner, "-V")
     long_version = invoke(runner, "--version")

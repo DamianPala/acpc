@@ -78,6 +78,12 @@ Heredoc prompt:
   Review the implementation and make the required edits.
   PROMPT
 
+Maintenance and setup:
+  stop <id>         cancel a running session
+  rm <id>           delete a finished session's on-disk state
+  prune             delete finished sessions older than retention (--older-than D)
+  install <agent>   install the agent's adapter
+
 Common commands:
   run, continue, wait, status, log, agents, daemon, stop, rm, prune, install
   Use `acpc <command> --help` for the command's full reference.
