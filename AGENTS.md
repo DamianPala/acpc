@@ -4,9 +4,8 @@
 
 - `SPEC.md` (repo root) is the normative contract. Behavior changes land in the spec first, in the same change as the code. On any conflict between code, docs and spec, the spec wins.
 - **Local-only.** Never push to origin, never release, never touch PyPI. Origin is frozen deliberately.
-- **Never install this build globally.** The system `acpc` (0.3.0.dev1) is the dispatch tool for the agents building this repo; shadowing it mid-build breaks the build loop. Develop with `uv run acpc ...`. The system `acpc` is a non-editable snapshot on purpose — never `uv tool install -e`.
-- All tests and dev runs use an isolated state root (temp dir via env override). Never touch `~/.acpc` or `~/.config/acpc`.
-- The donor repo `/home/haz/ai/lab/projects/acpc` is read-only reference material. Never modify it.
+- **The installed `acpc` is the working tool** — a non-editable snapshot on purpose: acpc dispatches the agents that edit this repo, so an editable install would change the tool under them mid-task. Develop with `uv run acpc ...`; after a change lands on main, reinstall deliberately with `uv tool install --force "git+file:///home/haz/ai/lab/projects/acpc@main"` — never `-e`.
+- All tests and dev runs use an isolated state root (temp dir via env override). Never touch `~/.acpc`.
 
 ## Testing
 
