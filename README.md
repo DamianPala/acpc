@@ -16,18 +16,20 @@ acpc is built for a specific primary user: **another agent calling it through a 
 # 90% of usage is this:
 acpc run codex "fix the failing test in tests/test_auth.py" --cwd ~/repo --permissions write
 
-# Background + collect later:
-id="$(acpc run codex "run the full suite and summarize" --bg | head -n1)"
-acpc wait "$id"
+# Background + collect later. --bg prints the session id, then its dir:
+acpc run codex "run the full suite and summarize" --bg
+acpc wait x7k2
 
 # Follow up in the same session, context preserved:
-acpc continue "$id" "now apply the same fix to the v2 API"
+acpc continue x7k2 "now apply the same fix to the v2 API"
 
 # Long prompts via heredoc:
 acpc run claude - --permissions write <<'PROMPT'
 Review the implementation against SPEC.md and make the required edits.
 PROMPT
 ```
+
+An agent caller reads the session id straight from the `--bg` output — shell variables don't survive across its tool calls anyway. A script that really chains in one shell uses `--bg --json` and takes `jq -r .session_id`.
 
 ## Command surface
 

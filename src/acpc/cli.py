@@ -61,9 +61,10 @@ Sync run:
   acpc run <agent> "Explain this code"
   acpc run <agent> "Implement the fix" --permissions write
 
-Background run + wait:
-  id="$(acpc run <agent> "Run the tests" --bg | head -n1)"
-  acpc wait "$id"
+Background run + wait (--bg prints the session id, then its dir):
+  acpc run <agent> "Run the tests" --bg
+  acpc wait <id>
+  Scripts chaining in one shell: --bg --json, id from `jq -r .session_id`.
 
 Continue:
   acpc continue <id> "Now summarize the result"
