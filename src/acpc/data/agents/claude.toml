@@ -20,8 +20,11 @@ env_passthrough = [
     "CLAUDE_CODE_USE_VERTEX",
 ]
 bypass_modes = ["bypassPermissions"]
-# TODO(stage3): verify live effort support with the adapter.
-efforts = ["low", "medium", "high", "max"]
+# Verified live 2026-08-06 against claude-agent-acp 0.64.0: the effort config
+# option id is `effort` (the default `reasoning_effort` returns "Internal
+# error: Unknown config option"), with these advertised values.
+effort_config_id = "effort"
+efforts = ["default", "low", "medium", "high", "xhigh", "max"]
 
 [presets]
 fast = { model = "claude-haiku-4-5", effort = "high" }

@@ -33,6 +33,7 @@ _ENTRY_KEYS: Final = frozenset(
         "home_env",
         "bypass_modes",
         "efforts",
+        "effort_config_id",
         "env_passthrough",
         "extends",
         "description",
@@ -53,6 +54,7 @@ _FIELD_NAMES: Final = (
     "home_env",
     "bypass_modes",
     "efforts",
+    "effort_config_id",
     "env_passthrough",
     "description",
     "model",
@@ -124,6 +126,9 @@ class ResolvedEntry:
     home_env: str | None
     bypass_modes: tuple[str, ...]
     efforts: tuple[str, ...]
+    # The session config option id that carries effort — a vendor fact like
+    # home_env (codex speaks `reasoning_effort`, claude speaks `effort`).
+    effort_config_id: str | None
     env_passthrough: tuple[str, ...]
     description: str | None
     model: str | None
@@ -490,6 +495,7 @@ def _to_resolved(
         home_env=string_or_none("home_env"),
         bypass_modes=strings("bypass_modes"),
         efforts=strings("efforts"),
+        effort_config_id=string_or_none("effort_config_id"),
         env_passthrough=strings("env_passthrough"),
         description=string_or_none("description"),
         model=string_or_none("model"),

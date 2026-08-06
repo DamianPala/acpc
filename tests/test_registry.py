@@ -79,6 +79,7 @@ def test_a_variant_inherits_the_parent_adapter_contract_lists(tmp_path: Path) ->
         "base",
         'name = "Base"\ncommand = "python -m base"\n'
         'efforts = ["low", "high"]\nbypass_modes = ["yolo"]\n'
+        'effort_config_id = "effort"\n'
         'env_passthrough = ["BASE_KEY"]\n',
     )
     write_entry(agents, "worker", 'extends = "base"\nmodel = "base-model"\n')
@@ -88,6 +89,7 @@ def test_a_variant_inherits_the_parent_adapter_contract_lists(tmp_path: Path) ->
 
     assert worker.efforts == ("low", "high")
     assert worker.bypass_modes == ("yolo",)
+    assert worker.effort_config_id == "effort"
     assert worker.env_passthrough == ("BASE_KEY",)
     with pytest.raises(RegistryError, match="low, high"):
         registry.resolve_call("worker", effort="medium")

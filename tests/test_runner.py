@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 import pytest
+from acp import RequestError
 
 from acpc import cache, runner, sessions, vocab
 from acpc.registry import AgentRegistry
@@ -283,6 +284,38 @@ def test_an_unknown_mode_fails_the_turn_rather_than_running_it() -> None:
 
     assert outcome.state == "failed"
     assert sessions.read_meta(session_id).state == "failed"
+
+
+def test_the_entrys_effort_config_id_names_the_wire_option(state_root: Path) -> None:
+    """The effort config id is a vendor fact (codex speaks `reasoning_effort`,
+    claude speaks `effort`), so the entry declares it and a wrong id fails the
+    turn with the vendor's own diagnosis, not a bare 'Internal error'."""
+    (state_root / "agents" / "custom.toml").write_text(
+        'extends = "mock"\neffort_config_id = "custom_effort"\neffort = "high"\n',
+        encoding="utf-8",
+    )
+
+    session_id, outcome = start_turn("echo:hi", agent="custom")
+
+    assert outcome.state == "failed"
+    answer = sessions.answer_path(session_id).read_text(encoding="utf-8")
+    assert "the adapter rejected effort 'high' (config option 'custom_effort')" in answer
+    assert "Unknown config option: custom_effort" in answer
+    assert "(JSON-RPC -32603)" in answer
+
+
+def test_describe_error_surfaces_the_json_rpc_data() -> None:
+    """A JSON-RPC error's fixed message hides the vendor's diagnosis in data."""
+    error = RequestError(
+        -32603, "Internal error", {"details": "Unknown config option: reasoning_effort"}
+    )
+
+    described = runner.describe_error(error)
+
+    assert described == (
+        "Internal error: Unknown config option: reasoning_effort (JSON-RPC -32603)"
+    )
+    assert runner.describe_error(ValueError("plain failure")) == "plain failure"
 
 
 def test_the_cwd_is_where_the_adapter_runs(tmp_path: Path) -> None:

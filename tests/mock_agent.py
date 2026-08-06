@@ -362,6 +362,12 @@ class MockAgent(Agent):
     async def set_config_option(
         self, config_id: str, session_id: str, value: str | bool, **kwargs: Any
     ) -> SetSessionConfigOptionResponse | None:
+        if config_id not in {"model", "reasoning_effort"}:
+            # Vendor-faithful: claude-agent-acp 0.64.0 answers an unknown
+            # config id with exactly this JSON-RPC shape.
+            raise RequestError(
+                -32603, "Internal error", {"details": f"Unknown config option: {config_id}"}
+            )
         if config_id == "model" and isinstance(value, str):
             if value not in MODELS:
                 raise RequestError(400, f"unsupported model: {value}")

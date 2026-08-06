@@ -26,7 +26,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from acp import PROTOCOL_VERSION, text_block
+from acp import PROTOCOL_VERSION, RequestError, text_block
 
 from acpc import (
     cache,
@@ -53,6 +53,26 @@ _FAILURE_STOP_REASONS = frozenset({"refusal", "max_tokens", "max_turn_requests"}
 
 class RunnerError(Exception):
     """A turn could not be started; the message is one actionable line."""
+
+
+def describe_error(error: BaseException) -> str:
+    """Render a failure with everything the adapter actually said.
+
+    A JSON-RPC error's fixed message ("Internal error") often hides the
+    vendor's real diagnosis, which rides in the optional `data` member.
+    """
+    if not isinstance(error, RequestError):
+        return str(error)
+    message = str(error) or "adapter error"
+    data = error.data
+    detail: str | None = None
+    if isinstance(data, Mapping):
+        raw = data.get("details") or data.get("message") or (data if data else None)
+        detail = str(raw) if raw is not None else None
+    elif data is not None:
+        detail = str(data)
+    suffix = f": {detail}" if detail else ""
+    return f"{message}{suffix} (JSON-RPC {error.code})"
 
 
 LOAD_SESSION_CAPABILITY_ERROR = (
@@ -238,23 +258,53 @@ async def _drive_turn(
     )
 
 
+# What most adapters call their effort session config option; entries override
+# it via `effort_config_id` (claude speaks `effort`).
+_DEFAULT_EFFORT_CONFIG_ID = "reasoning_effort"
+
+
 async def _apply_call_options(conn: Any, adapter_session_id: str, request: TurnRequest) -> None:
     """Apply --mode/--model/--effort to the adapter session before prompting."""
     resolution = request.resolution
     if request.mode is not None:
-        await conn.set_session_mode(session_id=adapter_session_id, mode_id=request.mode)
+        await _configure(
+            conn.set_session_mode(session_id=adapter_session_id, mode_id=request.mode),
+            f"mode {request.mode!r}",
+        )
     if resolution.model is not None:
-        await conn.set_config_option(
-            config_id="model",
-            session_id=adapter_session_id,
-            value=resolution.model,
+        await _configure(
+            conn.set_config_option(
+                config_id="model",
+                session_id=adapter_session_id,
+                value=resolution.model,
+            ),
+            f"model {resolution.model!r}",
         )
     if resolution.effort is not None:
-        await conn.set_config_option(
-            config_id="reasoning_effort",
-            session_id=adapter_session_id,
-            value=resolution.effort,
+        effort_config_id = resolution.entry.effort_config_id or _DEFAULT_EFFORT_CONFIG_ID
+        await _configure(
+            conn.set_config_option(
+                config_id=effort_config_id,
+                session_id=adapter_session_id,
+                value=resolution.effort,
+            ),
+            f"effort {resolution.effort!r} (config option {effort_config_id!r})",
         )
+
+
+class AdapterRejection(RuntimeError):
+    """An adapter refused a session option; the message carries the detail.
+
+    Deliberately not a RunnerError: it fails the turn like any other adapter
+    error, so the message lands in answer.md and the transcript."""
+
+
+async def _configure(call: Any, what: str) -> None:
+    """Name the rejected option: the bare JSON-RPC reply doesn't say which."""
+    try:
+        await call
+    except RequestError as error:
+        raise AdapterRejection(f"the adapter rejected {what}: {describe_error(error)}") from None
 
 
 async def _await_prompt(
@@ -431,7 +481,7 @@ async def _execute_via_daemon(
         reply = await waiting
         outcome = reply.get("outcome") or {}
         if error := outcome.get("error"):
-            raise RunnerError(str(error))
+            raise RunnerError(f"{error} [adapter log: {_daemon_log_note(target)}]")
         return TurnOutcome(
             state=str(outcome.get("state", "failed")),
             stop_reason=outcome.get("stop_reason"),
@@ -442,6 +492,22 @@ async def _execute_via_daemon(
     finally:
         with contextlib.suppress(Exception):
             await daemon.close()
+
+
+def _daemon_log_note(target: str) -> str:
+    """Point a failed turn at the adapter's stderr, saying so when it's empty.
+
+    An empty log at failure time is itself a finding: the error came over the
+    protocol and there is nothing more to read there.
+    """
+    from acpc import daemon as daemon_module
+
+    log_file = daemon_module.log_path_for_target(target)
+    try:
+        empty = log_file.stat().st_size == 0
+    except OSError:
+        empty = True
+    return f"{log_file} (empty)" if empty else str(log_file)
 
 
 def _answer_on_disk(session_id: str) -> str:
@@ -514,14 +580,14 @@ def _finalize(
     """
     answer = outcome.answer
     if error is not None and not answer:
-        answer = f"{error}\n"
+        answer = f"{describe_error(error)}\n"
     sessions.write_answer(session_id, answer)
 
     events_path = sessions.transcript_path(session_id)
     with contextlib.suppress(Exception):
         events = transcript.Transcript(events_path)
         if error is not None:
-            events.append("error", message=str(error))
+            events.append("error", message=describe_error(error))
         events.append("state", **{"from": "running", "to": outcome.state})
 
     state = outcome.state
@@ -591,6 +657,7 @@ def session_resolution(resolution: CallResolution, *, cwd: str | None) -> dict[s
     payload["adapter"] = {
         "home_env": resolution.entry.home_env,
         "bypass_modes": list(resolution.entry.bypass_modes),
+        "effort_config_id": resolution.entry.effort_config_id,
     }
     return payload
 
@@ -634,6 +701,9 @@ def resolution_from_session(meta: sessions.SessionMeta) -> CallResolution:
     home_env = adapter.get("home_env")
     if home_env is not None and not isinstance(home_env, str):
         raise RunnerError(f"session {meta.session_id} has invalid stored home environment name")
+    effort_config_id = adapter.get("effort_config_id")
+    if effort_config_id is not None and not isinstance(effort_config_id, str):
+        raise RunnerError(f"session {meta.session_id} has invalid stored effort config id")
     bypass_modes = stored_strings("bypass_modes", adapter)
     env_passthrough = stored_strings("env_passthrough", payload)
 
@@ -648,6 +718,7 @@ def resolution_from_session(meta: sessions.SessionMeta) -> CallResolution:
         home_env=home_env,
         bypass_modes=bypass_modes,
         efforts=(),
+        effort_config_id=effort_config_id,
         env_passthrough=env_passthrough,
         description=None,
         model=None,

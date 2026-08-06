@@ -639,7 +639,7 @@ class Daemon:
             "stop_reason": outcome.stop_reason,
         }
         if error is not None:
-            payload["error"] = str(error)
+            payload["error"] = runner.describe_error(error)
         turn.result = payload
         self._resolve_waiters(turn, payload)
 
