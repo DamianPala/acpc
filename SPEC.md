@@ -193,7 +193,7 @@ log <id> [--since CURSOR] [--tail N] [--prose] [--json] [--max-output BYTES]
 | Option | Purpose |
 |--------|---------|
 | (default) | Last 20 events, condensed — the progress view: "what is it doing" |
-| `--since CURSOR` | Only events after the cursor, never re-emitted; combinable with `--tail` |
+| `--since CURSOR` | Only events after the cursor, never re-emitted; combinable with `--tail`. A cursor past the transcript's end adds one stderr note naming the highest cursor there is — `-- --since 999 is past the transcript's end (highest cursor: 45)`. A note and not a usage error: a poller that overshoots by one is doing nothing wrong and has to keep working, so stdout and the exit code are unchanged. Only an explicitly passed `--since` is checked; the implicit start points (`--wait-new`, `--follow --tail 0`) are not caller mistakes |
 | `--tail N` | Just the last N of the selected events |
 | `--prose` | The content view: "what is it thinking/writing" — agent messages only, untruncated, no tool lines; agents write markdown natively, so this reads as clean markdown. The event window (`--since`/`--tail`) selects; `--prose` only renders — a full-history dump is always an explicit `--since 0` |
 | `--json` | Raw transcript events for `jq`, each carrying its index; not for reading — lossless inspection is `transcript.ndjson` itself. With `--prose` a usage error — one view per call |

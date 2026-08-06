@@ -838,6 +838,17 @@ if begin_section S08-views "status list/detail, log default/--since/--tail/--pro
     run_acpc log "does-not-exist"
     assert_eq "log on an unknown id is a usage error" "2" "$LAST_RC"
 
+    # An explicit cursor past the transcript's end is a stderr note, not an
+    # error; the quiet form suppresses the note with the footer.
+    run_acpc log "$UTIL_ID" --since 999999
+    assert_eq "past-end --since keeps the snapshot successful" "0" "$LAST_RC"
+    assert_eq "past-end --since keeps stdout empty" "" "$LAST_OUT"
+    assert_contains "past-end --since names the highest cursor" "$LAST_ERR" \
+        "-- --since 999999 is past the transcript's end (highest cursor:"
+    run_acpc log "$UTIL_ID" --since 999999 --quiet
+    assert_eq "quiet past-end --since stays successful" "0" "$LAST_RC"
+    assert_eq "quiet past-end --since suppresses stderr" "" "$LAST_ERR"
+
     end_section S08-views
 fi
 

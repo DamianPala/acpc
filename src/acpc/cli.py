@@ -1234,6 +1234,13 @@ def log_command(
         raise UsageProblem(str(error)) from None
     explicit_since = since is not None
     cursor = 0 if since is None else since
+    # Only an explicit --since is checked, so the extra read that finds the
+    # transcript's end is only paid for when there is something to check.
+    since_note = None
+    if explicit_since:
+        highest_cursor = _read_transcript_page(transcript_file).next_cursor
+        if cursor > highest_cursor:
+            since_note = _since_past_end_note(cursor, highest_cursor)
     selection_tail = tail
     if selection_tail is None and not explicit_since:
         selection_tail = _FOLLOW_DEFAULT_TAIL if follow else _LOG_DEFAULT_TAIL
@@ -1249,6 +1256,7 @@ def log_command(
             max_output=max_output,
             timeout=timeout,
             quiet=quiet,
+            since_note=since_note,
         )
         return
 
@@ -1297,6 +1305,8 @@ def log_command(
     )
     _write_stdout(rendered.text)
     if not quiet:
+        if since_note is not None:
+            _echo_metadata(since_note)
         if gave_up_waiting and meta.state not in vocab.FINISHED_STATES:
             _echo_metadata(_still_running_note(meta.session_id, timeout))
         # The cursor is a global transcript index, not an event count.  Read
@@ -1380,6 +1390,7 @@ def _follow_log(
     max_output: int,
     timeout: float | None,
     quiet: bool,
+    since_note: str | None,
 ) -> None:
     """Collect events until the session ends, the timeout expires, or the
     budget runs out — SPEC `log --follow`'s three endings, one exit code each."""
@@ -1421,6 +1432,8 @@ def _follow_log(
     # termination signal, so it has to be current.
     meta = _load_view_session(meta.session_id)
     if not quiet:
+        if since_note is not None:
+            _echo_metadata(since_note)
         if timed_out and meta.state not in vocab.FINISHED_STATES:
             _echo_metadata(_still_running_note(meta.session_id, timeout))
         if exhausted:
@@ -1440,6 +1453,11 @@ def _budget_exhausted_note(session_id: str, max_output: int, cursor: int) -> str
         f"-- stopped: --max-output {max_output} exhausted — resume with: "
         f"acpc log {session_id} --follow --since {cursor}"
     )
+
+
+def _since_past_end_note(since: int, highest_cursor: int) -> str:
+    """SPEC `log --since`: report an explicit cursor beyond the transcript."""
+    return f"-- --since {since} is past the transcript's end (highest cursor: {highest_cursor})"
 
 
 def _still_running_note(session_id: str, timeout: float | None) -> str:

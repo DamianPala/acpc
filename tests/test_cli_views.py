@@ -290,6 +290,69 @@ def test_log_applies_tail_after_since(cli: CliRunner) -> None:
     )
 
 
+def test_log_since_past_the_end_notes_highest_cursor(cli: CliRunner) -> None:
+    """An explicit cursor past a finished transcript is noted, not rejected."""
+    meta = session_with_messages(3)
+
+    result = invoke(cli, "log", meta.session_id, "--since", "999")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert result.stdout == ""
+    assert result.stderr.startswith(
+        "-- --since 999 is past the transcript's end (highest cursor: 3)"
+    )
+
+
+def test_log_since_equal_to_the_end_is_silent(cli: CliRunner) -> None:
+    """A caught-up cursor does not produce a past-the-end note."""
+    meta = session_with_messages(3)
+
+    result = invoke(cli, "log", meta.session_id, "--since", "3")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert result.stdout == ""
+    assert "past the transcript's end" not in result.stderr
+
+
+def test_log_since_below_the_end_stays_silent_and_renders_events(cli: CliRunner) -> None:
+    """A cursor inside the transcript keeps the ordinary event view."""
+    meta = session_with_messages(3)
+
+    result = invoke(cli, "log", meta.session_id, "--since", "1")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert "event-2" in result.stdout
+    assert "past the transcript's end" not in result.stderr
+
+
+def test_log_since_on_an_empty_transcript_uses_zero_as_the_end(cli: CliRunner) -> None:
+    """An empty transcript treats zero as caught up and one as too far."""
+    meta = finished_session()
+    transcript.Transcript(sessions.transcript_path(meta.session_id))
+
+    caught_up = invoke(cli, "log", meta.session_id, "--since", "0")
+    past_end = invoke(cli, "log", meta.session_id, "--since", "1")
+
+    assert caught_up.exit_code == vocab.EXIT_OK
+    assert "past the transcript's end" not in caught_up.stderr
+    assert past_end.exit_code == vocab.EXIT_OK
+    assert past_end.stdout == ""
+    assert past_end.stderr.startswith(
+        "-- --since 1 is past the transcript's end (highest cursor: 0)"
+    )
+
+
+def test_log_since_past_the_end_is_suppressed_by_quiet(cli: CliRunner) -> None:
+    """Quiet suppresses the past-the-end note along with the footer."""
+    meta = session_with_messages(3)
+
+    result = invoke(cli, "log", meta.session_id, "--since", "999", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert result.stdout == ""
+    assert result.stderr == ""
+
+
 def test_finished_log_footer_carries_exit_code_and_answer_path(cli: CliRunner) -> None:
     """A finished log footer identifies the exit code and answer artifact."""
     session_id = run_mock(cli)
@@ -361,7 +424,7 @@ def test_log_wait_new_timeout_prints_the_footer(cli: CliRunner) -> None:
 
     assert result.exit_code == vocab.EXIT_TIMEOUT
     assert result.stdout == ""
-    assert result.stderr.lstrip().startswith("-- done")
+    assert "-- done" in result.stderr
     assert "cursor:" in result.stderr
 
 
@@ -405,7 +468,30 @@ def test_wait_new_on_a_finished_session_returns_at_once(cli: CliRunner) -> None:
 
     assert time.monotonic() - started < 5
     assert result.exit_code == vocab.EXIT_TIMEOUT
-    assert result.stderr.lstrip().startswith("-- done")
+    assert "-- done" in result.stderr
+
+
+def test_wait_new_notes_only_an_explicit_past_end_cursor(cli: CliRunner) -> None:
+    """Wait-new keeps its 124 result while distinguishing an explicit overshoot."""
+    meta = session_with_messages(3)
+
+    explicit = invoke(
+        cli,
+        "log",
+        meta.session_id,
+        "--since",
+        "999",
+        "--wait-new",
+        "--timeout",
+        "30",
+    )
+    implicit = invoke(cli, "log", meta.session_id, "--wait-new", "--timeout", "30")
+
+    assert explicit.exit_code == vocab.EXIT_TIMEOUT
+    assert explicit.stdout == ""
+    assert "-- --since 999 is past the transcript's end (highest cursor: 3)" in explicit.stderr
+    assert implicit.exit_code == vocab.EXIT_TIMEOUT
+    assert "past the transcript's end" not in implicit.stderr
 
 
 def test_wait_new_timeout_on_a_running_session_says_it_still_runs(cli: CliRunner) -> None:
@@ -493,6 +579,21 @@ def test_follow_tail_zero_replays_nothing(cli: CliRunner) -> None:
 
     assert result.exit_code == vocab.EXIT_OK
     assert result.stdout == ""
+
+
+def test_follow_notes_only_an_explicit_past_end_cursor(cli: CliRunner) -> None:
+    """Follow keeps its success result and only notes an explicit overshoot."""
+    meta = session_with_messages(3)
+
+    explicit = invoke(cli, "log", meta.session_id, "--follow", "--since", "999")
+    implicit = invoke(cli, "log", meta.session_id, "--follow", "--tail", "0")
+
+    assert explicit.exit_code == vocab.EXIT_OK
+    assert explicit.stdout == ""
+    assert "-- --since 999 is past the transcript's end (highest cursor: 3)" in explicit.stderr
+    assert implicit.exit_code == vocab.EXIT_OK
+    assert implicit.stdout == ""
+    assert "past the transcript's end" not in implicit.stderr
 
 
 def test_follow_since_resumes_without_a_replay(cli: CliRunner) -> None:
