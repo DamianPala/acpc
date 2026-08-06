@@ -282,7 +282,7 @@ EOF
 | `--home <dir>` | Vendor home override (the dir with the vendor's config + credentials). The provider switch (see *Agent variants*); ad-hoc counterpart of a variant's `home` field |
 | `-o <file>` | Write the answer to the given path; stdout then carries only a short confirmation (path, size, session id). `answer.md` in the session dir is always written regardless |
 | `--bg` | Return immediately with session ID + session dir path. With `-o`, the file is written when the session finishes |
-| `--timeout <s>` | Cancels the session on expiry (state `timeout`, exit 124). No default — wall-clock limits belong to the calling harness |
+| `--timeout <s>` | Cancels the session on expiry (state `timeout`, exit 124). No default — wall-clock limits belong to the calling harness. A bare number is seconds; a suffixed value is a duration (`90s`, `5m`, `1h`, `1h30m`), the vocabulary the config file already uses. Every `--timeout` in the CLI reads the same way |
 | `--name <alias>` | Human-typeable handle for `continue`/`status`/`log`. Reusing a name rebinds it to the new session with a warning — hard error while the old session is `running`. `last` is reserved |
 | `--dry-run` | Print what this call would resolve to (model, effort, permissions, home, declared env, cwd — and where each value came from), then exit |
 | `--max-output <bytes>` | Cap on stdout bytes (default 128 KiB, 0 disables). Truncation keeps the head, cuts on a UTF-8 boundary, and ends with a marker line naming the full answer path. The marker sits at the tail, which some harness previews clip — the stderr summary repeats the session dir, so the path always survives. Shapes stdout only: `-o` files and `answer.md` are always complete. With `--json`, truncation applies to the `answer` field and sets `truncated: true`; the envelope is always valid JSON |
@@ -403,7 +403,7 @@ wait <id> [--timeout S] [-o FILE] [--max-output BYTES] [--quiet]
 
 | Option | Purpose |
 |--------|---------|
-| `--timeout <s>` | Stops *waiting* only (exit 124): the session keeps running, unlike `run --timeout`, which cancels it — and the exit says so on stderr (`-- still running (gave up waiting after Ns) — session continues; acpc stop <id> to cancel`) |
+| `--timeout <s>` | Stops *waiting* only (exit 124): the session keeps running, unlike `run --timeout`, which cancels it — and the exit says so on stderr (`-- still running (gave up waiting after Ns) — session continues; acpc stop <id> to cancel`). Seconds or a suffixed duration, as in `run`; absent, it blocks indefinitely |
 | `-o` / `--max-output` / `--quiet` | As in `run` — `wait` prints an answer, so it shapes it the same way |
 
 Block until a background session finishes, then print its answer; exit code mirrors the session result. On an already-finished session it returns immediately — the free way to reprint an answer.
@@ -543,6 +543,7 @@ The recommended primary channel for usage docs is a short snippet in the caller'
 - **`acpc --help`** — the cheat sheet, ≤100 lines: canonical examples grouped by task (sync run, bg run + wait, continue, status/log polling, heredoc prompt; write-task examples carry `--permissions write`), complete for the 90% path on its own; ends with a flag → ACP mapping table, 3-4 lines (`--mode` → `session/set_mode`, `--permissions` → `request_permission`, …).
 - **`acpc <cmd> --help`** — progressive disclosure: that command's full reference — synopsis, options table, semantics, one example.
 - **Every command has a real page**: the short verbs too — `stop`, `rm` and `install` document their synopsis, the state rules that govern them, and one example; the root page keeps their one-liners so first contact never dead-ends.
+- **Every option documents itself**: a help string, always — no option is ever a bare metavar — plus its default. An option with a real default value shows it (`[default: 131072]`); an option whose *absence* means a behavior names that behavior instead (`--timeout` absent blocks indefinitely; `log` with no `--since`/`--tail` shows the last 20 events; `--permissions` absent applies the TTY/non-TTY rule). The bar this sets: a caller can price a call's context cost and predict its no-flag behavior from `-h` alone, without reading this document.
 - `--help`/`-h` and `--version`/`-V` both accepted.
 
 ## Anti-features

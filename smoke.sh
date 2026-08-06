@@ -1120,6 +1120,19 @@ if begin_section S12-cli "help contract, -V, TTY rules, hostile inputs"; then
         assert_contains "'$verb --help' has an example" "$LAST_OUT" "Example"
     done
 
+    for help_flag in -h --help; do
+        run_acpc agents "$help_flag"
+        assert_eq "agents $help_flag succeeds" "0" "$LAST_RC"
+        assert_contains "agents $help_flag documents its options" "$LAST_OUT" "--models"
+    done
+    run_acpc wait --help
+    assert_contains "wait help explains an absent timeout" "$LAST_OUT" "indefinitely"
+    assert_contains "wait help shows the max-output default" "$LAST_OUT" "131072"
+    run_acpc log --help
+    assert_contains "log help explains its last-20 default" "$LAST_OUT" "last 20 events"
+    assert_contains "log help explains an absent timeout" "$LAST_OUT" "indefinitely"
+    assert_contains "log help shows the max-output default" "$LAST_OUT" "131072"
+
     run_acpc -V
     assert_contains "-V prints the version" "$LAST_OUT" "acpc"
     V_OUTPUT="$LAST_OUT"

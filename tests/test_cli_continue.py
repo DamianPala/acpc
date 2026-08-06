@@ -110,6 +110,17 @@ def test_continue_rotates_the_previous_turn_artifacts(cli: CliRunner) -> None:
     assert sessions.answer_path(session_id).is_file()
 
 
+def test_continue_accepts_a_suffixed_timeout(cli: CliRunner) -> None:
+    session_id = start_session(cli)
+
+    result = invoke(
+        cli, "continue", session_id, "slow:2 suffixed continue", "--timeout", "1m", "--quiet"
+    )
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert "waited 2s" in result.stdout
+
+
 def test_blocking_continue_emits_the_early_line_before_a_slow_turn_finishes(
     cli: CliRunner, live_daemon: None
 ) -> None:

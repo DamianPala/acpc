@@ -53,6 +53,34 @@ class AgentProblem(click.ClickException):
         return self.message
 
 
+class TimeoutParamType(click.ParamType):
+    """Parse CLI timeout values as seconds or config-style durations."""
+
+    name = "duration"
+    _ERROR = "use seconds (90) or a suffixed value (90s, 5m, 1h, 1h30m)"
+
+    def __init__(self, *, allow_zero: bool = False) -> None:
+        self.allow_zero = allow_zero
+
+    def convert(
+        self,
+        value: Any,
+        param: click.Parameter | None,
+        ctx: click.Context | None,
+    ) -> float:
+        text = str(value)
+        if text.count(".") == 1 and text.replace(".", "", 1).isdecimal():
+            seconds = float(text)
+            if seconds == 0 and not self.allow_zero:
+                self.fail(f"{text!r} is not a duration — {self._ERROR}", param, ctx)
+            return seconds
+        candidate = f"{text}s" if text.isdecimal() else text
+        try:
+            return config.parse_duration(candidate, allow_zero=self.allow_zero)
+        except ValueError:
+            self.fail(f"{text!r} is not a duration — {self._ERROR}", param, ctx)
+
+
 _ROOT_HELP = """acpc — dispatch coding agents over ACP.
 
 Quick reference
@@ -152,7 +180,11 @@ def _friendly_usage_message(message: str) -> str:
     return message
 
 
-@click.group(cls=_CheatSheetGroup, invoke_without_command=True)
+@click.group(
+    cls=_CheatSheetGroup,
+    invoke_without_command=True,
+    context_settings={"show_default": True},
+)
 @click.version_option(__version__, "-V", "--version", message="acpc %(version)s")
 @click.help_option("-h", "--help")
 @click.pass_context
@@ -759,6 +791,7 @@ def _run_agents_view(
     help="Launch, authenticate and apply the resolved options.",
 )
 @click.option("--json", "json_mode", is_flag=True, help="Emit this view as JSON.")
+@click.help_option("-h", "--help")
 @click.pass_context
 def agents_group(
     ctx: click.Context,
@@ -786,6 +819,7 @@ def agents_group(
     help="Launch, authenticate and apply the resolved options.",
 )
 @click.option("--json", "json_mode", is_flag=True, help="Emit this view as JSON.")
+@click.help_option("-h", "--help")
 def _agent_view_command(
     name: str, models: bool, commands: bool, check_live: bool, json_mode: bool
 ) -> None:
@@ -824,11 +858,22 @@ def _agents_check(registry: AgentRegistry, name: str | None, *, json_mode: bool)
 
 @agents_group.command(name="init")
 @click.argument("name")
-@click.option("--extends", "parent", required=True, metavar="AGENT")
-@click.option("--model", metavar="M")
-@click.option("--effort", metavar="E")
-@click.option("--permissions", type=click.Choice(vocab.PERMISSION_VALUES), metavar="P")
-@click.option("--home", metavar="DIR")
+@click.option(
+    "--extends",
+    "parent",
+    required=True,
+    metavar="AGENT",
+    help="Base agent entry to inherit settings from.",
+)
+@click.option("--model", metavar="M", help="Default model or preset for the variant.")
+@click.option("--effort", metavar="E", help="Default reasoning effort for the variant.")
+@click.option(
+    "--permissions",
+    type=click.Choice(vocab.PERMISSION_VALUES),
+    metavar="P",
+    help="Default permission policy for the variant.",
+)
+@click.option("--home", metavar="DIR", help="Vendor home override for the variant.")
 @click.option("--json", "json_mode", is_flag=True, help="Emit the created entry as JSON.")
 @click.help_option("-h", "--help")
 def agents_init_command(
@@ -1173,16 +1218,28 @@ def status_command(selector: str | None, all_sessions: bool, json_mode: bool) ->
 
 @main.command(name="log")
 @click.argument("selector")
-@click.option("--since", type=click.IntRange(min=0), default=None, metavar="N")
-@click.option("--tail", type=click.IntRange(min=0), default=None, metavar="N")
+@click.option(
+    "--since",
+    type=click.IntRange(min=0),
+    default=None,
+    metavar="N",
+    help="Show only events after this cursor; without --since or --tail, show the last 20 events.",
+)
+@click.option(
+    "--tail",
+    type=click.IntRange(min=0),
+    default=None,
+    metavar="N",
+    help="Show only the last N selected events; without --since or --tail, show the last 20 events.",
+)
 @click.option("--prose", is_flag=True, help="Render full agent messages.")
 @click.option("--json", "json_mode", is_flag=True, help="Emit raw transcript events as NDJSON.")
 @click.option(
     "--max-output",
     type=click.IntRange(min=0),
     default=render.DEFAULT_LOG_MAX_OUTPUT,
-    show_default=True,
     metavar="BYTES",
+    help="Cap rendered output bytes; 0 disables the cap.",
 )
 @click.option("--wait-new", is_flag=True, help="Wait for new transcript events.")
 @click.option(
@@ -1193,10 +1250,13 @@ def status_command(selector: str | None, all_sessions: bool, json_mode: bool) ->
 )
 @click.option(
     "--timeout",
-    type=click.FloatRange(min=0),
+    type=TimeoutParamType(allow_zero=True),
     default=None,
     metavar="S",
-    help="Give up waiting after S seconds (exit 124); requires --wait-new or --follow.",
+    help=(
+        "Give up waiting after this duration (exit 124); absent, it blocks indefinitely; "
+        "requires --wait-new or --follow."
+    ),
 )
 @click.option("--quiet", is_flag=True, help="Suppress the stderr footer.")
 @click.help_option("-h", "--help")
@@ -1483,20 +1543,24 @@ def _still_running_note(session_id: str, timeout: float | None) -> str:
     help=(
         "\b\n"
         "Approval policy: all, write (= edit + execute), read (incl. network fetch), none, "
-        "prompt."
+        "prompt; absent, prompt on a TTY and read otherwise."
     ),
 )
 @click.option("--mode", metavar="M", help="Callee's operating mode (ACP session/set_mode).")
 @click.option("--home", metavar="DIR", help="Vendor home override.")
 @click.option("-o", "--output", "output_file", metavar="FILE", help="Write the answer to a file.")
-@click.option("--timeout", type=float, metavar="S", help="Cancel the session after S seconds.")
+@click.option(
+    "--timeout",
+    type=TimeoutParamType(),
+    metavar="S",
+    help="Cancel the session after this duration; absent, no wall-clock limit (the callee runs until it is done).",
+)
 @click.option("--name", "alias", metavar="ALIAS", help="Human-typeable handle for this session.")
 @click.option("--dry-run", is_flag=True, help="Print what this call resolves to, then exit.")
 @click.option(
     "--max-output",
     type=click.IntRange(min=0),
     default=output.DEFAULT_MAX_OUTPUT,
-    show_default=True,
     metavar="BYTES",
     help="Cap on stdout bytes; 0 disables the cap.",
 )
@@ -1678,25 +1742,65 @@ def _dispatch_background(session_id: str, request: runner.TurnRequest, *, json_m
 @click.option("--prompt-file", "prompt_file", metavar="FILE", help="Read the prompt from a file.")
 @click.option("-o", "--output", "output_file", metavar="FILE", help="Write the answer to a file.")
 @click.option("--bg", "background", is_flag=True, help="Dispatch and return the session id.")
-@click.option("--timeout", type=float, metavar="S", help="Cancel the session after S seconds.")
+@click.option(
+    "--timeout",
+    type=TimeoutParamType(),
+    metavar="S",
+    help="Cancel the session after this duration; absent, no wall-clock limit (the callee runs until it is done).",
+)
 @click.option(
     "--max-output",
     type=click.IntRange(min=0),
     default=output.DEFAULT_MAX_OUTPUT,
-    show_default=True,
     metavar="BYTES",
     help="Cap on stdout bytes; 0 disables the cap.",
 )
 @click.option("--quiet", is_flag=True, help="Suppress the stderr summary line.")
 @click.option("--json", "json_mode", is_flag=True, help="Emit this command's output as JSON.")
-@click.option("--permissions", metavar="P", hidden=True)
-@click.option("--model", metavar="M", hidden=True)
-@click.option("--effort", metavar="E", hidden=True)
-@click.option("--mode", metavar="M", hidden=True)
-@click.option("--cwd", metavar="DIR", hidden=True)
-@click.option("--home", metavar="DIR", hidden=True)
-@click.option("--name", "alias", metavar="ALIAS", hidden=True)
-@click.option("--dry-run", is_flag=True, hidden=True)
+@click.option(
+    "--permissions",
+    metavar="P",
+    hidden=True,
+    help="Run-only permission policy; continue reuses the stored policy.",
+)
+@click.option(
+    "--model",
+    metavar="M",
+    hidden=True,
+    help="Run-only model override; continue reuses the stored model.",
+)
+@click.option(
+    "--effort",
+    metavar="E",
+    hidden=True,
+    help="Run-only reasoning effort; continue reuses the stored effort.",
+)
+@click.option(
+    "--mode",
+    metavar="M",
+    hidden=True,
+    help="Run-only operating mode; continue reuses the stored mode.",
+)
+@click.option(
+    "--cwd",
+    metavar="DIR",
+    hidden=True,
+    help="Run-only working directory; continue reuses the stored directory.",
+)
+@click.option(
+    "--home",
+    metavar="DIR",
+    hidden=True,
+    help="Run-only vendor home; continue reuses the stored home.",
+)
+@click.option(
+    "--name",
+    "alias",
+    metavar="ALIAS",
+    hidden=True,
+    help="Run-only session name; continue reuses the stored name.",
+)
+@click.option("--dry-run", is_flag=True, hidden=True, help="Run-only resolution preview.")
 @click.help_option("-h", "--help")
 def continue_command(
     selector: str,
@@ -1854,15 +1958,14 @@ def _steer_prompt(instruction: str) -> str:
 @click.option("--bg", "background", is_flag=True, help="Dispatch and return the session id.")
 @click.option(
     "--timeout",
-    type=float,
+    type=TimeoutParamType(),
     metavar="S",
-    help="Cancel the redirected turn after S seconds; absent means no limit.",
+    help="Cancel the redirected turn after this duration; absent, no wall-clock limit (the callee runs until it is done).",
 )
 @click.option(
     "--max-output",
     type=click.IntRange(min=0),
     default=output.DEFAULT_MAX_OUTPUT,
-    show_default=True,
     metavar="BYTES",
     help="Cap on stdout bytes; 0 disables the cap.",
 )
@@ -1919,14 +2022,20 @@ def steer_command(
 
 @main.command(name="wait")
 @click.argument("selector")
-@click.option("--timeout", type=click.FloatRange(min=0), default=None, metavar="S")
+@click.option(
+    "--timeout",
+    type=TimeoutParamType(allow_zero=True),
+    default=None,
+    metavar="S",
+    help="Stop waiting after this duration; absent, it blocks indefinitely.",
+)
 @click.option("-o", "--output", "output_file", metavar="FILE", help="Write the answer to a file.")
 @click.option(
     "--max-output",
     type=click.IntRange(min=0),
     default=output.DEFAULT_MAX_OUTPUT,
-    show_default=True,
     metavar="BYTES",
+    help="Cap rendered output bytes; 0 disables the cap.",
 )
 @click.option("--quiet", is_flag=True, help="Suppress the stderr summary line.")
 @click.option("--json", "json_mode", is_flag=True, help="Emit this command's output as JSON.")

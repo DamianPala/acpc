@@ -497,6 +497,37 @@ def test_a_timeout_exits_124(cli: CliRunner) -> None:
     assert result.exit_code == vocab.EXIT_TIMEOUT
 
 
+def test_a_bare_integer_timeout_is_seconds(cli: CliRunner) -> None:
+    result = invoke(cli, "run", "mock", "slow:2 bare seconds", "--timeout", "1", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_TIMEOUT
+
+
+def test_a_five_minute_timeout_is_not_five_seconds(cli: CliRunner) -> None:
+    result = invoke(cli, "run", "mock", "slow:6 five minute timeout", "--timeout", "5m", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert "waited 6s" in result.stdout
+
+
+def test_an_invalid_timeout_has_the_pinned_duration_error(cli: CliRunner) -> None:
+    result = invoke(cli, "run", "mock", "hello", "--timeout", "5x")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert result.stderr == (
+        "Error: Invalid value for '--timeout': '5x' is not a duration — "
+        "use seconds (90) or a suffixed value (90s, 5m, 1h, 1h30m)\n"
+    )
+
+
+@pytest.mark.parametrize("value", ["-1", "-1m"])
+def test_negative_timeout_is_a_usage_error(cli: CliRunner, value: str) -> None:
+    result = invoke(cli, "run", "mock", "hello", "--timeout", value, "--dry-run")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert "--timeout" in result.stderr
+
+
 # --- session naming ---------------------------------------------------------
 
 

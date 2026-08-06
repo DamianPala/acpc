@@ -98,6 +98,23 @@ def test_steer_cancels_the_turn_and_runs_the_instruction(cli: CliRunner) -> None
     assert sessions.read_meta(session_id).turns == turns_before + 1
 
 
+def test_steer_accepts_a_suffixed_timeout(cli: CliRunner) -> None:
+    session_id = mid_turn_session(cli)
+
+    result = invoke(
+        cli,
+        "steer",
+        session_id,
+        "diagnose only",
+        "--timeout",
+        "1m",
+        "--quiet",
+    )
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert "Working through:" in result.stdout
+
+
 def test_steer_stores_the_wrapped_instruction_verbatim(cli: CliRunner) -> None:
     """SPEC steer: what was sent is what is on disk, preamble included."""
     session_id = mid_turn_session(cli)

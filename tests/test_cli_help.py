@@ -1,9 +1,11 @@
 """Behavioral tests for first-contact help and CLI hardening."""
 
 import json
+import re
 import sys
 from pathlib import Path
 
+import click
 import pytest
 from click.testing import CliRunner
 
@@ -44,6 +46,29 @@ def invoke(runner: CliRunner, *args: str):
     return runner.invoke(main, list(args), catch_exceptions=False)
 
 
+def _command_tree(command: click.Command, path: tuple[str, ...] = ()):
+    """Discover the registered Click command tree for the help contract."""
+    yield path, command
+    if isinstance(command, click.Group):
+        for name in sorted(command.commands):
+            yield from _command_tree(command.commands[name], (*path, name))
+
+
+def _rendered_option_record(rendered: str, option: click.Option) -> str:
+    """Return one option row, including its wrapped help continuation."""
+    lines = rendered.splitlines()
+    start = next(
+        index
+        for index, line in enumerate(lines)
+        if line.startswith("  ") and any(line[2:].startswith(label) for label in option.opts)
+    )
+    end = next(
+        (index for index in range(start + 1, len(lines)) if lines[index].startswith("  -")),
+        len(lines),
+    )
+    return " ".join(lines[start:end])
+
+
 def test_root_help_is_a_compact_cheat_sheet(runner: CliRunner) -> None:
     result = invoke(runner, "--help")
 
@@ -66,6 +91,68 @@ def test_short_help_matches_root_help(runner: CliRunner) -> None:
     short_help = invoke(runner, "-h")
 
     assert short_help.stdout == long_help.stdout
+
+
+def test_every_registered_command_has_helpful_options_and_both_help_spellings(
+    runner: CliRunner,
+) -> None:
+    """The Click tree is the source of truth for the option-help sweep."""
+    for path, command in _command_tree(main):
+        for spelling in ("-h", "--help"):
+            result = invoke(runner, *path, spelling)
+            assert result.exit_code == vocab.EXIT_OK, (
+                f"{' '.join(path) or 'acpc'} {spelling} failed: {result.stderr}"
+            )
+
+        # The root is a deliberately custom cheat sheet, so it does not render
+        # Click's option table. Its two help spellings are checked above.
+        if not path:
+            continue
+        rendered = invoke(runner, *path, "--help").stdout
+        for option in command.params:
+            if not isinstance(option, click.Option) or option.hidden:
+                continue
+            labels = "/".join(option.opts)
+            record = _rendered_option_record(rendered, option)
+            for label in option.opts:
+                record = record.replace(label, " ")
+            if option.metavar is not None:
+                record = record.replace(option.metavar, " ")
+            record = re.sub(r"\[[^]]*\]", " ", record)
+            record = re.sub(r"\b[A-Z][A-Z0-9_-]*\b", " ", record)
+            assert re.search(r"[A-Za-z]{2,}", record), (
+                f"{' '.join(path)} {labels} has no rendered help text"
+            )
+
+
+@pytest.mark.parametrize("spelling", ["-h", "--help"])
+def test_named_agents_view_accepts_both_help_spellings(runner: CliRunner, spelling: str) -> None:
+    result = invoke(runner, "agents", "mock", spelling)
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert "Render one named adapter or variant." in result.stdout
+
+
+def test_help_names_behavioral_defaults_and_global_output_default(runner: CliRunner) -> None:
+    def normalized(text: str) -> str:
+        return " ".join(text.split()).replace("wall- clock", "wall-clock")
+
+    run_help = normalized(invoke(runner, "run", "--help").stdout)
+    continue_help = normalized(invoke(runner, "continue", "--help").stdout)
+    steer_help = normalized(invoke(runner, "steer", "--help").stdout)
+    wait_help = normalized(invoke(runner, "wait", "--help").stdout)
+    log_help = normalized(invoke(runner, "log", "--help").stdout)
+
+    assert "absent, no wall-clock limit (the callee runs until it is done)" in run_help
+    assert "absent, no wall-clock limit (the callee runs until it is done)" in continue_help
+    assert "absent, no wall-clock limit (the callee runs until it is done)" in steer_help
+    assert "absent, it blocks indefinitely" in wait_help
+    assert "absent, it blocks indefinitely" in log_help
+    assert "without --since or --tail, show the last 20 events" in log_help
+    assert "absent, prompt on a TTY and read otherwise" in run_help
+    assert "[default: 131072" in run_help
+    assert "[default: 131072" in wait_help
+    assert "[default: 131072" in log_help
 
 
 def test_run_help_is_a_distinct_reference_page(runner: CliRunner) -> None:

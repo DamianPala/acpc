@@ -216,6 +216,43 @@ def test_log_defaults_to_the_last_twenty_events(cli: CliRunner) -> None:
     assert "event-0" not in result.stdout and "event-20" in result.stdout
 
 
+def test_wait_accepts_a_suffixed_timeout_on_a_finished_session(cli: CliRunner) -> None:
+    session_id = run_mock(cli)
+
+    result = invoke(cli, "wait", session_id, "--timeout", "1m", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_OK
+
+
+def test_log_accepts_a_suffixed_timeout_on_a_finished_session(cli: CliRunner) -> None:
+    session_id = run_mock(cli)
+
+    result = invoke(cli, "log", session_id, "--follow", "--timeout", "1m", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_OK
+
+
+def test_zero_timeout_remains_allowed_for_wait_and_log(cli: CliRunner) -> None:
+    running = running_session("zero wait timeout")
+    wait_result = invoke(cli, "wait", running.session_id, "--timeout", "0", "--quiet")
+
+    finished = run_mock(cli)
+    log_result = invoke(cli, "log", finished, "--wait-new", "--timeout", "0", "--quiet")
+
+    assert wait_result.exit_code == vocab.EXIT_TIMEOUT
+    assert log_result.exit_code == vocab.EXIT_TIMEOUT
+
+
+@pytest.mark.parametrize("verb_args", [("wait", "missing"), ("log", "missing", "--wait-new")])
+def test_negative_timeout_is_a_usage_error_for_waiting_views(
+    cli: CliRunner, verb_args: tuple[str, ...]
+) -> None:
+    result = invoke(cli, *verb_args, "--timeout", "-1")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert "--timeout" in result.stderr
+
+
 def test_log_tail_limits_the_selected_events(cli: CliRunner) -> None:
     """Log --tail limits the number of rendered event lines."""
     session_id = run_mock(cli)
