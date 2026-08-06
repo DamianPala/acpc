@@ -44,7 +44,7 @@ agents init <name> --extends <agent> [--model M] [--effort E] [--permissions P] 
 | Option | Purpose |
 |--------|---------|
 | `--models` / `--commands` | Dump the full advertised list. Accepted on any name — a variant delegates to its parent |
-| `--check` | Live probe: launch + auth. With name one adapter, without every installed one; one line per adapter, any failure → exit 1 |
+| `--check` | Live probe: launch + auth + apply the resolved options (mode/model/effort), so a config the adapter would reject fails the check rather than the next run; no prompt is sent, so model access itself still surfaces at `run` time. With name one adapter, without every installed one; one line per adapter, any failure → exit 1 |
 | `init --extends <agent>` | Scaffold a variant; the flags mirror the entry's fields |
 
 Without name: one aligned row per adapter and variant. Variants (indented) show only their delta in fixed columns — model, effort, permissions, home (`·` = unset; home `~`-abbreviated, copy-able into `--home`). Status is `installed`/`missing` only; auth is not shown — cached auth state rots; the truth surfaces at `run` time as an actionable error. `agents --check` is the opt-in live probe.

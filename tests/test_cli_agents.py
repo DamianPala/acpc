@@ -214,6 +214,23 @@ def test_check_reports_a_missing_named_adapter_with_exit_one(cli: CliRunner) -> 
     assert "failed" in result.stdout
 
 
+def test_check_applies_the_resolved_options_so_a_bad_config_fails_it(
+    cli: CliRunner, state_root: Path
+) -> None:
+    """--check must fail on a config the adapter rejects (a wrong effort id
+    made every claude run die while --check kept saying ok)."""
+    (state_root / "agents" / "brokenfx.toml").write_text(
+        MOCK_ENTRY.replace("[presets]", 'effort_config_id = "bogus_effort_id"\n\n[presets]'),
+        encoding="utf-8",
+    )
+
+    result = invoke(cli, "agents", "brokenfx", "--check")
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    assert "brokenfx failed" in result.stdout
+    assert "Unknown config option: bogus_effort_id" in result.stdout
+
+
 def test_agents_init_writes_the_requested_variant_fields(cli: CliRunner, state_root: Path) -> None:
     result = invoke(
         cli,

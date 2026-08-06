@@ -723,7 +723,12 @@ def _run_agents_view(
 @main.group(name="agents", cls=_AgentsGroup, invoke_without_command=True)
 @click.option("--models", is_flag=True, help="Show full advertised presets and models.")
 @click.option("--commands", is_flag=True, help="Show advertised slash commands.")
-@click.option("--check", "check_live", is_flag=True, help="Launch and authenticate the adapter.")
+@click.option(
+    "--check",
+    "check_live",
+    is_flag=True,
+    help="Launch, authenticate and apply the resolved options.",
+)
 @click.option("--json", "json_mode", is_flag=True, help="Emit this view as JSON.")
 @click.pass_context
 def agents_group(
@@ -745,7 +750,12 @@ def agents_group(
 @click.argument("name")
 @click.option("--models", is_flag=True, help="Show full advertised presets and models.")
 @click.option("--commands", is_flag=True, help="Show advertised slash commands.")
-@click.option("--check", "check_live", is_flag=True, help="Launch and authenticate the adapter.")
+@click.option(
+    "--check",
+    "check_live",
+    is_flag=True,
+    help="Launch, authenticate and apply the resolved options.",
+)
 @click.option("--json", "json_mode", is_flag=True, help="Emit this view as JSON.")
 def _agent_view_command(
     name: str, models: bool, commands: bool, check_live: bool, json_mode: bool

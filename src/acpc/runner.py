@@ -232,7 +232,7 @@ async def _drive_turn(
                 adapter_session_id = session.session_id
                 client.capture_advertised(session)
 
-            await _apply_call_options(conn, adapter_session_id, request)
+            await apply_call_options(conn, adapter_session_id, request)
 
             prompt_task = asyncio.create_task(
                 conn.prompt(
@@ -263,7 +263,7 @@ async def _drive_turn(
 _DEFAULT_EFFORT_CONFIG_ID = "reasoning_effort"
 
 
-async def _apply_call_options(conn: Any, adapter_session_id: str, request: TurnRequest) -> None:
+async def apply_call_options(conn: Any, adapter_session_id: str, request: TurnRequest) -> None:
     """Apply --mode/--model/--effort to the adapter session before prompting."""
     resolution = request.resolution
     if request.mode is not None:

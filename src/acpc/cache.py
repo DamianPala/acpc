@@ -196,6 +196,17 @@ async def probe_advertised(resolution: CallResolution) -> dict[str, Any]:
                 await connection.initialize(protocol_version=PROTOCOL_VERSION)
                 session = await connection.new_session(cwd=str(Path.cwd()), mcp_servers=[])
                 client.capture_advertised(session)
+                # Apply the resolved options exactly as a run would: a config
+                # the adapter rejects (wrong effort id, unknown model) must
+                # fail the check, not first surface on a paid run.  Imported
+                # lazily — runner imports this module at load time.
+                from acpc import runner as runner_module
+
+                await runner_module.apply_call_options(
+                    connection,
+                    session.session_id,
+                    runner_module.TurnRequest(resolution=resolution, prompt=""),
+                )
                 deadline = time.monotonic() + _PROBE_UPDATE_WAIT
                 while not client.advertised["commands"] and time.monotonic() < deadline:
                     await asyncio.sleep(0.01)

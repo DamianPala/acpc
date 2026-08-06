@@ -599,7 +599,7 @@ class Daemon:
         self.host.adapter_sessions[session_id] = adapter_session_id
         self.host.mux.bind(adapter_session_id, client)
         try:
-            await runner._apply_call_options(conn, adapter_session_id, request)
+            await runner.apply_call_options(conn, adapter_session_id, request)
             prompt_task = asyncio.create_task(
                 conn.prompt(session_id=adapter_session_id, prompt=[text_block(request.prompt)])
             )
