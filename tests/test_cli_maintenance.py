@@ -95,6 +95,16 @@ def test_stop_unknown_session_is_a_usage_error(cli: CliRunner) -> None:
     assert result.exit_code == vocab.EXIT_USAGE
 
 
+def test_daemon_status_with_no_daemons_is_a_successful_empty_report(cli: CliRunner) -> None:
+    """No daemons is a normal state, not a failure — scripted cleanliness
+    checks (`acpc daemon status && …`) depend on the zero exit."""
+    result = invoke(cli, "daemon", "status")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert result.stdout == ""
+    assert "no daemons running" in result.stderr
+
+
 def test_stop_running_session_cancels_daemon_and_preserves_artifacts(
     cli: CliRunner, state_root: Path, live_daemon: None
 ) -> None:
