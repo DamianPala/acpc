@@ -16,18 +16,16 @@
 - **Verify a test can fail.** Before trusting a new test, break the code it covers and confirm it goes red. Lesson from 2026-08-04: an entire daemon test group stayed green while silently exercising the wrong source tree; only mutation testing exposed it.
 - Every test must be deterministic and self-contained: own temp state root, no dependence on wall-clock timing tighter than the spec's own timeouts, no ordering dependence between tests.
 
-## Dispatching agents (Stage 2)
+## Dispatching agents
 
-Implementation slices go through the installed `acpc` (0.3.0.dev1) to the `builder` registry variant — gpt-5.6-luna @ xhigh, `permissions write`, OpenRouter home, already set up and working:
+Implementation work dispatched to an agent goes through the installed `acpc` to the `builder` registry variant — gpt-5.6-luna @ xhigh, `permissions write`, OpenRouter home, already set up and working:
 
 ```bash
 set -a && . ~/.config/secrets/base.env && set +a   # OpenRouter key via env_key
-acpc run builder --input-file <slice-prompt.md> --cwd <this worktree>
+acpc run builder --input-file <task-prompt.md> --cwd <this worktree>
 ```
 
-- **Tier `max` slices (PLAN.md):** Opus implements those itself (the orchestrator, or an Opus subagent via the Agent tool) — they are never dispatched to `builder`.
-- **Escalation after two failed reviews:** rerun `builder --effort max`; if that round fails review too, Opus takes the slice over.
-- **Slice reviews are Opus too** — the orchestrator itself or an Opus subagent, never the registry's `reviewer` variant (that one is a different stack).
+- **Reviews are Opus** — the orchestrator itself or an Opus subagent, never the registry's `reviewer` variant (that one is a different stack).
 - Pass specs and long prompts with `--input-file`, never as a positional argument. Argv is visible in `ps`/`/proc/*/cmdline`; on 2026-08-04 a dispatch was SIGKILLed because the spec text in argv matched a cleanup helper's `pgrep -f` pattern.
 - Select provider/home by naming a registry variant; never export `CODEX_HOME`/`CLAUDE_CONFIG_DIR` around a dispatch. Daemons are keyed on the entry's declared environment, not ambient env — exporting the home binds the wrong provider into a shared daemon.
 
@@ -44,4 +42,4 @@ acpc run builder --input-file <slice-prompt.md> --cwd <this worktree>
 - Lint/format: `uv run ruff check && uv run ruff format`
 - Type check: `uv run pyright`
 - Tests: `uv run pytest`
-- Acceptance: `smoke.sh` (sectioned; sections flip green as PLAN.md slices land)
+- Acceptance: `smoke.sh` (end-to-end against the ACP mock agent)
