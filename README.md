@@ -6,8 +6,6 @@ acpc is built for a specific primary user: **another agent calling it through a 
 
 `SPEC.md` is the normative contract; this README is the tour.
 
-> **Status: 0.3, local install.** Not on PyPI. Requires Python ≥ 3.13.
-
 ## The whole mental model
 
 *`run` blocks and prints the answer; `--bg` returns an ID; `status`/`log`/`wait`/`continue`/`stop` operate on that ID; everything is on disk under a predictable path.*

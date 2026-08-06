@@ -30,7 +30,7 @@ permissions.py (frozen)         kind classification + approval policy
 vocab.py (frozen)               efforts, permission values, session states, exit codes
 ```
 
-"(frozen)" = Stage 1 harvested foundation; read-only for Stage 2 implementer agents (see PLAN.md).
+"(frozen)" = Stage 1 harvested foundation, kept read-only for the Stage 2 implementer agents (the build history is in status.md).
 
 ## Module ownership
 
