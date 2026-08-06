@@ -608,9 +608,15 @@ ${BG1_DIR}" "$LAST_OUT"
     set -e
     assert_eq "SIGTERM on a sync run exits 143" "143" "$SIGTERM_RC"
     SIGTERM_ERR="$(cat "${SCRATCH}/sigterm.err")"
-    SIGTERM_ID="$(grep -oE '[abcdefghijkmnpqrstuvwxyz23456789]{4}' <<<"$SIGTERM_ERR" | head -n1)"
+    SIGTERM_ID="$(
+        sed -nE \
+            's/.*still RUNNING: ([abcdefghijkmnpqrstuvwxyz23456789]{4,}).*/\1/p' \
+            <<<"$SIGTERM_ERR" |
+            head -n1
+    )"
     assert_true "SIGTERM prints the session id to stderr on the way out" \
         "$([[ -n "$SIGTERM_ID" ]] && echo 0 || echo 1)"
+    assert_contains "SIGTERM detach names wait and stop" "$SIGTERM_ERR" "acpc wait"
     run_acpc status "$SIGTERM_ID" --json
     assert_eq "detached session survives SIGTERM (still running)" "running" \
         "$(json_field "$LAST_OUT" '.state')"
@@ -997,6 +1003,7 @@ if begin_section S12-cli "help contract, -V, TTY rules, hostile inputs"; then
     assert_contains "cheat sheet has a write-task example with --permissions write" \
         "$HELP_MAIN" "--permissions write"
     assert_contains "cheat sheet ends with a flag -> ACP mapping" "$HELP_MAIN" "request_permission"
+    assert_contains "cheat sheet explains write permissions" "$HELP_MAIN" "write (= edit + execute)"
     run_acpc -h
     assert_eq "-h matches --help" "$HELP_MAIN" "$LAST_OUT"
 
@@ -1004,11 +1011,14 @@ if begin_section S12-cli "help contract, -V, TTY rules, hostile inputs"; then
     assert_true "run --help is its own reference, not the root page" \
         "$([[ "$LAST_OUT" != "$HELP_MAIN" ]] && echo 0 || echo 1)"
     assert_contains "run --help documents --max-output" "$LAST_OUT" "--max-output"
+    assert_contains "run --help explains write permissions" "$LAST_OUT" "write (= edit + execute)"
     run_acpc log --help
     assert_contains "log --help documents --wait-new" "$LAST_OUT" "--wait-new"
     for verb in stop rm install; do
         run_acpc "$verb" --help
-        assert_eq "'$verb --help' prints the root page (no stub pages)" "$HELP_MAIN" "$LAST_OUT"
+        assert_true "'$verb --help' is its own reference page" \
+            "$([[ "$LAST_OUT" != "$HELP_MAIN" ]] && echo 0 || echo 1)"
+        assert_contains "'$verb --help' has an example" "$LAST_OUT" "Example"
     done
 
     run_acpc -V

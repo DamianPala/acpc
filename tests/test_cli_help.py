@@ -53,6 +53,14 @@ def test_root_help_is_a_compact_cheat_sheet(runner: CliRunner) -> None:
     assert "request_permission" in result.stdout
 
 
+def test_permission_help_names_the_tier_gloss(runner: CliRunner) -> None:
+    root_help = invoke(runner, "--help")
+    run_help = invoke(runner, "run", "--help")
+
+    assert "write (= edit + execute)" in root_help.stdout
+    assert "write (= edit + execute)" in run_help.stdout
+
+
 def test_short_help_matches_root_help(runner: CliRunner) -> None:
     long_help = invoke(runner, "--help")
     short_help = invoke(runner, "-h")
@@ -77,29 +85,82 @@ def test_log_help_documents_activity_waiting(runner: CliRunner) -> None:
 
 
 @pytest.mark.parametrize("verb", ["stop", "rm", "install"])
-def test_short_verbs_reuse_the_root_help_page(runner: CliRunner, verb: str) -> None:
+def test_short_verbs_have_real_help_pages(runner: CliRunner, verb: str) -> None:
     root_help = invoke(runner, "--help")
     command_help = invoke(runner, verb, "--help")
 
-    assert command_help.stdout == root_help.stdout
+    assert command_help.stdout != root_help.stdout
+    assert "Example" in command_help.stdout
 
 
-def test_the_root_page_describes_every_verb_that_redirects_to_it(runner: CliRunner) -> None:
-    """The no-stub-pages rule's premise: a redirected `--help` is only not a
-    dead end if the cheat sheet itself says what the verb does."""
+def test_no_command_redirects_to_root_help_and_root_keeps_verb_one_liners(
+    runner: CliRunner,
+) -> None:
     root_help = invoke(runner, "--help").stdout
     redirected = [
         name for name in main.commands if invoke(runner, name, "--help").stdout == root_help
     ]
 
-    assert redirected  # the rule is in force; an empty list would test nothing
-    for name in redirected:
+    assert redirected == []
+    for name in ("stop", "rm", "prune", "install"):
         described = [
             line
             for line in root_help.splitlines()
-            if line.strip().startswith(name) and len(line.split()) >= 3
+            if line.strip().startswith(f"{name} ") and len(line.split()) >= 3
         ]
-        assert described, f"the root page never says what `{name}` does"
+        assert described, f"the root page needs a one-liner for `{name}`"
+
+
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        (
+            ("--follow",),
+            (
+                "Error: --follow is not an acpc flag — live-follow is: acpc log <id> "
+                "--wait-new [--timeout S]"
+            ),
+        ),
+        (
+            ("-f",),
+            (
+                "Error: --follow is not an acpc flag — live-follow is: acpc log <id> "
+                "--wait-new [--timeout S]"
+            ),
+        ),
+        (
+            ("status", "--detach"),
+            (
+                "Error: --detach is not an acpc flag — background dispatch is: acpc run "
+                '<agent> "<prompt>" --bg'
+            ),
+        ),
+        (
+            ("-d",),
+            (
+                "Error: --detach is not an acpc flag — background dispatch is: acpc run "
+                '<agent> "<prompt>" --bg'
+            ),
+        ),
+        (
+            ("status", "-C", "/tmp"),
+            "Error: -C is not an acpc flag — the working-directory flag is --cwd DIR",
+        ),
+        (
+            ("logs", "q7x2"),
+            "Error: no such command 'logs' — the viewing command is: acpc log <id>",
+        ),
+    ],
+)
+def test_neighboring_tool_aliases_are_one_line_usage_errors(
+    runner: CliRunner, args: tuple[str, ...], expected: str
+) -> None:
+    result = invoke(runner, *args)
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert result.stderr == f"{expected}\n"
+    assert len(result.stderr.splitlines()) == 1
+    assert "Traceback" not in result.stderr
 
 
 def test_short_version_matches_long_version(runner: CliRunner) -> None:

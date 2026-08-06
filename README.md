@@ -71,7 +71,7 @@ $ acpc log x7k2 --since 42
 | 130 | cancelled — SIGINT or `stop` |
 | 141 / 143 | SIGPIPE / SIGTERM |
 
-**Client death ≠ session death.** SIGINT cancels the session. SIGTERM — a harness killing the tool call on its own timeout, the normal case for an agent caller — *detaches*: the session keeps running under the daemon, the client prints the session id to stderr on the way out, and `wait <id>` collects the answer later.
+**Client death ≠ session death.** SIGINT cancels the session. SIGTERM — a harness killing the tool call on its own timeout, the normal case for an agent caller — *detaches*: the session keeps running under the daemon, the client's last stderr line names the id and its options (`wait` for the answer, `stop` to cancel), and `wait <id>` collects the answer later.
 
 ## Permissions
 

@@ -83,6 +83,7 @@ Maintenance and setup:
   rm <id>           delete a finished session's on-disk state
   prune             delete finished sessions older than retention (--older-than D)
   install <agent>   install the agent's adapter
+  Killing acpc does not stop the session — acpc stop does.
 
 Common commands:
   run, continue, wait, status, log, agents, daemon, stop, rm, prune, install
@@ -91,6 +92,7 @@ Common commands:
 Flag → ACP
   --mode         → session/set_mode
   --permissions  → request_permission
+                   all · write (= edit + execute) · read (incl. network fetch) · none · prompt
   --model        → session/new (model)
   --effort       → session/new (effort)"""
 
@@ -109,18 +111,43 @@ class _CheatSheetGroup(click.Group):
         try:
             return super().main(*args, **kwargs)
         except click.UsageError as error:
-            click.echo(f"Error: {error.format_message()}", err=True)
+            message = _friendly_usage_message(error.format_message())
+            click.echo(f"Error: {message}", err=True)
             raise SystemExit(error.exit_code) from None
         except click.ClickException as error:
             error.show()
             raise SystemExit(error.exit_code) from None
 
 
-class _RootHelpCommand(click.Command):
-    """Make a short command's help intentionally reuse the cheat sheet."""
-
-    def get_help(self, ctx: click.Context) -> str:
-        return _ROOT_HELP
+def _friendly_usage_message(message: str) -> str:
+    """Replace known neighboring-tool spellings with their acpc equivalents."""
+    follow_hint = (
+        "--follow is not an acpc flag — live-follow is: acpc log <id> --wait-new [--timeout S]"
+    )
+    detach_hint = (
+        '--detach is not an acpc flag — background dispatch is: acpc run <agent> "<prompt>" --bg'
+    )
+    aliases = {
+        "--follow": follow_hint,
+        "-f": follow_hint,
+        "--detach": detach_hint,
+        "-d": detach_hint,
+        "-C": "-C is not an acpc flag — the working-directory flag is --cwd DIR",
+    }
+    if "No such option" in message:
+        for spelling, replacement in aliases.items():
+            markers = (
+                f"No such option: {spelling}",
+                f"No such option '{spelling}'",
+                f'No such option "{spelling}"',
+            )
+            if any(marker in message for marker in markers):
+                return replacement
+    if "No such command" in message and (
+        "No such command 'logs'" in message or 'No such command "logs"' in message
+    ):
+        return "no such command 'logs' — the viewing command is: acpc log <id>"
+    return message
 
 
 @click.group(cls=_CheatSheetGroup, invoke_without_command=True)
@@ -857,12 +884,18 @@ def agents_init_command(
         _write_stdout(f"created {target}\n")
 
 
-@main.command(name="install", cls=_RootHelpCommand)
+@main.command(name="install")
 @click.argument("agent")
 @click.option("--json", "json_mode", is_flag=True, help="Emit the install result as JSON.")
 @click.help_option("-h", "--help")
 def install_command(agent: str, json_mode: bool) -> None:
-    """Run an adapter definition's install command."""
+    """Run an agent's install command from its registry entry.
+
+    Resolves the agent like ``run`` does, runs its ``install_command`` and
+    relays the installer's output; a failing installer exits 1.
+
+    Example: ``acpc install codex``
+    """
     try:
         registry = AgentRegistry()
         registry.resolve(agent)
@@ -932,12 +965,18 @@ def _maintenance_json(payload: Mapping[str, Any]) -> None:
     _write_stdout(json.dumps(dict(payload), ensure_ascii=False) + "\n")
 
 
-@main.command(name="stop", cls=_RootHelpCommand)
+@main.command(name="stop")
 @click.argument("selector")
 @click.option("--json", "json_mode", is_flag=True, help="Emit the result as JSON.")
 @click.help_option("-h", "--help")
 def stop_command(selector: str, json_mode: bool) -> None:
-    """Cancel an active session, or do nothing when it is already finished."""
+    """Cancel a running session (ACP session/cancel).
+
+    Stopping an already-finished session is a successful no-op that
+    reports the state it found; an unknown id is a usage error.
+
+    Example: ``acpc stop q7x2``
+    """
     meta = _load_view_session(selector)
     if meta.is_active:
         cancelled = False
@@ -974,12 +1013,18 @@ def stop_command(selector: str, json_mode: bool) -> None:
     click.echo(f"-- stop {meta.session_id} · {meta.state}", err=True)
 
 
-@main.command(name="rm", cls=_RootHelpCommand)
+@main.command(name="rm")
 @click.argument("selector")
 @click.option("--json", "json_mode", is_flag=True, help="Emit the result as JSON.")
 @click.help_option("-h", "--help")
 def rm_command(selector: str, json_mode: bool) -> None:
-    """Delete a finished session's on-disk state."""
+    """Delete a finished session's on-disk state.
+
+    Errors on a starting or running session — stop it first. Prints the
+    removed session id; ``--json`` also lists the deleted paths.
+
+    Example: ``acpc rm q7x2``
+    """
     meta = _load_view_session(selector)
     advertised_paths = sessions.session_paths(meta.session_id)
     try:
@@ -1234,7 +1279,11 @@ def _still_running_note(session_id: str, timeout: float | None) -> str:
 @click.option(
     "--permissions",
     type=click.Choice(vocab.PERMISSION_VALUES),
-    help="Approval policy for ACP permission requests.",
+    help=(
+        "\b\n"
+        "Approval policy: all, write (= edit + execute), read (incl. network fetch), none, "
+        "prompt."
+    ),
 )
 @click.option("--mode", metavar="M", help="Callee's operating mode (ACP session/set_mode).")
 @click.option("--home", metavar="DIR", help="Vendor home override.")
@@ -1368,7 +1417,10 @@ def run_command(
     if outcome.state == "detached":
         # SPEC *Output contract*: the session outlives this client, so the way
         # out has to say which session the caller can still reach.
-        _echo_metadata(f"-- {meta.session_id} detached · still running")
+        _echo_metadata(
+            f"-- detached, still RUNNING: {meta.session_id}"
+            f" — answer: acpc wait {meta.session_id} · cancel: acpc stop {meta.session_id}"
+        )
         raise SystemExit(outcome.exit_code)
 
     if not quiet:
@@ -1531,7 +1583,10 @@ def continue_command(
     )
     _write_stdout(result.text)
     if outcome.state == "detached":
-        _echo_metadata(f"-- {meta.session_id} detached · still running")
+        _echo_metadata(
+            f"-- detached, still RUNNING: {meta.session_id}"
+            f" — answer: acpc wait {meta.session_id} · cancel: acpc stop {meta.session_id}"
+        )
         raise SystemExit(outcome.exit_code)
     if not quiet:
         _echo_metadata(output.format_summary(final, route_note=_route_note(outcome)))
