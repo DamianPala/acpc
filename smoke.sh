@@ -724,6 +724,11 @@ if begin_section S08-views "status list/detail, log default/--since/--tail/--pro
     assert_json_valid "status --json is valid" "$LAST_OUT"
     run_acpc status "$UTIL_ID" --json
     assert_json_valid "status <id> --json is valid" "$LAST_OUT"
+    assert_eq "finished status detail has null idle age" "null" "$(json_field "$LAST_OUT" '.idle_seconds')"
+    run_acpc status --all --json
+    assert_json_valid "status list JSON carries idle age" "$LAST_OUT"
+    assert_eq "finished status list has null idle age" "null" \
+        "$(jq -r --arg id "$UTIL_ID" '.sessions[] | select(.session_id == $id) | .idle_seconds' <<<"$LAST_OUT")"
 
     # log: default view, footer on stderr, cursor there too
     run_acpc log "$UTIL_ID"

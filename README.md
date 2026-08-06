@@ -10,6 +10,8 @@ acpc is built for a specific primary user: **another agent calling it through a 
 
 *`run` blocks and prints the answer; `--bg` returns an ID; `status`/`log`/`wait`/`continue`/`stop` operate on that ID; everything is on disk under a predictable path.*
 
+`status` is a lightweight pulse: active sessions show `idle <age>` since their newest transcript event, while finished sessions show `·`. The JSON view exposes the same value as `idle_seconds` (`null` when unavailable or finished).
+
 ```bash
 # 90% of usage is this:
 acpc run codex "fix the failing test in tests/test_auth.py" --cwd ~/repo --permissions write

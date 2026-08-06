@@ -147,7 +147,9 @@ def test_status_json_with_an_id_reports_detail_fields(cli: CliRunner) -> None:
 
     result = invoke(cli, "status", meta.session_id, "--json")
 
-    assert json.loads(result.stdout)["state"] == "done"
+    payload = json.loads(result.stdout)
+    assert payload["state"] == "done"
+    assert payload["idle_seconds"] is None
 
 
 def test_status_json_without_an_id_returns_a_session_list(cli: CliRunner) -> None:
@@ -156,7 +158,20 @@ def test_status_json_without_an_id_returns_a_session_list(cli: CliRunner) -> Non
 
     result = invoke(cli, "status", "--json")
 
-    assert json.loads(result.stdout)["sessions"][0]["session_id"] == meta.session_id
+    row = json.loads(result.stdout)["sessions"][0]
+    assert row["session_id"] == meta.session_id
+    assert row["idle_seconds"] is None
+
+
+def test_status_without_a_transcript_is_clean_for_an_active_session(cli: CliRunner) -> None:
+    meta = running_session("no transcript yet")
+
+    text_result = invoke(cli, "status", meta.session_id)
+    json_result = invoke(cli, "status", meta.session_id, "--json")
+
+    assert text_result.exit_code == 0
+    assert "idle " not in text_result.stdout
+    assert json.loads(json_result.stdout)["idle_seconds"] is None
 
 
 def test_status_rejects_all_with_a_session_id(cli: CliRunner) -> None:

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from acpc.transcript import SCHEMA, Transcript, TranscriptError
+from acpc.transcript import SCHEMA, Transcript, TranscriptError, last_event_time
 
 
 @pytest.fixture
@@ -26,6 +26,63 @@ def test_create_writes_version_header_and_owner_only_file(transcript_path: Path)
     assert json.loads(transcript_path.read_text()) == {"schema": SCHEMA}
     assert stat.S_IMODE(transcript_path.stat().st_mode) == 0o600
     assert transcript.read() == ([], 0)
+
+
+def test_last_event_time_returns_the_newest_complete_event_timestamp(
+    transcript_path: Path,
+) -> None:
+    transcript = Transcript(transcript_path)
+    transcript.append("msg", text="first", ts=1234.5)
+    transcript.append("msg", text="last", ts=1250)
+
+    assert last_event_time(transcript_path) == 1250.0
+
+
+def test_last_event_time_returns_none_for_header_only_and_missing_files(
+    transcript_path: Path,
+) -> None:
+    Transcript(transcript_path)
+
+    assert last_event_time(transcript_path) is None
+    assert last_event_time(transcript_path.with_name("missing.ndjson")) is None
+
+
+def test_last_event_time_skips_a_torn_final_line(transcript_path: Path) -> None:
+    transcript = Transcript(transcript_path)
+    transcript.append("msg", text="complete", ts=1234)
+    with transcript_path.open("ab") as file:
+        file.write(b'{"i": 2, "ts": 9999, "type": "msg"')
+
+    assert last_event_time(transcript_path) == 1234.0
+
+
+def test_last_event_time_returns_none_for_a_garbage_final_line(transcript_path: Path) -> None:
+    transcript = Transcript(transcript_path)
+    transcript.append("msg", text="complete", ts=1234)
+    with transcript_path.open("ab") as file:
+        file.write(b"not-json\n")
+
+    assert last_event_time(transcript_path) is None
+
+
+def test_last_event_time_reads_only_the_tail_of_a_large_file(transcript_path: Path) -> None:
+    transcript = Transcript(transcript_path)
+    for index in range(100):
+        transcript.append("msg", text="x" * 100, ts=float(index))
+
+    assert transcript_path.stat().st_size > 8192
+    assert last_event_time(transcript_path) == 99.0
+
+
+def test_last_event_time_does_not_repair_a_torn_transcript(transcript_path: Path) -> None:
+    transcript = Transcript(transcript_path)
+    transcript.append("msg", text="complete", ts=1234)
+    with transcript_path.open("ab") as file:
+        file.write(b'{"i": 2, "ts": 9999, "type": "msg"')
+    before = transcript_path.read_bytes()
+
+    assert last_event_time(transcript_path) == 1234.0
+    assert transcript_path.read_bytes() == before
 
 
 def test_append_assigns_wire_fields_and_allows_unknown_fields(

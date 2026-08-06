@@ -7,6 +7,7 @@ shared by all :class:`Transcript` instances in this process.
 """
 
 import json
+import math
 import os
 import threading
 import time
@@ -31,6 +32,8 @@ _REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "state": ("from", "to"),
     "usage": ("tokens", "cost"),
 }
+
+_TAIL_READ_BYTES = 8192
 
 
 class _PathState:
@@ -118,6 +121,44 @@ def _validate_read_event(path: Path, value: Any, line_number: int) -> dict[str, 
     if isinstance(index, bool) or not isinstance(index, int):
         raise _format_error(path, f"line {line_number} has no integer index")
     return value
+
+
+def last_event_time(path: Path | str) -> float | None:
+    """Return the timestamp from the last complete transcript event, if any.
+
+    This is intentionally independent from :class:`Transcript`: status needs
+    a bounded, read-only pulse and the regular reader repairs torn tails.
+    """
+    target = Path(path).expanduser()
+    try:
+        with target.open("rb") as file:
+            file.seek(0, os.SEEK_END)
+            size = file.tell()
+            file.seek(max(0, size - _TAIL_READ_BYTES), os.SEEK_SET)
+            data = file.read(min(size, _TAIL_READ_BYTES))
+    except OSError:
+        return None
+
+    complete_lines = [line for line in data.splitlines(keepends=True) if line.endswith(b"\n")]
+    if not complete_lines:
+        return None
+    try:
+        value = json.loads(_line_payload(complete_lines[-1]).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    index = value.get("i")
+    if isinstance(index, bool) or not isinstance(index, int):
+        return None
+    timestamp = value.get("ts")
+    if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)):
+        return None
+    try:
+        timestamp_float = float(timestamp)
+    except (OverflowError, ValueError):
+        return None
+    return timestamp_float if math.isfinite(timestamp_float) else None
 
 
 def _parse(

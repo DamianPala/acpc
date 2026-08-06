@@ -2,6 +2,8 @@
 
 ## Now
 
+- **2026-08-06 — S4 status idle age:** active status views now derive `idle <age>` from a bounded, read-only transcript-tail read; finished or damaged/unavailable transcripts render `·`/`null`. The age is threaded through the existing render clock so slow-versus-hung comparisons are deterministic in tests.
+
 **Stage 3 is complete through section 4; the branch is ready to land.** Acceptance review, full green bar (**432 tests**, ruff + format + pyright + shellcheck clean, `./smoke.sh` 417/417), and live testing against OpenRouter-backed and real codex found and fixed **four product defects** — transcript chunk fragmentation (`c46b41f`), variant inheritance dropping adapter contract lists incl. the bypass-mode guard (`dc729de`), a dead adapter poisoning its daemon target (`487a2fe`), and meta.json storing the pre-TTY-resolution permission policy (`b799dc4`). Guessed codex vendor facts were verified live and corrected (`1057164`), the SPEC catalog-cap discrepancy settled (`5dc157c`), README rewritten for the 0.3 surface (`ea5e54b`) and the standing live-test plan committed (`6e629ea`). Zero leaked processes after every run. Post-report, one more defect from Damian's manual testing was fixed at the gate (`62f5c8e`, the new branch tip): an answer without a trailing newline glued the stderr `--` summary to its last line in a merged blob — the CLI now leads the next stderr metadata line with a newline (on stderr only, stdout stays byte-identical to `answer.md`), across run/continue/wait summaries, detach notices and log footers; SPEC's output contract states the rule.
 
 **A cold-start UX test round (2026-08-06, uninstructed Sonnet, --help-only, real adapters) landed five more fixes at the gate** — see the Stage 3 UX round entry under *Done*.

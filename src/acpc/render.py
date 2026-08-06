@@ -1,13 +1,14 @@
 """On-demand rendering for transcript and session status views."""
 
 import json
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from acpc import sessions
+from acpc import sessions, transcript
 from acpc.output import format_duration, format_tokens
 
 Clock = Callable[[], float]
@@ -298,12 +299,32 @@ def _status_selection(
 
 
 def _status_row(meta: sessions.SessionMeta, *, clock: Clock | None) -> str:
-    runtime = format_duration(sessions.runtime_seconds(meta, clock=clock))
+    runtime_seconds, now = _status_timing(meta, clock=clock)
+    runtime = format_duration(runtime_seconds)
+    idle_seconds = _idle_seconds(meta, now=now)
+    idle = f"idle {format_duration(idle_seconds)}" if idle_seconds is not None else "·"
     name = meta.name or "·"
     snippet = json.dumps(meta.prompt_snippet, ensure_ascii=False)
     return (
-        f"{meta.session_id:<4}  {meta.entry:<10} {meta.state:<9} {runtime:<8} {name:<16} {snippet}"
+        f"{meta.session_id:<4}  {meta.entry:<10} {meta.state:<9} {runtime:<8} "
+        f"{idle:<11} {name:<16} {snippet}"
     )
+
+
+def _status_timing(meta: sessions.SessionMeta, *, clock: Clock | None) -> tuple[float, float]:
+    """Sample the clock once, so runtime and idle age describe one instant."""
+    now = time.time() if clock is None else clock()
+    runtime_seconds = sessions.runtime_seconds(meta, clock=lambda: now)
+    return runtime_seconds, now
+
+
+def _idle_seconds(meta: sessions.SessionMeta, *, now: float) -> float | None:
+    if not meta.is_active:
+        return None
+    last_event = transcript.last_event_time(sessions.transcript_path(meta.session_id))
+    if last_event is None:
+        return None
+    return max(0.0, now - last_event)
 
 
 def render_status_list(
@@ -343,13 +364,16 @@ def render_status_detail(
     clock: Clock | None = None,
 ) -> str:
     """Render one session's status detail view."""
-    runtime = format_duration(sessions.runtime_seconds(meta, clock=clock))
+    runtime_seconds, now = _status_timing(meta, clock=clock)
+    runtime = format_duration(runtime_seconds)
+    idle_seconds = _idle_seconds(meta, now=now)
+    idle = f" · idle {format_duration(idle_seconds)}" if idle_seconds is not None else ""
     exit_text = f"exit {meta.exit_code}" if meta.exit_code is not None else "exit ·"
     tokens = format_tokens(meta.tokens)
     name = meta.name or "·"
     directory = _display_path(sessions.session_dir(meta.session_id))
     lines = [
-        f"state    {meta.state} · {exit_text} · {runtime} · {tokens}",
+        f"state    {meta.state}{idle} · {exit_text} · {runtime} · {tokens}",
         f"agent    {meta.entry} ({meta.base_adapter}) · name: {name}",
         f"dir      {directory} · answer: {Path(sessions.answer_path(meta.session_id)).name}",
     ]
@@ -364,19 +388,21 @@ def status_list_json(
 ) -> dict[str, Any]:
     """Build the JSON shape for ``status`` without an id."""
     selected = _status_selection(sessions_in, all_sessions=all_sessions)
-    return {
-        "sessions": [
+    rows = []
+    for meta in selected:
+        runtime_seconds, now = _status_timing(meta, clock=clock)
+        rows.append(
             {
                 "session_id": meta.session_id,
                 "entry": meta.entry,
                 "state": meta.state,
                 "name": meta.name,
                 "prompt_snippet": meta.prompt_snippet,
-                "runtime": sessions.runtime_seconds(meta, clock=clock),
+                "runtime": runtime_seconds,
+                "idle_seconds": _idle_seconds(meta, now=now),
             }
-            for meta in selected
-        ]
-    }
+        )
+    return {"sessions": rows}
 
 
 def status_detail_json(
@@ -385,6 +411,7 @@ def status_detail_json(
     clock: Clock | None = None,
 ) -> dict[str, Any]:
     """Build the JSON shape for ``status <id>``."""
+    runtime_seconds, now = _status_timing(meta, clock=clock)
     return {
         "session_id": meta.session_id,
         "state": meta.state,
@@ -393,7 +420,8 @@ def status_detail_json(
         "entry": meta.entry,
         "base_adapter": meta.base_adapter,
         "name": meta.name,
-        "runtime": sessions.runtime_seconds(meta, clock=clock),
+        "runtime": runtime_seconds,
+        "idle_seconds": _idle_seconds(meta, now=now),
         "tokens": meta.tokens,
         "cost": meta.cost,
         "exit_code": meta.exit_code,

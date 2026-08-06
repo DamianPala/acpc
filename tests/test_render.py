@@ -5,7 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from acpc import render, sessions
+from acpc import render, sessions, transcript
+from acpc.output import format_duration
 
 
 @pytest.fixture(autouse=True)
@@ -20,6 +21,16 @@ def make_session(*, session_id_hint: str = "prompt") -> sessions.SessionMeta:
         prompt=session_id_hint,
         clock=lambda: 100.0,
     )
+
+
+def add_transcript_event(meta: sessions.SessionMeta, timestamp: float) -> None:
+    transcript.Transcript(sessions.transcript_path(meta.session_id)).append(
+        "msg", text="activity", ts=timestamp
+    )
+
+
+def status_line(text: str, meta: sessions.SessionMeta) -> str:
+    return next(line for line in text.splitlines() if line.startswith(meta.session_id))
 
 
 def event(index: int, event_type: str, **fields: object) -> dict[str, object]:
@@ -180,6 +191,109 @@ def test_status_list_limits_finished_sessions_and_json_preserves_fields() -> Non
     assert "--all for all 7" in text
     assert len(payload["sessions"]) == 6
     assert payload["sessions"][0]["prompt_snippet"] == "active prompt"
+
+
+def test_status_list_renders_idle_age_for_active_and_dot_for_finished() -> None:
+    active = make_session(session_id_hint="active prompt")
+    add_transcript_event(active, 115.0)
+    finished = sessions.transition(
+        make_session(session_id_hint="finished prompt").session_id,
+        "done",
+        clock=lambda: 110.0,
+        exit_code=0,
+    )
+    add_transcript_event(finished, 105.0)
+
+    text = render.render_status_list([active, finished], clock=lambda: 120.0, all_sessions=True)
+
+    active_row = status_line(text, active)
+    finished_row = status_line(text, finished)
+    assert "idle 0m05s" in active_row
+    assert "·" in finished_row
+    assert "idle " not in finished_row
+
+
+def test_status_detail_labels_idle_age_only_for_active_sessions() -> None:
+    active = make_session()
+    add_transcript_event(active, 115.0)
+    finished = sessions.transition(
+        make_session().session_id,
+        "done",
+        clock=lambda: 110.0,
+        exit_code=0,
+    )
+    add_transcript_event(finished, 105.0)
+
+    active_state = render.render_status_detail(active, clock=lambda: 120.0).splitlines()[0]
+    finished_state = render.render_status_detail(finished, clock=lambda: 120.0).splitlines()[0]
+
+    assert "· idle 0m05s" in active_state
+    assert "idle " not in finished_state
+
+
+def test_status_ages_distinguish_fresh_and_stale_activity_and_grow_with_time() -> None:
+    fresh = make_session(session_id_hint="fresh")
+    stale = make_session(session_id_hint="stale")
+    add_transcript_event(fresh, 119.0)
+    add_transcript_event(stale, 105.0)
+
+    text = render.render_status_list([fresh, stale], clock=lambda: 120.0, all_sessions=True)
+    initial = render.status_list_json([fresh, stale], all_sessions=True, clock=lambda: 120.0)
+    later = render.status_list_json([fresh, stale], all_sessions=True, clock=lambda: 130.0)
+    initial_rows = {row["session_id"]: row for row in initial["sessions"]}
+    later_rows = {row["session_id"]: row for row in later["sessions"]}
+
+    assert "idle " in status_line(text, fresh)
+    assert "idle " in status_line(text, stale)
+    assert (
+        initial_rows[stale.session_id]["idle_seconds"]
+        > initial_rows[fresh.session_id]["idle_seconds"]
+    )
+    assert (
+        later_rows[stale.session_id]["idle_seconds"]
+        > initial_rows[stale.session_id]["idle_seconds"]
+    )
+
+
+def test_status_json_idle_seconds_match_text_and_finished_sessions_are_null() -> None:
+    active = make_session()
+    add_transcript_event(active, 115.0)
+    finished = sessions.transition(
+        make_session().session_id,
+        "done",
+        clock=lambda: 110.0,
+        exit_code=0,
+    )
+    add_transcript_event(finished, 105.0)
+
+    list_payload = render.status_list_json(
+        [active, finished], all_sessions=True, clock=lambda: 120.0
+    )
+    list_rows = {row["session_id"]: row for row in list_payload["sessions"]}
+    active_idle = list_rows[active.session_id]["idle_seconds"]
+    finished_idle = list_rows[finished.session_id]["idle_seconds"]
+    text = render.render_status_list([active, finished], all_sessions=True, clock=lambda: 120.0)
+
+    assert isinstance(active_idle, float)
+    assert finished_idle is None
+    assert f"idle {format_duration(active_idle)}" in status_line(text, active)
+
+    detail_payload = render.status_detail_json(active, clock=lambda: 120.0)
+    finished_detail = render.status_detail_json(finished, clock=lambda: 120.0)
+    assert detail_payload["idle_seconds"] == active_idle
+    assert isinstance(detail_payload["idle_seconds"], float)
+    assert finished_detail["idle_seconds"] is None
+
+
+def test_status_without_a_transcript_shows_dot_and_null() -> None:
+    active = make_session()
+
+    text = render.render_status_list([active], all_sessions=True, clock=lambda: 120.0)
+    payload = render.status_list_json([active], all_sessions=True, clock=lambda: 120.0)
+
+    assert "·" in status_line(text, active)
+    assert "idle " not in status_line(text, active)
+    assert payload["sessions"][0]["idle_seconds"] is None
 
 
 def test_status_detail_json_contains_pinned_vitals() -> None:

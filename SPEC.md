@@ -322,21 +322,23 @@ status [id] [--all]
 |--------|---------|
 | `--all` | Every session, not just running + the 5 most recent finished; with an id it's a usage error |
 
-Without id: one line per session — id, the entry it ran on (variant or adapter), state, runtime, name, prompt snippet (five backgrounded codex runs must not look identical). Defaults to all running + the 5 most recent finished.
+Without id: one line per session — id, the entry it ran on (variant or adapter), state, runtime, idle age, name, prompt snippet (five backgrounded codex runs must not look identical). Defaults to all running + the 5 most recent finished.
 
-With id: one session's vitals — state (exit code once finished), runtime, tokens/cost so far (cumulative across the session's turns), the entry with its base adapter, name, session dir and answer path.
+The **idle age** is the time since the session's newest transcript event, shown as `idle <age>` on active sessions and `·` on finished ones. Runtime alone cannot tell a slow turn from a hung one; an age that keeps growing while the state stays `running` is the signal that something is stuck. It is a fixed-cost read of the transcript's tail — the last complete line, never a parse of the stream — and it is read-only: a damaged or torn transcript yields no age rather than an error or a repair.
 
-A pulse, not a dump: reads `meta.json` + process liveness, never the transcript — "what is it doing right now" is `log <id> --tail 1`. State is verified, not trusted: a `running` session whose daemon or adapter is gone reports `orphaned`, never a stale `running` (see *Session states*).
+With id: one session's vitals — state (exit code once finished), runtime, idle age while active, tokens/cost so far (cumulative across the session's turns), the entry with its base adapter, name, session dir and answer path.
+
+A pulse, not a dump: reads `meta.json`, process liveness and the transcript's last line — never the event stream, so the cost per session is fixed no matter how long the run got. "What is it doing right now" is still `log <id> --tail 1`; `status` answers only "is it still moving". State is verified, not trusted: a `running` session whose daemon or adapter is gone reports `orphaned`, never a stale `running` (see *Session states*).
 
 ```
 $ acpc status
-x7k2  codex     running  3m12s   ·            "Fix the failing test in tests/test_auth.py"
-p9d4  claude    running  0m41s   researcher   "Research X and write findings to ./findings…"
-kq8w  reviewer  done     12m40s  spec-review  "Review the diff against the spec and report…"
-b3nn  codex     failed   2m05s   ·            "Summarize the repository changes"
-m2w7  claude    done     8m19s   docs         "Update the README quick-start for the new CLI"
-ze6a  codex     timeout  30m00s  ·            "Migrate the config loader to TOML and run the…"
-q4hf  builder   done     22m03s  ·            "Implement the session lock and its tests per…"
+x7k2  codex     running  3m12s   idle 0m04s  ·            "Fix the failing test in tests/test_auth.py"
+p9d4  claude    running  0m41s   idle 0m38s  researcher   "Research X and write findings to ./findings…"
+kq8w  reviewer  done     12m40s  ·           spec-review  "Review the diff against the spec and report…"
+b3nn  codex     failed   2m05s   ·           ·            "Summarize the repository changes"
+m2w7  claude    done     8m19s   ·           docs         "Update the README quick-start for the new CLI"
+ze6a  codex     timeout  30m00s  ·           ·            "Migrate the config loader to TOML and run the…"
+q4hf  builder   done     22m03s  ·           ·            "Implement the session lock and its tests per…"
 -- 2 running · 5 recent · --all for all 17
 
 $ acpc status kq8w
