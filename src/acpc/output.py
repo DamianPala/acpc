@@ -246,16 +246,3 @@ def format_summary(
     if route_note:
         parts.append(route_note)
     return "-- " + " | ".join(parts)
-
-
-def emit_summary(
-    meta: sessions.SessionMeta,
-    *,
-    stream: TextIO | None = None,
-    runtime: float | None = None,
-    route_note: str | None = None,
-) -> str:
-    """Write and return the one-line stderr summary."""
-    line = format_summary(meta, runtime=runtime, route_note=route_note)
-    (sys.stderr if stream is None else stream).write(line + "\n")
-    return line

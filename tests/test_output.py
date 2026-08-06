@@ -1,7 +1,6 @@
 """Behavioral tests for stdout shaping, JSON envelopes, and summaries."""
 
 import json
-from io import StringIO
 from pathlib import Path
 
 import pytest
@@ -99,12 +98,10 @@ def test_summary_is_one_prefixed_stderr_line() -> None:
         tokens=41_000,
         cost=0.42,
     )
-    stream = StringIO()
-
-    line = output.emit_summary(meta, stream=stream, runtime=12.0)
+    line = output.format_summary(meta, runtime=12.0)
 
     assert line.startswith("-- ")
-    assert stream.getvalue() == line + "\n"
+    assert "\n" not in line
     assert "exit 0" in line
     assert "41k tok" in line
     assert f"dir {sessions.session_dir(meta.session_id)}" in line

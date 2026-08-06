@@ -122,6 +122,10 @@ class _RootHelpCommand(click.Command):
 @click.pass_context
 def main(ctx: click.Context) -> None:
     """acpc — dispatch coding agents over ACP."""
+    # Fresh per invocation: in-process callers (tests) would otherwise inherit
+    # the previous command's unterminated-stdout state.
+    global _stdout_line_open
+    _stdout_line_open = False
     if ctx.invoked_subcommand is None:
         click.echo(ctx.get_help())
 
@@ -234,8 +238,15 @@ def _emit_dry_run(payload: dict[str, Any], *, json_mode: bool) -> None:
     click.echo("\n".join(lines))
 
 
+# Whether the last stdout write left its final line unterminated.  Answers and
+# transcript content need not end with a newline, and stdout must carry their
+# exact bytes, so the stderr side compensates (see _echo_metadata).
+_stdout_line_open = False
+
+
 def _write_stdout(text: str) -> None:
     """Write the answer, turning a closed stdout into SPEC's exit 141."""
+    global _stdout_line_open
     try:
         sys.stdout.write(text)
         sys.stdout.flush()
@@ -244,6 +255,23 @@ def _write_stdout(text: str) -> None:
         devnull = os.open(os.devnull, os.O_WRONLY)
         os.dup2(devnull, sys.stdout.fileno())
         sys.exit(vocab.EXIT_SIGPIPE)
+    if text:
+        _stdout_line_open = not text.endswith("\n")
+
+
+def _echo_metadata(line: str) -> None:
+    """Write a `--` stderr line, opening a fresh line if stdout left none.
+
+    SPEC *Output contract*: the `--` prefix separates metadata only at a line
+    boundary.  When the answer ends without a trailing newline, a merged blob
+    would glue the summary to its last line — the newline goes on stderr,
+    never stdout, which stays byte-identical to `answer.md`.
+    """
+    global _stdout_line_open
+    if _stdout_line_open:
+        line = "\n" + line
+        _stdout_line_open = False
+    click.echo(line, err=True)
 
 
 def _display_home(value: str | None) -> str:
@@ -1142,7 +1170,7 @@ def log_command(
             cursor=rendered.next_cursor,
             event_count=event_count,
         )
-        click.echo(footer, err=True)
+        _echo_metadata(footer)
 
 
 @main.command(name="run")
@@ -1285,11 +1313,11 @@ def run_command(
     if outcome.state == "detached":
         # SPEC *Output contract*: the session outlives this client, so the way
         # out has to say which session the caller can still reach.
-        click.echo(f"-- {meta.session_id} detached · still running", err=True)
+        _echo_metadata(f"-- {meta.session_id} detached · still running")
         raise SystemExit(outcome.exit_code)
 
     if not quiet:
-        output.emit_summary(final, route_note=_route_note(outcome))
+        _echo_metadata(output.format_summary(final, route_note=_route_note(outcome)))
 
     raise SystemExit(outcome.exit_code)
 
@@ -1448,10 +1476,10 @@ def continue_command(
     )
     _write_stdout(result.text)
     if outcome.state == "detached":
-        click.echo(f"-- {meta.session_id} detached · still running", err=True)
+        _echo_metadata(f"-- {meta.session_id} detached · still running")
         raise SystemExit(outcome.exit_code)
     if not quiet:
-        output.emit_summary(final, route_note=_route_note(outcome))
+        _echo_metadata(output.format_summary(final, route_note=_route_note(outcome)))
     raise SystemExit(outcome.exit_code)
 
 
@@ -1501,7 +1529,7 @@ def wait_command(
     )
     _write_stdout(result.text)
     if not quiet:
-        output.emit_summary(final)
+        _echo_metadata(output.format_summary(final))
     raise SystemExit(runner.exit_code_for(final.state, final.stop_reason))
 
 

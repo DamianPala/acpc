@@ -236,6 +236,23 @@ def test_without_quiet_the_summary_is_exactly_one_stderr_line(cli: CliRunner) ->
     assert "exit 0" in summary_lines[0]
 
 
+def test_the_summary_starts_on_a_fresh_line_after_an_unterminated_answer(cli: CliRunner) -> None:
+    """SPEC output contract: `--` separates only at a line boundary, and the
+    compensating newline goes to stderr — stdout stays byte-identical to
+    answer.md."""
+    result = invoke(cli, "run", "mock", "echo:no trailing newline")
+
+    assert result.stdout == "no trailing newline"
+    assert result.stderr.startswith("\n-- ")
+
+
+def test_a_terminated_answer_gets_no_blank_line_before_the_summary(cli: CliRunner) -> None:
+    result = invoke(cli, "run", "mock", "echo:ends with a newline\n")
+
+    assert result.stdout == "ends with a newline\n"
+    assert result.stderr.startswith("-- ")
+
+
 def test_the_direct_child_note_rides_the_one_summary_line(cli: CliRunner) -> None:
     result = invoke(cli, "run", "mock", "echo:route me")
 

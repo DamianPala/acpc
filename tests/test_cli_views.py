@@ -229,6 +229,17 @@ def test_log_prose_renders_markdown_without_tool_lines(cli: CliRunner) -> None:
     assert "## Answer" in result.stdout and "tool" not in result.stdout
 
 
+def test_the_log_footer_starts_on_a_fresh_line_after_unterminated_prose(cli: CliRunner) -> None:
+    """Prose is verbatim message text, which need not end with a newline; the
+    footer's compensating newline goes to stderr, keeping stdout clean."""
+    session_id = run_mock(cli, "echo:prose without a newline")
+
+    result = invoke(cli, "log", session_id, "--prose")
+
+    assert result.stdout == "prose without a newline"
+    assert result.stderr.startswith("\n-- ")
+
+
 def test_log_quiet_suppresses_the_stderr_footer(cli: CliRunner) -> None:
     """Log --quiet suppresses its stderr footer."""
     session_id = run_mock(cli)
