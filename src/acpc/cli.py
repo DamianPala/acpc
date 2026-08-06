@@ -1263,7 +1263,11 @@ def run_command(
     # The TTY-resolved policy is part of the resolved invocation: meta.json
     # stores everything --dry-run shows, and `continue` reuses it verbatim.
     resolution = replace(resolution, permissions=policy)
-    resolved_cwd = str(Path(cwd).expanduser().resolve()) if cwd else None
+    # Resolved to an absolute path here, at the caller: the adapter receives
+    # cwd over session/new, so a relative path would be resolved against
+    # whatever process hosts the adapter — the daemon's directory, not the
+    # caller's — and vendors reject a literal ".".
+    resolved_cwd = str(Path(cwd).expanduser().resolve()) if cwd else os.getcwd()
 
     if dry_run:
         payload = runner.resolution_payload(resolution, cwd=resolved_cwd)

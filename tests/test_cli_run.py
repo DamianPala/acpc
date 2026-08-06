@@ -261,6 +261,40 @@ def test_the_direct_child_note_rides_the_one_summary_line(cli: CliRunner) -> Non
     assert "direct child" in summary_lines[0]
 
 
+def test_a_default_cwd_resolves_to_the_callers_absolute_directory(
+    cli: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The adapter receives cwd over session/new and resolves a relative path
+    against its own host process, so acpc must send the caller's absolute
+    directory — vendors reject a literal '.'."""
+    caller_dir = tmp_path / "caller"
+    caller_dir.mkdir()
+    monkeypatch.chdir(caller_dir)
+
+    result = invoke(cli, "run", "mock", "echo:x", "--dry-run", "--json")
+
+    payload = json.loads(result.stdout)
+    assert payload["cwd"] == str(caller_dir.resolve())
+
+
+def test_the_stored_resolution_carries_the_default_cwd(
+    cli: CliRunner, state_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """meta.json is what the daemon path and continue reuse, so the resolved
+    default cwd has to be stored, not re-derived by another process."""
+    caller_dir = tmp_path / "caller"
+    caller_dir.mkdir()
+    monkeypatch.chdir(caller_dir)
+
+    result = invoke(cli, "run", "mock", "echo:x", "--quiet", "--json")
+
+    session_id = json.loads(result.stdout)["session_id"]
+    meta = json.loads(
+        (state_root / "sessions" / session_id / "meta.json").read_text(encoding="utf-8")
+    )
+    assert meta["resolution"]["cwd"] == str(caller_dir.resolve())
+
+
 def test_output_file_receives_the_answer(cli: CliRunner, tmp_path: Path) -> None:
     target = tmp_path / "answer.md"
 

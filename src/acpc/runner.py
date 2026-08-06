@@ -18,6 +18,7 @@ resolved call and a finished session:
 
 import asyncio
 import contextlib
+import os
 import shutil
 import signal
 import sys
@@ -203,11 +204,11 @@ async def _drive_turn(
                 adapter_session_id = request.resume_adapter_session
                 await conn.load_session(
                     session_id=adapter_session_id,
-                    cwd=request.cwd or ".",
+                    cwd=request.cwd or os.getcwd(),
                     mcp_servers=[],
                 )
             else:
-                session = await conn.new_session(cwd=request.cwd or ".", mcp_servers=[])
+                session = await conn.new_session(cwd=request.cwd or os.getcwd(), mcp_servers=[])
                 adapter_session_id = session.session_id
                 client.capture_advertised(session)
 

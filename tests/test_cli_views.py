@@ -365,9 +365,7 @@ def test_wait_new_footer_reports_the_state_reached_during_the_wait(cli: CliRunne
     writer = threading.Thread(target=finish_session)
     writer.start()
     try:
-        result = invoke(
-            cli, "log", meta.session_id, "--since", "0", "--wait-new", "--timeout", "2"
-        )
+        result = invoke(cli, "log", meta.session_id, "--since", "0", "--wait-new", "--timeout", "2")
     finally:
         writer.join(timeout=2)
 
