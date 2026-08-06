@@ -304,9 +304,10 @@ def _status_row(meta: sessions.SessionMeta, *, clock: Clock | None) -> str:
     idle_seconds = _idle_seconds(meta, now=now)
     idle = f"idle {format_duration(idle_seconds)}" if idle_seconds is not None else "·"
     name = meta.name or "·"
+    model = meta.resolved_model or "·"
     snippet = json.dumps(meta.prompt_snippet, ensure_ascii=False)
     return (
-        f"{meta.session_id:<4}  {meta.entry:<10} {meta.state:<9} {runtime:<8} "
+        f"{meta.session_id:<4}  {meta.entry:<10} {model:<14} {meta.state:<9} {runtime:<8} "
         f"{idle:<11} {name:<16} {snippet}"
     )
 
@@ -372,9 +373,10 @@ def render_status_detail(
     tokens = format_tokens(meta.tokens)
     name = meta.name or "·"
     directory = _display_path(sessions.session_dir(meta.session_id))
+    model = meta.resolved_model or "·"
     lines = [
         f"state    {meta.state}{idle} · {exit_text} · {runtime} · {tokens}",
-        f"agent    {meta.entry} ({meta.base_adapter}) · name: {name}",
+        f"agent    {meta.entry} ({meta.base_adapter}) · model: {model} · name: {name}",
         f"dir      {directory} · answer: {Path(sessions.answer_path(meta.session_id)).name}",
     ]
     return "\n".join(lines) + "\n"
@@ -395,6 +397,7 @@ def status_list_json(
             {
                 "session_id": meta.session_id,
                 "entry": meta.entry,
+                "model": meta.resolved_model,
                 "state": meta.state,
                 "name": meta.name,
                 "prompt_snippet": meta.prompt_snippet,
@@ -419,6 +422,7 @@ def status_detail_json(
         "turns": meta.turns,
         "entry": meta.entry,
         "base_adapter": meta.base_adapter,
+        "model": meta.resolved_model,
         "name": meta.name,
         "runtime": runtime_seconds,
         "idle_seconds": _idle_seconds(meta, now=now),

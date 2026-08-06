@@ -21,6 +21,7 @@ Acceptance: full bar twice back-to-back, both green (535 pytest, ruff check + fo
   - `4742930` **S6 `--since` beyond-max note** — review fix: the max cursor was computed on every `log` call, a third full transcript parse; now lazy.
   - `82ccd17` **S7 duration suffixes + the help sweep** — one shared Click `ParamType` for all five `--timeout` options, global `show_default`, and a sweep test that walks the Click tree and fails on any option without help text. Found and fixed a real bug: `acpc agents -h` did not work.
   - `1ae69b6` **S8 cheat sheet** — root `--help` regrouped by the caller's decision, 64 lines.
+  - **S4 rider (Damian-approved, landed after acceptance)** — a resolved-model column between entry and state in the `status` text view, the same field in both `--json` shapes. It proved its own case immediately: while live-testing I ran `explorer` believing it was real codex, and the resolution shows it inherits `gpt-5.6-luna` and the OpenRouter home from `general` through `extends`. The entry name said nothing.
   - Also fixed: a latent smoke race where the `--wait-new` long-poll reused the shared ~64s mock session; on a loaded machine the section reached it at t+90s, after that session was already done. It now dispatches its own victim.
 
 **0.3 — landed as `v0.3.0`, the globally installed tool.** Its full live-test report is local-only at `docs/plans/stage3/live-test-report.md`.

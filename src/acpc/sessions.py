@@ -131,6 +131,23 @@ class SessionMeta:
     def is_finished(self) -> bool:
         return self.state in vocab.FINISHED_STATES
 
+    @property
+    def resolved_model(self) -> str | None:
+        """The model this session actually ran on, as resolved at dispatch.
+
+        Every session resolves one, adapter defaults included, but the dig is
+        defensive: `meta.json` can come from an older writer or a torn write,
+        and a status view must never be the thing that raises.
+        """
+        resolved = self.resolution.get("resolved")
+        if not isinstance(resolved, dict):
+            return None
+        model = resolved.get("model")
+        if not isinstance(model, dict):
+            return None
+        value = model.get("value")
+        return value if isinstance(value, str) and value else None
+
 
 _META_FIELDS: tuple[str, ...] = tuple(f.name for f in fields(SessionMeta) if f.name != "extra")
 

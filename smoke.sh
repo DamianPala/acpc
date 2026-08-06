@@ -729,6 +729,15 @@ if begin_section S08-views "status list/detail, log default/--since/--tail/--pro
     assert_json_valid "status list JSON carries idle age" "$LAST_OUT"
     assert_eq "finished status list has null idle age" "null" \
         "$(jq -r --arg id "$UTIL_ID" '.sessions[] | select(.session_id == $id) | .idle_seconds' <<<"$LAST_OUT")"
+    assert_eq "status list JSON names the resolved model" "mock-sonnet-5" \
+        "$(jq -r --arg id "$UTIL_ID" '.sessions[] | select(.session_id == $id) | .model' <<<"$LAST_OUT")"
+    run_acpc status "$UTIL_ID" --json
+    assert_eq "status detail JSON names the resolved model" "mock-sonnet-5" \
+        "$(json_field "$LAST_OUT" '.model')"
+    run_acpc status "$UTIL_ID"
+    assert_contains "status <id> text names the resolved model" "$LAST_OUT" "model: mock-sonnet-5"
+    run_acpc status --all
+    assert_contains "status list text names the resolved model" "$LAST_OUT" "mock-sonnet-5"
 
     # log: default view, footer on stderr, cursor there too
     run_acpc log "$UTIL_ID"

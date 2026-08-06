@@ -152,6 +152,19 @@ def test_status_json_with_an_id_reports_detail_fields(cli: CliRunner) -> None:
     assert payload["idle_seconds"] is None
 
 
+def test_status_reports_the_model_a_real_dispatch_resolved(cli: CliRunner) -> None:
+    """End to end: the column reads the resolution the dispatch actually stored."""
+    session_id = run_mock(cli, "echo:which model")
+
+    text = invoke(cli, "status", session_id).stdout
+    detail = json.loads(invoke(cli, "status", session_id, "--json").stdout)
+    row = json.loads(invoke(cli, "status", "--json").stdout)["sessions"][0]
+
+    assert detail["model"] == "mock-sonnet-5"
+    assert row["model"] == "mock-sonnet-5"
+    assert "model: mock-sonnet-5" in text
+
+
 def test_status_json_without_an_id_returns_a_session_list(cli: CliRunner) -> None:
     """Status JSON without an id returns the list envelope."""
     meta = finished_session()

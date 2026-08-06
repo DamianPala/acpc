@@ -14,12 +14,18 @@ def isolated_state_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setenv("ACPC_HOME", str(tmp_path / "state"))
 
 
-def make_session(*, session_id_hint: str = "prompt") -> sessions.SessionMeta:
+def make_session(
+    *, session_id_hint: str = "prompt", model: str | None = "mock-sonnet-5"
+) -> sessions.SessionMeta:
+    resolved: dict[str, object] = {}
+    if model is not None:
+        resolved["model"] = {"value": model, "source": "adapter default"}
     return sessions.create_session(
         entry="mock",
         base_adapter="mock",
         prompt=session_id_hint,
         clock=lambda: 100.0,
+        resolution={"resolved": resolved},
     )
 
 
@@ -191,6 +197,64 @@ def test_status_list_limits_finished_sessions_and_json_preserves_fields() -> Non
     assert "--all for all 7" in text
     assert len(payload["sessions"]) == 6
     assert payload["sessions"][0]["prompt_snippet"] == "active prompt"
+
+
+def test_status_list_places_the_resolved_model_between_entry_and_state() -> None:
+    """The column's position is the contract: entry, then who actually ran."""
+    meta = make_session(model="gpt-5.6-luna")
+
+    row = status_line(render.render_status_list([meta], clock=lambda: 120.0), meta)
+    columns = row.split()
+
+    assert columns[:4] == [meta.session_id, "mock", "gpt-5.6-luna", meta.state]
+
+
+def test_status_views_fall_back_to_a_dot_when_no_model_was_resolved() -> None:
+    """A meta from an older writer must not take the status views down."""
+    meta = make_session(model=None)
+
+    row = status_line(render.render_status_list([meta], clock=lambda: 120.0), meta)
+    detail = render.render_status_detail(meta, clock=lambda: 120.0)
+
+    assert row.split()[:4] == [meta.session_id, "mock", "·", meta.state]
+    assert "model: ·" in detail
+    assert render.status_list_json([meta], clock=lambda: 120.0)["sessions"][0]["model"] is None
+    assert render.status_detail_json(meta, clock=lambda: 120.0)["model"] is None
+
+
+def test_status_json_carries_the_resolved_model_in_both_shapes() -> None:
+    meta = make_session(model="gpt-5.6-terra")
+
+    list_payload = render.status_list_json([meta], clock=lambda: 120.0)
+    detail_payload = render.status_detail_json(meta, clock=lambda: 120.0)
+    detail_text = render.render_status_detail(meta, clock=lambda: 120.0)
+
+    assert list_payload["sessions"][0]["model"] == "gpt-5.6-terra"
+    assert detail_payload["model"] == "gpt-5.6-terra"
+    assert "model: gpt-5.6-terra" in detail_text
+
+
+def test_two_entries_on_one_model_are_distinguishable_only_by_the_model_column() -> None:
+    """The reason the column exists: `extends` hides who does the work."""
+    builder = sessions.create_session(
+        entry="builder",
+        base_adapter="codex",
+        prompt="implement",
+        clock=lambda: 100.0,
+        resolution={"resolved": {"model": {"value": "gpt-5.6-luna", "source": "entry"}}},
+    )
+    reviewer = sessions.create_session(
+        entry="reviewer",
+        base_adapter="codex",
+        prompt="review",
+        clock=lambda: 100.0,
+        resolution={"resolved": {"model": {"value": "gpt-5.6-terra", "source": "entry"}}},
+    )
+
+    text = render.render_status_list([builder, reviewer], clock=lambda: 120.0, all_sessions=True)
+
+    assert "gpt-5.6-luna" in status_line(text, builder)
+    assert "gpt-5.6-terra" in status_line(text, reviewer)
 
 
 def test_status_list_renders_idle_age_for_active_and_dot_for_finished() -> None:
