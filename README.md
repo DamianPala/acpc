@@ -8,7 +8,7 @@ acpc is built for a specific primary user: **another agent calling it through a 
 
 ## The whole mental model
 
-*`run` blocks and prints the answer; `--bg` returns an ID; `status`/`log`/`wait`/`continue`/`stop` operate on that ID; everything is on disk under a predictable path.*
+*`run` blocks and prints the answer; `--bg` returns an ID; `status`/`log`/`wait`/`continue`/`steer`/`stop` operate on that ID; everything is on disk under a predictable path.*
 
 `status` is a lightweight pulse: active sessions show `idle <age>` since their newest transcript event, while finished sessions show `·`. The JSON view exposes the same value as `idle_seconds` (`null` when unavailable or finished). Every row also names the model the session resolved to, because entry names hide it — two variants that both `extend` the same parent run the same model, and only the column says so.
 

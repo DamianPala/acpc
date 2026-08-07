@@ -12,7 +12,7 @@ Normative: the implementation is adjusted to match this document; behavior chang
 ## Command surface
 
 Small verb set. The whole mental model in one sentence:
-*"`run` blocks and prints the answer; `--bg` returns an ID; `status`/`log`/`wait`/`continue`/`stop` operate on that ID; everything is on disk under a predictable path."*
+*"`run` blocks and prints the answer; `--bg` returns an ID; `status`/`log`/`wait`/`continue`/`steer`/`stop` operate on that ID; everything is on disk under a predictable path."*
 
 ```
 run <agent> (prompt | - | --prompt-file) [options]   # default: block, stdout = final answer
