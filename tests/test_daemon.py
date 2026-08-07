@@ -124,6 +124,23 @@ def test_a_bypass_mode_under_permissions_all_still_rebuilds(state_root: Path) ->
     assert rebuild(payload).resolution.mode == "yolo"
 
 
+def test_a_turn_that_cannot_be_built_is_refused_in_a_reply_not_a_dropped_connection(
+    state_root: Path,
+) -> None:
+    """A refusal the caller cannot read is worse than no refusal at all.
+
+    Raising out of `_start` leaves the connection with no frame, so the client
+    sees a socket error rather than the reason, and the session it already
+    created stays `starting` until orphan detection finds it.
+    """
+    frame = {"session_id": new_session("x"), "payload": dispatch_payload() | {"mode": "yolo"}}
+
+    reply = asyncio.run(daemon.Daemon(target())._start(frame))
+
+    assert reply["ok"] is False
+    assert "bypasses permission requests" in reply["error"]
+
+
 # --- routing ----------------------------------------------------------------
 
 

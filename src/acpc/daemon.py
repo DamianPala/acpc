@@ -39,7 +39,7 @@ from acp import PROTOCOL_VERSION, text_block
 from acpc import __version__, config, ipc, paths, runner, sessions, transcript, vocab
 from acpc.client import AcpcClient
 from acpc.permissions import PermissionLevel
-from acpc.registry import AgentRegistry, RegistryError
+from acpc.registry import AgentRegistry
 from acpc.spawn import spawn_adapter
 
 # How often the idle sweep runs. Short enough that a test can set a tiny TTL
@@ -470,7 +470,12 @@ class Daemon:
             return {"ok": False, "error": f"session {session_id} already has a turn in flight"}
         try:
             request = self._rebuild_request(frame.get("payload") or {})
-        except (RegistryError, runner.RunnerError, KeyError) as error:
+        except Exception as error:  # noqa: BLE001
+            # Every way of failing to build a turn is the same reply. This was
+            # a list of expected types until a new raise was added to
+            # `_rebuild_request` and escaped it: an uncaught one here leaves the
+            # connection with no reply at all, so the caller sees a socket error
+            # instead of the reason. Nothing else is scoped in this try.
             return {"ok": False, "error": str(error)}
 
         queued = self._slots.locked()
@@ -527,6 +532,15 @@ class Daemon:
         which for `mode`, the one field whose resolved value is legitimately
         `None`, silently adopts whatever the entry says at *this* moment.
 
+        The lookup is still trusted for everything the payload does not carry,
+        and that list is wider than the five fields: the command, the env and
+        passthrough behind `adapter_environment`, `home_env`, the bypass list,
+        `effort_config_id`, and the effort validation that runs on the entry's
+        own value. So an entry edit can still redirect a live session's provider
+        mid-conversation, and an entry that grows an unsupported effort makes
+        `continue` fail here rather than run on its stored one. Both are the
+        cost of shipping the entry as a name; only SPEC's five are pinned.
+
         Provenance is deliberately left as the lookup produced it: nothing on
         this path reads it, `session_resolution` runs client-side at dispatch.
         """
@@ -544,7 +558,7 @@ class Daemon:
         if resolution.mode in resolution.entry.bypass_modes and resolution.permissions != "all":
             raise DaemonError(
                 f"mode {resolution.mode} bypasses permission requests on "
-                f"{resolution.entry.entry} under policy {resolution.permissions}"
+                f"{resolution.entry.entry}; it is only accepted with --permissions all"
             )
         return runner.TurnRequest(
             resolution=resolution,

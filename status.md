@@ -158,6 +158,8 @@ Release: bump `0.4.0` → `0.4.1` (the pending `uv.lock` version line rides here
 
 ## Backlog (post-0.4)
 
+- **The daemon still re-derives a turn's env from the entry file.** Slice A pinned SPEC's five resolved fields to the dispatch payload, but `adapter_environment` reads `declared_env` and `env_passthrough` from the fresh lookup, and the payload carries neither — so editing an entry's `[env]` redirects a live session to a different provider mid-conversation, the same shape as the mode bug one field over. `meta.json` stores both, so the stored resolution is not what runs. Not a SPEC violation (SPEC:154 lists only the five) and pre-existing, but the fix is the same move: carry env on the wire or accept it and say so.
+
 - Every 0.3 backlog item shipped in 0.4: `log --follow`, the `--since` beyond-max guard, `--timeout` duration suffixes, the `daemon status` idle column (S10) and the missing separator between an answer's messages (S11).
 - **A transcript event boundary can fall mid-word**, so a condensed `log` row can open with a word fragment (`"rawnień i coś odrzu"` / `"cono, podsumowanie…"` observed live). The `↪` marker makes it readable, and the alternative — re-chunking on word boundaries — would mean rewriting transcript content rather than rendering it. Cosmetic, recorded rather than fixed.
 - **A backgrounded `acpc wait` did not rouse an idle waiter** (2026-08-07): the wait exited 0 and its completion surfaced only ~20 minutes later. The cheat sheet sells `wait` as a completion push; that claim needs a caveat if the push can be missed. Poll with explicit sleeps is the workaround.
