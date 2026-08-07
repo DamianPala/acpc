@@ -21,11 +21,11 @@ Implementation work dispatched to an agent goes through the installed `acpc` to 
 
 ```bash
 set -a && . ~/.config/secrets/base.env && set +a   # OpenRouter key via env_key
-acpc run builder --input-file <task-prompt.md> --cwd <this worktree>
+acpc run builder --prompt-file <task-prompt.md> --cwd <this worktree>
 ```
 
 - **Reviews are Opus** — the orchestrator itself or an Opus subagent, never the registry's `reviewer` variant (that one is a different stack).
-- Pass specs and long prompts with `--input-file`, never as a positional argument. Argv is visible in `ps`/`/proc/*/cmdline`; on 2026-08-04 a dispatch was SIGKILLed because the spec text in argv matched a cleanup helper's `pgrep -f` pattern.
+- Pass specs and long prompts with `--prompt-file`, never as a positional argument. Argv is visible in `ps`/`/proc/*/cmdline`; on 2026-08-04 a dispatch was SIGKILLed because the spec text in argv matched a cleanup helper's `pgrep -f` pattern.
 - Select provider/home by naming a registry variant; never export `CODEX_HOME`/`CLAUDE_CONFIG_DIR` around a dispatch. Daemons are keyed on the entry's declared environment, not ambient env — exporting the home binds the wrong provider into a shared daemon.
 
 ## Docs contract
