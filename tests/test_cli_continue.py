@@ -171,6 +171,34 @@ def test_continue_uses_the_stored_resolution_after_entry_changes(
     assert "mock-opus-5/xhigh" in result.stdout
 
 
+def test_continue_reapplies_the_stored_mode(cli: CliRunner) -> None:
+    first = invoke(cli, "run", "mock", "settings", "--mode", "plan", "--quiet", "--json")
+    session_id = json.loads(first.stdout)["session_id"]
+
+    stored = sessions.load(session_id).resolution["resolved"]["mode"]
+    assert stored == {"value": "plan", "source": "call flag"}
+
+    result = invoke(cli, "continue", session_id, "settings", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert "/plan/1/" in result.stdout
+
+
+def test_continue_without_a_stored_mode_sends_no_mode_option(cli: CliRunner) -> None:
+    session_id = start_session(cli, "settings")
+    meta = sessions.load(session_id)
+    del meta.resolution["resolved"]["mode"]
+    with sessions.session_lock(session_id):
+        sessions.write_meta(meta)
+
+    result = invoke(cli, "continue", session_id, "settings", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_OK
+    _model, _effort, mode, _model_calls, mode_calls, _effort_calls = result.stdout.split("/")
+    assert mode == "-"
+    assert mode_calls == "0"
+
+
 def test_continue_preserves_the_stored_home_environment(cli: CliRunner) -> None:
     session_id = start_session(cli)
 

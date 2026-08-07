@@ -40,7 +40,7 @@ Command reference below is alphabetical. Sections open with their synopsis; `--j
 
 ```
 agents [name] [--models | --commands | --check]
-agents init <name> --extends <agent> [--model M] [--effort E] [--permissions P] [--home DIR]
+agents init <name> --extends <agent> [--model M] [--effort E] [--mode M] [--permissions P] [--home DIR]
 ```
 
 | Option | Purpose |
@@ -76,6 +76,7 @@ extends      codex
 description  Implements a task against a plan; writes the code and runs the commands the plan calls for.
 model        gpt-5.6-luna (entry)
 effort       xhigh (entry)
+mode         · (unset)
 permissions  write (entry)
 home         ~/.codex-openrouter (entry)
 env          MODEL_PROVIDER=openrouter (entry) · passthrough: OPENROUTER_API_KEY
@@ -150,7 +151,7 @@ Follow-up turn in an existing session, full context preserved. The caller can se
 
 - **Sessions are durable on the adapter side**: resume goes through ACP `session/load`, so `continue` works after the daemon expired or the machine rebooted — the daemon only makes the next turn start warm. The history `session/load` replays is already in the transcript and is not re-appended. Adapters without the `loadSession` capability fail with an actionable error.
 - **`continue` on a `running` session is an error**, not a queue.
-- **The turn runs with the session's stored resolution**: model, effort, permissions and home come from `meta.json`, not from re-resolving the agent entry — editing an entry never changes a session mid-conversation.
+- **The turn runs with the session's stored resolution**: model, effort, mode, permissions and home come from `meta.json`, not from re-resolving the agent entry — editing an entry never changes a session mid-conversation. A session stored before mode was resolvable has none; the turn then sends no `session/set_mode` rather than failing.
 - **The early session line applies here too**: a blocking `continue` prints `-- session <id> | dir <path>` at dispatch, exactly as `run` does (see *Output contract*).
 
 A separate verb only because `run` takes an agent and `continue` takes a session. Each turn's prompt and answer are kept on disk (see *State on disk*). A `run`-only flag here is a usage error that names the rule — `continue reuses the session's permissions — drop --permissions` — never a bare "unrecognized argument".
@@ -276,6 +277,22 @@ Research X. Write findings to ./findings.md.
 EOF
 ```
 
+```
+$ acpc run codex "probe" --dry-run
+entry        codex (codex)
+command      codex-acp
+model        gpt-5.6-terra (adapter default)
+effort       xhigh (adapter default)
+mode         · (unset)
+permissions  read (unset)
+home         ~/.codex (adapter default)
+cwd          /home/haz/ai/lab/projects/acpc-mode
+passthrough  CODEX_HOME · CODEX_PATH · CODEX_CONFIG · MODEL_PROVIDER · CODEX_API_KEY · OPENAI_API_KEY · INITIAL_AGENT_MODE
+
+$ acpc run codex "probe" --dry-run --json
+{"entry": "codex", "base_adapter": "codex", "command": "codex-acp", "cwd": "/home/haz/ai/lab/projects/acpc-mode", "env": {}, "env_passthrough": ["CODEX_HOME", "CODEX_PATH", "CODEX_CONFIG", "MODEL_PROVIDER", "CODEX_API_KEY", "OPENAI_API_KEY", "INITIAL_AGENT_MODE"], "resolved": {"model": {"value": "gpt-5.6-terra", "source": "adapter default"}, "effort": {"value": "xhigh", "source": "adapter default"}, "mode": {"value": null, "source": "unset"}, "permissions": {"value": "read", "source": "unset"}, "home": {"value": "~/.codex", "source": "adapter default"}}}
+```
+
 | Option | Purpose |
 |--------|---------|
 | prompt as arg, `-` (stdin), or `--prompt-file` | Heredoc/stdin for long prompts with quotes and backticks. Exactly one source — zero or two is a usage error naming the options; stdin is never read implicitly |
@@ -283,7 +300,7 @@ EOF
 | `--model <tier\|id>` | A tier (`fast`/`standard`/`max`, resolved through the adapter's preset table — see *Agent variants*) or a raw model ID from `agents <name> --models`. Explicit `--effort` overrides the preset's effort, and supplies one where the preset has none |
 | `--effort <level>` | Reasoning effort, orthogonal to `--model`. Superset scale (none/minimal/low/medium/high/xhigh/max/ultra) mapped per adapter; a level the resolved model doesn't support is a hard usage error listing the supported levels — never a silent fallback |
 | `--permissions all\|write\|read\|none\|prompt` | Approval policy for ACP permission requests (defined below). Default: agent entry if set, else `prompt` on a TTY and `read` otherwise; `--bg` counts as non-TTY here (see *TTY vs non-TTY*) |
-| `--mode <name>` | Callee's operating mode (ACP `session/set_mode`), vendor pass-through, adapter default if omitted. Behavioral hint; a mode that suppresses permission requests is rejected unless `--permissions all` (see below). Values via `agents` |
+| `--mode <name>` | Callee's operating mode (ACP `session/set_mode`), vendor pass-through. Overrides an entry's `mode`; with neither, acpc sends nothing and the adapter keeps whatever its own config selected. Behavioral hint; a mode that suppresses permission requests is rejected unless `--permissions all` (see below), whichever of the two set it. Values via `agents` |
 | `--home <dir>` | Vendor home override (the dir with the vendor's config + credentials). The provider switch (see *Agent variants*); ad-hoc counterpart of a variant's `home` field |
 | `-o <file>` | Write the answer to the given path; stdout then carries only a short confirmation (path, size, session id). `answer.md` in the session dir is always written regardless |
 | `--bg` | Return immediately with session ID + session dir path. With `-o`, the file is written when the session finishes |
@@ -310,7 +327,7 @@ Unknown kinds are denied under `read`, `write` and `none`, asked under `prompt`,
 - **The non-TTY default is a silent read-only trap**: a caller that neither passes `--permissions` nor runs an entry with a permission default gets a read-only callee — writes are denied without an error, the turn ends normally, exit 0, nothing changed. Pass `--permissions write` (or `all`) whenever the task is supposed to modify anything. When the policy was defaulted, the end-of-run summary counts what it denied and names the flag to pass (see *Output contract*).
 - **`execute` subsumes `delete`/`move`** in practice — excluding those kinds only constrains adapters that classify honestly.
 - **`fetch` is network egress** — under the non-TTY default a callee processing untrusted input can reach the network; use `none` when that matters.
-- **An approval policy, not a sandbox**: it answers the requests the adapter emits, so a `--mode` that stops the callee from asking (vendor bypass modes) would evade it — such combinations are rejected at parse time unless `--permissions all`. A real boundary means confining the adapter itself: a container, a dedicated user, or the vendor's own sandbox.
+- **An approval policy, not a sandbox**: it answers the requests the adapter emits, so a mode that stops the callee from asking (vendor bypass modes) would evade it — such combinations are rejected at resolution time unless `--permissions all`. The rule is about the *resolved* mode, not the flag: an entry that pins a bypass mode is refused exactly like `--mode` would be, or a config file becomes the way around the policy. A real boundary means confining the adapter itself: a container, a dedicated user, or the vendor's own sandbox.
 - **The same door exists at runtime**: a callee can *request* a mode switch (kind `switch_mode`), so a switch into a bypass mode is treated like an unknown kind — denied below `all`, asked under `prompt` — while switches between ordinary modes (e.g. plan → default) stay in the read tier.
 - **Bypass lists are adapter-declared**: ACP does not mark modes as bypass; a vendor mode absent from the adapter definition's list passes both guards until the definition is updated.
 
@@ -422,7 +439,7 @@ acpc wait x7k2 --timeout 600
 
 ## Agent variants
 
-A named agent entry can bundle model, effort, permissions and environment, so `run builder "task"` replaces four flags. The one acceptable form of configuration, under one condition: resolution stays fully inspectable — `agents <name>` shows what an entry resolves to, `--dry-run` what a specific call resolves to and why.
+A named agent entry can bundle model, effort, mode, permissions and environment, so `run builder "task"` replaces five flags. The one acceptable form of configuration, under one condition: resolution stays fully inspectable — `agents <name>` shows what an entry resolves to, `--dry-run` what a specific call resolves to and why.
 
 ```
 # ~/.acpc/agents/builder.toml — hand-editable; `agents init` scaffolds this

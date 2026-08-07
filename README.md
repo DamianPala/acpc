@@ -43,7 +43,7 @@ wait <id> [--timeout S]    # block until done, print the answer
 stop <id>
 rm <id> | prune [--older-than D] [--dry-run]
 agents [name] [--models|--commands|--check]   # adapters + variants; resolved definitions
-agents init <name> --extends <agent>          # scaffold a variant
+agents init <name> --extends <agent> [--mode M]  # scaffold a variant
 install <agent>
 daemon status|stop [target] [--force]   # plumbing escape hatch — never needed in the happy path
 ```
@@ -86,11 +86,11 @@ $ acpc log x7k2 --since 42
 Two edges worth internalizing:
 
 - **The non-TTY default is a silent read-only trap.** A caller that passes no `--permissions` gets a read-only callee — write requests are denied without an error and the turn exits 0. Pass `--permissions write` whenever the task should modify anything.
-- **This is an approval policy, not a sandbox.** It answers the requests the adapter emits; it cannot stop an adapter that never asks. Concretely: codex's default `agent` mode auto-allows edits inside the workspace without asking, so a policy below `all` only bites in its `read-only` mode. A vendor mode that suppresses requests entirely (`agent-full-access`) is rejected at parse time unless `--permissions all`. A real boundary means confining the adapter itself: a container, a dedicated user, or the vendor's own sandbox.
+- **This is an approval policy, not a sandbox.** It answers the requests the adapter emits; it cannot stop an adapter that never asks. Concretely: codex's default `agent` mode auto-allows edits inside the workspace without asking, so a policy below `all` only bites in its `read-only` mode. A vendor mode that suppresses requests entirely (`agent-full-access`) is rejected at resolution time unless `--permissions all`, whether it came from `--mode` or an entry. A real boundary means confining the adapter itself: a container, a dedicated user, or the vendor's own sandbox.
 
 ## Agent variants
 
-A named TOML entry bundles model, effort, permissions, home and environment, so `run builder "task"` replaces four flags:
+A named TOML entry bundles model, effort, mode, permissions, home and environment, so `run builder "task"` replaces five flags:
 
 ```toml
 # ~/.acpc/agents/builder.toml — hand-editable; `agents init` scaffolds this

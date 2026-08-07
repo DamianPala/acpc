@@ -32,6 +32,7 @@ extends = "mock"
 description = "Implements a task against a plan."
 model = "mock-opus-5"
 effort = "xhigh"
+mode = "plan"
 permissions = "write"
 """
 
@@ -197,6 +198,27 @@ def test_variant_detail_shows_provenance(cli: CliRunner) -> None:
 
     assert result.exit_code == vocab.EXIT_OK
     assert "model        mock-opus-5 (entry)" in result.stdout
+
+
+def test_agents_detail_shows_mode_and_its_source(cli: CliRunner) -> None:
+    result = invoke(cli, "agents", "builder")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert "effort       xhigh (entry)" in result.stdout
+    assert "mode         plan (entry)" in result.stdout
+    assert "permissions  write (entry)" in result.stdout
+
+    payload = json.loads(invoke(cli, "agents", "builder", "--json").stdout)
+    assert payload["resolved"]["mode"] == {"value": "plan", "source": "entry"}
+
+
+def test_agents_detail_renders_an_unset_mode_with_its_source(cli: CliRunner) -> None:
+    result = invoke(cli, "agents", "mock")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert "mode         · (unset)" in result.stdout
+    payload = json.loads(invoke(cli, "agents", "mock", "--json").stdout)
+    assert payload["resolved"]["mode"] == {"value": None, "source": "unset"}
 
 
 def test_variant_detail_points_to_parent_catalog(cli: CliRunner) -> None:

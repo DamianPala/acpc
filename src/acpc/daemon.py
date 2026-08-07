@@ -524,6 +524,7 @@ class Daemon:
             payload["entry"],
             model=payload.get("model"),
             effort=payload.get("effort"),
+            mode=payload.get("mode"),
             permissions=payload.get("permissions"),
             home=payload.get("home"),
         )
@@ -531,7 +532,6 @@ class Daemon:
             resolution=resolution,
             prompt=payload.get("prompt", ""),
             cwd=payload.get("cwd"),
-            mode=payload.get("mode"),
             timeout=payload.get("timeout"),
             resume_adapter_session=payload.get("resume_adapter_session"),
         )

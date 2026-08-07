@@ -70,6 +70,41 @@ def test_variant_inherits_and_reports_nearest_field_provenance(tmp_path: Path) -
     assert child.provenance["effort"].path.name == "child.toml"
 
 
+def test_mode_inherits_through_extends_and_a_child_or_flag_can_override_it(
+    tmp_path: Path,
+) -> None:
+    agents = tmp_path / "agents"
+    write_entry(
+        agents,
+        "base",
+        'command = "python -m base"\nmode = "base-mode"\n',
+    )
+    write_entry(agents, "parent", 'extends = "base"\n')
+    write_entry(agents, "child", 'extends = "parent"\nmode = "child-mode"\n')
+
+    registry = AgentRegistry(agents)
+    inherited = registry.resolve_call("parent")
+    overridden = registry.resolve_call("child")
+    flag = registry.resolve_call("child", mode="flag-mode")
+
+    assert inherited.mode == "base-mode"
+    assert inherited.provenance["mode"].path == agents / "base.toml"
+    assert overridden.mode == "child-mode"
+    assert overridden.provenance["mode"].path == agents / "child.toml"
+    assert flag.mode == "flag-mode"
+    assert flag.provenance["mode"].kind == "call"
+
+
+def test_mode_is_unset_without_an_entry_or_call_value(tmp_path: Path) -> None:
+    agents = tmp_path / "agents"
+    write_entry(agents, "plain", 'command = "python -m plain"\n')
+
+    resolution = AgentRegistry(agents).resolve_call("plain")
+
+    assert resolution.mode is None
+    assert resolution.provenance["mode"].kind == "unset"
+
+
 def test_description_accepts_long_and_multiline_values_for_resolution(tmp_path: Path) -> None:
     agents = tmp_path / "agents"
     long_description = "long " * 100

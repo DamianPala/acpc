@@ -93,7 +93,6 @@ class TurnRequest:
     resolution: CallResolution
     prompt: str
     cwd: str | None = None
-    mode: str | None = None
     timeout: float | None = None
     permission_prompt: Callable[[str, str], bool] | None = None
     resume_adapter_session: str | None = None
@@ -266,12 +265,12 @@ _DEFAULT_EFFORT_CONFIG_ID = "reasoning_effort"
 
 
 async def apply_call_options(conn: Any, adapter_session_id: str, request: TurnRequest) -> None:
-    """Apply --mode/--model/--effort to the adapter session before prompting."""
+    """Apply resolved mode/model/effort to the adapter session before prompting."""
     resolution = request.resolution
-    if request.mode is not None:
+    if resolution.mode is not None:
         await _configure(
-            conn.set_session_mode(session_id=adapter_session_id, mode_id=request.mode),
-            f"mode {request.mode!r}",
+            conn.set_session_mode(session_id=adapter_session_id, mode_id=resolution.mode),
+            f"mode {resolution.mode!r}",
         )
     if resolution.model is not None:
         await _configure(
@@ -407,10 +406,10 @@ def daemon_payload(request: TurnRequest) -> dict[str, Any]:
         "entry": resolution.entry.entry,
         "model": resolution.model,
         "effort": resolution.effort,
+        "mode": resolution.mode,
         "permissions": resolution.permissions,
         "home": resolution.home,
         "cwd": request.cwd,
-        "mode": request.mode,
         "timeout": request.timeout,
         "prompt": request.prompt,
         "resume_adapter_session": request.resume_adapter_session,
@@ -651,6 +650,7 @@ def resolution_payload(resolution: CallResolution, *, cwd: str | None) -> dict[s
     fields: dict[str, Any] = {
         "model": resolution.model,
         "effort": resolution.effort,
+        "mode": resolution.mode,
         "permissions": resolution.permissions,
         "home": resolution.home,
     }
@@ -751,6 +751,7 @@ def resolution_from_session(meta: sessions.SessionMeta) -> CallResolution:
         description=None,
         model=None,
         effort=None,
+        mode=None,
         permissions=None,
         env=dict(declared_env),
         presets={},
@@ -761,6 +762,7 @@ def resolution_from_session(meta: sessions.SessionMeta) -> CallResolution:
         entry=entry,
         model=_stored_value(payload, "model"),
         effort=_stored_value(payload, "effort"),
+        mode=_stored_value(payload, "mode"),
         permissions=_stored_value(payload, "permissions"),
         home=_stored_value(payload, "home"),
         declared_env=dict(declared_env),

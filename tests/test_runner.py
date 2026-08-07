@@ -55,10 +55,15 @@ def resolve(agent: str = "mock", **overrides: str | None):
 
 
 def start_turn(
-    prompt: str, *, agent: str = "mock", permissions: str | None = None, **kwargs
+    prompt: str,
+    *,
+    agent: str = "mock",
+    permissions: str | None = None,
+    mode: str | None = None,
+    **kwargs,
 ) -> tuple[str, runner.TurnOutcome]:
     """Create a session and run one turn against the mock, as `run` does."""
-    resolution = resolve(agent, permissions=permissions)
+    resolution = resolve(agent, mode=mode, permissions=permissions)
     meta = sessions.create_session(
         entry=resolution.entry.entry,
         base_adapter=resolution.entry.base_adapter,
@@ -269,8 +274,32 @@ def test_model_and_effort_are_applied_to_the_adapter_session() -> None:
     assert effort_calls == "1"
 
 
+def test_no_mode_value_does_not_call_set_session_mode() -> None:
+    _, outcome = start_turn("settings")
+
+    _model, _effort, mode, _model_calls, mode_calls, _effort_calls = outcome.answer.strip().split(
+        "/"
+    )
+    assert mode == "-"
+    assert mode_calls == "0"
+
+
 def test_mode_is_applied_via_set_session_mode() -> None:
     _, outcome = start_turn("settings", mode="plan")
+
+    _model, _effort, mode, _model_calls, mode_calls, _effort_calls = outcome.answer.strip().split(
+        "/"
+    )
+    assert mode == "plan"
+    assert mode_calls == "1"
+
+
+def test_an_entry_mode_is_applied_via_set_session_mode(state_root: Path) -> None:
+    (state_root / "agents" / "pinned.toml").write_text(
+        'extends = "mock"\nmode = "plan"\n', encoding="utf-8"
+    )
+
+    _, outcome = start_turn("settings", agent="pinned")
 
     _model, _effort, mode, _model_calls, mode_calls, _effort_calls = outcome.answer.strip().split(
         "/"

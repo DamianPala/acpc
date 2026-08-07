@@ -40,6 +40,7 @@ _ENTRY_KEYS: Final = frozenset(
         "description",
         "model",
         "effort",
+        "mode",
         "permissions",
         "env",
         "presets",
@@ -60,6 +61,7 @@ _FIELD_NAMES: Final = (
     "description",
     "model",
     "effort",
+    "mode",
     "permissions",
     "env",
     "presets",
@@ -98,6 +100,7 @@ class CallResolution:
     entry: "ResolvedEntry"
     model: str | None
     effort: str | None
+    mode: str | None
     permissions: str | None
     home: str | None
     declared_env: Mapping[str, str]
@@ -138,6 +141,7 @@ class ResolvedEntry:
     description: str | None
     model: str | None
     effort: str | None
+    mode: str | None
     permissions: str | None
     env: Mapping[str, str]
     presets: Mapping[str, Preset]
@@ -198,6 +202,7 @@ class ResolvedEntry:
         *,
         model: str | None = None,
         effort: str | None = None,
+        mode: str | None = None,
         permissions: str | None = None,
         home: str | None = None,
     ) -> CallResolution:
@@ -262,6 +267,12 @@ class ResolvedEntry:
         if resolved_effort is not None:
             self._validate_effort(resolved_effort)
 
+        resolved_mode = self.mode if mode is None else mode
+        if resolved_mode is not None:
+            sources["mode"] = self.source_for("mode") if mode is None else FieldSource("call")
+        else:
+            sources["mode"] = FieldSource("unset")
+
         resolved_permissions = self.permissions if permissions is None else permissions
         if resolved_permissions is not None and resolved_permissions not in PERMISSION_VALUES:
             supported = ", ".join(PERMISSION_VALUES)
@@ -287,6 +298,7 @@ class ResolvedEntry:
             entry=self,
             model=resolved_model,
             effort=resolved_effort,
+            mode=resolved_mode,
             permissions=resolved_permissions,
             home=resolved_home,
             declared_env=dict(self.env),
@@ -384,6 +396,7 @@ def _parse_entry(
         "extends",
         "description",
         "model",
+        "mode",
     ):
         if key in raw:
             _expect_string(path, key, raw[key], allow_empty=key == "description")
@@ -508,6 +521,7 @@ def _to_resolved(
         description=string_or_none("description"),
         model=string_or_none("model"),
         effort=string_or_none("effort"),
+        mode=string_or_none("mode"),
         permissions=string_or_none("permissions"),
         env=env,
         presets=presets,
@@ -613,12 +627,14 @@ class AgentRegistry:
         *,
         model: str | None = None,
         effort: str | None = None,
+        mode: str | None = None,
         permissions: str | None = None,
         home: str | None = None,
     ) -> CallResolution:
         return self.resolve(name).resolve_call(
             model=model,
             effort=effort,
+            mode=mode,
             permissions=permissions,
             home=home,
         )

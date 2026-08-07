@@ -314,13 +314,20 @@ def _resolve_permissions(
     return policy
 
 
-def _guard_bypass_mode(mode: str | None, policy: str, resolution: CallResolution) -> None:
+def _guard_bypass_mode(policy: str, resolution: CallResolution) -> None:
     """SPEC *Permissions*: a bypass mode evades the policy unless it is `all`."""
+    mode = resolution.mode
     if mode is None or policy == "all":
         return
     if mode in resolution.entry.bypass_modes:
+        if resolution.provenance.get("mode", FieldSource("unset")).kind == "call":
+            raise UsageProblem(
+                f"--mode {mode} bypasses permission requests on {resolution.entry.entry}; "
+                "it is only accepted with --permissions all"
+            )
         raise UsageProblem(
-            f"--mode {mode} bypasses permission requests on {resolution.entry.entry}; "
+            f"agent '{resolution.entry.entry}' sets mode {mode}, which bypasses permission "
+            f"requests on {resolution.entry.base_adapter}; "
             "it is only accepted with --permissions all"
         )
 
@@ -632,6 +639,7 @@ def _render_entry_detail(
     resolved_values = {
         "model": resolution.model,
         "effort": resolution.effort,
+        "mode": resolution.mode,
         "permissions": resolution.permissions,
         "home": resolution.home,
     }
@@ -1049,6 +1057,7 @@ def _agents_check(registry: AgentRegistry, name: str | None, *, json_mode: bool)
 )
 @click.option("--model", metavar="M", help="Default model or preset for the variant.")
 @click.option("--effort", metavar="E", help="Default reasoning effort for the variant.")
+@click.option("--mode", metavar="M", help="Default operating mode for the variant.")
 @click.option(
     "--permissions",
     type=click.Choice(vocab.PERMISSION_VALUES),
@@ -1063,6 +1072,7 @@ def agents_init_command(
     parent: str,
     model: str | None,
     effort: str | None,
+    mode: str | None,
     permissions: str | None,
     home: str | None,
     json_mode: bool,
@@ -1090,6 +1100,7 @@ def agents_init_command(
         ("extends", parent),
         ("model", model),
         ("effort", effort),
+        ("mode", mode),
         ("permissions", permissions),
         ("home", home),
     ]
@@ -1801,7 +1812,11 @@ def _still_running_note(session_id: str, timeout: float | None) -> str:
         "prompt; absent, prompt on a TTY and read otherwise."
     ),
 )
-@click.option("--mode", metavar="M", help="Callee's operating mode (ACP session/set_mode).")
+@click.option(
+    "--mode",
+    metavar="M",
+    help="Callee's operating mode (ACP session/set_mode); overrides the entry's mode.",
+)
 @click.option("--home", metavar="DIR", help="Vendor home override.")
 @click.option("-o", "--output", "output_file", metavar="FILE", help="Write the answer to a file.")
 @click.option(
@@ -1854,14 +1869,19 @@ def run_command(
     try:
         registry = AgentRegistry()
         resolution = registry.resolve_call(
-            agent, model=model, effort=effort, permissions=permissions, home=home
+            agent,
+            model=model,
+            effort=effort,
+            mode=mode,
+            permissions=permissions,
+            home=home,
         )
     except RegistryError as error:
         raise UsageProblem(str(error)) from None
 
     defaulted_permissions = permissions is None and resolution.permissions is None
     policy = _resolve_permissions(permissions, resolution, tty=tty, background=background)
-    _guard_bypass_mode(mode, policy, resolution)
+    _guard_bypass_mode(policy, resolution)
     # The TTY-resolved policy is part of the resolved invocation: meta.json
     # stores everything --dry-run shows, and `continue` reuses it verbatim.
     resolution = replace(resolution, permissions=policy)
@@ -1912,7 +1932,6 @@ def run_command(
         resolution=resolution,
         prompt=prompt,
         cwd=resolved_cwd,
-        mode=mode,
         timeout=timeout,
         permission_prompt=_tty_permission_prompt if policy == "prompt" else None,
     )

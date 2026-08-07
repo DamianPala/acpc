@@ -195,6 +195,36 @@ def test_dry_run_json_is_machine_readable(cli: CliRunner) -> None:
     assert "entry_definition" not in payload
 
 
+def test_dry_run_reports_mode_for_entry_flag_and_unset_sources(
+    cli: CliRunner, state_root: Path
+) -> None:
+    (state_root / "agents" / "pinned.toml").write_text(
+        'extends = "mock"\nmode = "plan"\n', encoding="utf-8"
+    )
+
+    entry = json.loads(invoke(cli, "run", "pinned", "probe", "--dry-run", "--json").stdout)
+    flag = json.loads(
+        invoke(
+            cli,
+            "run",
+            "pinned",
+            "probe",
+            "--mode",
+            "flag-mode",
+            "--dry-run",
+            "--json",
+        ).stdout
+    )
+    unset = json.loads(invoke(cli, "run", "mock", "probe", "--dry-run", "--json").stdout)
+
+    assert entry["resolved"]["mode"] == {
+        "value": "plan",
+        "source": f"entry ({state_root / 'agents' / 'pinned.toml'})",
+    }
+    assert flag["resolved"]["mode"] == {"value": "flag-mode", "source": "call flag"}
+    assert unset["resolved"]["mode"] == {"value": None, "source": "unset"}
+
+
 def test_dry_run_reports_the_permission_policy_it_would_use(cli: CliRunner) -> None:
     result = invoke(cli, "run", "mock", "probe", "--dry-run", "--json")
 
@@ -346,6 +376,34 @@ def test_a_bypass_mode_is_rejected_unless_permissions_are_all(cli: CliRunner) ->
 
     assert result.exit_code == vocab.EXIT_USAGE
     assert "yolo" in result.stderr
+
+
+def test_an_entry_bypass_mode_is_rejected_at_resolution(cli: CliRunner, state_root: Path) -> None:
+    (state_root / "agents" / "unsafe.toml").write_text(
+        'extends = "mock"\nmode = "yolo"\n', encoding="utf-8"
+    )
+
+    result = invoke(cli, "run", "unsafe", "probe", "--permissions", "write")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert (
+        "agent 'unsafe' sets mode yolo, which bypasses permission requests on mock; "
+        "it is only accepted with --permissions all"
+    ) in result.stderr
+    assert not (state_root / "sessions").exists()
+
+
+def test_an_entry_bypass_mode_is_accepted_with_permissions_all(
+    cli: CliRunner, state_root: Path
+) -> None:
+    (state_root / "agents" / "unsafe.toml").write_text(
+        'extends = "mock"\nmode = "yolo"\n', encoding="utf-8"
+    )
+
+    result = invoke(cli, "run", "unsafe", "settings", "--permissions", "all", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert "/yolo/" in result.stdout
 
 
 def test_a_bypass_mode_is_accepted_with_permissions_all(cli: CliRunner) -> None:
