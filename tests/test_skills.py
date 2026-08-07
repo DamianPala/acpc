@@ -177,6 +177,10 @@ def test_json_views_include_paths_body_and_null_description(
     }
     assert f"-- skill json-skill | dir {directory}" in detail.stderr
 
+    before_the_name = invoke(cli, "skills", "--json", "json-skill")
+    assert before_the_name.exit_code == vocab.EXIT_OK
+    assert json.loads(before_the_name.stdout) == detail_payload
+
 
 def test_unknown_skill_is_usage_error_pointing_at_listing_command(cli: CliRunner) -> None:
     result = invoke(cli, "skills", "does-not-exist")

@@ -105,17 +105,17 @@ def _parse_frontmatter(lines: list[str]) -> dict[str, str | None]:
                 values[key] = _block_value(block_lines, value)
             index = next_index
             continue
-        if key in {"name", "description"}:
+        if key == "description":
             values[key] = _parse_scalar(value)
         index += 1
     return values
 
 
-def _parse_document(text: str) -> tuple[str | None, str | None, str]:
-    """Return frontmatter name, description, and the exact body after it."""
+def _parse_document(text: str) -> tuple[str | None, str]:
+    """Return the frontmatter description and the exact body after it."""
     lines = text.splitlines(keepends=True)
     if not lines or _line_text(lines[0]).strip() != "---":
-        return None, None, text
+        return None, text
     closing = next(
         (
             index
@@ -125,9 +125,9 @@ def _parse_document(text: str) -> tuple[str | None, str | None, str]:
         None,
     )
     if closing is None:
-        return None, None, text
+        return None, text
     metadata = _parse_frontmatter(lines[1:closing])
-    return metadata.get("name"), metadata.get("description"), "".join(lines[closing + 1 :])
+    return metadata.get("description"), "".join(lines[closing + 1 :])
 
 
 def _load_skill(resource: Any) -> Skill | None:
@@ -140,7 +140,7 @@ def _load_skill(resource: Any) -> Skill | None:
             content = handle.read()
     except (OSError, UnicodeError):
         return None
-    _, description, body = _parse_document(content)
+    description, body = _parse_document(content)
     return Skill(name=resource.name, description=description, path=path, body=body)
 
 
@@ -148,7 +148,7 @@ def _bundled_resources() -> Iterator[Any]:
     root = files("acpc").joinpath("data", "skills")
     try:
         resources = sorted(root.iterdir(), key=lambda item: item.name)
-    except (OSError, FileNotFoundError):
+    except OSError:
         return
     yield from resources
 

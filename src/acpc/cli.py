@@ -720,44 +720,50 @@ def _render_commands(
     }
 
 
-class _AgentsGroup(click.Group):
+class _NamedViewGroup(click.Group):
+    """Treat an unknown first word as the optional named-view argument.
+
+    Subclasses name the command that renders one item; group-level flags the
+    caller already typed are forwarded to it, so `--json <name>` and
+    `<name> --json` are the same call.
+    """
+
+    @property
+    def view_command(self) -> click.Command:
+        """The command that renders one named item."""
+        raise NotImplementedError
+
+    def resolve_command(
+        self, ctx: click.Context, args: list[str]
+    ) -> tuple[str | None, click.Command | None, list[str]]:
+        if args and not args[0].startswith("-") and args[0] not in self.commands:
+            forwarded = list(args)
+            for parameter in self.params:
+                if not isinstance(parameter, click.Option) or not parameter.is_flag:
+                    continue
+                if parameter.name is None or not ctx.params.get(parameter.name):
+                    continue
+                flag = next((option for option in parameter.opts if option.startswith("--")), None)
+                if flag is not None:
+                    forwarded.append(flag)
+            return args[0], self.view_command, forwarded
+        return super().resolve_command(ctx, args)
+
+
+class _AgentsGroup(_NamedViewGroup):
     """Treat an unknown first word as the optional agent view name."""
 
-    def resolve_command(
-        self, ctx: click.Context, args: list[str]
-    ) -> tuple[str | None, click.Command | None, list[str]]:
-        if args and not args[0].startswith("-") and args[0] not in self.commands:
-            forwarded = list(args)
-            for parameter in self.params:
-                if not isinstance(parameter, click.Option) or not parameter.is_flag:
-                    continue
-                if parameter.name is None or not ctx.params.get(parameter.name):
-                    continue
-                flag = next((option for option in parameter.opts if option.startswith("--")), None)
-                if flag is not None:
-                    forwarded.append(flag)
-            return args[0], _agent_view_command, forwarded
-        return super().resolve_command(ctx, args)
+    @property
+    def view_command(self) -> click.Command:
+        return _agent_view_command
 
 
-class _SkillsGroup(click.Group):
+class _SkillsGroup(_NamedViewGroup):
     """Treat an unknown first word as the optional skill view name."""
 
-    def resolve_command(
-        self, ctx: click.Context, args: list[str]
-    ) -> tuple[str | None, click.Command | None, list[str]]:
-        if args and not args[0].startswith("-") and args[0] not in self.commands:
-            forwarded = list(args)
-            for parameter in self.params:
-                if not isinstance(parameter, click.Option) or not parameter.is_flag:
-                    continue
-                if parameter.name is None or not ctx.params.get(parameter.name):
-                    continue
-                flag = next((option for option in parameter.opts if option.startswith("--")), None)
-                if flag is not None:
-                    forwarded.append(flag)
-            return args[0], _skill_view_command, forwarded
-        return super().resolve_command(ctx, args)
+    @property
+    def view_command(self) -> click.Command:
+        return _skill_view_command
 
 
 def _models_overview(registry: AgentRegistry) -> tuple[str, dict[str, Any], list[str]]:
@@ -1096,21 +1102,20 @@ def agents_init_command(
 
 def _run_skills_view(name: str | None, *, json_mode: bool) -> None:
     """List bundled skills or render one skill's body and directory."""
-    try:
-        if name is None:
-            bundled = skills.list_skills()
+    if name is None:
+        bundled = skills.list_skills()
+        if json_mode:
             payload = [_skill_payload(skill, include_body=False) for skill in bundled]
-            if json_mode:
-                _write_stdout(json.dumps(payload, ensure_ascii=False) + "\n")
-                return
-            rows = render.format_table(
-                [_skill_row(skill) for skill in bundled],
-                header=("name", "description"),
-                separator="  ",
-            )
-            _write_stdout("\n".join(rows) + "\n")
+            _write_stdout(json.dumps(payload, ensure_ascii=False) + "\n")
             return
+        rows = render.format_table(
+            [_skill_row(skill) for skill in bundled],
+            header=("name", "description"),
+        )
+        _write_stdout("\n".join(rows) + "\n")
+        return
 
+    try:
         skill = skills.get_skill(name)
     except skills.SkillNotFoundError:
         raise UsageProblem(f"unknown skill {name!r} — use acpc skills") from None

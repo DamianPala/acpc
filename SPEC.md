@@ -462,12 +462,7 @@ Entry TOMLs are trusted at the level of shell config: an adapter definition name
 
 ## Bundled skills
 
-`acpc skills` lists the skills bundled in the package; `acpc skills <name>` prints one skill's
-body. The source is bundled-only: readable `SKILL.md` files directly under `data/skills/*` are
-served, and a directory name wins over any frontmatter `name`. In the detail view the body is
-verbatim on stdout and the skill directory is metadata on stderr as `-- skill <name> | dir
-<path>`. Both views accept `--json`; the list emits an array and the detail view adds `body`.
-An unknown name is a usage error (exit 2) pointing at `acpc skills`.
+`acpc skills` lists the skills bundled in the package; `acpc skills <name>` prints one skill's body. The source is bundled-only: readable `SKILL.md` files directly under `data/skills/*` are served, and the directory name wins over any frontmatter `name` — it is what the filesystem can be trusted about, and it is what `skills <name>` takes. In the detail view the body is verbatim on stdout, byte-identical to the file below the frontmatter, and the skill directory rides on stderr as `-- skill <name> | dir <path>` — which is how a caller finds `references/` without a flag for it. Both views accept `--json`; the list emits an array and the detail view adds `body`. An unknown name is a usage error (exit 2) pointing at `acpc skills`.
 
 ## Output contract
 
@@ -577,8 +572,5 @@ Out of scope — none of these deliver value to an agent caller:
 - **Terminal streaming as a primary mode.** Append to the transcript file; the terminal shows the final answer.
 - **Rich configuration system.** Anything important is a flag — flags are visible in `--help`, config state is not. `config.toml` holds housekeeping knobs only (retention, daemon TTL and capacity), never anything that changes a call's behavior.
 - **MCP server wrapping.** A plain CLI via shell is cheaper in context, standard, composable.
-- **No user skills directory, no install, no scopes, no marketplace.** `acpc` serves only the
-  skills it ships; an operator's own skill belongs in the harness's own skills directory.
-- **A bundled skill is not meant to be installed into a harness's global skills directory
-  either.** That would put it in every session's roster in every project and pay its description
-  in context each time, making this command redundant and reintroducing the cost it avoids.
+- **No user skills directory, no install, no scopes, no marketplace.** `acpc` serves what it ships; a skill of the operator's own belongs in their harness's own skills directory. Adding a second source is a SPEC change, not an implementation detail.
+- **A bundled skill is not meant to be installed into a harness's global skills directory either.** It would then sit in every session's roster in every project, paying its description in context each time, for a task run a couple of times a year. This command exists so that trade never has to be made.
