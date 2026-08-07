@@ -339,6 +339,88 @@ def test_status_list_limits_finished_sessions_and_json_preserves_fields() -> Non
     assert payload["sessions"][0]["prompt_snippet"] == "active prompt"
 
 
+def test_status_list_has_one_lowercase_header_and_aligns_long_columns() -> None:
+    short = sessions.create_session(
+        entry="tiny",
+        base_adapter="mock",
+        prompt="short prompt",
+        name="short-name",
+        clock=lambda: 100.0,
+        resolution={"resolved": {"model": {"value": "tiny-model", "source": "entry"}}},
+    )
+    long = sessions.create_session(
+        entry="entry-name-longer-than-the-old-column",
+        base_adapter="mock",
+        prompt="long prompt",
+        name="name-longer-than-the-old-column",
+        clock=lambda: 100.0,
+        resolution={
+            "resolved": {
+                "model": {
+                    "value": "vendor/model-with-a-deliberately-long-identifier",
+                    "source": "entry",
+                }
+            }
+        },
+    )
+
+    text = render.render_status_list([short, long], all_sessions=True, clock=lambda: 120.0)
+    lines = text.splitlines()
+    header = lines[0]
+    headings = ("id", "entry", "model", "state", "runtime", "idle", "name", "prompt")
+
+    assert header.split() == list(headings)
+    assert lines.count(header) == 1
+    header_offsets = [header.index(heading) for heading in headings]
+    expected_rows = {
+        short.session_id: (
+            short.session_id,
+            short.entry,
+            "tiny-model",
+            "starting",
+            "0m20s",
+            "·",
+            "short-name",
+            '"short prompt"',
+        ),
+        long.session_id: (
+            long.session_id,
+            long.entry,
+            "vendor/model-with-a-deliberately-long-identifier",
+            "starting",
+            "0m20s",
+            "·",
+            "name-longer-than-the-old-column",
+            '"long prompt"',
+        ),
+    }
+    for session_id, cells in expected_rows.items():
+        row = status_line(text, sessions.read_meta(session_id))
+        assert [row.index(cell, offset) for cell, offset in zip(cells, header_offsets)] == (
+            header_offsets
+        )
+
+
+def test_status_list_computes_widths_down_for_short_values() -> None:
+    meta = sessions.create_session(
+        entry="tiny",
+        base_adapter="mock",
+        prompt="p",
+        name="short-name",
+        clock=lambda: 100.0,
+        resolution={"resolved": {"model": {"value": "tiny-model", "source": "entry"}}},
+    )
+
+    text = render.render_status_list([meta], all_sessions=True, clock=lambda: 120.0)
+    lines = text.splitlines()
+    header = lines[0]
+    row = status_line(text, meta)
+
+    assert row.index("tiny") == header.index("entry")
+    assert row.index("tiny-model") == header.index("model")
+    assert row.index("short-name") == header.index("name")
+
+
 def test_status_list_places_the_resolved_model_between_entry_and_state() -> None:
     """The column's position is the contract: entry, then who actually ran."""
     meta = make_session(model="gpt-5.6-luna")
@@ -522,3 +604,15 @@ def test_status_detail_abbreviates_home_and_uses_answer_filename(
     expected_dir = Path("~") / "state" / "sessions" / meta.session_id
     assert f"dir      {expected_dir} · answer: answer.md" in text
     assert f"answer: {sessions.answer_path(meta.session_id)}" not in text
+
+
+def test_status_detail_text_remains_the_existing_labeled_view() -> None:
+    meta = make_session()
+
+    text = render.render_status_detail(meta, clock=lambda: 120.0)
+
+    assert text == (
+        "state    starting · exit · · 0m20s · 0 tok\n"
+        "agent    mock (mock) · model: mock-sonnet-5 · name: ·\n"
+        f"dir      {sessions.session_dir(meta.session_id)} · answer: answer.md\n"
+    )

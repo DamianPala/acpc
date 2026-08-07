@@ -27,6 +27,49 @@ class RenderedEvents:
     last_event: int | None = None
 
 
+def format_table(
+    rows: Sequence[Sequence[str]],
+    *,
+    header: Sequence[str] | None = None,
+    prefix: str = "",
+    continuation_prefix: str | None = None,
+    separator: str = "  ",
+) -> list[str]:
+    """Format rows with widths measured from the header and all rendered rows.
+
+    The final cell is deliberately free-running: it is where descriptions,
+    prompts, and paths belong, so padding it would only add trailing spaces.
+    ``continuation_prefix`` supports views whose first line carries a block
+    label while subsequent lines are indented beneath it.
+    """
+    rendered_rows = [tuple(row) for row in rows]
+    if header is not None:
+        measured_rows = [tuple(header), *rendered_rows]
+    else:
+        measured_rows = rendered_rows
+    if not measured_rows:
+        return []
+
+    column_count = len(measured_rows[0])
+    if any(len(row) != column_count for row in measured_rows):
+        raise ValueError("table rows must have the same number of columns")
+    widths = [max(len(row[index]) for row in measured_rows) for index in range(column_count)]
+
+    lines: list[str] = []
+    all_rows = measured_rows
+    for index, row in enumerate(all_rows):
+        cells = [
+            value if cell_index == column_count - 1 else f"{value:<{widths[cell_index]}}"
+            for cell_index, value in enumerate(row)
+        ]
+        if continuation_prefix is None or index == 0:
+            line_prefix = prefix
+        else:
+            line_prefix = continuation_prefix
+        lines.append(line_prefix + separator.join(cells).rstrip())
+    return lines
+
+
 def _validate_max_output(max_output: int) -> None:
     if isinstance(max_output, bool) or not isinstance(max_output, int) or max_output < 0:
         raise ValueError("max_output must be a non-negative integer")
@@ -361,7 +404,7 @@ def _status_selection(
     return active + finished
 
 
-def _status_row(meta: sessions.SessionMeta, *, clock: Clock | None) -> str:
+def _status_row(meta: sessions.SessionMeta, *, clock: Clock | None) -> tuple[str, ...]:
     runtime_seconds, now = _status_timing(meta, clock=clock)
     runtime = format_duration(runtime_seconds)
     idle_seconds = _idle_seconds(meta, now=now)
@@ -370,8 +413,14 @@ def _status_row(meta: sessions.SessionMeta, *, clock: Clock | None) -> str:
     model = meta.resolved_model or "·"
     snippet = json.dumps(meta.prompt_snippet, ensure_ascii=False)
     return (
-        f"{meta.session_id:<4}  {meta.entry:<10} {model:<14} {meta.state:<9} {runtime:<8} "
-        f"{idle:<11} {name:<16} {snippet}"
+        meta.session_id,
+        meta.entry,
+        model,
+        meta.state,
+        runtime,
+        idle,
+        name,
+        snippet,
     )
 
 
@@ -415,7 +464,11 @@ def render_status_list(
 ) -> str:
     """Render the status list and its in-view summary footer."""
     selected = _status_selection(sessions_in, all_sessions=all_sessions)
-    lines = [_status_row(meta, clock=clock) for meta in selected]
+    lines = format_table(
+        [_status_row(meta, clock=clock) for meta in selected],
+        header=("id", "entry", "model", "state", "runtime", "idle", "name", "prompt"),
+        separator="  ",
+    )
     running_count = sum(meta.is_active for meta in sessions_in)
     finished_count = len([meta for meta in sessions_in if meta.is_finished])
     if all_sessions:

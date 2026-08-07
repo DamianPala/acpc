@@ -189,6 +189,27 @@ def test_daemon_status_idle_age_grows_between_clock_reads(
     assert "idle 0m20s" in _daemon_status_line(second, target)
 
 
+def test_daemon_status_aligns_rows_without_a_header(
+    cli: CliRunner, state_root: Path, live_daemon: None
+) -> None:
+    long_agent = "daemon-target-with-a-long-name"
+    (state_root / "agents" / f"{long_agent}.toml").write_text(
+        'extends = "mock"\nhome = "~/.daemon-home-with-a-long-name"\n',
+        encoding="utf-8",
+    )
+    short_target = _target()
+    long_target = _target(long_agent)
+    _start_daemon(short_target)
+    _start_daemon(long_target)
+
+    result = invoke(cli, "daemon", "status")
+    assert result.exit_code == vocab.EXIT_OK
+    rows = [_daemon_status_line(result, target) for target in (short_target, long_target)]
+    assert result.stdout.splitlines()[0].split()[0] != "target"
+    assert [row.index("pid ") for row in rows] == [rows[0].index("pid ")] * 2
+    assert [row.index("up ") for row in rows] == [rows[0].index("up ")] * 2
+
+
 def test_daemon_status_running_target_renders_dot_and_json_null(
     cli: CliRunner, live_daemon: None
 ) -> None:
@@ -240,6 +261,9 @@ def test_daemon_status_json_idle_age_matches_text(cli: CliRunner, live_daemon: N
     entry = json.loads(json_result.stdout)["daemons"][0]
     assert entry["idle_seconds"] == 10.0
     assert "idle 0m10s" in _daemon_status_line(text_result, target)
+    assert (
+        json_result.stdout == json.dumps(json.loads(json_result.stdout), ensure_ascii=False) + "\n"
+    )
 
 
 def test_daemon_status_never_served_target_has_no_idle_age(

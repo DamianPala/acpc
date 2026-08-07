@@ -174,6 +174,7 @@ def test_status_json_without_an_id_returns_a_session_list(cli: CliRunner) -> Non
     row = json.loads(result.stdout)["sessions"][0]
     assert row["session_id"] == meta.session_id
     assert row["idle_seconds"] is None
+    assert result.stdout == json.dumps(json.loads(result.stdout), ensure_ascii=False) + "\n"
 
 
 def test_status_without_a_transcript_is_clean_for_an_active_session(cli: CliRunner) -> None:

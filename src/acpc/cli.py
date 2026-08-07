@@ -446,37 +446,35 @@ def _local_variant_value(entry: ResolvedEntry, field: str) -> str | None:
 _ROSTER_DESCRIPTION_LIMIT = 80
 
 
-def _agent_row(entry: ResolvedEntry) -> str:
+def _agent_row(entry: ResolvedEntry) -> tuple[str, ...]:
     status = entry.install_status
     if status == "missing":
         status = f"missing → acpc install {entry.entry}"
     description = (
-        f" {render.snippet(entry.description, limit=_ROSTER_DESCRIPTION_LIMIT)}"
+        render.snippet(entry.description, limit=_ROSTER_DESCRIPTION_LIMIT)
         if entry.description is not None
         else ""
     )
-    # Pad only when a description follows, so a roster without them keeps
-    # its old ragged-right shape rather than growing trailing whitespace.
-    status_column = f"{status:<12}" if description else status
-    return f"{entry.entry:<12} {entry.name:<28} {status_column}{description}"
+    return (entry.entry, entry.name, status, description)
 
 
-def _variant_row(entry: ResolvedEntry) -> str:
+def _variant_row(entry: ResolvedEntry) -> tuple[str, ...]:
     values = {
         field: _local_variant_value(entry, field)
         for field in ("model", "effort", "permissions", "home")
     }
     description = (
-        f" {render.snippet(entry.description, limit=_ROSTER_DESCRIPTION_LIMIT)}"
+        render.snippet(entry.description, limit=_ROSTER_DESCRIPTION_LIMIT)
         if entry.description is not None
         else ""
     )
-    home = values["home"] or "·"
-    home_column = f"{home:<20}" if description else home
     return (
-        f"  {entry.entry:<12} {values['model'] or '·':<20} "
-        f"{values['effort'] or '·':<8} {values['permissions'] or '·':<12} "
-        f"{home_column}{description}"
+        entry.entry,
+        values["model"] or "·",
+        values["effort"] or "·",
+        values["permissions"] or "·",
+        values["home"] or "·",
+        description,
     )
 
 
@@ -655,11 +653,16 @@ def _render_models(
 ) -> tuple[str, dict[str, Any]]:
     advertised = _advertised_payload(record)
     lines: list[str] = []
-    for index, (tier, preset) in enumerate(entry.presets.items()):
-        prefix = "          " if index else "presets   "
-        lines.append(f"{prefix}{tier:<10} {preset.model:<24} {preset.effort}")
-    if not entry.presets:
-        lines.append("presets    ·")
+    preset_rows = [(tier, preset.model, preset.effort) for tier, preset in entry.presets.items()]
+    lines.extend(
+        render.format_table(
+            preset_rows,
+            header=("tier", "model", "effort"),
+            prefix="presets   ",
+            continuation_prefix="          ",
+            separator="  ",
+        )
+    )
     models = [str(item) for item in advertised.get("models", [])]
     lines.append("models    " + ("\n          ".join(models) if models else "·"))
     lines.append(_cache_footer(record))
@@ -821,10 +824,36 @@ def _run_agents_view(
                     ]
                     for adapter in registry.adapters
                 }
+                adapter_items = list(registry.adapters)
+                adapter_lines = render.format_table(
+                    [_agent_row(adapter) for adapter in adapter_items], separator="  "
+                )
+                adapter_lines_by_entry = {
+                    adapter.entry: adapter_lines[index]
+                    for index, adapter in enumerate(adapter_items)
+                }
+                variant_items = [
+                    item for adapter in registry.adapters for item in variants[adapter.entry]
+                ]
+                variant_lines = render.format_table(
+                    [_variant_row(item) for item in variant_items],
+                    header=("entry", "model", "effort", "permissions", "home", "description"),
+                    prefix="  ",
+                    separator="  ",
+                )
+                variant_lines_by_entry = {
+                    item.entry: variant_lines[index + 1] for index, item in enumerate(variant_items)
+                }
                 lines: list[str] = []
-                for adapter in registry.adapters:
-                    lines.append(_agent_row(adapter))
-                    lines.extend(_variant_row(item) for item in variants[adapter.entry])
+                variant_header_added = False
+                for adapter in adapter_items:
+                    lines.append(adapter_lines_by_entry[adapter.entry])
+                    if variants[adapter.entry] and not variant_header_added:
+                        lines.append(variant_lines[0])
+                        variant_header_added = True
+                    lines.extend(
+                        variant_lines_by_entry[item.entry] for item in variants[adapter.entry]
+                    )
                 _write_stdout("\n".join(lines) + "\n")
         else:
             entry = registry.resolve(name)
@@ -2218,12 +2247,18 @@ def daemon_status_command(agent: str | None, json_mode: bool) -> None:
     if not entries:
         click.echo("-- no daemons running", err=True)
         return
-    lines = [
-        f"{item['target']:<28} pid {item['pid']:<8} up {output.format_duration(item['uptime'])} "
-        f"· {_daemon_idle_column(item['idle_seconds']):<11} "
-        f"· {len(item['sessions'])} sessions · {item['log']}"
+    rows = [
+        (
+            str(item["target"]),
+            f"pid {item['pid']}",
+            f"up {output.format_duration(item['uptime'])}",
+            f"· {_daemon_idle_column(item['idle_seconds'])}",
+            f"· {len(item['sessions'])} sessions",
+            f"· {item['log']}",
+        )
         for item in entries
     ]
+    lines = render.format_table(rows, separator="  ")
     _write_stdout("\n".join(lines) + "\n")
 
 

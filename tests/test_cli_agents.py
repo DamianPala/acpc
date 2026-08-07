@@ -70,6 +70,37 @@ def test_agents_list_shows_variant_delta(cli: CliRunner) -> None:
     assert "mock-opus-5" in result.stdout
 
 
+def test_agents_list_labels_variant_columns_and_adapts_to_long_values(
+    cli: CliRunner, state_root: Path
+) -> None:
+    long_entry = "variant-name-longer-than-the-old-column"
+    long_model = "vendor/model-with-a-deliberately-long-identifier"
+    (state_root / "agents" / f"{long_entry}.toml").write_text(
+        f'''
+extends = "mock"
+model = "{long_model}"
+effort = "xhigh"
+permissions = "write"
+home = "~/.home-longer-than-the-old-column"
+''',
+        encoding="utf-8",
+    )
+
+    result = invoke(cli, "agents")
+    assert result.exit_code == vocab.EXIT_OK
+    lines = result.stdout.splitlines()
+    header = next(line for line in lines if line.startswith("  entry"))
+    row = next(line for line in lines if line.startswith(f"  {long_entry}"))
+    headings = ("entry", "model", "effort", "permissions", "home", "description")
+
+    assert header.split() == list(headings)
+    assert lines.count(header) == 1
+    assert [row.index(value) for value in (long_entry, long_model, "xhigh", "write")] == [
+        header.index(value) for value in headings[:4]
+    ]
+    assert not any(line.startswith("entry") for line in lines)
+
+
 def test_agents_views_render_present_and_absent_descriptions(cli: CliRunner) -> None:
     listed = invoke(cli, "agents")
 
@@ -204,6 +235,25 @@ def test_named_models_view_prints_full_presets(cli: CliRunner) -> None:
 
     assert result.exit_code == vocab.EXIT_OK
     assert "fast" in result.stdout and "mock-haiku-4-5" in result.stdout
+
+
+def test_named_models_view_labels_and_aligns_the_preset_table(cli: CliRunner) -> None:
+    result = invoke(cli, "agents", "mock", "--models")
+
+    assert result.exit_code == vocab.EXIT_OK
+    lines = result.stdout.splitlines()
+    header = lines[0]
+    fast = next(line for line in lines if "fast" in line)
+
+    assert header.split() == ["presets", "tier", "model", "effort"]
+    assert [fast.index(value) for value in ("fast", "mock-haiku-4-5", "high")] == [
+        header.index(value) for value in ("tier", "model", "effort")
+    ]
+    assert not any(line.split() == ["models"] for line in lines)
+    json_result = invoke(cli, "agents", "mock", "--models", "--json")
+    assert (
+        json_result.stdout == json.dumps(json.loads(json_result.stdout), ensure_ascii=False) + "\n"
+    )
 
 
 def test_models_overview_lists_variants(cli: CliRunner) -> None:
@@ -350,6 +400,7 @@ def test_agents_json_keeps_cache_metadata_off_stdout(cli: CliRunner) -> None:
 
     assert result.exit_code == vocab.EXIT_OK
     payload = json.loads(result.stdout)
+    assert result.stdout == json.dumps(payload, ensure_ascii=False) + "\n"
     assert payload["agent"] == "mock"
     assert "cached" not in result.stdout
     assert "cached" in result.stderr
