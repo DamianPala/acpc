@@ -126,6 +126,23 @@ Stage 3 was complete through section 4 when the branch went to the gate. Accepta
 
 ## Next
 
+### 0.4.1 — the mode is invisible (planned 2026-08-07, `v0.4.0` stays where it is)
+
+One theme, found by probing `session/new` raw during a `/dev/tty` post-mortem: **the mode decides whether permission requests exist at all, and acpc neither pins it, stores it, nor shows it.** Measured that day — claude ships `default` but `~/.claude/settings.json` `defaultMode` overrides it (Damian's is `dontAsk`, which denies without ever asking); codex's default `agent` auto-allows workspace edits without asking. Both make `--permissions` inert, at opposite ends, silently. `builder-deepseek` works only because its own `home` happens to carry no `defaultMode`.
+
+| # | Change | Files |
+|---|---|---|
+| S1 | `mode` becomes an entry field: `_ENTRY_KEYS`/`_FIELD_NAMES`, provenance in `agents` + `--dry-run`, stored in `meta.json` so `continue` reapplies it (SPEC:153 omits it today, and nobody has checked whether `session/load` keeps it) | `registry.py`, `runner.py`, `cli.py`, SPEC:153+286 |
+| S2 | **Security gate for S1** — `_guard_bypass_mode` must fire on the *resolved* mode, not the flag, or an entry file becomes a way to smuggle `bypassPermissions` past the policy. SPEC:313 already states the rule in terms of the mode, so no wording changes | `cli.py:317` |
+| S3 | Keep `current_mode_id` from `session/new` instead of dropping it, plus a new adapter fact listing modes that emit no permission requests (codex `agent`; claude `dontAsk`, `auto`). One stderr note when the policy is below `all` and the session starts in one | `client.py:136-142`, `data/agents/*.toml` |
+| S4 | **Landed 2026-08-07.** Claude's vendor facts refreshed live: six modes, `auto · default · acceptEdits · plan · dontAsk · bypassPermissions`, and `auto` joins `bypass_modes` — a model classifier answers the prompts, so no request reaches acpc, which is exactly the evasion the list exists for. `dontAsk` stays off it: it emits nothing either, but denies rather than allows | `data/agents/claude.toml`, SPEC:98 |
+
+Order: S4 (done) → S3 (supplies the fact S1's note needs) → S1+S2 together, since S1 without S2 opens a hole.
+
+**Deliberately not in scope:** giving the shipped `claude` entry its own `home`. It runs on `~/.claude` today, so it inherits the operator's personal permission settings and subscription credentials — but changing that default would break auth for anyone who has already installed acpc, which is not a patch-release move. S3's note surfaces the symptom; home isolation stays a per-entry choice, as `builder-deepseek` already does it.
+
+Release: bump `0.4.0` → `0.4.1` (the pending `uv.lock` version line rides here), tag `v0.4.1`, `uv tool install --force`, then `acpc daemon stop` — item 4 of the landing checklist, because a warm daemon keeps serving the old client code until it is stopped. Then run E4 from `docs/live-test-plan.md` for real: it is the check that was skipped for want of a human and let the broken prompt ship. Until that reinstall happens the globally installed `acpc` still has the silent-denial bug, whatever `main` says.
+
 - **Fixed at the gate (Damian's ruling — effort is a property of the model, not the preset):** a preset's `effort` is now optional (`fast = { model = "claude-haiku-4-5" }` runs haiku at its own built-in level), `claude.toml`'s fast preset drops its effort, absent effort renders `·`/`null`, and the adapter's "unknown config option" rejection gains a hint naming the model. Explicit `--effort` on a knobless model stays a loud failure. Deliberately no runtime capability probing — the knowledge lives in the entry TOML with the other vendor facts.
 - **Recorded, not fixed:** a user TOML named after a shipped adapter merges per key, so it cannot *clear* an inherited preset effort by omission — only the file that defines the preset can drop it. Worth a SPEC sentence when presets next change.
 - **`docs/plans/` is gitignored, so PLAN.md has no history** — the cheat sheet's source of truth is an untracked file that one `git checkout` could destroy, and no commit can ever carry a change to it atomically with the code it governs. Decide before 0.5 whether the plan gets tracked.
@@ -151,6 +168,9 @@ Stage 3 was complete through section 4 when the branch went to the gate. Accepta
 - SPEC examples say "Claude Code (Anthropic)" where adapters render "Claude Code" — pre-existing cosmetic gap, flagged during the wave-5 SPEC alignment check.
 
 ## Decisions
+
+- 2026-08-07: **`prompt` stays TTY-only; asking over a non-TTY channel is rejected.** Raised after the `/dev/tty` fix, on the reasoning that if a PTY can be manufactured for a test, a pipe could serve too. It cannot: `script` *supplied* a terminal precisely because there was none. Of the three ways a non-TTY caller could answer, stdin is already the prompt source and SPEC's output contract forbids asking there (a pipe answers EOF, which is today's denial by a longer road); a classifier is `write`/`all` renamed; and delegating to the calling agent is the only coherent one but needs a control channel, paused-session state and a polling caller — a feature, not a policy tweak. The non-TTY case is already served: `_denied_summary` names the minimum policy that would have allowed what was denied, so one re-run fixes it, statelessly.
+- 2026-08-07: **`v0.4.0` is not moved; the `/dev/tty` fix ships as 0.4.1.** The tag never left this machine, so moving it would be cheap — but the bug was user-visible in the build that was actually installed, and a moved tag would erase that. A patch release records what happened and supplies the reinstall the fix needs anyway.
 
 - 2026-08-07: **0.4.0 landed on Damian's blanket go** ("leć z pracą dalej" after the pause), executed as the parked five-item checklist: ff `main`, bump + tag via `bump-my-version` (same mechanism as 0.3.0), forced reinstall, `daemon stop`, sanity dispatch. The sanity step earned its place immediately by catching the haiku-effort vendor regression.
 - 2026-08-06 (0.4): exit code **4** is pinned to output-budget exhaustion. `log --follow` needed an ending distinguishable from both a clean session end (0) and a timeout (124), because the caller's next move differs: resume from the cursor rather than wait or give up.
