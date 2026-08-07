@@ -25,6 +25,7 @@ stop <id>
 rm <id> | prune [--older-than D] [--dry-run]   # session cleanup (auto-prune per config retention)
 agents [name] [--models|--commands|--check]   # adapters + variants; with name: resolved definition (cached)
 agents init <name> --extends <agent>  # scaffold a variant
+skills [name] [--json]                # bundled skills; with name: skill body and directory
 install <agent>                       # one-step fix for "not installed"
 daemon status|stop [target] [--force]   # plumbing escape hatch — never needed in the happy path
 ```
@@ -459,6 +460,15 @@ The adapter's environment is constructed, not inherited — but not paranoid-emp
 
 Entry TOMLs are trusted at the level of shell config: an adapter definition names the command acpc executes and the env delivered to it. Only place files you trust in `agents/`.
 
+## Bundled skills
+
+`acpc skills` lists the skills bundled in the package; `acpc skills <name>` prints one skill's
+body. The source is bundled-only: readable `SKILL.md` files directly under `data/skills/*` are
+served, and a directory name wins over any frontmatter `name`. In the detail view the body is
+verbatim on stdout and the skill directory is metadata on stderr as `-- skill <name> | dir
+<path>`. Both views accept `--json`; the list emits an array and the detail view adds `body`.
+An unknown name is a usage error (exit 2) pointing at `acpc skills`.
+
 ## Output contract
 
 - **stdout carries exactly one thing, chosen by flags**: the answer (default), a short confirmation (`-o`), a JSON envelope (`--json`), a session ID + dir path (`--bg`). Never spinners, ANSI, logs or diagnostics — those go to stderr or the session log file.
@@ -567,3 +577,8 @@ Out of scope — none of these deliver value to an agent caller:
 - **Terminal streaming as a primary mode.** Append to the transcript file; the terminal shows the final answer.
 - **Rich configuration system.** Anything important is a flag — flags are visible in `--help`, config state is not. `config.toml` holds housekeeping knobs only (retention, daemon TTL and capacity), never anything that changes a call's behavior.
 - **MCP server wrapping.** A plain CLI via shell is cheaper in context, standard, composable.
+- **No user skills directory, no install, no scopes, no marketplace.** `acpc` serves only the
+  skills it ships; an operator's own skill belongs in the harness's own skills directory.
+- **A bundled skill is not meant to be installed into a harness's global skills directory
+  either.** That would put it in every session's roster in every project and pay its description
+  in context each time, making this command redundant and reintroducing the cost it avoids.

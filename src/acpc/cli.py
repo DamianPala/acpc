@@ -29,6 +29,7 @@ from acpc import (
     render,
     runner,
     sessions,
+    skills,
     transcript,
     vocab,
 )
@@ -135,7 +136,7 @@ Maintenance and setup:
   Killing acpc does not stop the session — acpc stop does.
 
 Common commands:
-  run, continue, steer, wait, status, log, agents, daemon,
+  run, continue, steer, wait, status, log, agents, skills, daemon,
   stop, rm, prune, install
   Use `acpc <command> --help` for the command's full reference.
 
@@ -478,6 +479,26 @@ def _variant_row(entry: ResolvedEntry) -> tuple[str, ...]:
     )
 
 
+def _skill_row(skill: skills.Skill) -> tuple[str, ...]:
+    description = (
+        render.snippet(skill.description, limit=_ROSTER_DESCRIPTION_LIMIT)
+        if skill.description is not None
+        else ""
+    )
+    return (skill.name, description)
+
+
+def _skill_payload(skill: skills.Skill, *, include_body: bool) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "name": skill.name,
+        "description": skill.description,
+        "path": str(skill.path),
+    }
+    if include_body:
+        payload["body"] = skill.body
+    return payload
+
+
 def _agent_list_payload(registry: AgentRegistry) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     for adapter in registry.adapters:
@@ -716,6 +737,26 @@ class _AgentsGroup(click.Group):
                 if flag is not None:
                     forwarded.append(flag)
             return args[0], _agent_view_command, forwarded
+        return super().resolve_command(ctx, args)
+
+
+class _SkillsGroup(click.Group):
+    """Treat an unknown first word as the optional skill view name."""
+
+    def resolve_command(
+        self, ctx: click.Context, args: list[str]
+    ) -> tuple[str | None, click.Command | None, list[str]]:
+        if args and not args[0].startswith("-") and args[0] not in self.commands:
+            forwarded = list(args)
+            for parameter in self.params:
+                if not isinstance(parameter, click.Option) or not parameter.is_flag:
+                    continue
+                if parameter.name is None or not ctx.params.get(parameter.name):
+                    continue
+                flag = next((option for option in parameter.opts if option.startswith("--")), None)
+                if flag is not None:
+                    forwarded.append(flag)
+            return args[0], _skill_view_command, forwarded
         return super().resolve_command(ctx, args)
 
 
@@ -1051,6 +1092,59 @@ def agents_init_command(
         _emit_json(payload)
     else:
         _write_stdout(f"created {target}\n")
+
+
+def _run_skills_view(name: str | None, *, json_mode: bool) -> None:
+    """List bundled skills or render one skill's body and directory."""
+    try:
+        if name is None:
+            bundled = skills.list_skills()
+            payload = [_skill_payload(skill, include_body=False) for skill in bundled]
+            if json_mode:
+                _write_stdout(json.dumps(payload, ensure_ascii=False) + "\n")
+                return
+            rows = render.format_table(
+                [_skill_row(skill) for skill in bundled],
+                header=("name", "description"),
+                separator="  ",
+            )
+            _write_stdout("\n".join(rows) + "\n")
+            return
+
+        skill = skills.get_skill(name)
+    except skills.SkillNotFoundError:
+        raise UsageProblem(f"unknown skill {name!r} — use acpc skills") from None
+
+    if json_mode:
+        _emit_json(_skill_payload(skill, include_body=True))
+    else:
+        _write_stdout(skill.body)
+    _echo_metadata(f"-- skill {skill.name} | dir {skill.path}")
+
+
+@main.group(name="skills", cls=_SkillsGroup, invoke_without_command=True)
+@click.option("--json", "json_mode", is_flag=True, help="Emit this view as JSON.")
+@click.help_option("-h", "--help")
+@click.pass_context
+def skills_group(ctx: click.Context, json_mode: bool) -> None:
+    """List bundled skills, or render one named skill.
+
+    Example: ``acpc skills provider-bringup``
+    """
+    if ctx.invoked_subcommand is None:
+        _run_skills_view(None, json_mode=json_mode)
+
+
+@click.command(name="skill-view")
+@click.argument("name")
+@click.option("--json", "json_mode", is_flag=True, help="Emit this view as JSON.")
+@click.help_option("-h", "--help")
+def _skill_view_command(name: str, json_mode: bool) -> None:
+    """Render one named bundled skill.
+
+    Example: ``acpc skills provider-bringup``
+    """
+    _run_skills_view(name, json_mode=json_mode)
 
 
 @main.command(name="install")

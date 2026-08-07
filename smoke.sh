@@ -31,6 +31,7 @@ declare -A SECTION_READY=(
     [S11-maintenance]=ready # stop semantics, rm, prune
     [S12-cli]=ready         # help contract, -V, TTY rules, hostile inputs
     [S13-permissions]=ready # permission tiers visible in log, bypass-mode guard (needs S06+S08)
+    ["S16-skills"]=ready      # bundled skill list/detail views and JSON
 )
 
 section_ready() {
@@ -1405,12 +1406,57 @@ PYEOF
 fi
 
 # ==============================================================================
+# S16-skills: bundled skill list/detail views and JSON
+# ==============================================================================
+if begin_section S16-skills "bundled skill list, detail, metadata, and JSON"; then
+    run_acpc skills
+    assert_eq "skills (list) exits 0" "0" "$LAST_RC"
+    assert_eq "skills list has a column header" "name description" \
+        "$(awk 'NR == 1 {$1 = $1; print}' <<<"$LAST_OUT")"
+    assert_contains "skills list shows provider-bringup" "$LAST_OUT" "provider-bringup"
+
+    run_acpc skills provider-bringup
+    assert_eq "skills <name> exits 0" "0" "$LAST_RC"
+    assert_contains "skill detail prints the body" "$LAST_OUT" "# Bringing up a provider"
+    assert_contains "skill detail prints its labeled directory on stderr" "$LAST_ERR" \
+        "-- skill provider-bringup | dir "
+    assert_not_contains "skill detail keeps its directory off stdout" "$LAST_OUT" \
+        "-- skill provider-bringup | dir "
+
+    run_acpc skills --json
+    assert_json_valid "skills list JSON is valid" "$LAST_OUT"
+    assert_eq "skills list JSON has provider-bringup" "provider-bringup" \
+        "$(jq -r '.[0].name' <<<"$LAST_OUT")"
+    SKILL_DIR="$(jq -r '.[0].path' <<<"$LAST_OUT")"
+    assert_file "skills list JSON path points at the skill directory" \
+        "${SKILL_DIR}/SKILL.md"
+
+    run_acpc skills provider-bringup --json
+    assert_json_valid "skills detail JSON is valid" "$LAST_OUT"
+    assert_eq "skills detail JSON includes its body" "provider-bringup" \
+        "$(jq -r '.name' <<<"$LAST_OUT")"
+    assert_contains "skills detail JSON has body text" "$LAST_OUT" "# Bringing up a provider"
+
+    run_acpc skills does-not-exist
+    assert_eq "unknown skill exits 2" "2" "$LAST_RC"
+    assert_contains "unknown skill points at acpc skills" "$LAST_ERR" "acpc skills"
+
+    for help_flag in -h --help; do
+        run_acpc skills "$help_flag"
+        assert_eq "skills $help_flag succeeds" "0" "$LAST_RC"
+        assert_contains "skills $help_flag documents JSON" "$LAST_OUT" "--json"
+    done
+
+    end_section S16-skills
+fi
+
+# ==============================================================================
 # Summary
 # ==============================================================================
 TOTAL=$((PASS_COUNT + FAIL_COUNT))
 printf '\n== smoke.sh sections ==\n' >&2
 for key in S06-run S07-daemon-bg S08-views S09-continue S10-agents S11-maintenance \
-    S13-permissions S12-cli; do
+    S13-permissions S12-cli S16-skills; do
     printf '  %-16s %s\n' "$key" "${SECTION_RESULT[$key]:-pending}" >&2
 done
 if [[ $PTY_SKIPPED -eq 1 ]]; then

@@ -21,6 +21,7 @@ cli.py                          argument parsing, verbs, help, exit codes, TTY d
   │     └── environment.py      (frozen) adapter env construction
   ├── transcript.py             NDJSON transcript: schema, append, cursors
   ├── render.py                 log/status views, footers, --max-output truncation
+  ├── skills.py                 bundled skill discovery, frontmatter, and body loading
   ├── output.py                 output contract: stdout modes, stderr summary, --json
   ├── cache.py                  advertised models/modes/commands cache under cache/<agent>/
   └── config.py                 config.toml (retention, daemon_ttl, daemon_max_concurrent)
@@ -38,6 +39,7 @@ vocab.py (frozen)               efforts, permission values, session states, exit
 | Module | Owns | SPEC.md sections |
 |--------|------|------------------|
 | `cli.py` | Verb surface, flag parsing, usage errors (exit 2), two-level `--help`, `-V`, TTY vs non-TTY rules, `last` selector | *Command surface*, *`--help`*, *TTY vs non-TTY* |
+| `skills.py` | Bundled `data/skills/*/SKILL.md` discovery, hand-parsed descriptions, directory-name identity, body loading | *Bundled skills* |
 | `config.py` | `config.toml` strict load (3 keys, unknown key = hard error), defaults | *State on disk* (config) |
 | `registry.py` | Shipped adapter TOMLs (`data/agents/`), user entries (`agents/`), `extends` resolution with per-field provenance, presets (tier → model+effort), effort superset mapping, bypass-mode lists, install status, `agents init` scaffolding | *Agent variants*, *`agents`*, *`install`* |
 | `sessions.py` | Session ids (4 chars, 32-glyph alphabet, re-roll on collision), session dirs, `meta.json` lifecycle (atomic replace), state machine + orphan detection (via `proc`), 30s startup grace, per-session lock, `--name` aliases, turn rotation (`prompt.<n>.md` at next-turn start), rm/prune | *State on disk*, *Session states*, *`rm`*, *`prune`* |
