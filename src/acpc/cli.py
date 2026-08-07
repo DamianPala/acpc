@@ -455,7 +455,10 @@ def _agent_row(entry: ResolvedEntry) -> str:
         if entry.description is not None
         else ""
     )
-    return f"{entry.entry:<12} {entry.name:<28} {status}{description}"
+    # Pad only when a description follows, so a roster without them keeps
+    # its old ragged-right shape rather than growing trailing whitespace.
+    status_column = f"{status:<12}" if description else status
+    return f"{entry.entry:<12} {entry.name:<28} {status_column}{description}"
 
 
 def _variant_row(entry: ResolvedEntry) -> str:
@@ -468,10 +471,12 @@ def _variant_row(entry: ResolvedEntry) -> str:
         if entry.description is not None
         else ""
     )
+    home = values["home"] or "·"
+    home_column = f"{home:<20}" if description else home
     return (
         f"  {entry.entry:<12} {values['model'] or '·':<20} "
         f"{values['effort'] or '·':<8} {values['permissions'] or '·':<12} "
-        f"{values['home'] or '·'}{description}"
+        f"{home_column}{description}"
     )
 
 
