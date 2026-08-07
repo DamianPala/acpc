@@ -44,7 +44,9 @@ def format_table(
     """
     rendered_rows = [tuple(row) for row in rows]
     if header is not None:
-        measured_rows = [tuple(header), *rendered_rows]
+        # Uppercased here, not at call sites, so no view can ship a
+        # lowercase header; block labels in `prefix` stay as written.
+        measured_rows = [tuple(label.upper() for label in header), *rendered_rows]
     else:
         measured_rows = rendered_rows
     if not measured_rows:

@@ -65,7 +65,7 @@ Advertised data — modes, models, slash commands — is adapter-level (variants
 $ acpc agents
 claude  Claude Code (Anthropic)  installed
 codex   Codex CLI (OpenAI)       installed
-  entry     model         effort  permissions  home                 description
+  ENTRY     MODEL         EFFORT  PERMISSIONS  HOME                 DESCRIPTION
   builder   gpt-5.6-luna  xhigh   write        ~/.codex-openrouter  Implements a task against a plan; writes the code and runs the commands the...
   explorer  gpt-5.6-luna  low     read         ~/.codex-openrouter  Answers a question, reading only.
   planner   gpt-5.6-sol   xhigh   write        ~/.codex-openrouter  Decomposes a problem into a plan.
@@ -102,7 +102,7 @@ variants     none
 -- cached 30m ago
 
 $ acpc agents claude --models
-presets   tier      model             effort
+presets   TIER      MODEL             EFFORT
           fast      claude-haiku-4-5  high
           standard  claude-sonnet-5   high
           max       claude-opus-5     max
@@ -114,18 +114,18 @@ models    claude-opus-5
 
 $ acpc agents --models
 codex
-  presets   tier      model          effort
+  presets   TIER      MODEL          EFFORT
             fast      gpt-5.6-luna   high
             standard  gpt-5.6-terra  xhigh
             max       gpt-5.6-sol    xhigh
   models    gpt-5.6-sol · gpt-5.6-terra · gpt-5.6-luna · gpt-5.5 · gpt-5.4
-  variants  entry     model         effort
+  variants  ENTRY     MODEL         EFFORT
             builder   gpt-5.6-luna  xhigh
             explorer  gpt-5.6-luna  low
             planner   gpt-5.6-sol   xhigh
             reviewer  gpt-5.6-sol   xhigh
 claude
-  presets   tier      model             effort
+  presets   TIER      MODEL             EFFORT
             fast      claude-haiku-4-5  high
             standard  claude-sonnet-5   high
             max       claude-opus-5     max
@@ -340,7 +340,7 @@ A pulse, not a dump: reads `meta.json`, process liveness and the transcript's la
 
 ```
 $ acpc status
-id    entry     model          state    runtime  idle   name         prompt
+ID    ENTRY     MODEL          STATE    RUNTIME  IDLE   NAME         PROMPT
 x7k2  codex     gpt-5.6-terra  running  3m12s    0m04s  ·            "Fix the failing test in tests/test_auth.py"
 p9d4  claude    claude-opus-5  running  0m41s    0m38s  researcher   "Research X and write findings to ./findings…"
 kq8w  reviewer  gpt-5.6-terra  done     12m40s   ·      spec-review  "Review the diff against the spec and report…"
@@ -467,7 +467,7 @@ Entry TOMLs are trusted at the level of shell config: an adapter definition name
 ## Output contract
 
 - **stdout carries exactly one thing, chosen by flags**: the answer (default), a short confirmation (`-o`), a JSON envelope (`--json`), a session ID + dir path (`--bg`). Never spinners, ANSI, logs or diagnostics — those go to stderr or the session log file.
-- **Every column is labeled, once — in a header or on the value, never nowhere.** A multi-row positional view prints one lowercase header line above its rows, on stdout with them (the `docker ps` prior): `status`'s list, the `agents` list's variant rows, the preset table in `agents <name> --models`. A view that labels each value inline instead — `daemon status`'s `pid 728419 · up 36m53s · idle 8m39s` — is already labeled and gets no header. What is never acceptable is a column whose meaning lives nowhere: a bare `·` in an unlabeled position is unreadable on first contact, and this tool's first-contact reader is usually an agent that cannot ask. Detail views are exempt (one labeled field per line already), as is the `log` stream (each event is self-describing).
+- **Every column is labeled, once — in a header or on the value, never nowhere.** A multi-row positional view prints one uppercase header line above its rows, on stdout with them (the `docker ps` prior — uppercase is what makes the label row readable as a label row at a glance; block labels like `presets` and inline-labeled values stay lowercase): `status`'s list, the `agents` list's variant rows, the preset table in `agents <name> --models`. A view that labels each value inline instead — `daemon status`'s `pid 728419 · up 36m53s · idle 8m39s` — is already labeled and gets no header. What is never acceptable is a column whose meaning lives nowhere: a bare `·` in an unlabeled position is unreadable on first contact, and this tool's first-contact reader is usually an agent that cannot ask. Detail views are exempt (one labeled field per line already), as is the `log` stream (each event is self-describing).
 - **Column widths are computed from the rendered rows, never fixed.** Each view measures what it is about to print and pads to the widest value, header included. A hardcoded width is aligned only for the values that existed when it was written: a 26-character model id or a 14-character entry name shears every column after it, and the row that most needs reading — the unusual one — is the row that breaks. One long value widens the table; it never misaligns it.
 - **A *message boundary* is where one agent message ends and the next begins**: any non-message update — a tool call, a thought chunk, a usage report, anything that is not an `agent_message_chunk` — arriving between two message chunks. Chunks with nothing between them are one message being streamed, however long the pause. The rule reads the update stream and never the clock, so a slow adapter cannot invent a boundary and a fast one cannot lose a real one. Two views consume this one definition: the answer separates messages at a boundary (below), and the condensed `log` view marks the events that continue across one (see `log`).
 - **"The answer" is defined**: the turn's ACP agent-message content, chunks concatenated in stream order; thought chunks and tool output excluded; markdown passed through verbatim. Narration interleaved between tool calls is part of it — never silently dropped, and never silently glued to what follows: at every message boundary the answer carries a blank line. stdout and `answer.md` carry identical bytes; for a single-turn session, `log --prose --since 0` renders the same content.

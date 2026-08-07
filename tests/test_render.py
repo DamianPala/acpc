@@ -367,7 +367,7 @@ def test_status_list_has_one_lowercase_header_and_aligns_long_columns() -> None:
     text = render.render_status_list([short, long], all_sessions=True, clock=lambda: 120.0)
     lines = text.splitlines()
     header = lines[0]
-    headings = ("id", "entry", "model", "state", "runtime", "idle", "name", "prompt")
+    headings = ("ID", "ENTRY", "MODEL", "STATE", "RUNTIME", "IDLE", "NAME", "PROMPT")
 
     assert header.split() == list(headings)
     assert lines.count(header) == 1
@@ -416,9 +416,9 @@ def test_status_list_computes_widths_down_for_short_values() -> None:
     header = lines[0]
     row = status_line(text, meta)
 
-    assert row.index("tiny") == header.index("entry")
-    assert row.index("tiny-model") == header.index("model")
-    assert row.index("short-name") == header.index("name")
+    assert row.index("tiny") == header.index("ENTRY")
+    assert row.index("tiny-model") == header.index("MODEL")
+    assert row.index("short-name") == header.index("NAME")
 
 
 def test_status_list_places_the_resolved_model_between_entry_and_state() -> None:

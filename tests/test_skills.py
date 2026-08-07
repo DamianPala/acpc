@@ -121,14 +121,14 @@ def test_list_has_header_alignment_sorting_and_bounded_rendered_description(
 
     assert result.exit_code == vocab.EXIT_OK
     lines = result.stdout.splitlines()
-    assert lines[0].split() == ["name", "description"]
+    assert lines[0].split() == ["NAME", "DESCRIPTION"]
     assert [line.split()[0] for line in lines[1:]] == [
         "alpha-name-longer-than-header",
         "zeta",
     ]
     header = lines[0]
     alpha = lines[1]
-    assert alpha.index("A long") == header.index("description")
+    assert alpha.index("A long") == header.index("DESCRIPTION")
     assert alpha.endswith("...")
     assert len(alpha.split("  ", 1)[1]) <= 80
     assert "repeated whitespace and" in alpha

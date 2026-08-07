@@ -89,16 +89,16 @@ home = "~/.home-longer-than-the-old-column"
     result = invoke(cli, "agents")
     assert result.exit_code == vocab.EXIT_OK
     lines = result.stdout.splitlines()
-    header = next(line for line in lines if line.startswith("  entry"))
+    header = next(line for line in lines if line.startswith("  ENTRY"))
     row = next(line for line in lines if line.startswith(f"  {long_entry}"))
-    headings = ("entry", "model", "effort", "permissions", "home", "description")
+    headings = ("ENTRY", "MODEL", "EFFORT", "PERMISSIONS", "HOME", "DESCRIPTION")
 
     assert header.split() == list(headings)
     assert lines.count(header) == 1
     assert [row.index(value) for value in (long_entry, long_model, "xhigh", "write")] == [
         header.index(value) for value in headings[:4]
     ]
-    assert not any(line.startswith("entry") for line in lines)
+    assert not any(line.startswith("ENTRY") for line in lines)
 
 
 def test_agents_views_render_present_and_absent_descriptions(cli: CliRunner) -> None:
@@ -245,9 +245,9 @@ def test_named_models_view_labels_and_aligns_the_preset_table(cli: CliRunner) ->
     header = lines[0]
     fast = next(line for line in lines if "fast" in line)
 
-    assert header.split() == ["presets", "tier", "model", "effort"]
+    assert header.split() == ["presets", "TIER", "MODEL", "EFFORT"]
     assert [fast.index(value) for value in ("fast", "mock-haiku-4-5", "high")] == [
-        header.index(value) for value in ("tier", "model", "effort")
+        header.index(value) for value in ("TIER", "MODEL", "EFFORT")
     ]
     assert not any(line.split() == ["models"] for line in lines)
     json_result = invoke(cli, "agents", "mock", "--models", "--json")
@@ -287,13 +287,13 @@ effort = "xhigh"
     variant_header = next(line for line in block if line.startswith("  variants"))
     variant_row = next(line for line in block if long_entry in line)
 
-    assert preset_header.split() == ["presets", "tier", "model", "effort"]
+    assert preset_header.split() == ["presets", "TIER", "MODEL", "EFFORT"]
     assert [fast.index(value) for value in ("fast", "mock-haiku-4-5", "high")] == [
-        preset_header.index(value) for value in ("tier", "model", "effort")
+        preset_header.index(value) for value in ("TIER", "MODEL", "EFFORT")
     ]
-    assert variant_header.split() == ["variants", "entry", "model", "effort"]
+    assert variant_header.split() == ["variants", "ENTRY", "MODEL", "EFFORT"]
     assert [variant_row.index(value) for value in (long_entry, long_model, "xhigh")] == [
-        variant_header.index(value) for value in ("entry", "model", "effort")
+        variant_header.index(value) for value in ("ENTRY", "MODEL", "EFFORT")
     ]
 
 

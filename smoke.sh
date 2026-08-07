@@ -738,7 +738,7 @@ if begin_section S08-views "status list/detail, log default/--since/--tail/--pro
     # status list: defaults to running + 5 most recent finished; footer in view
     run_acpc status
     assert_eq "status exits 0" "0" "$LAST_RC"
-    assert_eq "status list opens with a column header" "id entry model state runtime idle name prompt" \
+    assert_eq "status list opens with a column header" "ID ENTRY MODEL STATE RUNTIME IDLE NAME PROMPT" \
         "$(awk 'NR == 1 {$1 = $1; print}' <<<"$LAST_OUT")"
     run_acpc status --all
     assert_eq "status --all exits 0" "0" "$LAST_RC"
@@ -970,8 +970,8 @@ if begin_section S10-agents "agents views, variants, advertised data, install"; 
         "missing → acpc install phantom"
     assert_contains "agents list shows the builder variant" "$LAST_OUT" "builder"
     assert_eq "agents list labels the variant columns, once" \
-        "entry model effort permissions home description" \
-        "$(awk '/^  entry / {$1 = $1; print; exit}' <<<"$LAST_OUT")"
+        "ENTRY MODEL EFFORT PERMISSIONS HOME DESCRIPTION" \
+        "$(awk '/^  ENTRY / {$1 = $1; print; exit}' <<<"$LAST_OUT")"
     assert_contains "agents list shows the explorer variant" "$LAST_OUT" "explorer"
     assert_contains "variant rows show their model delta" "$LAST_OUT" "mock-opus-5"
 
@@ -988,14 +988,14 @@ if begin_section S10-agents "agents views, variants, advertised data, install"; 
     run_acpc agents mock --models
     assert_contains "agents <name> --models lists presets" "$LAST_OUT" "fast"
     assert_contains "presets carry model + effort pairs" "$LAST_OUT" "mock-haiku-4-5"
-    assert_eq "the preset table carries a column header" "presets tier model effort" \
+    assert_eq "the preset table carries a column header" "presets TIER MODEL EFFORT" \
         "$(awk 'NR == 1 {$1 = $1; print}' <<<"$LAST_OUT")"
     run_acpc agents --models
     assert_contains "agents --models overview lists mock" "$LAST_OUT" "mock"
     assert_contains "agents --models overview collapses variants" "$LAST_OUT" "builder"
-    assert_eq "the overview labels its preset columns" "presets tier model effort" \
+    assert_eq "the overview labels its preset columns" "presets TIER MODEL EFFORT" \
         "$(awk '/^  presets / {$1 = $1; print; exit}' <<<"$LAST_OUT")"
-    assert_eq "the overview labels its variant columns" "variants entry model effort" \
+    assert_eq "the overview labels its variant columns" "variants ENTRY MODEL EFFORT" \
         "$(awk '/^  variants / {$1 = $1; print; exit}' <<<"$LAST_OUT")"
 
     run_acpc agents mock --commands
@@ -1411,7 +1411,7 @@ fi
 if begin_section S16-skills "bundled skill list, detail, metadata, and JSON"; then
     run_acpc skills
     assert_eq "skills (list) exits 0" "0" "$LAST_RC"
-    assert_eq "skills list has a column header" "name description" \
+    assert_eq "skills list has a column header" "NAME DESCRIPTION" \
         "$(awk 'NR == 1 {$1 = $1; print}' <<<"$LAST_OUT")"
     assert_contains "skills list shows provider-bringup" "$LAST_OUT" "provider-bringup"
 
