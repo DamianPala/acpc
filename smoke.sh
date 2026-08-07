@@ -667,6 +667,11 @@ ${BG1_DIR}" "$LAST_OUT"
     run_acpc daemon stop stopper --force
     assert_eq "forced cleanup of the guarded session exits 0" "0" "$LAST_RC"
 
+    run_acpc daemon status --json
+    assert_json_valid "daemon status JSON carries idle age" "$LAST_OUT"
+    assert_eq "daemon status JSON has idle_seconds" "true" \
+        "$(jq 'all(.daemons[]; has("idle_seconds"))' <<<"$LAST_OUT")"
+
     # Concurrency: parallel bg dispatches, clean transcripts, no false orphans
     for i in 1 2 3 4 5 6; do
         run_acpc run mock "concurrent smoke task ${i}" --bg --quiet &

@@ -9,11 +9,13 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from click.testing import CliRunner
 
+import acpc.cli as cli_module
 from acpc import daemon, daemon_client, proc, runner, sessions, vocab
 from acpc.cli import main
 from acpc.registry import AgentRegistry
@@ -148,6 +150,112 @@ def test_daemon_status_with_no_daemons_is_a_successful_empty_report(cli: CliRunn
     assert result.exit_code == vocab.EXIT_OK
     assert result.stdout == ""
     assert "no daemons running" in result.stderr
+
+
+def _finished_target_session(target: str, *, finished_at: float = 110.0) -> str:
+    meta = sessions.create_session(
+        entry="mock",
+        base_adapter="mock",
+        prompt="idle age",
+        target=target,
+        clock=lambda: 100.0,
+    )
+    sessions.transition(meta.session_id, "done", clock=lambda: finished_at, exit_code=0)
+    return meta.session_id
+
+
+def _daemon_status_line(result: Any, target: str) -> str:
+    return next(line for line in result.stdout.splitlines() if line.startswith(target))
+
+
+def test_daemon_status_idle_age_grows_between_clock_reads(
+    cli: CliRunner, live_daemon: None
+) -> None:
+    target = _target()
+    _start_daemon(target)
+    _finished_target_session(target)
+    clock_values = iter((120.0, 130.0))
+    monkey_time = SimpleNamespace(time=lambda: next(clock_values))
+
+    original_time = cli_module.time
+    cli_module.time = monkey_time
+    try:
+        first = invoke(cli, "daemon", "status", "mock")
+        second = invoke(cli, "daemon", "status", "mock")
+    finally:
+        cli_module.time = original_time
+
+    assert "idle 0m10s" in _daemon_status_line(first, target)
+    assert "idle 0m20s" in _daemon_status_line(second, target)
+
+
+def test_daemon_status_running_target_renders_dot_and_json_null(
+    cli: CliRunner, live_daemon: None
+) -> None:
+    _start_slow_session(cli, "slow:5 daemon status running")
+
+    text_result = invoke(cli, "daemon", "status", "mock")
+    json_result = invoke(cli, "daemon", "status", "mock", "--json")
+    target = _target()
+    row = _daemon_status_line(text_result, target)
+    entry = json.loads(json_result.stdout)["daemons"][0]
+
+    assert "idle " not in row
+    assert "· ·" in row
+    assert entry["idle_seconds"] is None
+
+
+def test_daemon_status_starting_target_renders_dot_and_json_null(
+    cli: CliRunner, live_daemon: None
+) -> None:
+    target = _target()
+    _start_daemon(target)
+    _finished_target_session(target)
+    sessions.create_session(
+        entry="mock", base_adapter="mock", prompt="daemon status starting", target=target
+    )
+
+    text_result = invoke(cli, "daemon", "status", "mock")
+    json_result = invoke(cli, "daemon", "status", "mock", "--json")
+    row = _daemon_status_line(text_result, target)
+    entry = json.loads(json_result.stdout)["daemons"][0]
+
+    assert "idle " not in row
+    assert "· ·" in row
+    assert entry["idle_seconds"] is None
+
+
+def test_daemon_status_json_idle_age_matches_text(cli: CliRunner, live_daemon: None) -> None:
+    target = _target()
+    _start_daemon(target)
+    _finished_target_session(target)
+    original_time = cli_module.time
+    cli_module.time = SimpleNamespace(time=lambda: 120.0)
+    try:
+        text_result = invoke(cli, "daemon", "status", "mock")
+        json_result = invoke(cli, "daemon", "status", "mock", "--json")
+    finally:
+        cli_module.time = original_time
+
+    entry = json.loads(json_result.stdout)["daemons"][0]
+    assert entry["idle_seconds"] == 10.0
+    assert "idle 0m10s" in _daemon_status_line(text_result, target)
+
+
+def test_daemon_status_never_served_target_has_no_idle_age(
+    cli: CliRunner, live_daemon: None
+) -> None:
+    target = _target()
+    _start_daemon(target)
+
+    text_result = invoke(cli, "daemon", "status", "mock")
+    json_result = invoke(cli, "daemon", "status", "mock", "--json")
+    row = _daemon_status_line(text_result, target)
+    entry = json.loads(json_result.stdout)["daemons"][0]
+
+    assert "idle " not in row
+    assert "· ·" in row
+    assert entry["idle_seconds"] is None
 
 
 def test_daemon_stop_help_describes_force(cli: CliRunner) -> None:

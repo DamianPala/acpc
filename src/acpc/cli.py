@@ -2120,7 +2120,7 @@ def daemon_group() -> None:
 @click.option("--json", "json_mode", is_flag=True, help="Emit the status as JSON.")
 @click.help_option("-h", "--help")
 def daemon_status_command(agent: str | None, json_mode: bool) -> None:
-    """Report each live daemon with its pid, uptime and log path.
+    """Report each live daemon with its pid, uptime, idle age and log path.
 
     Example: ``acpc daemon status --json``
     """
@@ -2137,13 +2137,18 @@ def daemon_status_command(agent: str | None, json_mode: bool) -> None:
         return
     lines = [
         f"{item['target']:<28} pid {item['pid']:<8} up {output.format_duration(item['uptime'])} "
+        f"· {('idle ' + output.format_duration(item['idle_seconds'])) if item['idle_seconds'] is not None else '·':<11} "
         f"· {len(item['sessions'])} sessions · {item['log']}"
         for item in entries
     ]
     _write_stdout("\n".join(lines) + "\n")
 
 
-async def _collect_daemon_status(agent: str | None) -> list[dict[str, Any]]:
+async def _collect_daemon_status(
+    agent: str | None, *, clock: render.Clock | None = None
+) -> list[dict[str, Any]]:
+    now = time.time() if clock is None else clock()
+    session_metas = sessions.list_sessions(clock=lambda: now)
     entries: list[dict[str, Any]] = []
     for target in runner.daemon_targets_for(agent) if agent else runner.all_daemon_targets():
         daemon = await daemon_client.connect(target)
@@ -2154,7 +2159,9 @@ async def _collect_daemon_status(agent: str | None) -> list[dict[str, Any]]:
         finally:
             await daemon.close()
         if reply.get("ok"):
-            entries.append({key: value for key, value in reply.items() if key != "ok"})
+            entry = {key: value for key, value in reply.items() if key != "ok"}
+            entry["idle_seconds"] = render.daemon_idle_seconds(session_metas, target, now=now)
+            entries.append(entry)
     return entries
 
 

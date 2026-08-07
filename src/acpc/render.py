@@ -328,6 +328,22 @@ def _idle_seconds(meta: sessions.SessionMeta, *, now: float) -> float | None:
     return max(0.0, now - last_event)
 
 
+def daemon_idle_seconds(
+    sessions_in: Sequence[sessions.SessionMeta], target: str, *, now: float
+) -> float | None:
+    """Return the target's idle age, or ``None`` when it is not defined."""
+    target_sessions = [meta for meta in sessions_in if meta.target == target]
+    if any(meta.is_active for meta in target_sessions):
+        return None
+    last_finished = max(
+        (meta.finished_at for meta in target_sessions if meta.finished_at is not None),
+        default=None,
+    )
+    if last_finished is None:
+        return None
+    return max(0.0, now - last_finished)
+
+
 def render_status_list(
     sessions_in: Sequence[sessions.SessionMeta],
     *,

@@ -131,7 +131,7 @@ File-based state is a feature: grep it, read fragments selectively, depend on no
 A performance cache, nothing more: it keeps adapters warm so the next turn starts in ~2 s instead of a cold start. Auto-managed — starts on first use, expires after 30 min idle, restarts itself on version skew, heals itself if its adapter dies. One daemon per *target* (agent + home + declared env), so different providers or credentials never share a process. If a daemon cannot start at all, `run` falls back to a direct child and says so on stderr.
 
 ```bash
-acpc daemon status          # pid, uptime, per-target log path
+acpc daemon status          # pid, uptime, idle age, per-target log path
 acpc daemon stop codex      # controlled nuke; beats pkill, which kills mid-task dispatches
 acpc daemon stop codex --force  # ... and take its running sessions down with it
 ```
