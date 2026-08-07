@@ -769,6 +769,7 @@ if begin_section S08-views "status list/detail, log default/--since/--tail/--pro
     assert_contains "log footer (stderr) carries a cursor" "$LAST_ERR" "cursor:"
     assert_not_contains "log stdout does not carry the footer" "$LAST_OUT" "cursor:"
     assert_contains "finished session footer names the answer path" "$LAST_ERR" "answer"
+    assert_contains "finished session footer reports page coverage" "$LAST_ERR" "events "
 
     run_acpc log "$UTIL_ID" --tail 2
     LOG_TAIL_LINES="$(grep -c . <<<"$LAST_OUT" || true)"

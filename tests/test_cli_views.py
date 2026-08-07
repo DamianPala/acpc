@@ -414,7 +414,7 @@ def test_finished_log_footer_carries_exit_code_and_answer_path(cli: CliRunner) -
     )
 
 
-def test_running_log_footer_carries_the_event_count(cli: CliRunner) -> None:
+def test_running_log_footer_carries_the_event_coverage(cli: CliRunner) -> None:
     """A running log footer reports its transcript event count."""
     meta = running_session()
     transcript.Transcript(sessions.transcript_path(meta.session_id)).append(
@@ -423,7 +423,7 @@ def test_running_log_footer_carries_the_event_count(cli: CliRunner) -> None:
 
     result = invoke(cli, "log", meta.session_id)
 
-    assert "-- running" in result.stderr and "1 events" in result.stderr
+    assert "-- running" in result.stderr and "events 1–1 of 1" in result.stderr
 
 
 def test_log_rejects_prose_and_json_together(cli: CliRunner) -> None:

@@ -1428,6 +1428,8 @@ def log_command(
             meta,
             cursor=rendered.next_cursor,
             event_count=event_count,
+            page_start=rendered.first_event,
+            page_end=rendered.last_event,
         )
         _echo_metadata(footer)
     if timed_out:
@@ -1451,7 +1453,7 @@ def _emit_follow_page(
     used: int,
     transcript_path: Path,
     cursor: int,
-) -> tuple[int, int, bool]:
+) -> tuple[int, int, bool, int | None, int | None]:
     """Render one page inside the follow budget.
 
     SPEC `log --follow`: `--max-output` budgets the whole stream, so each page
@@ -1469,7 +1471,13 @@ def _emit_follow_page(
         cursor=cursor,
     )
     _write_stdout(rendered.text)
-    return rendered.next_cursor, used + len(rendered.text.encode("utf-8")), rendered.truncated
+    return (
+        rendered.next_cursor,
+        used + len(rendered.text.encode("utf-8")),
+        rendered.truncated,
+        rendered.first_event,
+        rendered.last_event,
+    )
 
 
 def _follow_start_cursor(
@@ -1512,11 +1520,13 @@ def _follow_log(
     used = 0
     exhausted = False
     timed_out = False
+    page_start: int | None = None
+    page_end: int | None = None
 
     while True:
         page = _read_transcript_page(transcript_file, since=cursor)
         if page.events:
-            cursor, used, exhausted = _emit_follow_page(
+            cursor, used, exhausted, rendered_start, rendered_end = _emit_follow_page(
                 page.events,
                 prose=prose,
                 json_mode=json_mode,
@@ -1525,6 +1535,10 @@ def _follow_log(
                 transcript_path=transcript_path,
                 cursor=cursor,
             )
+            if rendered_start is not None:
+                if page_start is None:
+                    page_start = rendered_start
+                page_end = rendered_end
             if exhausted:
                 break
             continue
@@ -1551,7 +1565,15 @@ def _follow_log(
         if exhausted:
             _echo_metadata(_budget_exhausted_note(meta.session_id, max_output, cursor))
         event_count = _read_transcript_page(transcript_file).next_cursor
-        _echo_metadata(render.format_log_footer(meta, cursor=cursor, event_count=event_count))
+        _echo_metadata(
+            render.format_log_footer(
+                meta,
+                cursor=cursor,
+                event_count=event_count,
+                page_start=page_start,
+                page_end=page_end,
+            )
+        )
     if exhausted:
         raise SystemExit(vocab.EXIT_BUDGET)
     if timed_out:

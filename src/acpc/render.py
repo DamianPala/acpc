@@ -23,6 +23,8 @@ class RenderedEvents:
     next_cursor: int
     truncated: bool
     printed_events: int
+    first_event: int | None = None
+    last_event: int | None = None
 
 
 def _validate_max_output(max_output: int) -> None:
@@ -48,7 +50,12 @@ def _message_snippet(text: str, *, full: bool) -> str:
     normalized = _single_line(text)
     if full or len(normalized) <= 200:
         return normalized
-    return normalized[:197].rstrip() + "..."
+    content_limit = 200 - len("...")
+    head = normalized[:content_limit]
+    boundary = head.rfind(" ")
+    if boundary >= 0:
+        head = head[:boundary]
+    return head.rstrip() + "..."
 
 
 def _event_index(event: Mapping[str, Any], fallback: int) -> int:
@@ -56,7 +63,9 @@ def _event_index(event: Mapping[str, Any], fallback: int) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) else fallback
 
 
-def format_event(event: Mapping[str, Any], *, full_message: bool = False) -> str:
+def format_event(
+    event: Mapping[str, Any], *, full_message: bool = False, continued: bool = False
+) -> str:
     """Format one transcript event as a condensed, single-line view."""
     event_type = str(event.get("type", "event"))
     timestamp = _event_timestamp(event)
@@ -70,11 +79,17 @@ def format_event(event: Mapping[str, Any], *, full_message: bool = False) -> str
         "usage": "usage ",
     }
     label = labels.get(event_type, f"{event_type} ")
+    if continued and event_type in {"msg", "thought"}:
+        label = f"{event_type} ↪ "
 
     if event_type in {"msg", "thought"}:
         text = str(event.get("text", ""))
         snippet = _message_snippet(text, full=full_message)
-        return f"[{timestamp}] {label}{json.dumps(snippet, ensure_ascii=False)} ({len(text)} chars)"
+        char_count = ""
+        if len(text) >= 1024:
+            compact_count = format_tokens(len(text)).removesuffix(" tok")
+            char_count = f" ({compact_count} chars)"
+        return f"[{timestamp}] {label}{json.dumps(snippet, ensure_ascii=False)}{char_count}"
     if event_type == "tool":
         name = _single_line(event.get("name", "tool"))
         args = _single_line(event.get("args_summary", ""))
@@ -137,6 +152,25 @@ def _json_line(event: Mapping[str, Any]) -> str:
     return json.dumps(dict(event), ensure_ascii=False, separators=(",", ":")) + "\n"
 
 
+def _continues_message(events: Sequence[Mapping[str, Any]], index: int) -> bool:
+    if index == 0:
+        return False
+    current = events[index]
+    previous = events[index - 1]
+    current_type = current.get("type")
+    if current_type not in {"msg", "thought"} or previous.get("type") != current_type:
+        return False
+    current_index = current.get("i")
+    previous_index = previous.get("i")
+    return (
+        isinstance(current_index, int)
+        and not isinstance(current_index, bool)
+        and isinstance(previous_index, int)
+        and not isinstance(previous_index, bool)
+        and current_index == previous_index + 1
+    )
+
+
 def render_events(
     events: Sequence[Mapping[str, Any]],
     *,
@@ -180,7 +214,11 @@ def render_events(
         rendered = (
             _prose_event(event)
             if prose
-            else format_event(event, full_message=index == last_message_index)
+            else format_event(
+                event,
+                full_message=index == last_message_index,
+                continued=_continues_message(events, index),
+            )
         )
         if (
             prose
@@ -199,6 +237,8 @@ def render_events(
     output = ""
     next_cursor = cursor
     printed_events = 0
+    first_event: int | None = None
+    last_event: int | None = None
     marker = _truncation_marker(transcript_path)
     for index, (event_cursor, unit) in enumerate(entries):
         if not unit:
@@ -212,17 +252,21 @@ def render_events(
             output += unit
             next_cursor = event_cursor
             printed_events += 1
+            if first_event is None:
+                first_event = event_cursor
+            last_event = event_cursor
             continue
 
         if not output:
             output = _text_with_marker(unit, max_output, marker)
             next_cursor = event_cursor
             printed_events += 1
+            first_event = last_event = event_cursor
         else:
             output += marker
-        return RenderedEvents(output, next_cursor, True, printed_events)
+        return RenderedEvents(output, next_cursor, True, printed_events, first_event, last_event)
 
-    return RenderedEvents(output, next_cursor, False, printed_events)
+    return RenderedEvents(output, next_cursor, False, printed_events, first_event, last_event)
 
 
 def _render_json_events(
@@ -235,6 +279,8 @@ def _render_json_events(
     output = ""
     next_cursor = cursor
     printed_events = 0
+    first_event: int | None = None
+    last_event: int | None = None
     for index, event in enumerate(events):
         event_cursor = _event_index(event, next_cursor)
         line = _json_line(event)
@@ -246,6 +292,9 @@ def _render_json_events(
             output += line
             next_cursor = event_cursor
             printed_events += 1
+            if first_event is None:
+                first_event = event_cursor
+            last_event = event_cursor
             continue
 
         # A partial JSON object would make the stream unusable.  The marker is
@@ -255,9 +304,9 @@ def _render_json_events(
         output += marker
         if not had_output:
             next_cursor = event_cursor
-        return RenderedEvents(output, next_cursor, True, printed_events)
+        return RenderedEvents(output, next_cursor, True, printed_events, first_event, last_event)
 
-    return RenderedEvents(output, next_cursor, False, printed_events)
+    return RenderedEvents(output, next_cursor, False, printed_events, first_event, last_event)
 
 
 def format_log_footer(
@@ -265,12 +314,17 @@ def format_log_footer(
     *,
     cursor: int,
     event_count: int = 0,
+    page_start: int | None = None,
+    page_end: int | None = None,
     runtime: float | None = None,
     clock: Clock | None = None,
 ) -> str:
     """Format the stderr footer for a log page."""
     if runtime is None:
         runtime = sessions.runtime_seconds(meta, clock=clock)
+    if page_start is None or page_end is None:
+        page_start = page_end = 0
+    coverage = f"events {page_start}–{page_end} of {event_count}"
     if meta.is_finished:
         qualifier = f" exit {meta.exit_code}" if meta.exit_code is not None else ""
         parts = [
@@ -282,8 +336,8 @@ def format_log_footer(
     else:
         parts = [
             f"{meta.state} {format_duration(runtime)}",
-            f"{event_count} events",
         ]
+    parts.append(coverage)
     parts.append(f"cursor: {cursor}")
     return "-- " + " | ".join(parts)
 

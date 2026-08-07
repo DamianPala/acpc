@@ -43,7 +43,7 @@ def event(index: int, event_type: str, **fields: object) -> dict[str, object]:
     return {"i": index, "ts": 1_700_000_000, "type": event_type, **fields}
 
 
-def test_condensed_events_include_tool_details_and_message_length() -> None:
+def test_condensed_events_include_tool_details_and_omit_routine_message_length() -> None:
     events = [
         event(
             1,
@@ -63,9 +63,135 @@ def test_condensed_events_include_tool_details_and_message_length() -> None:
     assert '"pytest -x"' in result.text
     assert "exit 1" in result.text
     assert "2.3s" in result.text
-    assert '"short message" (13 chars)' in result.text
+    assert '"short message"' in result.text
+    assert "(13 chars)" not in result.text
     assert "permission denied: write outside cwd" in result.text
     assert result.next_cursor == 3
+
+
+def _message_snippet(line: str, label: str = "msg   ") -> str:
+    return json.loads(line.split(label, 1)[1])
+
+
+def test_message_snippet_snaps_to_the_last_word_boundary() -> None:
+    text = ("word " * 60).strip()
+
+    line = render.format_event(event(1, "msg", text=text))
+
+    assert _message_snippet(line) == ("word " * 39).strip() + "..."
+
+
+def test_message_snippet_hard_cuts_a_single_oversized_token() -> None:
+    text = "x" * 300
+
+    line = render.format_event(event(1, "msg", text=text))
+
+    assert _message_snippet(line) == "x" * 197 + "..."
+
+
+def test_message_snippet_does_not_split_a_multibyte_character() -> None:
+    text = "🙂" * 300
+
+    line = render.format_event(event(1, "msg", text=text))
+    snippet = _message_snippet(line)
+
+    assert snippet == "🙂" * 197 + "..."
+    snippet.encode("utf-8").decode("utf-8")
+
+
+def test_message_length_is_only_reported_for_oversized_chunks() -> None:
+    short = render.format_event(event(1, "msg", text="x" * 1023))
+    large = render.format_event(event(2, "msg", text="x" * 1024))
+
+    assert "chars" not in short
+    assert "(1k chars)" in large
+
+
+def test_continuation_marker_marks_adjacent_same_type_events() -> None:
+    events = [
+        event(1, "msg", text="first"),
+        event(2, "msg", text="second"),
+        event(3, "thought", text="thinking"),
+        event(4, "thought", text="still thinking"),
+    ]
+
+    lines = render.render_events(events).text.splitlines()
+
+    assert "msg ↪" not in lines[0]
+    assert "msg ↪" in lines[1]
+    assert "thought ↪" not in lines[2]
+    assert "thought ↪" in lines[3]
+
+
+@pytest.mark.parametrize("separator", ["tool", "thought", "state", "usage"])
+def test_continuation_marker_stops_at_an_intervening_event(separator: str) -> None:
+    events = [
+        event(1, "msg", text="first"),
+        event(2, separator, text="intervening"),
+        event(3, "msg", text="second"),
+    ]
+
+    msg_lines = [line for line in render.render_events(events).text.splitlines() if "msg" in line]
+
+    assert len(msg_lines) == 2
+    assert "msg ↪" not in msg_lines[1]
+
+
+def test_first_event_in_a_page_is_not_marked_as_a_continuation() -> None:
+    events = [event(10, "msg", text="page starts here"), event(11, "msg", text="continues")]
+
+    lines = render.render_events(events, cursor=9).text.splitlines()
+
+    assert "msg ↪" not in lines[0]
+    assert "msg ↪" in lines[1]
+
+
+def test_continuation_marker_requires_consecutive_event_indices() -> None:
+    events = [event(10, "msg", text="first"), event(12, "msg", text="gap")]
+
+    lines = render.render_events(events).text.splitlines()
+
+    assert "msg ↪" not in lines[1]
+
+
+def test_footer_reports_the_range_actually_printed_for_each_window() -> None:
+    meta = sessions.transition(
+        make_session().session_id,
+        "running",
+        clock=lambda: 100.0,
+        pid=123,
+        process_start_time="token",
+    )
+    events = [event(index, "msg", text=f"event-{index}") for index in range(1, 26)]
+
+    windows = [
+        (events[-20:], 5, 0, "6–25 of 25"),
+        (events[-2:], 23, 0, "24–25 of 25"),
+        (events[10:], 10, 0, "11–25 of 25"),
+        (
+            [
+                event(1, "msg", text="first"),
+                event(2, "msg", text="x" * 500),
+                event(3, "msg", text="last"),
+            ],
+            0,
+            200,
+            "1–1 of 3",
+        ),
+        (events, 0, 0, "1–25 of 25"),
+    ]
+
+    for selected, cursor, max_output, expected in windows:
+        rendered = render.render_events(selected, cursor=cursor, max_output=max_output)
+        footer = render.format_log_footer(
+            meta,
+            cursor=rendered.next_cursor,
+            event_count=25 if expected != "1–1 of 3" else 3,
+            page_start=rendered.first_event,
+            page_end=rendered.last_event,
+            runtime=192.0,
+        )
+        assert f"events {expected}" in footer
 
 
 def test_prose_keeps_messages_full_and_errors_but_filters_tools() -> None:
@@ -161,7 +287,14 @@ def test_log_footer_groups_state_qualifier_and_matches_spec() -> None:
         pid=123,
         process_start_time="token",
     )
-    running_footer = render.format_log_footer(running, cursor=45, event_count=45, runtime=192.0)
+    running_footer = render.format_log_footer(
+        running,
+        cursor=45,
+        event_count=45,
+        page_start=26,
+        page_end=45,
+        runtime=192.0,
+    )
     done = sessions.transition(
         meta.session_id,
         "done",
@@ -171,12 +304,19 @@ def test_log_footer_groups_state_qualifier_and_matches_spec() -> None:
         tokens=41_000,
         cost=0.42,
     )
-    done_footer = render.format_log_footer(done, cursor=45, event_count=45, runtime=192.0)
+    done_footer = render.format_log_footer(
+        done,
+        cursor=45,
+        event_count=45,
+        page_start=26,
+        page_end=45,
+        runtime=192.0,
+    )
 
-    assert running_footer == "-- running 3m12s | 45 events | cursor: 45"
+    assert running_footer == "-- running 3m12s | events 26–45 of 45 | cursor: 45"
     assert done_footer == (
-        f"-- done exit 0 | 3m12s | 41k tok | answer: "
-        f"{sessions.answer_path(done.session_id)} | cursor: 45"
+        f"-- done exit 0 | 3m12s | 41k tok | answer: {sessions.answer_path(done.session_id)} "
+        "| events 26–45 of 45 | cursor: 45"
     )
 
 
