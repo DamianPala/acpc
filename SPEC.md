@@ -95,7 +95,7 @@ model        claude-sonnet-5 (adapter default)
 effort       high (adapter default)
 permissions  prompt on TTY, read otherwise (unset)
 home         ~/.claude (default)
-modes        default · acceptEdits · plan · bypassPermissions
+modes        auto · default · acceptEdits · plan · dontAsk · bypassPermissions
 models       4 · claude-opus-5 · claude-sonnet-5 · claude-haiku-4-5 · …   (--models for all)
 commands     52 · /review · /init · /compact · …          (--commands for all)
 variants     none
