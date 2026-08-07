@@ -326,12 +326,20 @@ def _guard_bypass_mode(mode: str | None, policy: str, resolution: CallResolution
 
 
 def _tty_permission_prompt(kind: str, title: str) -> bool:
-    """Ask the human on /dev/tty — never on stdin (SPEC *Output contract*)."""
+    """Ask the human on /dev/tty — never on stdin (SPEC *Output contract*).
+
+    The terminal is opened twice, once per direction: a single "r+" handle
+    raises `io.UnsupportedOperation: File or stream is not seekable`, which is
+    an OSError and would be caught below as a silent denial.
+    """
     try:
-        with open("/dev/tty", "r+", encoding="utf-8") as tty:
-            tty.write(f"acpc: allow {kind}? {title} [y/N] ")
-            tty.flush()
-            return tty.readline().strip().lower() in {"y", "yes"}
+        with (
+            open("/dev/tty", "w", encoding="utf-8") as ask,
+            open("/dev/tty", encoding="utf-8") as answer,
+        ):
+            ask.write(f"acpc: allow {kind}? {title} [y/N] ")
+            ask.flush()
+            return answer.readline().strip().lower() in {"y", "yes"}
     except OSError:
         return False
 

@@ -2,6 +2,7 @@
 
 import json
 import os
+import pty
 import queue
 import subprocess
 import sys
@@ -226,6 +227,46 @@ def test_permissions_prompt_without_a_terminal_is_a_usage_error(cli: CliRunner) 
 
     assert result.exit_code == vocab.EXIT_USAGE
     assert "terminal" in result.stderr
+
+
+def _ask_under_a_pty(answer: str) -> tuple[bool, str]:
+    """Run the prompt in a child that owns a real controlling terminal.
+
+    `pty.fork` is the only way to exercise the `/dev/tty` branch: the prompt
+    deliberately ignores stdin, so redirecting it proves nothing.
+    """
+    child = (
+        "import sys; from acpc.cli import _tty_permission_prompt as ask; "
+        "sys.exit(0 if ask('edit', 'Write blocked.md') else 1)"
+    )
+    pid, fd = pty.fork()
+    if pid == 0:  # pragma: no cover - replaced by execv in the child
+        os.execv(sys.executable, [sys.executable, "-c", child])
+    os.write(fd, answer.encode())
+    asked = b""
+    try:
+        while chunk := os.read(fd, 1024):
+            asked += chunk
+    except OSError:
+        pass  # EIO is how a pty master reports the child closing its end
+    finally:
+        os.close(fd)
+    return os.waitpid(pid, 0)[1] == 0, asked.decode(errors="replace")
+
+
+# forkpty warns about threads (xdist runs us multi-threaded); the child execs at once.
+@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
+@pytest.mark.parametrize(
+    ("answer", "allowed"),
+    [("y\n", True), ("yes\n", True), ("n\n", False), ("\n", False)],
+)
+def test_the_tty_prompt_asks_on_the_terminal_and_reads_the_answer(
+    answer: str, allowed: bool
+) -> None:
+    granted, asked = _ask_under_a_pty(answer)
+
+    assert granted is allowed
+    assert "acpc: allow edit? Write blocked.md [y/N]" in asked
 
 
 def test_default_policy_denials_are_visible_and_persisted(cli: CliRunner, state_root: Path) -> None:

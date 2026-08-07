@@ -127,7 +127,7 @@ D2 shipped broken in 0.2 and was caught by review, not tests. Measure it.
 | E1 | `--permissions read` with a prompt that writes a file | Turn ends normally, exit 0, file **not** created — the documented silent read-only trap |
 | E2 | `acpc log <id>` after E1 | A `permission` event per decision with the denial visible; never filtered from any view |
 | E3 | `--permissions none` | Every request denied, turn still ends cleanly |
-| E4 | `--permissions prompt` on a real TTY (tier 2, human present) | A human is actually asked on `/dev/tty`; same flag non-TTY → usage error exit 2, not a downgrade |
+| E4 | `--permissions prompt` on a real TTY (tier 2, human present) | A human is actually asked on `/dev/tty`; same flag non-TTY → usage error exit 2, not a downgrade. The asking mechanism itself is now covered in pytest under `pty.fork`, after a skipped E4 let a broken prompt ship in 0.4.0 — this check is only about a real vendor's requests reaching it |
 | E5 | `--mode <bypass mode>` without `--permissions all` | Rejected at parse time, exit 2, naming the rule |
 
 ## F. Failure paths (tier 1)
