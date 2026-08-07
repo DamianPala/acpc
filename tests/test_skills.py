@@ -162,13 +162,15 @@ def test_json_views_include_paths_body_and_null_description(
     assert detail.exit_code == vocab.EXIT_OK
     list_payload = json.loads(listed.stdout)
     detail_payload = json.loads(detail.stdout)
-    assert list_payload == [
-        {
-            "name": "json-skill",
-            "description": None,
-            "path": str(directory),
-        }
-    ]
+    assert list_payload == {
+        "skills": [
+            {
+                "name": "json-skill",
+                "description": None,
+                "path": str(directory),
+            }
+        ]
+    }
     assert detail_payload == {
         "name": "json-skill",
         "description": None,

@@ -1105,8 +1105,7 @@ def _run_skills_view(name: str | None, *, json_mode: bool) -> None:
     if name is None:
         bundled = skills.list_skills()
         if json_mode:
-            payload = [_skill_payload(skill, include_body=False) for skill in bundled]
-            _write_stdout(json.dumps(payload, ensure_ascii=False) + "\n")
+            _emit_json({"skills": [_skill_payload(skill, include_body=False) for skill in bundled]})
             return
         rows = render.format_table(
             [_skill_row(skill) for skill in bundled],

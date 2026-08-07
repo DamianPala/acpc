@@ -462,7 +462,7 @@ Entry TOMLs are trusted at the level of shell config: an adapter definition name
 
 ## Bundled skills
 
-`acpc skills` lists the skills bundled in the package; `acpc skills <name>` prints one skill's body. The source is bundled-only: readable `SKILL.md` files directly under `data/skills/*` are served, and the directory name wins over any frontmatter `name` — it is what the filesystem can be trusted about, and it is what `skills <name>` takes. In the detail view the body is verbatim on stdout, byte-identical to the file below the frontmatter, and the skill directory rides on stderr as `-- skill <name> | dir <path>` — which is how a caller finds `references/` without a flag for it. Both views accept `--json`; the list emits an array and the detail view adds `body`. An unknown name is a usage error (exit 2) pointing at `acpc skills`.
+`acpc skills` lists the skills bundled in the package; `acpc skills <name>` prints one skill's body. The source is bundled-only: readable `SKILL.md` files directly under `data/skills/*` are served, and the directory name wins over any frontmatter `name` — it is what the filesystem can be trusted about, and it is what `skills <name>` takes. In the detail view the body is verbatim on stdout, byte-identical to the file below the frontmatter, and the skill directory rides on stderr as `-- skill <name> | dir <path>` — which is how a caller finds `references/` without a flag for it. Both views accept `--json`; the list emits `{"skills": [...]}` like every other list view, and the detail view adds `body`. An unknown name is a usage error (exit 2) pointing at `acpc skills`.
 
 ## Output contract
 
