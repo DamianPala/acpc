@@ -1143,7 +1143,10 @@ if begin_section S12-cli "help contract, -V, TTY rules, hostile inputs"; then
         "Steering a running session" "Context care" "Maintenance and setup" "Common commands"; do
         assert_contains "cheat sheet groups by task: '$group'" "$HELP_MAIN" "$group"
     done
-    assert_contains "cheat sheet says content is read from disk" "$HELP_MAIN" "answer.md from disk"
+    assert_contains "cheat sheet says wait already prints the answer" \
+        "$HELP_MAIN" "block until done, prints the answer"
+    assert_contains "cheat sheet frames the file read as the fallback" \
+        "$HELP_MAIN" "Truncated or huge answer?"
     assert_contains "cheat sheet warns that killing acpc leaves the session running" \
         "$HELP_MAIN" "acpc stop does."
     assert_contains "cheat sheet frames --follow as the supervision case" \

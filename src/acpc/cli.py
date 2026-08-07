@@ -93,8 +93,8 @@ Short task (fits your tool-call window — blocks, answer on stdout):
 
 Long or uncertain task (background):
   acpc run <agent> "Run the tests" --bg --json    # {"session_id": ..., "paths": ...}
-  acpc wait <id> --quiet                          # block until done
-  Content: read <dir>/answer.md from disk, selectively — always complete.
+  acpc wait <id> --quiet                          # block until done, prints the answer
+  Truncated or huge answer? Read <dir>/answer.md selectively — always complete.
   In a shell that can background calls, `wait` becomes a completion push.
 
 Checking on a run:
