@@ -109,6 +109,22 @@ The `home` field is the provider switch: OpenAI vs OpenRouter vs a local endpoin
 
 `--model fast|standard|max` resolves through the adapter's preset table (overridable per adapter in `agents/`). The adapter's environment is **constructed, not inherited**: a base system set, capability variables (ssh agent, proxies, CA bundles), and the entry's declared env — the rest of your ambient environment never reaches the adapter.
 
+## Teaching agents about acpc
+
+acpc documents itself: the root `--help` is a complete cheat sheet, and every command's `--help` names its own defaults. Don't copy usage documentation into your agent instructions — it goes stale the first time a flag moves, and the copy is what the agent will believe.
+
+Add only the routing knowledge an agent cannot infer from the tool, e.g. in your global `AGENTS.md`:
+
+```markdown
+## acpc — dispatch external coding agents (codex, claude, agy)
+- Models available in your harness's own subagent tool → use that tool.
+  acpc is for external agents only.
+- First contact: `acpc --help` (complete cheat sheet).
+- Entries and what each is for: `acpc agents`.
+```
+
+Give every entry in `~/.acpc/agents/` a one-line `description`. `acpc agents` prints it beside each entry, so an agent reading the roster learns what `builder` is *for* from the tool rather than from documentation you have to keep in sync.
+
 ## State on disk
 
 ```
