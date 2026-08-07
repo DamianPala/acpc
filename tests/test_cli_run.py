@@ -387,10 +387,25 @@ def test_an_entry_bypass_mode_is_rejected_at_resolution(cli: CliRunner, state_ro
 
     assert result.exit_code == vocab.EXIT_USAGE
     assert (
-        "agent 'unsafe' sets mode yolo, which bypasses permission requests on mock; "
+        f"agent 'unsafe' resolves mode yolo ({state_root / 'agents' / 'unsafe.toml'}), "
+        "which bypasses permission requests on mock; "
         "it is only accepted with --permissions all"
     ) in result.stderr
     assert not (state_root / "sessions").exists()
+
+
+def test_an_inherited_bypass_mode_names_the_file_that_pins_it(
+    cli: CliRunner, state_root: Path
+) -> None:
+    """The entry named on the command line is not where the mode lives."""
+    agents = state_root / "agents"
+    (agents / "parent.toml").write_text('extends = "mock"\nmode = "yolo"\n', encoding="utf-8")
+    (agents / "child.toml").write_text('extends = "parent"\n', encoding="utf-8")
+
+    result = invoke(cli, "run", "child", "probe", "--permissions", "write")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert f"agent 'child' resolves mode yolo ({agents / 'parent.toml'})" in result.stderr
 
 
 def test_an_entry_bypass_mode_is_accepted_with_permissions_all(

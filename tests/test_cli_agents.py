@@ -9,6 +9,7 @@ from click.testing import CliRunner
 
 from acpc import cache, vocab
 from acpc.cli import main
+from acpc.registry import AgentRegistry
 
 MOCK_AGENT_SCRIPT = str(Path(__file__).with_name("mock_agent.py"))
 
@@ -479,6 +480,8 @@ def test_agents_init_writes_the_requested_variant_fields(cli: CliRunner, state_r
         "mock-opus-5",
         "--effort",
         "xhigh",
+        "--mode",
+        "plan",
         "--permissions",
         "write",
         "--home",
@@ -489,6 +492,8 @@ def test_agents_init_writes_the_requested_variant_fields(cli: CliRunner, state_r
     created = (state_root / "agents" / "smoke-variant.toml").read_text(encoding="utf-8")
     assert 'extends = "mock"' in created
     assert 'permissions = "write"' in created
+    assert 'mode = "plan"' in created
+    assert AgentRegistry(state_root / "agents").resolve("smoke-variant").mode == "plan"
 
 
 def test_install_returns_one_for_a_failed_definition_command(cli: CliRunner) -> None:

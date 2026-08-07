@@ -320,14 +320,19 @@ def _guard_bypass_mode(policy: str, resolution: CallResolution) -> None:
     if mode is None or policy == "all":
         return
     if mode in resolution.entry.bypass_modes:
-        if resolution.provenance.get("mode", FieldSource("unset")).kind == "call":
+        source = resolution.provenance.get("mode", FieldSource("unset"))
+        if source.kind == "call":
             raise UsageProblem(
                 f"--mode {mode} bypasses permission requests on {resolution.entry.entry}; "
                 "it is only accepted with --permissions all"
             )
+        # An inherited mode is pinned in a parent's file, not the entry named on
+        # the command line, so naming only the entry sends the reader to the
+        # wrong TOML. Provenance already knows which one to edit.
+        where = f" ({source.path})" if source.path is not None else ""
         raise UsageProblem(
-            f"agent '{resolution.entry.entry}' sets mode {mode}, which bypasses permission "
-            f"requests on {resolution.entry.base_adapter}; "
+            f"agent '{resolution.entry.entry}' resolves mode {mode}{where}, which bypasses "
+            f"permission requests on {resolution.entry.base_adapter}; "
             "it is only accepted with --permissions all"
         )
 
@@ -1057,7 +1062,7 @@ def _agents_check(registry: AgentRegistry, name: str | None, *, json_mode: bool)
 )
 @click.option("--model", metavar="M", help="Default model or preset for the variant.")
 @click.option("--effort", metavar="E", help="Default reasoning effort for the variant.")
-@click.option("--mode", metavar="M", help="Default operating mode for the variant.")
+@click.option("--mode", metavar="MODE", help="Default operating mode for the variant.")
 @click.option(
     "--permissions",
     type=click.Choice(vocab.PERMISSION_VALUES),

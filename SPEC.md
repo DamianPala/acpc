@@ -40,7 +40,7 @@ Command reference below is alphabetical. Sections open with their synopsis; `--j
 
 ```
 agents [name] [--models | --commands | --check]
-agents init <name> --extends <agent> [--model M] [--effort E] [--mode M] [--permissions P] [--home DIR]
+agents init <name> --extends <agent> [--model M] [--effort E] [--mode MODE] [--permissions P] [--home DIR]
 ```
 
 | Option | Purpose |
@@ -286,11 +286,11 @@ effort       xhigh (adapter default)
 mode         · (unset)
 permissions  read (unset)
 home         ~/.codex (adapter default)
-cwd          /home/haz/ai/lab/projects/acpc-mode
+cwd          ~/repo
 passthrough  CODEX_HOME · CODEX_PATH · CODEX_CONFIG · MODEL_PROVIDER · CODEX_API_KEY · OPENAI_API_KEY · INITIAL_AGENT_MODE
 
 $ acpc run codex "probe" --dry-run --json
-{"entry": "codex", "base_adapter": "codex", "command": "codex-acp", "cwd": "/home/haz/ai/lab/projects/acpc-mode", "env": {}, "env_passthrough": ["CODEX_HOME", "CODEX_PATH", "CODEX_CONFIG", "MODEL_PROVIDER", "CODEX_API_KEY", "OPENAI_API_KEY", "INITIAL_AGENT_MODE"], "resolved": {"model": {"value": "gpt-5.6-terra", "source": "adapter default"}, "effort": {"value": "xhigh", "source": "adapter default"}, "mode": {"value": null, "source": "unset"}, "permissions": {"value": "read", "source": "unset"}, "home": {"value": "~/.codex", "source": "adapter default"}}}
+{"entry": "codex", "base_adapter": "codex", "command": "codex-acp", "cwd": "~/repo", "env": {}, "env_passthrough": ["CODEX_HOME", "CODEX_PATH", "CODEX_CONFIG", "MODEL_PROVIDER", "CODEX_API_KEY", "OPENAI_API_KEY", "INITIAL_AGENT_MODE"], "resolved": {"model": {"value": "gpt-5.6-terra", "source": "adapter default"}, "effort": {"value": "xhigh", "source": "adapter default"}, "mode": {"value": null, "source": "unset"}, "permissions": {"value": "read", "source": "unset"}, "home": {"value": "~/.codex", "source": "adapter default"}}}
 ```
 
 | Option | Purpose |

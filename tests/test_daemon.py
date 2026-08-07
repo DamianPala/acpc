@@ -81,6 +81,49 @@ def next_turn(session_id: str, prompt: str) -> runner.TurnOutcome:
     return run_turn(session_id, prompt, resume_adapter_session=resumed)
 
 
+def dispatch_payload(prompt: str = "x") -> dict:
+    return runner.daemon_payload(runner.TurnRequest(resolution=resolve(), prompt=prompt))
+
+
+def rebuild(payload: dict) -> runner.TurnRequest:
+    return daemon.Daemon(target())._rebuild_request(payload)
+
+
+# --- rebuilding a dispatched turn -------------------------------------------
+
+
+def test_a_rebuilt_turn_ignores_a_mode_the_entry_gained_after_dispatch(
+    state_root: Path,
+) -> None:
+    """SPEC: editing an entry never changes a session mid-conversation.
+
+    `mode` is the only resolved field legitimately `None`, so it is the one an
+    entry can reclaim if the daemon reads `None` as "not set on this call".
+    """
+    payload = dispatch_payload()
+    assert payload["mode"] is None
+
+    (state_root / "agents" / "mock.toml").write_text(
+        MOCK_ENTRY.replace("[presets]", 'mode = "plan"\n\n[presets]'), encoding="utf-8"
+    )
+
+    assert rebuild(payload).resolution.mode is None
+
+
+def test_a_bypass_mode_reaching_the_daemon_fails_the_turn(state_root: Path) -> None:
+    """Backstop only: arriving here at all means the CLI guard was evaded."""
+    payload = dispatch_payload() | {"mode": "yolo", "permissions": "read"}
+
+    with pytest.raises(daemon.DaemonError, match="bypasses permission requests"):
+        rebuild(payload)
+
+
+def test_a_bypass_mode_under_permissions_all_still_rebuilds(state_root: Path) -> None:
+    payload = dispatch_payload() | {"mode": "yolo", "permissions": "all"}
+
+    assert rebuild(payload).resolution.mode == "yolo"
+
+
 # --- routing ----------------------------------------------------------------
 
 

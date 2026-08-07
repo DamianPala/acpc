@@ -30,7 +30,7 @@ import functools
 import os
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -515,19 +515,37 @@ class Daemon:
     def _rebuild_request(self, payload: dict[str, Any]) -> runner.TurnRequest:
         """Rebuild the turn from the small serializable shape the client sent.
 
-        The entry is re-resolved here rather than shipped whole: the daemon
-        reads the same `ACPC_HOME` as its client, so resolving by name plus the
-        call's own overrides is both smaller on the wire and impossible to
-        desynchronize from the registry.
+        The entry is looked up here rather than shipped whole — the daemon
+        reads the same `ACPC_HOME` as its client, so the adapter contract
+        (command, env, bypass list) is smaller on the wire as a name. The
+        *resolved* fields are then taken from the payload verbatim, never
+        re-derived from the entry: the client already resolved them and
+        `meta.json` stored them, and SPEC's "editing an entry never changes a
+        session mid-conversation" holds only if this side agrees. Passing them
+        back as overrides would not, because an override of `None` reads as
+        "not set on this call" and hands the decision back to the entry file —
+        which for `mode`, the one field whose resolved value is legitimately
+        `None`, silently adopts whatever the entry says at *this* moment.
+
+        Provenance is deliberately left as the lookup produced it: nothing on
+        this path reads it, `session_resolution` runs client-side at dispatch.
         """
-        resolution = AgentRegistry().resolve_call(
-            payload["entry"],
+        resolution = replace(
+            AgentRegistry().resolve_call(payload["entry"]),
             model=payload.get("model"),
             effort=payload.get("effort"),
             mode=payload.get("mode"),
             permissions=payload.get("permissions"),
             home=payload.get("home"),
         )
+        # Backstop, not the gate: the CLI refuses this combination at
+        # resolution time. If one ever reaches a daemon the policy has already
+        # been evaded, so fail the turn rather than set the mode.
+        if resolution.mode in resolution.entry.bypass_modes and resolution.permissions != "all":
+            raise DaemonError(
+                f"mode {resolution.mode} bypasses permission requests on "
+                f"{resolution.entry.entry} under policy {resolution.permissions}"
+            )
         return runner.TurnRequest(
             resolution=resolution,
             prompt=payload.get("prompt", ""),

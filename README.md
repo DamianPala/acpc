@@ -43,7 +43,7 @@ wait <id> [--timeout S]    # block until done, print the answer
 stop <id>
 rm <id> | prune [--older-than D] [--dry-run]
 agents [name] [--models|--commands|--check]   # adapters + variants; resolved definitions
-agents init <name> --extends <agent> [--mode M]  # scaffold a variant
+agents init <name> --extends <agent>          # scaffold a variant
 install <agent>
 daemon status|stop [target] [--force]   # plumbing escape hatch — never needed in the happy path
 ```
