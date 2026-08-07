@@ -125,6 +125,18 @@ Add only the routing knowledge an agent cannot infer from the tool, e.g. in your
 
 Give every entry in `~/.acpc/agents/` a one-line `description`. `acpc agents` prints it beside each entry, so an agent reading the roster learns what `builder` is *for* from the tool rather than from documentation you have to keep in sync.
 
+If your roster is stable, add a purpose table so the agent knows the roles before its first call — this is routing knowledge, not usage documentation:
+
+```markdown
+| Entry | For |
+|-------|-----|
+| builder | implements against an existing plan |
+| explorer | cheap read-only research |
+| codex | the real vendor CLI for heavier work |
+```
+
+Keep it to purpose only. Models, efforts and flags belong to the tool — `acpc agents` always shows the current truth.
+
 ## State on disk
 
 ```
