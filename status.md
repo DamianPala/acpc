@@ -126,7 +126,13 @@ Stage 3 was complete through section 4 when the branch went to the gate. Accepta
 
 ## Next
 
-### 0.4.1 — the mode is invisible (planned 2026-08-07, `v0.4.0` stays where it is)
+### 0.4.1 — the mode is invisible (**S1/S2/S4 released as `v0.4.1` 2026-08-07**; S3 open)
+
+**Released.** `main` fast-forwarded to the slice tip (no merge commit — commitlint rejects them), bumped and tagged `v0.4.1`, `uv tool install --force`, daemons stopped, slice worktree and branch deleted. `v0.4.0` left where it was, per the decision below. The bump commit carries `uv.lock` this time: 0.4.0's touched only `pyproject.toml`, so the lock sat a version behind and dirtied the tree on every `uv run` — which cost a reviewer real time.
+
+Two checks on the *installed* binary rather than the source tree: an entry carrying `mode = "read-only"` now resolves and renders `mode read-only (entry)`, where 0.4.0 refused it as an unknown key; and **E4 was finally run for real** — under a PTY, `y`/`n`/`y` to edit/execute/delete mapped exactly onto allowed/denied. That is the check whose skipping let the broken prompt ship.
+
+Bar at release: 618 pytest, ruff check + format, pyright 0 errors. Slice A went through two Opus review rounds, both of which found a real must-fix (see the fix commits); every new guard was mutation-checked red.
 
 One theme, found by probing `session/new` raw during a `/dev/tty` post-mortem: **the mode decides whether permission requests exist at all, and acpc neither pins it, stores it, nor shows it.** Measured that day — claude ships `default` but `~/.claude/settings.json` `defaultMode` overrides it (Damian's is `dontAsk`, which denies without ever asking); codex's default `agent` auto-allows workspace edits without asking. Both make `--permissions` inert, at opposite ends, silently. `builder-deepseek` works only because its own `home` happens to carry no `defaultMode`.
 
@@ -137,7 +143,9 @@ One theme, found by probing `session/new` raw during a `/dev/tty` post-mortem: *
 | S3 | Keep `current_mode_id` from `session/new` instead of dropping it, plus a new adapter fact listing modes that emit no permission requests (codex `agent`; claude `dontAsk`, `auto`). One stderr note when the policy is below `all` and the session starts in one | `client.py:136-142`, `data/agents/*.toml` |
 | S4 | **Landed 2026-08-07.** Claude's vendor facts refreshed live: six modes, `auto · default · acceptEdits · plan · dontAsk · bypassPermissions`, and `auto` joins `bypass_modes` — a model classifier answers the prompts, so no request reaches acpc, which is exactly the evasion the list exists for. `dontAsk` stays off it: it emits nothing either, but denies rather than allows | `data/agents/claude.toml`, SPEC:98 |
 
-Order: S4 (done) → S3 (supplies the fact S1's note needs) → S1+S2 together, since S1 without S2 opens a hole.
+Order as run: S4 → S1+S2 (dispatched as one slice, since S1 without S2 opens a hole) → S3 still open. Two defects came out of review rather than tests, both in the daemon: it re-resolved a rebuilt turn's fields through the entry file, where an override of `None` reads as "not set on this call" — so an entry that gained a `mode` after dispatch reclaimed it on `continue`, past the guard, falsifying the very SPEC line the slice pinned. The backstop added for that then raised past `_start`'s hand-kept `except` tuple and killed the connection instead of replying. Payload values are now final and the seam answers every build failure the same way.
+
+**Still to do after S3:** the six entries in `~/.acpc/agents/` carry no `mode`, because until 0.4.1 the key was a parse error. `explorer` is the one that matters — `permissions = "read"` against codex's `agent` start mode (verified live 2026-08-07 by raw probe), which auto-allows workspace edits without emitting a request, so its policy is decorative and it can write.
 
 **Deliberately not in scope:** giving the shipped `claude` entry its own `home`. It runs on `~/.claude` today, so it inherits the operator's personal permission settings and subscription credentials — but changing that default would break auth for anyone who has already installed acpc, which is not a patch-release move. S3's note surfaces the symptom; home isolation stays a per-entry choice, as `builder-deepseek` already does it.
 
