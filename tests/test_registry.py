@@ -22,7 +22,6 @@ def test_shipped_adapter_facts_and_presets_are_available(tmp_path: Path) -> None
 
     claude = registry.resolve("claude")
     codex = registry.resolve("codex")
-    gemini = registry.resolve("gemini")
 
     assert claude.command_args == ("claude-agent-acp",)
     assert claude.install_command == "npm install -g @agentclientprotocol/claude-agent-acp"
@@ -31,10 +30,6 @@ def test_shipped_adapter_facts_and_presets_are_available(tmp_path: Path) -> None
     assert "bypassPermissions" in claude.bypass_modes
     assert claude.presets["max"].model == "claude-opus-5"
     assert codex.presets["standard"].effort == "xhigh"
-    assert gemini.command_args == ("gemini", "--acp")
-    assert gemini.home == "~/.gemini"
-    assert gemini.bypass_modes == ("yolo",)
-    assert gemini.presets == {}
 
 
 def test_variant_inherits_and_reports_nearest_field_provenance(tmp_path: Path) -> None:
@@ -200,8 +195,11 @@ def test_preset_resolution_and_explicit_effort_override_keep_sources(tmp_path: P
 
 
 def test_presetless_adapter_names_the_preset_mechanism(tmp_path: Path) -> None:
-    with pytest.raises(RegistryError, match=r"gemini: --model fast requires a \[presets\] table"):
-        AgentRegistry(tmp_path / "agents").resolve_call("gemini", model="fast")
+    agents = tmp_path / "agents"
+    write_entry(agents, "plain", 'command = "python -m plain"\n')
+
+    with pytest.raises(RegistryError, match=r"plain: --model fast requires a \[presets\] table"):
+        AgentRegistry(agents).resolve_call("plain", model="fast")
 
 
 def test_call_resolution_delivers_home_through_the_adapter_home_variable(
@@ -297,7 +295,10 @@ def test_an_explicit_effort_overrides_the_adapter_default(tmp_path: Path) -> Non
 
 
 def test_a_presetless_adapter_has_no_default_model(tmp_path: Path) -> None:
-    call = AgentRegistry(tmp_path / "agents").resolve_call("gemini")
+    agents = tmp_path / "agents"
+    write_entry(agents, "plain", 'command = "python -m plain"\n')
+
+    call = AgentRegistry(agents).resolve_call("plain")
 
     assert call.model is None
     assert call.effort is None

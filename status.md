@@ -116,7 +116,7 @@ Stage 3 was complete through section 4 when the branch went to the gate. Accepta
 ## Next
 
 - **0.4 landing, gated on Damian's explicit go item by item:** merge `feat/0.4`, bump version to 0.4.0, tag `v0.4.0`, `uv tool install --force`. Nothing pushed, nothing tagged, the installed tool untouched.
-- Open: claude and gemini TOMLs still carry `TODO(stage3)` vendor-fact markers — verify live when those adapters are in scope (the standing checklist is `docs/live-test-plan.md`).
+- Open: the claude TOML still carries `TODO(stage3)` vendor-fact markers — verify live when that adapter is in scope (the standing checklist is `docs/live-test-plan.md`). The gemini adapter was retired 2026-08-07: the Gemini CLI no longer exists.
 
 - **Convention-friction package (2026-08-06, approved by Damian):** conventions agents carry in from neighboring tools, made to work or answered with a pointer. Implementation dispatched to the `builder` variant (Luna) from pinned-wording specs under `docs/plans/stage3/`; SPEC/doc wording authored by the orchestrator, folded into each implementation commit per the AGENTS.md docs contract.
   - **H3+M1** (`7fa332f`): `log --wait-new` on a finished session returns immediately (the `logs -f` convention — following a stopped stream ends) with 124 and the finished footer; a timeout on a *running* session says so on stderr (`-- still running (gave up waiting after Ns) — session continues; acpc stop <id> to cancel`), for `wait` too.

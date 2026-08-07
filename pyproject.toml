@@ -9,7 +9,7 @@ authors = [
     { name = "Damian Pala", email = "noreply@damianpala.com" },
 ]
 requires-python = ">=3.13"
-keywords = ["acp", "agent-client-protocol", "ai-agents", "claude", "codex", "gemini", "cli", "llm"]
+keywords = ["acp", "agent-client-protocol", "ai-agents", "claude", "codex", "cli", "llm"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",

@@ -9,7 +9,7 @@ Run `uv run pytest && ./smoke.sh` first. If either is red, stop.
 ## Two tiers
 
 - **Tier 1 (cheap, the bulk):** groups B, C, D, E, F on OpenRouter-backed entries (`codex-acp` + a fast model, Luna-class). Same adapter code path as subscription codex, negligible cost, so repeat runs are fine.
-- **Tier 2 (vendor, short):** the checks that only real vendor surfaces can answer — group V, plus E4 (TTY prompt, human in the loop). One trivial prompt per check. **Codex only** (operator decision 2026-08-05): claude and gemini are not live-tested; their shipped TOMLs keep the `TODO(stage3)` markers as an accepted risk until first real use, and the environment facts recorded below for them are informational. Codex's TOML facts were verified live 2026-08-06.
+- **Tier 2 (vendor, short):** the checks that only real vendor surfaces can answer — group V, plus E4 (TTY prompt, human in the loop). One trivial prompt per check. **Codex only** (operator decision 2026-08-05): claude is not live-tested; its shipped TOML keeps the `TODO(stage3)` markers as an accepted risk until first real use, and the environment facts recorded below for it are informational. Codex's TOML facts were verified live 2026-08-06. (The gemini adapter was retired 2026-08-07 — the Gemini CLI no longer exists.)
 
 ## Rails
 
@@ -60,11 +60,10 @@ cp ~/.codex-openrouter/{config.toml,installation_id,version.json} ~/.codex-openr
 
 ## Environment facts (verified 2026-08-05/06)
 
-- Adapter binaries all on PATH: `codex-acp`, `claude-agent-acp`, `gemini` (plus vendor `codex`, `claude`) under `~/.local/bin`.
-- Vendor homes exist: `~/.codex`, `~/.claude`, `~/.gemini`, `~/.codex-openrouter`.
+- Adapter binaries all on PATH: `codex-acp`, `claude-agent-acp` (plus vendor `codex`, `claude`) under `~/.local/bin`.
+- Vendor homes exist: `~/.codex`, `~/.claude`, `~/.codex-openrouter`.
 - **claude:** `~/.claude/.credentials.json` fresh — expected to just work.
 - **codex (tier 2):** auth lives in the system **keyring** (`cli_auth_credentials_store = "keyring"` in `~/.codex/config.toml`), not `auth.json`. Measured 2026-08-06: vendor codex authenticated through acpc's constructed env **without** `DBUS_SESSION_BUS_ADDRESS`/`XDG_RUNTIME_DIR` — the risk did not materialize; no passthrough additions needed. If a future run fails auth here, add `env_passthrough = ["DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR"]` to a `codex.toml` override in the test home and record the outcome.
-- **gemini (tier 2):** no OAuth creds on disk (`oauth_creds.json` absent); auth via `GEMINI_API_KEY` — the gemini test entry needs `env_passthrough = ["GEMINI_API_KEY"]`.
 - A vendor login-status command (`codex login status` and friends) is **not** a credential check — it can report a logged-in state for a refresh token that has already been spent. Only a real call proves the credentials currently work.
 - **codex mode semantics (measured 2026-08-06):** the default `agent` mode auto-allows workspace edits and commands without emitting `request_permission`, so `--permissions` below `all` only bites in `read-only` mode; `agent-full-access` never asks and is the declared bypass mode. A callee's shell commands re-source the operator's profile, so ambient secrets are visible to it even though acpc's adapter env is clean — the vendor sandbox is the boundary there.
 
@@ -153,7 +152,7 @@ Verifies the shipped codex TOML against vendor reality, one trivial prompt per c
 | V1 | `acpc agents codex` after one real run | Advertised modes, models, commands as the vendor announces them; compare `bypass_modes` and `efforts` in the shipped TOML against reality; fix the TOML in the same change |
 | V2 | `acpc agents codex --models` | Preset table resolves to model IDs the vendor actually accepts (`--model fast` must not 404) |
 | V3 | `acpc continue` on a codex session after `daemon stop` | Does real codex support `loadSession` and restore context on the cold path; record either way |
-| V4 | `acpc agents codex --check` | Launch+auth verdict, exit 0; a failure → exit 1. The unnamed `--check` live-probes every installed adapter — do not run it while claude/gemini are excluded from live testing |
+| V4 | `acpc agents codex --check` | Launch+auth verdict, exit 0; a failure → exit 1. The unnamed `--check` live-probes every installed adapter — do not run it while claude is excluded from live testing |
 | V5 | `--mode` values from `agents codex` | `session/set_mode` accepted and observably changes behavior (`read-only` makes codex emit permission requests) |
 
 ## G. Teardown

@@ -1,6 +1,6 @@
 # acpc Specification
 
-What a CLI for dispatching agents (codex, claude, gemini) should look like from the perspective of its primary user: another agent calling it through a shell tool.
+What a CLI for dispatching agents (codex, claude) should look like from the perspective of its primary user: another agent calling it through a shell tool.
 Normative: the implementation is adjusted to match this document; behavior changes land here first, in the same change as the code.
 
 ## How an agent consumes a CLI (design constraints)
@@ -68,7 +68,6 @@ codex    Codex CLI (OpenAI)        installed
   explorer   gpt-5.6-luna   low    read   ~/.codex-openrouter
   planner    gpt-5.6-sol    xhigh  write  ~/.codex-openrouter
   reviewer   gpt-5.6-sol    xhigh  read   ~/.codex-openrouter
-gemini   Gemini CLI (Google)       missing → acpc install gemini
 
 $ acpc agents builder           # what this entry resolves to
 extends      codex

@@ -1,6 +1,6 @@
 # acpc
 
-Dispatch coding agents (codex, claude, gemini) over the Agent Client Protocol, from the command line.
+Dispatch coding agents (codex, claude) over the Agent Client Protocol, from the command line.
 
 acpc is built for a specific primary user: **another agent calling it through a shell tool**. Everything follows from that — blocking calls that print the answer once, plain text with no spinners or ANSI, state on disk that can be grepped, and exit codes that mean something. A human at a terminal is the secondary audience and still gets an honest tool.
 
