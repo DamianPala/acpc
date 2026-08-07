@@ -2,9 +2,11 @@
 
 ## Now
 
-**0.4 is built and accepted on `feat/0.4`; landing is Damian's gate.** Eight slices, one commit each, tip `1ae69b6`. Nothing pushed, nothing tagged, the installed tool is still 0.3.0.
+**0.4 is built and accepted on `feat/0.4`; landing is Damian's gate.** Fifteen slices, one commit each, tip `4a1c9dc`. Nothing pushed, nothing tagged, the installed tool is still 0.3.0.
 
-The surface 0.4 adds: `log --follow` (a bounded stream replacing the `--wait-new` + cursor loop, with three endings — session end 0, timeout 124, output budget 4); `steer <id> <instruction>` (cancel-and-redirect as one verb, pinned preamble stored verbatim in `prompt.md`); an early `-- session <id> | dir <path>` line on blocking dispatch so the id is usable mid-run; `status` idle age plus a resolved-model column; a `daemon stop` guard for targets with active sessions (`--force` bypasses); a stderr note when `--since` runs past the transcript's end; duration suffixes on every `--timeout`; and a root `--help` regrouped by the caller's decision rather than by command name.
+Waves 4 and 5 added seven more slices after the first acceptance run (S9–S15), so the bar was rerun from scratch: **582 pytest, ruff check + format, pyright 0 errors, shellcheck, smoke 559/559**, zero leaked processes. Every touched view was eyeballed live against real adapters.
+
+The surface 0.4 adds: `log --follow` (a bounded stream replacing the `--wait-new` + cursor loop, with three endings — session end 0, timeout 124, output budget 4); `steer <id> <instruction>` (cancel-and-redirect as one verb, pinned preamble stored verbatim in `prompt.md`); an early `-- session <id> | dir <path>` line on blocking dispatch so the id is usable mid-run; `status` idle age plus a resolved-model column; a `daemon stop` guard for targets with active sessions (`--force` bypasses); a stderr note when `--since` runs past the transcript's end; duration suffixes on every `--timeout`; and a root `--help` regrouped by the caller's decision rather than by command name. Waves 4 and 5 then added: a `daemon status` idle column; blank-line separation between an answer's messages; hints for the `docker`/`systemctl` daemon spellings; a condensed `log` view that marks events continuing across a message boundary; an optional `description` on every entry, shown in `agents`; the gemini adapter retired; and column headers with computed widths on every table view.
 
 Acceptance: full bar twice back-to-back, both green (535 pytest, ruff check + format, pyright 0 errors, shellcheck, smoke 495/495), zero leaked processes after each. Live tier 1 (Luna over OpenRouter) covered all three follow endings with exact cursor resume, early-line timing (t+1s versus t+11s for the summary), and steer end to end. Live tier 2 (real codex) covered steer — the cancel landed in about a second — and one follow smoke. Every new guard was mutation-checked red before landing.
 
@@ -23,6 +25,10 @@ Acceptance: full bar twice back-to-back, both green (535 pytest, ruff check + fo
   - `1ae69b6` **S8 cheat sheet** — root `--help` regrouped by the caller's decision, 64 lines.
   - **S4 rider (Damian-approved, landed after acceptance)** — a resolved-model column between entry and state in the `status` text view, the same field in both `--json` shapes. It proved its own case immediately: while live-testing I ran `explorer` believing it was real codex, and the resolution shows it inherits `gpt-5.6-luna` and the OpenRouter home from `general` through `extends`. The entry name said nothing.
   - Also fixed: a latent smoke race where the `--wait-new` long-poll reused the shared ~64s mock session; on a loaded machine the section reached it at t+90s, after that session was already done. It now dispatches its own victim.
+  - **Wave 4 (S9–S12, three of them dispatched in parallel on separate worktrees):** `eda10e2` the resolved-model column, `a9b6a8e` **S10** `daemon status` idle age (the 0.3 backlog item — uptime cannot say how close a daemon is to being reaped), `a9ce3f1` **S11** blank-line separation between an answer's messages at a detected boundary, `36420b6` **S12** hints for the `docker`/`systemctl` daemon spellings. `af01337` defines the *message boundary* once in SPEC, and both S11 and S13 reference that one definition rather than restating it.
+  - **Wave 5 (S13–S15):** `aaffb5c` **S13** condensed `log` view (continuation markers, coverage range in the footer), `54c75f3`+`8b440a6`+`65c2d65` **S14** an optional entry `description` — respecced mid-flight from a hard 80-char parse error to no limit at all, with truncation moved into the list view (`405fa57`), so context protection lives where the context is spent; `e7ab440` **S15** column headers and computed widths, after a live roster sheared on a 26-character model id.
+  - **Review fix on top of S15** (`4a1c9dc`): S15 pinned two conventions in SPEC but implemented them in four views. `agents --models` (no name) still built its preset and variant rows with hardcoded 10/24-wide f-strings and no header, and `agents <name> --commands` padded names to 18 against real catalogs carrying 32-character names. Both fixed, SPEC's examples regenerated from the actual renderer, and smoke — which had no header coverage at all — now asserts each header by its column labels rather than by spacing.
+  - **The daemon runs the client code**, so a live test of a client-side change can fail against correct code: S11's separator did nothing until `acpc daemon stop`, because the running daemon had been started before the cherry-pick and version-skew self-heal keys only on the version string. That is why `daemon stop` is item 4 of the landing checklist.
 
 **0.3 — landed as `v0.3.0`, the globally installed tool.** Its full live-test report is local-only at `docs/plans/stage3/live-test-report.md`.
 
@@ -115,7 +121,8 @@ Stage 3 was complete through section 4 when the branch went to the gate. Accepta
 
 ## Next
 
-- **0.4 landing, gated on Damian's explicit go item by item:** merge `feat/0.4`, bump version to 0.4.0, tag `v0.4.0`, `uv tool install --force`. Nothing pushed, nothing tagged, the installed tool untouched.
+- **0.4 landing, gated on Damian's explicit go item by item:** fast-forward `main` to `feat/0.4`, bump the version to 0.4.0 and tag `v0.4.0`, `uv tool install --force`, `acpc daemon stop` (any daemon still up is running 0.3.0 client code), then one sanity dispatch. Nothing pushed, nothing tagged, the installed tool untouched until then.
+- **Post-landing, operator config not repo work:** write a `description` into each of the five entries in `~/.acpc/agents/`. `acpc agents` prints it beside every entry, which is where a dispatching agent learns what `builder` is *for*.
 - Open: the claude TOML still carries `TODO(stage3)` vendor-fact markers — verify live when that adapter is in scope (the standing checklist is `docs/live-test-plan.md`). The gemini adapter was retired 2026-08-07: the Gemini CLI no longer exists.
 
 - **Convention-friction package (2026-08-06, approved by Damian):** conventions agents carry in from neighboring tools, made to work or answered with a pointer. Implementation dispatched to the `builder` variant (Luna) from pinned-wording specs under `docs/plans/stage3/`; SPEC/doc wording authored by the orchestrator, folded into each implementation commit per the AGENTS.md docs contract.
@@ -127,9 +134,8 @@ Stage 3 was complete through section 4 when the branch went to the gate. Accepta
 
 ## Backlog (post-0.4)
 
-- Every 0.3 backlog item (`log --follow`, the `--since` beyond-max guard, `--timeout` duration suffixes) shipped in 0.4.
-- **`daemon status` shows uptime, not idle time** (found during the 0.4 zero-leak check): a daemon reported `up 1h48m` against a 30 m TTL, which reads as a leak until you check the session mtimes and find it was 28 min idle. Uptime cannot tell you how close a daemon is to being reaped; idle age can. S4 added exactly this to session `status` — the daemon view should get the same column.
-- **Two adjacent assistant messages are concatenated without a separator in `answer.md`** (observed live 2026-08-06, pre-existing in 0.3): a preamble message and the final answer render as `...from those documents.acpc's primary user is...`. stdout stays byte-identical to `answer.md`, so the output contract holds; it is the joining that reads wrong. Needs a decision on whether `answer.md` is every assistant message or only the final one.
+- Every 0.3 backlog item shipped in 0.4: `log --follow`, the `--since` beyond-max guard, `--timeout` duration suffixes, the `daemon status` idle column (S10) and the missing separator between an answer's messages (S11).
+- **`available_commands_update`, `config_option_update` and `current_mode_update` set the message-boundary flag but write no transcript event**, so in theory S11 (separator) and S13 (continuation marker) could disagree about where a boundary is. Verified not reachable today — all three arrive at session setup, before any message chunk — but the two views derive the same fact from different sources, which is what makes the divergence possible at all.
 
 ## Decisions
 
