@@ -161,7 +161,8 @@ class _CheatSheetGroup(click.Group):
         try:
             return super().main(*args, **kwargs)
         except click.UsageError as error:
-            message = _friendly_usage_message(error.format_message())
+            command_path = error.ctx.command_path if error.ctx is not None else None
+            message = _friendly_usage_message(error.format_message(), command_path=command_path)
             click.echo(f"Error: {message}", err=True)
             raise SystemExit(error.exit_code) from None
         except click.ClickException as error:
@@ -169,7 +170,7 @@ class _CheatSheetGroup(click.Group):
             raise SystemExit(error.exit_code) from None
 
 
-def _friendly_usage_message(message: str) -> str:
+def _friendly_usage_message(message: str, *, command_path: str | None = None) -> str:
     """Replace known neighboring-tool spellings with their acpc equivalents."""
     follow_hint = (
         "--follow is not a flag on this command — following a session is: "
@@ -194,6 +195,36 @@ def _friendly_usage_message(message: str) -> str:
             )
             if any(marker in message for marker in markers):
                 return replacement
+    command_parts = (command_path or "").split()
+    daemon_group = command_parts[-1:] == ["daemon"]
+    daemon_stop = command_parts[-2:] == ["daemon", "stop"]
+    if daemon_stop and "No such option" in message:
+        for marker in (
+            "No such option: --all",
+            "No such option '--all'",
+            'No such option "--all"',
+        ):
+            if marker in message:
+                return (
+                    "--all is not a daemon flag — bare acpc daemon stop already addresses every "
+                    "daemon"
+                )
+    if daemon_group and "No such command" in message:
+        for spelling in ("list", "ls", "ps"):
+            if (
+                f"No such command '{spelling}'" in message
+                or f'No such command "{spelling}"' in message
+            ):
+                return f"no such command '{spelling}' — the daemon view is: acpc daemon status"
+        for spelling in ("start", "restart"):
+            if (
+                f"No such command '{spelling}'" in message
+                or f'No such command "{spelling}"' in message
+            ):
+                return (
+                    f"no such command '{spelling}' — daemons start on first use; acpc daemon "
+                    "stop <agent> and the next run is the restart"
+                )
     if "No such command" in message and (
         "No such command 'logs'" in message or 'No such command "logs"' in message
     ):

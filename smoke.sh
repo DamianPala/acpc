@@ -1318,6 +1318,27 @@ PYEOF
         assert_not_contains "unknown flag on '${verb_args}': no traceback" "$LAST_ERR" "Traceback"
     done
 
+    # Neighboring docker/systemctl spellings are hints, never aliases.
+    declare -A DAEMON_HINTS=(
+        ["daemon list"]="Error: no such command 'list' — the daemon view is: acpc daemon status"
+        ["daemon ls"]="Error: no such command 'ls' — the daemon view is: acpc daemon status"
+        ["daemon ps"]="Error: no such command 'ps' — the daemon view is: acpc daemon status"
+        ["daemon stop --all"]="Error: --all is not a daemon flag — bare acpc daemon stop already addresses every daemon"
+        ["daemon start"]="Error: no such command 'start' — daemons start on first use; acpc daemon stop <agent> and the next run is the restart"
+        ["daemon restart"]="Error: no such command 'restart' — daemons start on first use; acpc daemon stop <agent> and the next run is the restart"
+    )
+    for daemon_args in "${!DAEMON_HINTS[@]}"; do
+        # shellcheck disable=SC2086
+        run_acpc $daemon_args
+        assert_eq "'$daemon_args' is a hint, not an alias" "2" "$LAST_RC"
+        assert_eq "'$daemon_args' has the pinned hint" "${DAEMON_HINTS[$daemon_args]}" "$LAST_ERR"
+        assert_eq "'$daemon_args' is one line" "1" "$(wc -l <<<"$LAST_ERR")"
+        assert_not_contains "'$daemon_args' has no traceback" "$LAST_ERR" "Traceback"
+    done
+    run_acpc list
+    assert_eq "top-level list stays outside daemon hints" "2" "$LAST_RC"
+    assert_not_contains "top-level list does not mention daemon status" "$LAST_ERR" "daemon status"
+
     end_section S12-cli
 fi
 

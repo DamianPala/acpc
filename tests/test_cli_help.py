@@ -237,6 +237,39 @@ def test_no_command_redirects_to_root_help_and_root_keeps_verb_one_liners(
             ("logs", "q7x2"),
             "Error: no such command 'logs' — the viewing command is: acpc log <id>",
         ),
+        (
+            ("daemon", "list"),
+            "Error: no such command 'list' — the daemon view is: acpc daemon status",
+        ),
+        (
+            ("daemon", "ls"),
+            "Error: no such command 'ls' — the daemon view is: acpc daemon status",
+        ),
+        (
+            ("daemon", "ps"),
+            "Error: no such command 'ps' — the daemon view is: acpc daemon status",
+        ),
+        (
+            ("daemon", "stop", "--all"),
+            (
+                "Error: --all is not a daemon flag — bare acpc daemon stop already addresses "
+                "every daemon"
+            ),
+        ),
+        (
+            ("daemon", "start"),
+            (
+                "Error: no such command 'start' — daemons start on first use; acpc daemon stop "
+                "<agent> and the next run is the restart"
+            ),
+        ),
+        (
+            ("daemon", "restart"),
+            (
+                "Error: no such command 'restart' — daemons start on first use; acpc daemon stop "
+                "<agent> and the next run is the restart"
+            ),
+        ),
     ],
 )
 def test_neighboring_tool_aliases_are_one_line_usage_errors(
@@ -248,6 +281,13 @@ def test_neighboring_tool_aliases_are_one_line_usage_errors(
     assert result.stderr == f"{expected}\n"
     assert len(result.stderr.splitlines()) == 1
     assert "Traceback" not in result.stderr
+
+
+def test_top_level_command_does_not_get_a_daemon_hint(runner: CliRunner) -> None:
+    result = invoke(runner, "list")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert "daemon status" not in result.stderr
 
 
 def test_short_version_matches_long_version(runner: CliRunner) -> None:
