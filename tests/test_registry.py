@@ -72,6 +72,54 @@ def test_variant_inherits_and_reports_nearest_field_provenance(tmp_path: Path) -
     assert child.provenance["effort"].path.name == "child.toml"
 
 
+def test_description_accepts_long_and_multiline_values_for_resolution(tmp_path: Path) -> None:
+    agents = tmp_path / "agents"
+    long_description = "long " * 100
+    multiline_description = "first line\nsecond line\nthird line"
+    write_entry(
+        agents,
+        "long",
+        f'command = "python"\ndescription = "{long_description}"\n',
+    )
+    write_entry(
+        agents,
+        "multiline",
+        'command = "python"\ndescription = """first line\nsecond line\nthird line"""\n',
+    )
+    write_entry(agents, "empty", 'command = "python"\ndescription = ""\n')
+
+    registry = AgentRegistry(agents)
+
+    assert registry.resolve_call("long").entry.description == long_description
+    assert registry.resolve_call("multiline").entry.description == multiline_description
+    assert registry.resolve_call("empty").entry.description == ""
+
+
+def test_description_is_not_inherited_across_two_levels_but_child_keeps_its_own(
+    tmp_path: Path,
+) -> None:
+    agents = tmp_path / "agents"
+    write_entry(
+        agents,
+        "a",
+        'command = "python"\ndescription = "The adapter purpose."\n',
+    )
+    write_entry(agents, "b", 'extends = "a"\n')
+    write_entry(agents, "c", 'extends = "b"\n')
+    write_entry(
+        agents,
+        "own",
+        'extends = "b"\ndescription = "The child purpose."\n',
+    )
+
+    registry = AgentRegistry(agents)
+
+    assert registry.resolve("a").description == "The adapter purpose."
+    assert registry.resolve("b").description is None
+    assert registry.resolve("c").description is None
+    assert registry.resolve("own").description == "The child purpose."
+
+
 def test_a_variant_inherits_the_parent_adapter_contract_lists(tmp_path: Path) -> None:
     agents = tmp_path / "agents"
     write_entry(

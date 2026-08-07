@@ -70,6 +70,83 @@ def test_agents_list_shows_variant_delta(cli: CliRunner) -> None:
     assert "mock-opus-5" in result.stdout
 
 
+def test_agents_views_render_present_and_absent_descriptions(cli: CliRunner) -> None:
+    listed = invoke(cli, "agents")
+
+    assert listed.exit_code == vocab.EXIT_OK
+    builder_row = next(line for line in listed.stdout.splitlines() if line.startswith("  builder"))
+    mock_row = next(line for line in listed.stdout.splitlines() if line.startswith("mock"))
+    assert builder_row.endswith("Implements a task against a plan.")
+    assert mock_row.endswith("installed")
+    assert "description" not in mock_row
+
+    builder_detail = invoke(cli, "agents", "builder")
+    assert "description  Implements a task against a plan." in builder_detail.stdout
+
+    mock_detail = invoke(cli, "agents", "mock")
+    assert "description  " not in mock_detail.stdout
+
+    list_json = json.loads(invoke(cli, "agents", "--json").stdout)
+    descriptions = {item["name"]: item["description"] for item in list_json["agents"]}
+    assert descriptions["builder"] == "Implements a task against a plan."
+    assert descriptions["mock"] is None
+
+    builder_json = json.loads(invoke(cli, "agents", "builder", "--json").stdout)
+    assert builder_json["description"] == "Implements a task against a plan."
+    mock_json = json.loads(invoke(cli, "agents", "mock", "--json").stdout)
+    assert mock_json["description"] is None
+
+
+def test_agents_list_truncates_but_detail_and_json_keep_full_description(
+    cli: CliRunner, state_root: Path
+) -> None:
+    full_description = (
+        "A deliberately long description with   repeated whitespace\n"
+        "and enough words to exceed the list view budget while preserving its full detail value."
+    )
+    adapter_description = (
+        "An adapter description with   enough words to exercise the same list-only truncation path."
+    )
+    (state_root / "agents" / "mock.toml").write_text(
+        MOCK_ENTRY.replace(
+            "[presets]",
+            f'description = """{adapter_description}"""\n\n[presets]',
+        ),
+        encoding="utf-8",
+    )
+    (state_root / "agents" / "builder.toml").write_text(
+        BUILDER_ENTRY.replace(
+            'description = "Implements a task against a plan."',
+            f'description = """{full_description}"""',
+        ),
+        encoding="utf-8",
+    )
+
+    listed = invoke(cli, "agents")
+    builder_row = next(line for line in listed.stdout.splitlines() if line.startswith("  builder"))
+    mock_row = next(line for line in listed.stdout.splitlines() if line.startswith("mock"))
+    builder_snippet = (
+        "A deliberately long description with repeated whitespace and enough words to..."
+    )
+    mock_snippet = "An adapter description with enough words to exercise the same list-only..."
+    assert builder_row.endswith(builder_snippet)
+    assert mock_row.endswith(mock_snippet)
+    assert full_description not in listed.stdout
+    assert len(builder_snippet) <= 80
+    assert len(mock_snippet) <= 80
+
+    detail = invoke(cli, "agents", "builder")
+    assert f"description  {full_description}" in detail.stdout
+
+    list_payload = json.loads(invoke(cli, "agents", "--json").stdout)
+    descriptions = {item["name"]: item["description"] for item in list_payload["agents"]}
+    assert descriptions["builder"] == full_description
+    assert descriptions["mock"] == adapter_description
+
+    detail_payload = json.loads(invoke(cli, "agents", "builder", "--json").stdout)
+    assert detail_payload["description"] == full_description
+
+
 def test_agents_list_shows_missing_install_hint(cli: CliRunner) -> None:
     result = invoke(cli, "agents")
 

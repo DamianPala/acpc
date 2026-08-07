@@ -46,11 +46,11 @@ def _single_line(value: object) -> str:
     return " ".join(str(value).split())
 
 
-def _message_snippet(text: str, *, full: bool) -> str:
+def _message_snippet(text: str, *, full: bool, limit: int = 200) -> str:
     normalized = _single_line(text)
-    if full or len(normalized) <= 200:
+    if full or len(normalized) <= limit:
         return normalized
-    content_limit = 200 - len("...")
+    content_limit = limit - len("...")
     head = normalized[:content_limit]
     boundary = head.rfind(" ")
     if boundary >= 0:

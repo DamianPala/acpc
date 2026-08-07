@@ -1019,6 +1019,50 @@ if begin_section S10-agents "agents views, variants, advertised data, install"; 
     run_acpc agents
     assert_eq "agents recovers once the malformed entry is removed" "0" "$LAST_RC"
 
+    # Entry descriptions: present values render in every roster/detail view;
+    # absent values remain absent in text and become null in JSON.
+    run_acpc agents
+    assert_contains "agents list appends the variant description" "$LAST_OUT" \
+        "Implements a task against a plan."
+    run_acpc agents builder
+    assert_contains "agents detail renders the variant description" "$LAST_OUT" \
+        "description  Implements a task against a plan."
+    run_acpc agents mock
+    assert_not_contains "agents detail omits an absent description" "$LAST_OUT" \
+        "description  "
+    run_acpc agents --json
+    assert_eq "agents list JSON carries the description" "Implements a task against a plan." \
+        "$(jq -r '.agents[] | select(.name == "builder") | .description' <<<"$LAST_OUT")"
+    assert_eq "agents list JSON uses null when absent" "null" \
+        "$(jq -r '.agents[] | select(.name == "mock") | .description' <<<"$LAST_OUT")"
+    run_acpc agents builder --json
+    assert_eq "agents detail JSON carries the description" "Implements a task against a plan." \
+        "$(jq -r '.description' <<<"$LAST_OUT")"
+    run_acpc agents mock --json
+    assert_eq "agents detail JSON uses null when absent" "null" \
+        "$(jq -r '.description' <<<"$LAST_OUT")"
+
+    cat >"${ACPC_HOME}/agents/long-description.toml" <<'EOF'
+extends = "mock"
+description = """A deliberately long description with   repeated whitespace
+and enough words to exceed the list view budget while preserving its full detail value."""
+EOF
+    LONG_DESCRIPTION=$'A deliberately long description with   repeated whitespace\nand enough words to exceed the list view budget while preserving its full detail value.'
+    run_acpc run long-description "description dispatch" --quiet
+    assert_eq "long and multiline description does not break dispatch" "0" "$LAST_RC"
+    run_acpc agents
+    assert_contains "agents list normalizes and truncates descriptions" "$LAST_OUT" \
+        "A deliberately long description with repeated whitespace and enough words to..."
+    run_acpc agents long-description
+    assert_contains "agents detail keeps the full multiline description" "$LAST_OUT" \
+        "$LONG_DESCRIPTION"
+    run_acpc agents --json
+    assert_eq "agents list JSON keeps the full description" "$LONG_DESCRIPTION" \
+        "$(jq -r '.agents[] | select(.name == "long-description") | .description' <<<"$LAST_OUT")"
+    run_acpc agents long-description --json
+    assert_eq "agents detail JSON keeps the full description" "$LONG_DESCRIPTION" \
+        "$(jq -r '.description' <<<"$LAST_OUT")"
+
     end_section S10-agents
 fi
 

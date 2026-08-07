@@ -23,6 +23,7 @@ from acpc.paths import agents_dir
 from acpc.vocab import EFFORT_VALUES, PERMISSION_VALUES
 
 _TIERS: Final = frozenset({"fast", "standard", "max"})
+_NON_INHERITABLE_FIELDS: Final = frozenset({"description"})
 _ENTRY_KEYS: Final = frozenset(
     {
         "name",
@@ -339,8 +340,8 @@ def _merge_parsed(parent: _ParsedEntry, child: _ParsedEntry) -> _ParsedEntry:
     return _ParsedEntry(data=data, source=child.source, provenance=provenance)
 
 
-def _expect_string(path: Path, key: str, value: Any) -> str:
-    if not isinstance(value, str) or not value:
+def _expect_string(path: Path, key: str, value: Any, *, allow_empty: bool = False) -> str:
+    if not isinstance(value, str) or (not allow_empty and not value):
         raise RegistryError(f"{path}: key '{key}' must be a non-empty string")
     return value
 
@@ -380,7 +381,7 @@ def _parse_entry(
         "model",
     ):
         if key in raw:
-            _expect_string(path, key, raw[key])
+            _expect_string(path, key, raw[key], allow_empty=key == "description")
     if "effort" in raw:
         value = _expect_string(path, "effort", raw["effort"])
         if value not in EFFORT_VALUES:
@@ -574,7 +575,9 @@ class AgentRegistry:
         if extends:
             parent = self._resolve(extends, (*stack, name))
             parent_data = {
-                key: getattr(parent, key) for key in _FIELD_NAMES if key not in {"presets", "env"}
+                key: getattr(parent, key)
+                for key in _FIELD_NAMES
+                if key not in {"presets", "env"} and key not in _NON_INHERITABLE_FIELDS
             }
             # Rebuild nested values from the parent's public representation;
             # provenance is kept separately and then overlaid with the child.
@@ -583,10 +586,15 @@ class AgentRegistry:
                 for tier, item in parent.presets.items()
             }
             parent_data["env"] = dict(parent.env)
+            parent_provenance = {
+                field: source
+                for field, source in parent.provenance.items()
+                if field not in _NON_INHERITABLE_FIELDS
+            }
             parent_parsed = _ParsedEntry(
                 data=parent_data,
                 source=parent.source,
-                provenance=parent.provenance,
+                provenance=parent_provenance,
             )
             merged = _merge_parsed(parent_parsed, parsed)
             return _to_resolved(name, merged, extends, parent.base_adapter)

@@ -445,7 +445,12 @@ def _agent_row(entry: ResolvedEntry) -> str:
     status = entry.install_status
     if status == "missing":
         status = f"missing → acpc install {entry.entry}"
-    return f"{entry.entry:<12} {entry.name:<28} {status}"
+    description = (
+        f" {render._message_snippet(entry.description, full=False, limit=80)}"
+        if entry.description is not None
+        else ""
+    )
+    return f"{entry.entry:<12} {entry.name:<28} {status}{description}"
 
 
 def _variant_row(entry: ResolvedEntry) -> str:
@@ -453,10 +458,15 @@ def _variant_row(entry: ResolvedEntry) -> str:
         field: _local_variant_value(entry, field)
         for field in ("model", "effort", "permissions", "home")
     }
+    description = (
+        f" {render._message_snippet(entry.description, full=False, limit=80)}"
+        if entry.description is not None
+        else ""
+    )
     return (
         f"  {entry.entry:<12} {values['model'] or '·':<20} "
         f"{values['effort'] or '·':<8} {values['permissions'] or '·':<12} "
-        f"{values['home'] or '·'}"
+        f"{values['home'] or '·'}{description}"
     )
 
 
@@ -469,6 +479,7 @@ def _agent_list_payload(registry: AgentRegistry) -> dict[str, Any]:
                 "kind": "adapter",
                 "display_name": adapter.name,
                 "status": adapter.install_status,
+                "description": adapter.description,
             }
         )
         for variant in registry.variants:
@@ -483,6 +494,7 @@ def _agent_list_payload(registry: AgentRegistry) -> dict[str, Any]:
                     "effort": _local_variant_value(variant, "effort"),
                     "permissions": _local_variant_value(variant, "permissions"),
                     "home": _local_variant_value(variant, "home"),
+                    "description": variant.description,
                 }
             )
     return {"agents": rows}
@@ -611,6 +623,7 @@ def _render_entry_detail(
     payload = {
         "agent": entry.entry,
         "base_adapter": entry.base_adapter,
+        "description": entry.description,
         "resolved": {
             field: {
                 "value": value,
