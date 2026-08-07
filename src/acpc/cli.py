@@ -2137,6 +2137,13 @@ def _answer_text(session_id: str) -> str:
         return ""
 
 
+def _daemon_idle_column(idle_seconds: float | None) -> str:
+    """Render a target's idle age, or `·` when it is serving or has no history."""
+    if idle_seconds is None:
+        return "·"
+    return f"idle {output.format_duration(idle_seconds)}"
+
+
 @main.group(name="daemon", invoke_without_command=False)
 @click.help_option("-h", "--help")
 def daemon_group() -> None:
@@ -2168,7 +2175,7 @@ def daemon_status_command(agent: str | None, json_mode: bool) -> None:
         return
     lines = [
         f"{item['target']:<28} pid {item['pid']:<8} up {output.format_duration(item['uptime'])} "
-        f"· {('idle ' + output.format_duration(item['idle_seconds'])) if item['idle_seconds'] is not None else '·':<11} "
+        f"· {_daemon_idle_column(item['idle_seconds']):<11} "
         f"· {len(item['sessions'])} sessions · {item['log']}"
         for item in entries
     ]
