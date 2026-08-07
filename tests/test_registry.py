@@ -30,6 +30,9 @@ def test_shipped_adapter_facts_and_presets_are_available(tmp_path: Path) -> None
     assert "bypassPermissions" in claude.bypass_modes
     assert claude.presets["max"].model == "claude-opus-5"
     assert codex.presets["standard"].effort == "xhigh"
+    # claude CLI >=2.1.224 offers no effort option for haiku; see claude.toml.
+    assert claude.presets["fast"].model == "claude-haiku-4-5"
+    assert claude.presets["fast"].effort is None
 
 
 def test_variant_inherits_and_reports_nearest_field_provenance(tmp_path: Path) -> None:
@@ -192,6 +195,82 @@ def test_preset_resolution_and_explicit_effort_override_keep_sources(tmp_path: P
     assert call.provenance["model"].path.name == "codex.toml"
     assert call.provenance["effort"].kind == "call"
     assert call.provenance["effort"].path is None
+
+
+def test_a_preset_may_pin_the_model_alone(tmp_path: Path) -> None:
+    """Effort is a property of the model, not of the preset: a model whose
+    vendor exposes no effort setting is pinned by model alone and runs at its
+    own built-in level."""
+    agents = tmp_path / "agents"
+    write_entry(
+        agents,
+        "local",
+        'command = "python -m local"\n[presets]\nfast = { model = "local-fast" }\n',
+    )
+    registry = AgentRegistry(agents)
+
+    call = registry.resolve_call("local", model="fast")
+
+    assert call.model == "local-fast"
+    assert call.effort is None
+    assert call.provenance["model"].kind == "entry"
+    assert call.provenance["effort"].kind == "unset"
+
+
+def test_an_effortless_standard_preset_still_supplies_the_default_model(tmp_path: Path) -> None:
+    """`standard` doubles as the adapter default, and the model half of that
+    fallback must survive the effort half being absent."""
+    agents = tmp_path / "agents"
+    write_entry(
+        agents,
+        "local",
+        'command = "python -m local"\n[presets]\nstandard = { model = "local-standard" }\n',
+    )
+
+    call = AgentRegistry(agents).resolve_call("local")
+
+    assert call.model == "local-standard"
+    assert call.effort is None
+    assert call.provenance["model"].kind == "adapter-default"
+    assert call.provenance["effort"].kind == "unset"
+
+
+def test_an_explicit_effort_still_applies_over_an_effortless_preset(tmp_path: Path) -> None:
+    agents = tmp_path / "agents"
+    write_entry(
+        agents,
+        "local",
+        'command = "python -m local"\n[presets]\nfast = { model = "local-fast" }\n',
+    )
+
+    call = AgentRegistry(agents).resolve_call("local", model="fast", effort="xhigh")
+
+    assert call.effort == "xhigh"
+    assert call.provenance["effort"].kind == "call"
+
+
+def test_a_preset_without_a_model_is_still_rejected(tmp_path: Path) -> None:
+    agents = tmp_path / "agents"
+    write_entry(
+        agents,
+        "local",
+        'command = "python -m local"\n[presets]\nfast = { effort = "high" }\n',
+    )
+
+    with pytest.raises(RegistryError, match=r"\[presets.fast\] requires model"):
+        AgentRegistry(agents)
+
+
+def test_a_preset_effort_that_is_present_is_still_validated(tmp_path: Path) -> None:
+    agents = tmp_path / "agents"
+    write_entry(
+        agents,
+        "local",
+        'command = "python -m local"\n[presets]\nfast = { model = "m", effort = "turbo" }\n',
+    )
+
+    with pytest.raises(RegistryError, match=r"\[presets.fast\].effort has unsupported level"):
+        AgentRegistry(agents)
 
 
 def test_presetless_adapter_names_the_preset_mechanism(tmp_path: Path) -> None:

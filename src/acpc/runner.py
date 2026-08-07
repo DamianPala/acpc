@@ -291,6 +291,10 @@ async def apply_call_options(conn: Any, adapter_session_id: str, request: TurnRe
                 value=resolution.effort,
             ),
             f"effort {resolution.effort!r} (config option {effort_config_id!r})",
+            unknown_option_hint=(
+                f"model {resolution.model!r} may not take an effort setting — "
+                "drop --effort, or drop effort from the preset in the entry TOML"
+            ),
         )
 
 
@@ -301,12 +305,22 @@ class AdapterRejection(RuntimeError):
     error, so the message lands in answer.md and the transcript."""
 
 
-async def _configure(call: Any, what: str) -> None:
-    """Name the rejected option: the bare JSON-RPC reply doesn't say which."""
+async def _configure(call: Any, what: str, *, unknown_option_hint: str | None = None) -> None:
+    """Name the rejected option: the bare JSON-RPC reply doesn't say which.
+
+    An adapter that does not offer an option at all answers with a generic
+    internal error, so the vendor's own wording is the only signal that the
+    option is missing rather than the value wrong. When it says so, the hint
+    names what the caller can actually change.
+    """
     try:
         await call
     except RequestError as error:
-        raise AdapterRejection(f"the adapter rejected {what}: {describe_error(error)}") from None
+        detail = describe_error(error)
+        message = f"the adapter rejected {what}: {detail}"
+        if unknown_option_hint is not None and "unknown config option" in detail.lower():
+            message += f" — {unknown_option_hint}"
+        raise AdapterRejection(message) from None
 
 
 async def _await_prompt(

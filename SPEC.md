@@ -103,7 +103,7 @@ variants     none
 
 $ acpc agents claude --models
 presets   TIER      MODEL             EFFORT
-          fast      claude-haiku-4-5  high
+          fast      claude-haiku-4-5  ·
           standard  claude-sonnet-5   high
           max       claude-opus-5     max
 models    claude-opus-5
@@ -126,7 +126,7 @@ codex
             reviewer  gpt-5.6-sol   xhigh
 claude
   presets   TIER      MODEL             EFFORT
-            fast      claude-haiku-4-5  high
+            fast      claude-haiku-4-5  ·
             standard  claude-sonnet-5   high
             max       claude-opus-5     max
   models    claude-opus-5 · claude-sonnet-5 · claude-haiku-4-5 · claude-opus-4-8
@@ -280,7 +280,7 @@ EOF
 |--------|---------|
 | prompt as arg, `-` (stdin), or `--prompt-file` | Heredoc/stdin for long prompts with quotes and backticks. Exactly one source — zero or two is a usage error naming the options; stdin is never read implicitly |
 | `--cwd <dir>` | Working directory of the callee. Long flag on purpose: `-C`/`-c` invites confusion with `continue` |
-| `--model <tier\|id>` | A tier (`fast`/`standard`/`max`, resolved through the adapter's preset table — see *Agent variants*) or a raw model ID from `agents <name> --models`. Explicit `--effort` overrides the preset's effort |
+| `--model <tier\|id>` | A tier (`fast`/`standard`/`max`, resolved through the adapter's preset table — see *Agent variants*) or a raw model ID from `agents <name> --models`. Explicit `--effort` overrides the preset's effort, and supplies one where the preset has none |
 | `--effort <level>` | Reasoning effort, orthogonal to `--model`. Superset scale (none/minimal/low/medium/high/xhigh/max/ultra) mapped per adapter; a level the resolved model doesn't support is a hard usage error listing the supported levels — never a silent fallback |
 | `--permissions all\|write\|read\|none\|prompt` | Approval policy for ACP permission requests (defined below). Default: agent entry if set, else `prompt` on a TTY and `read` otherwise; `--bg` counts as non-TTY here (see *TTY vs non-TTY*) |
 | `--mode <name>` | Callee's operating mode (ACP `session/set_mode`), vendor pass-through, adapter default if omitted. Behavioral hint; a mode that suppresses permission requests is rejected unless `--permissions all` (see below). Values via `agents` |
@@ -445,13 +445,17 @@ The `home` field is also the provider dimension: OpenAI vs OpenRouter vs a local
 
 **`description`** is optional on any entry, adapter or variant, and takes any string the operator writes — any length, newlines included. A roster reading `builder`, `explorer`, `planner` says nothing about what any of them is *for*; that is the operator's knowledge, not inferable from `--help`, and it belongs in the entry rather than in external documentation that goes stale. **The config never rejects it and never truncates it on disk**: a purely informational field must not be able to break a working dispatch, so context protection lives in the view rather than in the parser. The `agents` list normalizes whitespace and cuts at a word boundary within an 80-character budget, the same cut the condensed `log` view uses; `agents <name>` shows the description verbatim and in full, and `--json` carries the whole value — truncation shapes the text list and nothing else. It is **not inherited through `extends`** — a variant's purpose is its own, and rendering the parent's text under a child's name would be a confident lie about what the child does. Absence renders as absence everywhere: nothing in the list row, no line in the detail view, `null` in `--json`.
 
-Presets are adapter-level: each adapter definition ships its `fast`/`standard`/`max` table of (model, effort) pairs — what `--model <tier>` resolves through and `agents <name> --models` prints. Overriding what a tier means uses the same mechanism as everything else — a `[presets]` table in a file under `agents/` for that adapter — never `config.toml`, so resolution stays inspectable with provenance like every other field. Tiers left out keep the adapter's shipped pair.
+Presets are adapter-level: each adapter definition ships its `fast`/`standard`/`max` table — what `--model <tier>` resolves through and `agents <name> --models` prints. `model` is required; **`effort` is optional, because effort is a property of the model rather than of the tier.** A vendor may expose no effort setting for a given model — claude CLI ≥2.1.224 offers none for Haiku 4.5 while keeping it for Sonnet and Opus — and a tier that pins such a model omits `effort` entirely, meaning the model runs at its own built-in level. Where an effort is present it is validated like any other. Overriding what a tier means uses the same mechanism as everything else — a `[presets]` table in a file under `agents/` for that adapter — never `config.toml`, so resolution stays inspectable with provenance like every other field. Tiers left out keep the adapter's shipped pair.
+
+A model with no effort setting is listed exactly that way: `agents <name> --models` and the cross-agent overview render `·` in the effort column and `--json` carries `null`, absence as absence. Asking for one anyway stays a loud failure rather than a silent downgrade — an explicit `--effort` the adapter rejects fails the turn, and the error names the resolved model as the likely reason it has no such setting. A preset effort the adapter rejects fails the same way: it means the entry TOML has gone stale against the vendor, and a one-line fix to a file beats a runtime capability probe that adapts silently.
 
 ```toml
 # ~/.acpc/agents/codex.toml — same override mechanism, aimed at the base adapter
 [presets]
 fast = { model = "gpt-5.6-luna", effort = "high" }
 max  = { model = "gpt-5.6-sol",  effort = "xhigh" }
+# effort omitted: this model has no effort setting to give it
+turbo = { model = "gpt-5.6-nova" }
 ```
 
 Environment is part of the entry, in two fields. An `[env]` table holds literal values declared in the entry (e.g. the vendor home path). `env_passthrough` lists variable *names* read from the caller's environment at call time — values are never stored on disk, which is how API keys travel. Both feed the daemon target key ("declared env"): `[env]` by name and value, `env_passthrough` by name *and the value read at call time* — hashed into the key, still never stored — so two entries with different env, or two callers holding different credentials, are separate targets that cannot serve each other's traffic (nobody silently rides on the first caller's API key).

@@ -674,7 +674,9 @@ def _render_models(
 ) -> tuple[str, dict[str, Any]]:
     advertised = _advertised_payload(record)
     lines: list[str] = []
-    preset_rows = [(tier, preset.model, preset.effort) for tier, preset in entry.presets.items()]
+    preset_rows = [
+        (tier, preset.model, preset.effort or "·") for tier, preset in entry.presets.items()
+    ]
     lines.extend(
         render.format_table(
             preset_rows,
@@ -777,7 +779,10 @@ def _models_overview(registry: AgentRegistry) -> tuple[str, dict[str, Any], list
         lines.append(entry.entry)
         lines.extend(
             render.format_table(
-                [(tier, preset.model, preset.effort) for tier, preset in entry.presets.items()],
+                [
+                    (tier, preset.model, preset.effort or "·")
+                    for tier, preset in entry.presets.items()
+                ],
                 header=("tier", "model", "effort"),
                 prefix="  presets   ",
                 continuation_prefix=" " * 12,

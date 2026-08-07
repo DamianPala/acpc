@@ -256,6 +256,36 @@ def test_named_models_view_labels_and_aligns_the_preset_table(cli: CliRunner) ->
     )
 
 
+def test_a_preset_without_an_effort_renders_as_absent_in_both_model_views(
+    cli: CliRunner, state_root: Path
+) -> None:
+    """Absence renders as absence: a model whose vendor offers no effort knob
+    shows `·`, not a level it is not actually running at."""
+    (state_root / "agents" / "noeffort.toml").write_text(
+        f'command = "{sys.executable} {MOCK_AGENT_SCRIPT}"\n'
+        "\n[presets]\n"
+        'fast = { model = "mock-haiku-4-5" }\n'
+        'standard = { model = "mock-sonnet-5", effort = "high" }\n',
+        encoding="utf-8",
+    )
+
+    named = invoke(cli, "agents", "noeffort", "--models")
+    overview = invoke(cli, "agents", "--models")
+
+    assert named.exit_code == vocab.EXIT_OK
+    assert overview.exit_code == vocab.EXIT_OK
+    header = next(line for line in named.stdout.splitlines() if "TIER" in line)
+    fast = next(line for line in named.stdout.splitlines() if "mock-haiku-4-5" in line)
+    standard = next(line for line in named.stdout.splitlines() if "mock-sonnet-5" in line)
+    assert fast.index("·") == header.index("EFFORT")
+    assert standard.index("high") == header.index("EFFORT")
+    assert any("mock-haiku-4-5" in line and "·" in line for line in overview.stdout.splitlines())
+
+    named_json = json.loads(invoke(cli, "agents", "noeffort", "--models", "--json").stdout)
+    assert named_json["presets"]["fast"] == {"model": "mock-haiku-4-5", "effort": None}
+    assert named_json["presets"]["standard"] == {"model": "mock-sonnet-5", "effort": "high"}
+
+
 def test_models_overview_lists_variants(cli: CliRunner) -> None:
     result = invoke(cli, "agents", "--models")
 

@@ -304,6 +304,29 @@ def test_the_entrys_effort_config_id_names_the_wire_option(state_root: Path) -> 
     assert "(JSON-RPC -32603)" in answer
 
 
+def test_an_unknown_effort_option_names_the_model_that_may_not_take_one(
+    state_root: Path,
+) -> None:
+    """An adapter that has no effort option at all answers with a generic
+    internal error, so the bare rejection reads as a bug in acpc. The hint
+    names the model, which is the thing the caller can actually change."""
+    (state_root / "agents" / "custom.toml").write_text(
+        'extends = "mock"\n'
+        'effort_config_id = "custom_effort"\n'
+        'effort = "high"\n'
+        'model = "mock-opus-5"\n',
+        encoding="utf-8",
+    )
+
+    session_id, outcome = start_turn("echo:hi", agent="custom")
+
+    assert outcome.state == "failed"
+    answer = sessions.answer_path(session_id).read_text(encoding="utf-8")
+    assert "Unknown config option: custom_effort" in answer
+    assert "model 'mock-opus-5' may not take an effort setting" in answer
+    assert "drop --effort, or drop effort from the preset in the entry TOML" in answer
+
+
 def test_describe_error_surfaces_the_json_rpc_data() -> None:
     """A JSON-RPC error's fixed message hides the vendor's diagnosis in data."""
     error = RequestError(

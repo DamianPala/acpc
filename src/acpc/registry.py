@@ -80,10 +80,14 @@ class FieldSource:
 
 @dataclass(frozen=True, slots=True)
 class Preset:
-    """An adapter-level model tier."""
+    """An adapter-level model tier.
+
+    ``effort`` is optional: a model whose vendor exposes no effort setting is
+    pinned by model alone, and the model then runs at its own built-in level.
+    """
 
     model: str
-    effort: str
+    effort: str | None
     source: Path
 
 
@@ -217,7 +221,8 @@ class ResolvedEntry:
             resolved_model = preset.model
             resolved_effort = preset.effort
             sources["model"] = self.provenance[f"presets.{model}.model"]
-            sources["effort"] = self.provenance[f"presets.{model}.effort"]
+            if resolved_effort is not None:
+                sources["effort"] = self.provenance[f"presets.{model}.effort"]
         elif model is not None:
             resolved_model = model
             resolved_effort = self.effort
@@ -241,7 +246,7 @@ class ResolvedEntry:
                 sources["model"] = FieldSource("adapter-default", default.source)
             if resolved_effort is not None:
                 sources["effort"] = self.source_for("effort")
-            elif default is not None:
+            elif default is not None and default.effort is not None:
                 resolved_effort = default.effort
                 sources["effort"] = FieldSource("adapter-default", default.source)
 
@@ -411,14 +416,15 @@ def _parse_entry(
             if unknown_preset:
                 names = ", ".join(repr(key) for key in unknown_preset)
                 raise RegistryError(f"{path}: [presets.{tier}] unknown key(s) {names}")
-            if set(preset) != _PRESET_KEYS:
-                raise RegistryError(f"{path}: [presets.{tier}] requires model and effort")
+            if "model" not in preset:
+                raise RegistryError(f"{path}: [presets.{tier}] requires model")
             _expect_string(path, f"presets.{tier}.model", preset["model"])
-            preset_effort = _expect_string(path, f"presets.{tier}.effort", preset["effort"])
-            if preset_effort not in EFFORT_VALUES:
-                raise RegistryError(
-                    f"{path}: [presets.{tier}].effort has unsupported level '{preset_effort}'"
-                )
+            if "effort" in preset:
+                preset_effort = _expect_string(path, f"presets.{tier}.effort", preset["effort"])
+                if preset_effort not in EFFORT_VALUES:
+                    raise RegistryError(
+                        f"{path}: [presets.{tier}].effort has unsupported level '{preset_effort}'"
+                    )
 
     if not allow_partial and "command" not in raw and "extends" not in raw:
         raise RegistryError(f"{path}: an entry must define 'command' or 'extends'")
@@ -461,9 +467,10 @@ def _to_resolved(
         source = parsed.provenance[f"presets.{tier}.model"].path
         if source is None:
             raise RegistryError(f"{parsed.source}: preset '{tier}' has no file source")
+        raw_effort = raw_preset.get("effort")
         presets[tier] = Preset(
             model=str(raw_preset["model"]),
-            effort=str(raw_preset["effort"]),
+            effort=None if raw_effort is None else str(raw_effort),
             source=source,
         )
 
