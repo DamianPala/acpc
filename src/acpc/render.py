@@ -46,9 +46,14 @@ def _single_line(value: object) -> str:
     return " ".join(str(value).split())
 
 
-def _message_snippet(text: str, *, full: bool, limit: int = 200) -> str:
+def snippet(text: str, *, limit: int = 200) -> str:
+    """Collapse whitespace, then cut at the last word boundary within `limit`.
+
+    A single token longer than the limit is cut hard — snapping to a
+    boundary that does not exist would return nothing.
+    """
     normalized = _single_line(text)
-    if full or len(normalized) <= limit:
+    if len(normalized) <= limit:
         return normalized
     content_limit = limit - len("...")
     head = normalized[:content_limit]
@@ -56,6 +61,10 @@ def _message_snippet(text: str, *, full: bool, limit: int = 200) -> str:
     if boundary >= 0:
         head = head[:boundary]
     return head.rstrip() + "..."
+
+
+def _message_snippet(text: str, *, full: bool) -> str:
+    return _single_line(text) if full else snippet(text)
 
 
 def _event_index(event: Mapping[str, Any], fallback: int) -> int:

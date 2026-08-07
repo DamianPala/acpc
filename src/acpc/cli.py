@@ -441,12 +441,17 @@ def _local_variant_value(entry: ResolvedEntry, field: str) -> str | None:
     return _display_home(value) if field == "home" else str(value)
 
 
+# SPEC: the roster bounds a description so a long one cannot bloat the
+# context of the agent reading it; the detail view and --json stay full.
+_ROSTER_DESCRIPTION_LIMIT = 80
+
+
 def _agent_row(entry: ResolvedEntry) -> str:
     status = entry.install_status
     if status == "missing":
         status = f"missing → acpc install {entry.entry}"
     description = (
-        f" {render._message_snippet(entry.description, full=False, limit=80)}"
+        f" {render.snippet(entry.description, limit=_ROSTER_DESCRIPTION_LIMIT)}"
         if entry.description is not None
         else ""
     )
@@ -459,7 +464,7 @@ def _variant_row(entry: ResolvedEntry) -> str:
         for field in ("model", "effort", "permissions", "home")
     }
     description = (
-        f" {render._message_snippet(entry.description, full=False, limit=80)}"
+        f" {render.snippet(entry.description, limit=_ROSTER_DESCRIPTION_LIMIT)}"
         if entry.description is not None
         else ""
     )
