@@ -455,7 +455,7 @@ Entry TOMLs are trusted at the level of shell config: an adapter definition name
 ## Output contract
 
 - **stdout carries exactly one thing, chosen by flags**: the answer (default), a short confirmation (`-o`), a JSON envelope (`--json`), a session ID + dir path (`--bg`). Never spinners, ANSI, logs or diagnostics — those go to stderr or the session log file.
-- **"The answer" is defined**: the turn's ACP agent-message content, chunks concatenated in stream order; thought chunks and tool output excluded; markdown passed through verbatim. Narration interleaved between tool calls is part of it — never silently dropped. stdout and `answer.md` carry identical bytes; for a single-turn session, `log --prose --since 0` renders the same content.
+- **"The answer" is defined**: the turn's ACP agent-message content, chunks concatenated in stream order; thought chunks and tool output excluded; markdown passed through verbatim. Narration interleaved between tool calls is part of it — never silently dropped, and never silently glued to what follows: when any non-message update arrives between two message chunks the boundary is detectable, and the answer carries a blank line there. Chunks with nothing between them are one message being streamed and stay joined. The rule reads the update stream and never the clock, so a slow adapter cannot invent a paragraph break, and a fast one cannot lose a real one. stdout and `answer.md` carry identical bytes; for a single-turn session, `log --prose --since 0` renders the same content.
 - **Fixed exit codes** (Unix conventions; finer-grained ACP `stop_reason` lives in `meta.json` and the `--json` envelope):
 
   | Code | Meaning |

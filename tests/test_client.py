@@ -153,7 +153,7 @@ def test_answer_keeps_interleaved_narration_and_excludes_tool_events(
     asyncio.run(scenario())
 
     events = transcript.read().events
-    assert client.answer == "before between after"
+    assert client.answer == "before \n\nbetween \n\nafter"
     assert [event["type"] for event in events] == ["msg", "msg", "tool", "thought", "msg"]
     tool = events[2]
     assert tool == {
@@ -167,6 +167,140 @@ def test_answer_keeps_interleaved_narration_and_excludes_tool_events(
     }
     assert "hidden tool output" not in client.answer
     assert "another private thought" not in client.answer
+
+
+def test_answer_separates_messages_at_a_tool_boundary(tmp_path: Path, monkeypatch: Any) -> None:
+    monkeypatch.setenv("ACPC_HOME", str(tmp_path / "acpc-state"))
+    client, _transcript = _make_client(tmp_path, PermissionLevel.READ)
+
+    async def scenario() -> None:
+        await client.session_update(
+            "adapter-session",
+            AgentMessageChunk(content=text_block("preamble"), session_update="agent_message_chunk"),
+        )
+        await client.session_update(
+            "adapter-session",
+            ToolCallStart(
+                tool_call_id="tool-1",
+                title="Read notes.md",
+                kind="read",
+                status="in_progress",
+                session_update="tool_call",
+            ),
+        )
+        await client.session_update(
+            "adapter-session",
+            ToolCallProgress(
+                tool_call_id="tool-1",
+                status="completed",
+                session_update="tool_call_update",
+            ),
+        )
+        await client.session_update(
+            "adapter-session",
+            AgentMessageChunk(content=text_block("answer"), session_update="agent_message_chunk"),
+        )
+
+    asyncio.run(scenario())
+
+    assert client.answer == "preamble\n\nanswer"
+
+
+def test_a_streamed_message_stays_joined_across_coalescer_cuts(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    monkeypatch.setenv("ACPC_HOME", str(tmp_path / "acpc-state"))
+    chunks = [f"{index:04d}" for index in range(5000)]
+    client, transcript = _make_ticking_client(
+        tmp_path, [index * 0.001 for index in range(len(chunks))]
+    )
+
+    async def scenario() -> None:
+        for chunk in chunks:
+            await client.session_update(
+                "adapter-session",
+                AgentMessageChunk(content=text_block(chunk), session_update="agent_message_chunk"),
+            )
+        client.flush()
+
+    asyncio.run(scenario())
+
+    assert client.answer == "".join(chunks)
+    assert len(transcript.read().events) > 1
+
+
+def test_a_thought_chunk_is_an_answer_boundary(tmp_path: Path, monkeypatch: Any) -> None:
+    monkeypatch.setenv("ACPC_HOME", str(tmp_path / "acpc-state"))
+    client, _transcript = _make_client(tmp_path, PermissionLevel.READ)
+
+    async def scenario() -> None:
+        await client.session_update(
+            "adapter-session",
+            AgentMessageChunk(content=text_block("before"), session_update="agent_message_chunk"),
+        )
+        await client.session_update(
+            "adapter-session",
+            AgentThoughtChunk(content=text_block("private"), session_update="agent_thought_chunk"),
+        )
+        await client.session_update(
+            "adapter-session",
+            AgentMessageChunk(content=text_block("after"), session_update="agent_message_chunk"),
+        )
+
+    asyncio.run(scenario())
+
+    assert client.answer == "before\n\nafter"
+
+
+def test_leading_message_has_no_separator_after_a_thought(tmp_path: Path, monkeypatch: Any) -> None:
+    monkeypatch.setenv("ACPC_HOME", str(tmp_path / "acpc-state"))
+    client, _transcript = _make_client(tmp_path, PermissionLevel.READ)
+
+    async def scenario() -> None:
+        await client.session_update(
+            "adapter-session",
+            AgentThoughtChunk(content=text_block("private"), session_update="agent_thought_chunk"),
+        )
+        await client.session_update(
+            "adapter-session",
+            AgentMessageChunk(content=text_block("answer"), session_update="agent_message_chunk"),
+        )
+
+    asyncio.run(scenario())
+
+    assert client.answer == "answer"
+    assert not client.answer.startswith("\n\n")
+
+
+def test_existing_blank_line_is_not_doubled_at_a_boundary(tmp_path: Path, monkeypatch: Any) -> None:
+    monkeypatch.setenv("ACPC_HOME", str(tmp_path / "acpc-state"))
+    client, _transcript = _make_client(tmp_path, PermissionLevel.READ)
+
+    async def scenario() -> None:
+        await client.session_update(
+            "adapter-session",
+            AgentMessageChunk(
+                content=text_block("first\n\n"), session_update="agent_message_chunk"
+            ),
+        )
+        await client.session_update(
+            "adapter-session",
+            ToolCallStart(
+                tool_call_id="tool-1",
+                title="Read notes.md",
+                kind="read",
+                status="in_progress",
+                session_update="tool_call",
+            ),
+        )
+        await client.session_update(
+            "adapter-session",
+            AgentMessageChunk(content=text_block("second"), session_update="agent_message_chunk"),
+        )
+
+    asyncio.run(scenario())
+
+    assert client.answer == "first\n\nsecond"
 
 
 def _make_ticking_client(tmp_path: Path, times: list[float]) -> tuple[AcpcClient, Transcript]:

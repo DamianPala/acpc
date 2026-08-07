@@ -379,6 +379,18 @@ def test_early_line_segments_match_the_summary_and_stdout_matches_answer_file(
     assert result.stdout == sessions.answer_path(session_id).read_text(encoding="utf-8")
 
 
+def test_stdout_bytes_match_answer_file_after_a_detectable_message_boundary(
+    cli: CliRunner,
+) -> None:
+    result = invoke(cli, "run", "mock", "separator contract probe")
+
+    assert "\n\n## Answer" in result.stdout
+    metadata_lines = [line for line in result.stderr.splitlines() if line.startswith("-- ")]
+    early_line = next(line for line in metadata_lines if line.startswith("-- session "))
+    session_id = early_line.split()[2]
+    assert result.stdout.encode("utf-8") == sessions.answer_path(session_id).read_bytes()
+
+
 def test_the_summary_starts_on_a_fresh_line_after_an_unterminated_answer(cli: CliRunner) -> None:
     """SPEC output contract: `--` separates only at a line boundary, and the
     compensating newline goes to stderr — stdout stays byte-identical to

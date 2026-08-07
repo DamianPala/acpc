@@ -93,6 +93,7 @@ class AcpcClient:
         self._clock = time.monotonic if clock is None else clock
         self._pending: _PendingChunks | None = None
         self._answer_parts: list[str] = []
+        self._answer_boundary_pending = False
         self._tool_calls: dict[str, _ToolCall] = {}
         self._tokens = 0
         self._cost: float | None = None
@@ -183,9 +184,18 @@ class AcpcClient:
         if update_type == "agent_message_chunk" and isinstance(update, AgentMessageChunk):
             text = getattr(update.content, "text", None)
             if isinstance(text, str):
+                if (
+                    self._answer_boundary_pending
+                    and self.answer
+                    and not self.answer.endswith("\n\n")
+                ):
+                    self._answer_parts.append("\n\n")
                 self._answer_parts.append(text)
+                self._answer_boundary_pending = False
                 self._buffer_chunk("msg", text)
             return
+
+        self._answer_boundary_pending = True
 
         if update_type == "agent_thought_chunk" and isinstance(update, AgentThoughtChunk):
             text = getattr(update.content, "text", None)

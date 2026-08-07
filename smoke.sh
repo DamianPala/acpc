@@ -546,6 +546,25 @@ if begin_section S06-run "run sync + session dir layout + output contract + exit
     set -e
     assert_eq "SIGPIPE on a closed stdout exits 141" "141" "$SIGPIPE_RC"
 
+    # S11: a non-message update separates two answer messages without
+    # changing stdout's byte identity with the answer on disk.
+    SEPARATOR_OUT="${SCRATCH}/separator.out"
+    SEPARATOR_ERR="${SCRATCH}/separator.err"
+    set +e
+    acpc run mock "separator smoke probe" >"$SEPARATOR_OUT" 2>"$SEPARATOR_ERR"
+    SEPARATOR_RC=$?
+    set -e
+    assert_eq "separator smoke run exits 0" "0" "$SEPARATOR_RC"
+    SEPARATOR_TEXT="$(cat "$SEPARATOR_OUT")"
+    assert_contains "detectable message boundary keeps markdown separated" "$SEPARATOR_TEXT" $'\n\n## Answer'
+    SEPARATOR_ID="$(sed -n 's/^-- session \([^ ]*\).*/\1/p' "$SEPARATOR_ERR" | head -n1)"
+    SEPARATOR_DIR="${ACPC_HOME}/sessions/${SEPARATOR_ID}"
+    if cmp -s "$SEPARATOR_OUT" "${SEPARATOR_DIR}/answer.md"; then
+        pass
+    else
+        fail "stdout matches answer.md bytes for separated answer messages"
+    fi
+
     # On-disk contract: 0700 dirs / 0600 files, meta parses, transcript header
     while IFS= read -r -d '' d; do
         assert_mode "dir is 0700: $d" "$d" "700"
