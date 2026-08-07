@@ -681,13 +681,14 @@ def _render_commands(
 ) -> tuple[str, dict[str, Any]]:
     advertised = _advertised_payload(record)
     commands = [item for item in advertised.get("commands", []) if isinstance(item, Mapping)]
-    lines = []
+    rows: list[tuple[str, str]] = []
     for command in commands:
         description = command.get("description", "")
         text = cache.first_sentence(description) if isinstance(description, str) else ""
         if isinstance(description, str) and text != description:
             text += "…"
-        lines.append(f"{_command_name(command):<18} {text}")
+        rows.append((_command_name(command), text))
+    lines = render.format_table(rows)
     lines.append(_commands_footer(entry.base_adapter, commands, record))
     return "\n".join(lines) + "\n", {
         "agent": entry.entry,
@@ -727,15 +728,32 @@ def _models_overview(registry: AgentRegistry) -> tuple[str, dict[str, Any], list
         advertised = _advertised_payload(record)
         models = [str(item) for item in advertised.get("models", [])]
         lines.append(entry.entry)
-        for index, (tier, preset) in enumerate(entry.presets.items()):
-            prefix = "  presets " if index == 0 else "          "
-            lines.append(f"{prefix}{tier:<10} {preset.model:<24} {preset.effort}")
+        lines.extend(
+            render.format_table(
+                [(tier, preset.model, preset.effort) for tier, preset in entry.presets.items()],
+                header=("tier", "model", "effort"),
+                prefix="  presets   ",
+                continuation_prefix=" " * 12,
+            )
+        )
         lines.append("  models    " + (" · ".join(models) if models else "·"))
         variants = [item for item in registry.variants if item.base_adapter == entry.entry]
-        for variant in variants:
-            model = _local_variant_value(variant, "model") or "·"
-            effort = _local_variant_value(variant, "effort") or "·"
-            lines.append(f"  variant   {variant.entry:<12} {model:<24} {effort}")
+        if variants:
+            lines.extend(
+                render.format_table(
+                    [
+                        (
+                            variant.entry,
+                            _local_variant_value(variant, "model") or "·",
+                            _local_variant_value(variant, "effort") or "·",
+                        )
+                        for variant in variants
+                    ],
+                    header=("entry", "model", "effort"),
+                    prefix="  variants  ",
+                    continuation_prefix=" " * 12,
+                )
+            )
         payload["agents"].append(
             {
                 "name": entry.entry,

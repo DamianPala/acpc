@@ -48,7 +48,7 @@ agents init <name> --extends <agent> [--model M] [--effort E] [--permissions P] 
 | `--check` | Live probe: launch + auth + apply the resolved options (mode/model/effort), so a config the adapter would reject fails the check rather than the next run; no prompt is sent, so model access itself still surfaces at `run` time. With name one adapter, without every installed one; one line per adapter, any failure → exit 1 |
 | `init --extends <agent>` | Scaffold a variant; the flags mirror the entry's fields |
 
-Without name: one aligned row per adapter and variant. Variants (indented) show only their delta in fixed columns — model, effort, permissions, home (`·` = unset; home `~`-abbreviated, copy-able into `--home`). Status is `installed`/`missing` only; auth is not shown — cached auth state rots; the truth surfaces at `run` time as an actionable error. `agents --check` is the opt-in live probe.
+Without name: one aligned row per adapter and variant. Variants (indented) show only their delta, under a header naming its columns — model, effort, permissions, home, description (`·` = unset; home `~`-abbreviated, copy-able into `--home`); widths are computed from the rows, per *Output contract*. Adapter rows are a different shape — entry, display name, install status — and carry no header of their own, since one header cannot describe both. Status is `installed`/`missing` only; auth is not shown — cached auth state rots; the truth surfaces at `run` time as an actionable error. `agents --check` is the opt-in live probe.
 
 With name: the resolved definition, field by field with provenance — the entry in general; one concrete call's resolution, with call-site flags applied, is `run --dry-run`.
 
@@ -62,16 +62,17 @@ Advertised data — modes, models, slash commands — is adapter-level (variants
 
 ```
 $ acpc agents
-claude   Claude Code (Anthropic)   installed
-codex    Codex CLI (OpenAI)        installed
-  builder    gpt-5.6-luna   xhigh  write  ~/.codex-openrouter
-  explorer   gpt-5.6-luna   low    read   ~/.codex-openrouter
-  planner    gpt-5.6-sol    xhigh  write  ~/.codex-openrouter
-  reviewer   gpt-5.6-sol    xhigh  read   ~/.codex-openrouter
+claude  Claude Code (Anthropic)  installed
+codex   Codex CLI (OpenAI)       installed
+  entry     model         effort  permissions  home                 description
+  builder   gpt-5.6-luna  xhigh   write        ~/.codex-openrouter  Implements a task against a plan; writes the code and runs the commands the...
+  explorer  gpt-5.6-luna  low     read         ~/.codex-openrouter  Answers a question, reading only.
+  planner   gpt-5.6-sol   xhigh   write        ~/.codex-openrouter  Decomposes a problem into a plan.
+  reviewer  gpt-5.6-sol   xhigh   read         ~/.codex-openrouter  Hunts defects in a change.
 
 $ acpc agents builder           # what this entry resolves to
 extends      codex
-description  Implements a task against a plan; writes code and runs commands.
+description  Implements a task against a plan; writes the code and runs the commands the plan calls for.
 model        gpt-5.6-luna (entry)
 effort       xhigh (entry)
 permissions  write (entry)
@@ -80,10 +81,10 @@ env          MODEL_PROVIDER=openrouter (entry) · passthrough: OPENROUTER_API_KE
 -- modes/models/commands: acpc agents codex
 
 $ acpc agents codex --commands
-/init            Create an AGENTS.md file with instructions for Codex
-/review          Review current changes and find issues
-/$image-gen      Generate or transform bitmap image assets from text prompts or references…
-/$openai-docs    Use when the user asks how to build with OpenAI products or APIs…
+/init          Create an AGENTS.md file with instructions for Codex
+/review        Review current changes and find issues
+/$image-gen    Generate or transform bitmap image assets from text prompts or references…
+/$openai-docs  Use when the user asks how to build with OpenAI products or APIs…
 …
 -- 47 commands (cached 2h ago) | full descriptions: ~/.acpc/cache/codex/commands.md
 
@@ -100,9 +101,10 @@ variants     none
 -- cached 30m ago
 
 $ acpc agents claude --models
-presets   fast      claude-haiku-4-5   high
-          standard  claude-sonnet-5    high
-          max       claude-opus-5      max
+presets   tier      model             effort
+          fast      claude-haiku-4-5  high
+          standard  claude-sonnet-5   high
+          max       claude-opus-5     max
 models    claude-opus-5
           claude-sonnet-5
           claude-haiku-4-5
@@ -111,18 +113,21 @@ models    claude-opus-5
 
 $ acpc agents --models
 codex
-  presets   fast      gpt-5.6-luna    high
-            standard  gpt-5.6-terra   xhigh
-            max       gpt-5.6-sol     xhigh
+  presets   tier      model          effort
+            fast      gpt-5.6-luna   high
+            standard  gpt-5.6-terra  xhigh
+            max       gpt-5.6-sol    xhigh
   models    gpt-5.6-sol · gpt-5.6-terra · gpt-5.6-luna · gpt-5.5 · gpt-5.4
-  variants  builder   gpt-5.6-luna    xhigh
-            explorer  gpt-5.6-luna    low
-            planner   gpt-5.6-sol     xhigh
-            reviewer  gpt-5.6-sol     xhigh
+  variants  entry     model         effort
+            builder   gpt-5.6-luna  xhigh
+            explorer  gpt-5.6-luna  low
+            planner   gpt-5.6-sol   xhigh
+            reviewer  gpt-5.6-sol   xhigh
 claude
-  presets   fast      claude-haiku-4-5   high
-            standard  claude-sonnet-5    high
-            max       claude-opus-5      max
+  presets   tier      model             effort
+            fast      claude-haiku-4-5  high
+            standard  claude-sonnet-5   high
+            max       claude-opus-5     max
   models    claude-opus-5 · claude-sonnet-5 · claude-haiku-4-5 · claude-opus-4-8
 -- cached: codex 2h ago · claude 30m ago
 
@@ -326,7 +331,7 @@ Without id: one line per session — id, the entry it ran on (variant or adapter
 
 The **resolved model** is the one the session actually ran on, read from the resolution stored in `meta.json` at dispatch. Entry names hide this: a variant inherits its model through `extends`, so `builder` and `explorer` can both be running `gpt-5.6-luna` while `reviewer` runs `gpt-5.6-terra`, and nothing in the entry name says so. Every session resolves a model — an adapter default counts — so the column is populated in practice; a session whose `meta.json` predates this field or lost it to a torn write renders `·` rather than failing the view.
 
-The **idle age** is the time since the session's newest transcript event, shown as `idle <age>` on active sessions and `·` on finished ones. Runtime alone cannot tell a slow turn from a hung one; an age that keeps growing while the state stays `running` is the signal that something is stuck. It is a fixed-cost read of the transcript's tail — the last complete line, never a parse of the stream — and it is read-only: a damaged or torn transcript yields no age rather than an error or a repair.
+The **idle age** is the time since the session's newest transcript event, shown on active sessions and `·` on finished ones. Runtime alone cannot tell a slow turn from a hung one; an age that keeps growing while the state stays `running` is the signal that something is stuck. It is a fixed-cost read of the transcript's tail — the last complete line, never a parse of the stream — and it is read-only: a damaged or torn transcript yields no age rather than an error or a repair.
 
 With id: one session's vitals — state (exit code once finished), runtime, idle age while active, tokens/cost so far (cumulative across the session's turns), the entry with its base adapter and resolved model, name, session dir and answer path.
 
@@ -334,13 +339,14 @@ A pulse, not a dump: reads `meta.json`, process liveness and the transcript's la
 
 ```
 $ acpc status
-x7k2  codex      gpt-5.6-terra  running   3m12s    idle 0m04s  ·                "Fix the failing test in tests/test_auth.py"
-p9d4  claude     claude-opus-5  running   0m41s    idle 0m38s  researcher       "Research X and write findings to ./findings…"
-kq8w  reviewer   gpt-5.6-terra  done      12m40s   ·           spec-review      "Review the diff against the spec and report…"
-b3nn  codex      gpt-5.6-terra  failed    2m05s    ·           ·                "Summarize the repository changes"
-m2w7  claude     claude-opus-5  done      8m19s    ·           docs             "Update the README quick-start for the new CLI"
-ze6a  codex      gpt-5.6-terra  timeout   30m00s   ·           ·                "Migrate the config loader to TOML and run the…"
-q4hf  builder    gpt-5.6-luna   done      22m03s   ·           ·                "Implement the session lock and its tests per…"
+id    entry     model          state    runtime  idle   name         prompt
+x7k2  codex     gpt-5.6-terra  running  3m12s    0m04s  ·            "Fix the failing test in tests/test_auth.py"
+p9d4  claude    claude-opus-5  running  0m41s    0m38s  researcher   "Research X and write findings to ./findings…"
+kq8w  reviewer  gpt-5.6-terra  done     12m40s   ·      spec-review  "Review the diff against the spec and report…"
+b3nn  codex     gpt-5.6-terra  failed   2m05s    ·      ·            "Summarize the repository changes"
+m2w7  claude    claude-opus-5  done     8m19s    ·      docs         "Update the README quick-start for the new CLI"
+ze6a  codex     gpt-5.6-terra  timeout  30m00s   ·      ·            "Migrate the config loader to TOML and run the…"
+q4hf  builder   gpt-5.6-luna   done     22m03s   ·      ·            "Implement the session lock and its tests per…"
 -- 2 running · 5 recent · --all for all 17
 
 $ acpc status kq8w

@@ -658,6 +658,9 @@ ${BG1_DIR}" "$LAST_OUT"
     run_acpc daemon status
     assert_eq "daemon status exits 0" "0" "$LAST_RC"
     assert_contains "daemon status names the mock target" "$LAST_OUT" "mock"
+    # Inline-labeled values, so alignment only: the first line is a target, not a header.
+    assert_contains "daemon status opens on a target row, not a header" \
+        "$(head -n 1 <<<"$LAST_OUT")" "pid"
     # Slow on purpose: the assertion below is about *active* sessions, and a
     # default mock turn is finished well inside the sleep that follows.
     run_acpc run stopper "slow:30 daemon stop victim" --bg --quiet
@@ -734,6 +737,8 @@ if begin_section S08-views "status list/detail, log default/--since/--tail/--pro
     # status list: defaults to running + 5 most recent finished; footer in view
     run_acpc status
     assert_eq "status exits 0" "0" "$LAST_RC"
+    assert_eq "status list opens with a column header" "id entry model state runtime idle name prompt" \
+        "$(awk 'NR == 1 {$1 = $1; print}' <<<"$LAST_OUT")"
     run_acpc status --all
     assert_eq "status --all exits 0" "0" "$LAST_RC"
     # Asserted via --all: at the S08 gate the S07 sessions don't exist yet, and
@@ -963,6 +968,9 @@ if begin_section S10-agents "agents views, variants, advertised data, install"; 
     assert_contains "agents list shows phantom missing with install hint" "$LAST_OUT" \
         "missing → acpc install phantom"
     assert_contains "agents list shows the builder variant" "$LAST_OUT" "builder"
+    assert_eq "agents list labels the variant columns, once" \
+        "entry model effort permissions home description" \
+        "$(awk '/^  entry / {$1 = $1; print; exit}' <<<"$LAST_OUT")"
     assert_contains "agents list shows the explorer variant" "$LAST_OUT" "explorer"
     assert_contains "variant rows show their model delta" "$LAST_OUT" "mock-opus-5"
 
@@ -979,9 +987,15 @@ if begin_section S10-agents "agents views, variants, advertised data, install"; 
     run_acpc agents mock --models
     assert_contains "agents <name> --models lists presets" "$LAST_OUT" "fast"
     assert_contains "presets carry model + effort pairs" "$LAST_OUT" "mock-haiku-4-5"
+    assert_eq "the preset table carries a column header" "presets tier model effort" \
+        "$(awk 'NR == 1 {$1 = $1; print}' <<<"$LAST_OUT")"
     run_acpc agents --models
     assert_contains "agents --models overview lists mock" "$LAST_OUT" "mock"
     assert_contains "agents --models overview collapses variants" "$LAST_OUT" "builder"
+    assert_eq "the overview labels its preset columns" "presets tier model effort" \
+        "$(awk '/^  presets / {$1 = $1; print; exit}' <<<"$LAST_OUT")"
+    assert_eq "the overview labels its variant columns" "variants entry model effort" \
+        "$(awk '/^  variants / {$1 = $1; print; exit}' <<<"$LAST_OUT")"
 
     run_acpc agents mock --commands
     assert_contains "agents mock --commands lists /review" "$LAST_OUT" "/review"

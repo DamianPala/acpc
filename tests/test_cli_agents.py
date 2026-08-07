@@ -263,6 +263,40 @@ def test_models_overview_lists_variants(cli: CliRunner) -> None:
     assert "mock" in result.stdout and "builder" in result.stdout
 
 
+def test_models_overview_labels_and_aligns_both_of_its_tables(
+    cli: CliRunner, state_root: Path
+) -> None:
+    long_entry = "variant-name-longer-than-the-old-column"
+    long_model = "vendor/model-with-a-deliberately-long-identifier"
+    (state_root / "agents" / f"{long_entry}.toml").write_text(
+        f'''
+extends = "mock"
+model = "{long_model}"
+effort = "xhigh"
+''',
+        encoding="utf-8",
+    )
+
+    result = invoke(cli, "agents", "--models")
+
+    assert result.exit_code == vocab.EXIT_OK
+    lines = result.stdout.splitlines()
+    block = lines[lines.index("mock") :]
+    preset_header = next(line for line in block if line.startswith("  presets"))
+    fast = next(line for line in block if "fast" in line)
+    variant_header = next(line for line in block if line.startswith("  variants"))
+    variant_row = next(line for line in block if long_entry in line)
+
+    assert preset_header.split() == ["presets", "tier", "model", "effort"]
+    assert [fast.index(value) for value in ("fast", "mock-haiku-4-5", "high")] == [
+        preset_header.index(value) for value in ("tier", "model", "effort")
+    ]
+    assert variant_header.split() == ["variants", "entry", "model", "effort"]
+    assert [variant_row.index(value) for value in (long_entry, long_model, "xhigh")] == [
+        variant_header.index(value) for value in ("entry", "model", "effort")
+    ]
+
+
 def test_variant_models_view_delegates_to_parent_catalog(cli: CliRunner) -> None:
     cache.refresh_advertised("mock", {"models": ["parent-model"]}, clock=lambda: 100.0)
 
@@ -323,6 +357,29 @@ def test_commands_view_truncates_sentences(cli: CliRunner) -> None:
     assert result.exit_code == vocab.EXIT_OK
     assert "/plan" in result.stdout
     assert "The complete explanation" not in result.stdout
+
+
+def test_commands_view_aligns_descriptions_past_the_longest_name(cli: CliRunner) -> None:
+    long_name = "command-name-longer-than-the-old-column"
+    cache.refresh_advertised(
+        "mock",
+        {
+            "commands": [
+                {"name": "short", "description": "Short one."},
+                {"name": long_name, "description": "Long one."},
+            ]
+        },
+        clock=lambda: 100.0,
+    )
+
+    result = invoke(cli, "agents", "mock", "--commands")
+
+    assert result.exit_code == vocab.EXIT_OK
+    lines = result.stdout.splitlines()
+    short_row = next(line for line in lines if line.startswith("/short"))
+    long_row = next(line for line in lines if line.startswith(f"/{long_name}"))
+
+    assert short_row.index("Short one.") == long_row.index("Long one.")
 
 
 def test_commands_view_names_full_cache_file(cli: CliRunner) -> None:
