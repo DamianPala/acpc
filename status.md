@@ -2,7 +2,9 @@
 
 ## Now
 
-**0.4 is built and accepted on `feat/0.4`; landing is Damian's gate.** Sixteen slices, one commit each, tip `7d75504`. Nothing pushed, nothing tagged, the installed tool is still 0.3.0.
+**0.4 LANDED 2026-08-07 (Damian's go).** `main` fast-forwarded to the sixteen-slice tip, version bumped (`a5b87f3`) and tagged `v0.4.0`, `uv tool install --force` → `acpc --version` 0.4.0, all daemons stopped, sanity dispatch green. Wave-5 worktrees, the `wave5/*` branches and `feat/0.4` deleted (patch-equivalent commits verified in `main` first); survey/test sessions pruned, the twelve slice-implementation transcripts kept. Nothing pushed — local-only as always.
+
+**One post-landing find, caught by the sanity dispatch:** claude CLI 2.1.224 offers no `effort` config option for Haiku 4.5 — after the model set the advertised options collapse to `mode/model/agent` (raw ACP probe; sonnet and opus keep `effort`, opus grew a `fast` toggle), so acpc's effort write failed and `acpc run claude --model fast` errored out. There is no record the fast preset ever ran green on claude (tier-2 live tests were codex-only), so this was vendor drift or latent from day one. Fixed at the gate — see *Next*. Two follow-up commits also rode the gate: uppercase table header labels (SPEC convention + all views + smoke) and the README purpose-table guidance.
 
 Waves 4 and 5 added eight more slices after the first acceptance run (S9–S16), so the bar was rerun from scratch, twice back to back: **591 pytest, ruff check + format, pyright 0 errors, shellcheck, `shfmt` steady at its pre-existing 69-line diff, smoke 578/578**, zero leaked daemons or adapters after each round. Every touched view was eyeballed live against real adapters, including the condensed `log` on a prose-heavy Polish session and the bundled-skill views.
 
@@ -10,7 +12,7 @@ The surface 0.4 adds: `log --follow` (a bounded stream replacing the `--wait-new
 
 Acceptance: full bar twice back-to-back, both green (535 pytest, ruff check + format, pyright 0 errors, shellcheck, smoke 495/495), zero leaked processes after each. Live tier 1 (Luna over OpenRouter) covered all three follow endings with exact cursor resume, early-line timing (t+1s versus t+11s for the summary), and steer end to end. Live tier 2 (real codex) covered steer — the cancel landed in about a second — and one follow smoke. Every new guard was mutation-checked red before landing.
 
-**Next: landing, gated on Damian's explicit go item by item** — bump to 0.4.0, tag, `uv tool install --force`. The plan and slice contract are local-only under `docs/plans/0.4/`.
+The plan and slice contract are local-only under `docs/plans/0.4/`.
 
 ## Done
 
@@ -122,10 +124,11 @@ Stage 3 was complete through section 4 when the branch went to the gate. Accepta
 
 ## Next
 
-- **0.4 landing, gated on Damian's explicit go item by item:** fast-forward `main` to `feat/0.4`, bump the version to 0.4.0 and tag `v0.4.0`, `uv tool install --force`, `acpc daemon stop` (any daemon still up is running 0.3.0 client code), then one sanity dispatch. Nothing pushed, nothing tagged, the installed tool untouched until then.
+- **Fixed at the gate (Damian's ruling — effort is a property of the model, not the preset):** a preset's `effort` is now optional (`fast = { model = "claude-haiku-4-5" }` runs haiku at its own built-in level), `claude.toml`'s fast preset drops its effort, absent effort renders `·`/`null`, and the adapter's "unknown config option" rejection gains a hint naming the model. Explicit `--effort` on a knobless model stays a loud failure. Deliberately no runtime capability probing — the knowledge lives in the entry TOML with the other vendor facts.
+- **Recorded, not fixed:** a user TOML named after a shipped adapter merges per key, so it cannot *clear* an inherited preset effort by omission — only the file that defines the preset can drop it. Worth a SPEC sentence when presets next change.
 - **`docs/plans/` is gitignored, so PLAN.md has no history** — the cheat sheet's source of truth is an untracked file that one `git checkout` could destroy, and no commit can ever carry a change to it atomically with the code it governs. Decide before 0.5 whether the plan gets tracked.
-- **Post-landing, operator config not repo work:** write a `description` into each of the five entries in `~/.acpc/agents/`. `acpc agents` prints it beside every entry, which is where a dispatching agent learns what `builder` is *for*.
 - Open: the claude TOML still carries `TODO(stage3)` vendor-fact markers — verify live when that adapter is in scope (the standing checklist is `docs/live-test-plan.md`). The gemini adapter was retired 2026-08-07: the Gemini CLI no longer exists.
+- Done post-landing: every entry in `~/.acpc/agents/` carries a `description` (rendered in `acpc agents`); the operator's global agent instructions point at `acpc --help` + `acpc agents` with a purpose table.
 
 - **Convention-friction package (2026-08-06, approved by Damian):** conventions agents carry in from neighboring tools, made to work or answered with a pointer. Implementation dispatched to the `builder` variant (Luna) from pinned-wording specs under `docs/plans/stage3/`; SPEC/doc wording authored by the orchestrator, folded into each implementation commit per the AGENTS.md docs contract.
   - **H3+M1** (`7fa332f`): `log --wait-new` on a finished session returns immediately (the `logs -f` convention — following a stopped stream ends) with 124 and the finished footer; a timeout on a *running* session says so on stderr (`-- still running (gave up waiting after Ns) — session continues; acpc stop <id> to cancel`), for `wait` too.
@@ -140,9 +143,14 @@ Stage 3 was complete through section 4 when the branch went to the gate. Accepta
 - **A transcript event boundary can fall mid-word**, so a condensed `log` row can open with a word fragment (`"rawnień i coś odrzu"` / `"cono, podsumowanie…"` observed live). The `↪` marker makes it readable, and the alternative — re-chunking on word boundaries — would mean rewriting transcript content rather than rendering it. Cosmetic, recorded rather than fixed.
 - **A backgrounded `acpc wait` did not rouse an idle waiter** (2026-08-07): the wait exited 0 and its completion surfaced only ~20 minutes later. The cheat sheet sells `wait` as a completion push; that claim needs a caveat if the push can be missed. Poll with explicit sleeps is the workaround.
 - **`available_commands_update`, `config_option_update` and `current_mode_update` set the message-boundary flag but write no transcript event**, so in theory S11 (separator) and S13 (continuation marker) could disagree about where a boundary is. Verified not reachable today — all three arrive at session setup, before any message chunk — but the two views derive the same fact from different sources, which is what makes the divergence possible at all.
+- **Daemon version-skew self-heal keys on the version string alone**, so during development a warm daemon serves stale client code until a manual `daemon stop`. Finer keying (source hash?) is a 0.5 design question.
+- **Vendor drift is now a live failure mode:** the haiku-effort break (see *Now*) came from a routine claude CLI auto-update. The candidate guard — consult the advertised config options after the model set instead of writing blind — would absorb this whole class.
+- Possible `agy` adapter, if it speaks ACP (Damian's mention at the gemini retirement).
+- SPEC examples say "Claude Code (Anthropic)" where adapters render "Claude Code" — pre-existing cosmetic gap, flagged during the wave-5 SPEC alignment check.
 
 ## Decisions
 
+- 2026-08-07: **0.4.0 landed on Damian's blanket go** ("leć z pracą dalej" after the pause), executed as the parked five-item checklist: ff `main`, bump + tag via `bump-my-version` (same mechanism as 0.3.0), forced reinstall, `daemon stop`, sanity dispatch. The sanity step earned its place immediately by catching the haiku-effort vendor regression.
 - 2026-08-06 (0.4): exit code **4** is pinned to output-budget exhaustion. `log --follow` needed an ending distinguishable from both a clean session end (0) and a timeout (124), because the caller's next move differs: resume from the cursor rather than wait or give up.
 - 2026-08-06 (0.4): `--follow`'s `--tail` replay is a **start point, not a filter** — it picks the cursor the stream begins at, and everything after it streams. Read as a filter, `--tail 0` replayed the whole transcript.
 - 2026-08-06 (0.4): `--max-output` budgets the **whole follow stream**, not each page. A per-page budget would let an unbounded stream past an explicitly bounded call.
