@@ -24,6 +24,8 @@ from acpc.vocab import EFFORT_VALUES, PERMISSION_ALIASES, PERMISSION_VALUES, nor
 
 _TIERS: Final = frozenset({"fast", "standard", "max"})
 _NON_INHERITABLE_FIELDS: Final = frozenset({"description"})
+_MODE_KEYS: Final = frozenset({"grants", "delegates"})
+_MODE_GRANTS: Final = frozenset(PERMISSION_VALUES[:-1])
 _ENTRY_KEYS: Final = frozenset(
     {
         "name",
@@ -43,6 +45,7 @@ _ENTRY_KEYS: Final = frozenset(
         "mode",
         "permissions",
         "env",
+        "modes",
         "presets",
     }
 )
@@ -64,6 +67,7 @@ _FIELD_NAMES: Final = (
     "mode",
     "permissions",
     "env",
+    "modes",
     "presets",
 )
 
@@ -91,6 +95,14 @@ class Preset:
     model: str
     effort: str | None
     source: Path
+
+
+@dataclass(frozen=True, slots=True)
+class ModeSpec:
+    """The permission facts measured for one vendor mode."""
+
+    grants: str
+    delegates: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,6 +156,7 @@ class ResolvedEntry:
     mode: str | None
     permissions: str | None
     env: Mapping[str, str]
+    modes: Mapping[str, ModeSpec]
     presets: Mapping[str, Preset]
     extends: str | None
     provenance: Mapping[str, FieldSource]
@@ -455,6 +468,27 @@ def _parse_entry(
                     raise RegistryError(
                         f"{path}: [presets.{tier}].effort has unsupported level '{preset_effort}'"
                     )
+    if "modes" in raw:
+        modes = raw["modes"]
+        if not isinstance(modes, dict):
+            raise RegistryError(f"{path}: table '[modes]' must contain vendor modes")
+        for mode, spec in modes.items():
+            if not isinstance(mode, str) or not isinstance(spec, dict):
+                raise RegistryError(f"{path}: each [modes] value must be a table")
+            unknown_mode_keys = sorted(set(spec) - _MODE_KEYS)
+            if unknown_mode_keys:
+                names = ", ".join(repr(key) for key in unknown_mode_keys)
+                raise RegistryError(f"{path}: [modes.{mode}] unknown key(s) {names}")
+            if "grants" not in spec:
+                raise RegistryError(f"{path}: [modes.{mode}] requires grants")
+            grants = _expect_string(path, f"modes.{mode}.grants", spec["grants"])
+            if grants not in _MODE_GRANTS:
+                supported = ", ".join(value for value in PERMISSION_VALUES if value in _MODE_GRANTS)
+                raise RegistryError(f"{path}: [modes.{mode}].grants must be one of: {supported}")
+            if "delegates" not in spec:
+                raise RegistryError(f"{path}: [modes.{mode}] requires delegates")
+            if not isinstance(spec["delegates"], bool):
+                raise RegistryError(f"{path}: [modes.{mode}].delegates must be a boolean")
 
     if not allow_partial and "command" not in raw and "extends" not in raw:
         raise RegistryError(f"{path}: an entry must define 'command' or 'extends'")
@@ -509,6 +543,18 @@ def _to_resolved(
             source=source,
         )
 
+    modes: dict[str, ModeSpec] = {}
+    raw_modes = data.get("modes", {})
+    if not isinstance(raw_modes, dict):  # validated earlier, defensive for merged values.
+        raise RegistryError(f"{parsed.source}: [modes] must be a table")
+    for mode, raw_mode in raw_modes.items():
+        if not isinstance(raw_mode, dict):
+            raise RegistryError(f"{parsed.source}: [modes.{mode}] must be a table")
+        modes[mode] = ModeSpec(
+            grants=str(raw_mode["grants"]),
+            delegates=bool(raw_mode["delegates"]),
+        )
+
     def string_or_none(key: str) -> str | None:
         value = data.get(key)
         return value if isinstance(value, str) else None
@@ -522,11 +568,18 @@ def _to_resolved(
     raw_env = data.get("env", {})
     env = dict(raw_env) if isinstance(raw_env, dict) else {}
     provenance = dict(parsed.provenance)
-    default_fields = {"bypass_modes", "efforts", "env_passthrough", "env", "presets"}
-    for field in _FIELD_NAMES:
-        if field not in provenance:
-            kind = "default" if field in default_fields or field == "name" else "unset"
-            provenance[field] = FieldSource(kind)
+    default_fields = {
+        "bypass_modes",
+        "efforts",
+        "env_passthrough",
+        "env",
+        "modes",
+        "presets",
+    }
+    for field_name in _FIELD_NAMES:
+        if field_name not in provenance:
+            kind = "default" if field_name in default_fields or field_name == "name" else "unset"
+            provenance[field_name] = FieldSource(kind)
     return ResolvedEntry(
         entry=name,
         base_adapter=base_adapter,
@@ -546,6 +599,7 @@ def _to_resolved(
         mode=string_or_none("mode"),
         permissions=normalize_permission(string_or_none("permissions")),
         env=env,
+        modes=modes,
         presets=presets,
         extends=extends,
         provenance=provenance,
@@ -632,13 +686,17 @@ class AgentRegistry:
             parent_data = {
                 key: getattr(parent, key)
                 for key in _FIELD_NAMES
-                if key not in {"presets", "env"} and key not in _NON_INHERITABLE_FIELDS
+                if key not in {"modes", "presets", "env"} and key not in _NON_INHERITABLE_FIELDS
             }
             # Rebuild nested values from the parent's public representation;
             # provenance is kept separately and then overlaid with the child.
             parent_data["presets"] = {
                 tier: {"model": item.model, "effort": item.effort}
                 for tier, item in parent.presets.items()
+            }
+            parent_data["modes"] = {
+                mode: {"grants": spec.grants, "delegates": spec.delegates}
+                for mode, spec in parent.modes.items()
             }
             parent_data["env"] = dict(parent.env)
             parent_provenance = {

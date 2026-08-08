@@ -23,6 +23,11 @@ bypass_modes = ["agent-full-access"]
 # Verified live 2026-08-06: codex-acp rejects minimal/ultra ("Invalid params").
 efforts = ["low", "medium", "high", "xhigh"]
 
+[modes]
+read-only = { grants = "edit", delegates = false }
+agent = { grants = "execute", delegates = false }
+agent-full-access = { grants = "all", delegates = false }
+
 [presets]
 fast = { model = "gpt-5.6-luna", effort = "high" }
 standard = { model = "gpt-5.6-terra", effort = "xhigh" }

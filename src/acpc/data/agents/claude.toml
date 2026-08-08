@@ -19,10 +19,6 @@ env_passthrough = [
     "CLAUDE_CODE_USE_MANTLE",
     "CLAUDE_CODE_USE_VERTEX",
 ]
-# Verified live 2026-08-07 (raw ACP probe, claude CLI 2.1.224): auto · default
-# · acceptEdits · plan · dontAsk · bypassPermissions. `auto` lets a vendor
-# classifier answer the prompts, so no request reaches acpc. `dontAsk` emits
-# none either but denies rather than allows, so it is not a bypass.
 bypass_modes = ["auto", "bypassPermissions"]
 # Verified live 2026-08-06 against claude-agent-acp 0.64.0: the effort config
 # option id is `effort` (the default `reasoning_effort` returns "Internal
@@ -34,6 +30,14 @@ bypass_modes = ["auto", "bypassPermissions"]
 # therefore pins the model only, and haiku runs at its own built-in level.
 effort_config_id = "effort"
 efforts = ["default", "low", "medium", "high", "xhigh", "max"]
+
+[modes]
+default = { grants = "read", delegates = true }
+plan = { grants = "read", delegates = true }
+auto = { grants = "read", delegates = true }
+acceptEdits = { grants = "execute", delegates = true }
+dontAsk = { grants = "none", delegates = false }
+bypassPermissions = { grants = "all", delegates = false }
 
 [presets]
 fast = { model = "claude-haiku-4-5" }

@@ -27,6 +27,11 @@ efforts = ["low", "medium", "high", "xhigh"]
 fast = {{ model = "mock-haiku-4-5", effort = "high" }}
 standard = {{ model = "mock-sonnet-5", effort = "high" }}
 max = {{ model = "mock-opus-5", effort = "xhigh" }}
+
+[modes]
+default = {{ grants = "read", delegates = true }}
+acceptEdits = {{ grants = "execute", delegates = true }}
+plan = {{ grants = "read", delegates = true }}
 '''
 
 BUILDER_ENTRY = """
@@ -408,9 +413,28 @@ def test_adapter_detail_caps_models_and_commands_but_never_modes(cli: CliRunner)
     result = invoke(cli, "agents", "mock")
 
     assert result.exit_code == vocab.EXIT_OK
-    assert "modes        5 · default · acceptEdits · plan · yolo · extra-mode" in result.stdout
+    assert (
+        "modes        5 · default (read · delegates) · acceptEdits (execute · delegates) · "
+        "plan (read · delegates) · yolo (undeclared) · extra-mode (undeclared)"
+    ) in result.stdout
     assert "models       4 · model-1 · model-2 · model-3 · …" in result.stdout
     assert "commands     4 · /command-1 · /command-2 · /command-3 · …" in result.stdout
+
+    payload = json.loads(invoke(cli, "agents", "mock", "--json").stdout)
+    assert payload["advertised"]["modes"] == [
+        "default",
+        "acceptEdits",
+        "plan",
+        "yolo",
+        "extra-mode",
+    ]
+    assert payload["advertised"]["mode_specs"] == {
+        "default": {"grants": "read", "delegates": True},
+        "acceptEdits": {"grants": "execute", "delegates": True},
+        "plan": {"grants": "read", "delegates": True},
+        "yolo": None,
+        "extra-mode": None,
+    }
 
 
 def test_named_models_view_accepts_options_before_the_name(cli: CliRunner) -> None:

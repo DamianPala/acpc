@@ -28,6 +28,25 @@ def test_shipped_adapter_facts_and_presets_are_available(tmp_path: Path) -> None
     assert claude.home == "~/.claude"
     assert claude.home_env == "CLAUDE_CONFIG_DIR"
     assert "bypassPermissions" in claude.bypass_modes
+    assert {
+        mode: {"grants": spec.grants, "delegates": spec.delegates}
+        for mode, spec in claude.modes.items()
+    } == {
+        "default": {"grants": "read", "delegates": True},
+        "plan": {"grants": "read", "delegates": True},
+        "auto": {"grants": "read", "delegates": True},
+        "acceptEdits": {"grants": "execute", "delegates": True},
+        "dontAsk": {"grants": "none", "delegates": False},
+        "bypassPermissions": {"grants": "all", "delegates": False},
+    }
+    assert {
+        mode: {"grants": spec.grants, "delegates": spec.delegates}
+        for mode, spec in codex.modes.items()
+    } == {
+        "read-only": {"grants": "edit", "delegates": False},
+        "agent": {"grants": "execute", "delegates": False},
+        "agent-full-access": {"grants": "all", "delegates": False},
+    }
     assert claude.presets["max"].model == "claude-opus-5"
     assert codex.presets["standard"].effort == "xhigh"
     # claude CLI >=2.1.224 offers no effort option for haiku; see claude.toml.
@@ -103,6 +122,64 @@ def test_mode_is_unset_without_an_entry_or_call_value(tmp_path: Path) -> None:
 
     assert resolution.mode is None
     assert resolution.provenance["mode"].kind == "unset"
+
+
+def test_variant_merges_modes_by_name_and_mode_field(tmp_path: Path) -> None:
+    agents = tmp_path / "agents"
+    write_entry(
+        agents,
+        "base",
+        'command = "python -m base"\n'
+        "[modes]\n"
+        'default = { grants = "read", delegates = true }\n'
+        "[modes.plan]\n"
+        'grants = "read"\n'
+        "delegates = true\n",
+    )
+    write_entry(
+        agents,
+        "child",
+        'extends = "base"\n[modes]\nplan = { grants = "execute", delegates = true }\n',
+    )
+
+    modes = AgentRegistry(agents).resolve("child").modes
+
+    assert modes["default"].grants == "read"
+    assert modes["default"].delegates
+    assert modes["plan"].grants == "execute"
+    assert modes["plan"].delegates
+
+
+def test_mode_grants_reject_ask_and_name_the_source_file(tmp_path: Path) -> None:
+    agents = tmp_path / "agents"
+    write_entry(
+        agents,
+        "invalid",
+        'command = "python"\n[modes]\ndefault = { grants = "ask", delegates = false }\n',
+    )
+
+    with pytest.raises(RegistryError) as error:
+        AgentRegistry(agents)
+
+    assert str(agents / "invalid.toml") in str(error.value)
+    assert "[modes.default].grants" in str(error.value)
+
+
+def test_unknown_mode_key_names_the_source_file(tmp_path: Path) -> None:
+    agents = tmp_path / "agents"
+    write_entry(
+        agents,
+        "invalid",
+        'command = "python"\n'
+        "[modes]\n"
+        'default = { grants = "read", delegates = true, typo = false }\n',
+    )
+
+    with pytest.raises(RegistryError) as error:
+        AgentRegistry(agents)
+
+    assert str(agents / "invalid.toml") in str(error.value)
+    assert "[modes.default] unknown key(s) 'typo'" in str(error.value)
 
 
 def test_permission_alias_is_accepted_and_stored_canonically(tmp_path: Path) -> None:

@@ -753,6 +753,8 @@ def resolution_from_session(meta: sessions.SessionMeta) -> CallResolution:
         mode=None,
         permissions=None,
         env=dict(declared_env),
+        # A later slice persists and restores the adapter's mode facts.
+        modes={},
         presets={},
         extends=None,
         provenance={},

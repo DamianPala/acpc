@@ -630,6 +630,14 @@ def _mode_name(value: Any) -> str:
     return str(candidate)
 
 
+def _mode_display(name: str, entry: ResolvedEntry) -> str:
+    spec = entry.modes.get(name)
+    if spec is None:
+        return f"{name} (undeclared)"
+    delegates = " · delegates" if spec.delegates else ""
+    return f"{name} ({spec.grants}{delegates})"
+
+
 def _advertised_payload(record: cache.CachedAdvertised | None) -> dict[str, Any]:
     if record is None:
         return {"modes": [], "models": [], "commands": []}
@@ -660,7 +668,7 @@ def _render_advertised_detail(
     commands = [item for item in advertised.get("commands", []) if isinstance(item, Mapping)]
     # Modes are never capped: this view is where legal --mode values come
     # from, and unlike models/commands there is no fuller view behind it.
-    visible_modes = modes
+    visible_modes = [_mode_display(mode, entry) for mode in modes]
     visible_models = models[:3] + (["…"] if len(models) > 3 else [])
     visible_commands = [_command_name(item) for item in commands[:3]]
     if len(commands) > 3:
@@ -674,6 +682,14 @@ def _render_advertised_detail(
     payload = {
         "advertised": {
             "modes": modes,
+            "mode_specs": {
+                mode: (
+                    {"grants": entry.modes[mode].grants, "delegates": entry.modes[mode].delegates}
+                    if mode in entry.modes
+                    else None
+                )
+                for mode in modes
+            },
             "models": models,
             "commands": [dict(item) for item in commands],
         }
