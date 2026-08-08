@@ -22,6 +22,12 @@ READ_KINDS: frozenset[str] = frozenset({"read", "search", "think", "fetch"})
 EDIT_KINDS: frozenset[str] = frozenset({"edit"})
 EXECUTE_KINDS: frozenset[str] = frozenset({"execute", "delete", "move"})
 
+CLIENT_METHOD_CATEGORIES = {
+    "fs/read_text_file": "read",
+    "fs/write_text_file": "edit",
+    "terminal/create": "execute",
+}
+
 
 class ModeSelectionError(ValueError):
     """A permission policy cannot admit the requested or selected mode."""

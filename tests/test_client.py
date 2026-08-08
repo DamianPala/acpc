@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from acp import PROTOCOL_VERSION, text_block
+from acp import PROTOCOL_VERSION, RequestError, text_block
 from acp.schema import (
     AgentMessageChunk,
     AgentThoughtChunk,
@@ -470,6 +470,180 @@ def test_permission_denials_are_answered_and_recorded(tmp_path: Path, monkeypatc
     assert len(errors) == 5
     assert all(event["message"].startswith("permission denied:") for event in errors)
     assert "switch_mode:yolo" in client.answer
+
+
+@pytest.mark.parametrize(
+    ("level", "should_write"),
+    [
+        (PermissionLevel.NONE, False),
+        (PermissionLevel.READ, False),
+        (PermissionLevel.EDIT, True),
+    ],
+)
+def test_filesystem_callback_write_is_gated_by_policy(
+    tmp_path: Path, monkeypatch: Any, level: PermissionLevel, should_write: bool
+) -> None:
+    """A callback-only filesystem write follows the client's permission policy."""
+    monkeypatch.setenv("ACPC_HOME", str(tmp_path / "acpc-state"))
+    client, _transcript = _make_client(tmp_path, level)
+    path = tmp_path / "callback-write.txt"
+
+    async def scenario() -> None:
+        async with _spawn(client, tmp_path) as (conn, _process):
+            await conn.initialize(protocol_version=PROTOCOL_VERSION)
+            session = await conn.new_session(cwd=str(tmp_path))
+            await conn.prompt(
+                session_id=session.session_id, prompt=[text_block("fs-write:callback-write.txt")]
+            )
+            await _drain_updates(lambda: "fs write callback-write.txt" in client.answer)
+
+    asyncio.run(scenario())
+
+    assert path.exists() is should_write
+
+
+@pytest.mark.parametrize(
+    ("level", "should_read"),
+    [
+        (PermissionLevel.NONE, False),
+        (PermissionLevel.READ, True),
+        (PermissionLevel.EDIT, True),
+        (PermissionLevel.EXECUTE, True),
+        (PermissionLevel.ALL, True),
+    ],
+)
+def test_filesystem_callback_read_is_gated_by_policy(
+    tmp_path: Path, monkeypatch: Any, level: PermissionLevel, should_read: bool
+) -> None:
+    """A callback-only filesystem read follows the client's permission policy."""
+    monkeypatch.setenv("ACPC_HOME", str(tmp_path / "acpc-state"))
+    source = tmp_path / "callback-read.txt"
+    source.write_text("callback content", encoding="utf-8")
+    client, _transcript = _make_client(tmp_path, level)
+
+    async def scenario() -> Any:
+        if should_read:
+            return await client.read_text_file(str(source), "adapter-session")
+        with pytest.raises(RequestError):
+            await client.read_text_file(str(source), "adapter-session")
+        return None
+
+    response = asyncio.run(scenario())
+
+    if should_read:
+        assert response.content == "callback content"
+
+
+def test_client_callback_flushes_buffered_message_before_permission_event(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """The transcript keeps agent prose before the callback decision it preceded."""
+    monkeypatch.setenv("ACPC_HOME", str(tmp_path / "acpc-state"))
+    source = tmp_path / "ordered-read.txt"
+    source.write_text("callback content", encoding="utf-8")
+    client, transcript = _make_client(tmp_path, PermissionLevel.READ)
+
+    async def scenario() -> None:
+        await client.session_update(
+            "adapter-session",
+            AgentMessageChunk(content=text_block("before"), session_update="agent_message_chunk"),
+        )
+        await client.read_text_file(str(source), "adapter-session")
+
+    asyncio.run(scenario())
+
+    events = transcript.read().events
+    assert [(event["type"], event.get("text"), event.get("kind")) for event in events] == [
+        ("msg", "before", None),
+        ("permission", None, "fs/read_text_file"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("level", "expected_error"),
+    [
+        (PermissionLevel.NONE, RequestError),
+        (PermissionLevel.READ, RequestError),
+        (PermissionLevel.EDIT, RequestError),
+        (PermissionLevel.EXECUTE, NotImplementedError),
+    ],
+)
+def test_terminal_creation_gate_precedes_unsupported_implementation(
+    tmp_path: Path,
+    monkeypatch: Any,
+    level: PermissionLevel,
+    expected_error: type[Exception],
+) -> None:
+    """Policy refusal is distinct from the terminal feature not being implemented."""
+    monkeypatch.setenv("ACPC_HOME", str(tmp_path / "acpc-state"))
+    client, _transcript = _make_client(tmp_path, level)
+
+    async def scenario() -> None:
+        with pytest.raises(expected_error):
+            await client.create_terminal("echo hello", "adapter-session")
+
+    asyncio.run(scenario())
+
+
+def test_filesystem_refusal_is_an_acp_error_and_connection_survives(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """A denied callback returns an ACP error, records it, and lets the turn finish."""
+    monkeypatch.setenv("ACPC_HOME", str(tmp_path / "acpc-state"))
+    client, transcript = _make_client(tmp_path, PermissionLevel.NONE)
+    path = tmp_path / "refused.txt"
+
+    async def scenario() -> None:
+        async with _spawn(client, tmp_path) as (conn, _process):
+            await conn.initialize(protocol_version=PROTOCOL_VERSION)
+            session = await conn.new_session(cwd=str(tmp_path))
+            await conn.prompt(
+                session_id=session.session_id, prompt=[text_block("fs-write:refused.txt")]
+            )
+            await _drain_updates(lambda: "fs write refused.txt error:" in client.answer)
+            client.flush()
+
+    asyncio.run(scenario())
+
+    assert not path.exists()
+    assert "permission denied: fs/write_text_file" in client.answer
+    assert client.denied == {"edit": 1}
+    events = transcript.read().events
+    assert {event["type"] for event in events} >= {"permission", "error", "msg"}
+    permission = next(event for event in events if event["type"] == "permission")
+    assert permission == {
+        "type": "permission",
+        "kind": "fs/write_text_file",
+        "decision": "deny",
+        "ts": 100.0,
+        "i": permission["i"],
+    }
+
+
+def test_ask_policy_prompts_for_client_edits_but_not_reads(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    """The callback path uses the same ask rule as request_permission."""
+    monkeypatch.setenv("ACPC_HOME", str(tmp_path / "acpc-state"))
+    source = tmp_path / "ask-read.txt"
+    source.write_text("readable", encoding="utf-8")
+    prompted: list[str] = []
+
+    def prompt(kind: str, _title: str) -> bool:
+        prompted.append(kind)
+        return True
+
+    client, _transcript = _make_client(tmp_path, PermissionLevel.ASK)
+    client.permission_prompt = prompt
+
+    async def scenario() -> None:
+        response = await client.read_text_file(str(source), "adapter-session")
+        assert response.content == "readable"
+        await client.write_text_file(str(tmp_path / "ask-write.txt"), "written", "adapter-session")
+
+    asyncio.run(scenario())
+
+    assert prompted == ["fs/write_text_file"]
 
 
 def test_switch_mode_reselection_denies_above_ceiling_and_allows_all(

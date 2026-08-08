@@ -10,6 +10,7 @@ import pytest
 from acp.schema import PermissionOption
 
 from acpc.permissions import (
+    CLIENT_METHOD_CATEGORIES,
     ModeSelectionError,
     PermissionLevel,
     classify_kind,
@@ -34,6 +35,10 @@ class TestClassifyKind:
 
     def test_edit_kind(self) -> None:
         assert classify_kind("edit") == "edit"
+
+    def test_client_method_names_are_a_separate_namespace(self) -> None:
+        assert classify_kind("fs/write_text_file") == "unknown"
+        assert CLIENT_METHOD_CATEGORIES["fs/write_text_file"] == "edit"
 
     @pytest.mark.parametrize("kind", ["execute", "delete", "move"])
     def test_execute_kinds(self, kind: str) -> None:

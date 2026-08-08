@@ -31,6 +31,7 @@ Exact-prefix triggers (donor design, for precise timing control in tests):
 - ``tool:TITLE``     one completed read-kind tool call
 - ``tool-edit:TITLE``one completed edit-kind tool call
 - ``write-file:NAME``request edit permission, then write NAME in the cwd
+- ``fs-write:NAME``write NAME through the ACP filesystem callback without asking permission
 - ``env:NAME``       answer with the value of environment variable NAME
 - ``settings``       answer with model/effort/mode state and call counts
 - ``stderr:TEXT``    print TEXT to stderr, then echo it
@@ -497,6 +498,23 @@ class MockAgent(Agent):
             allowed = await self._write_file_with_permission(session_id, name)
             result = "done" if allowed else "denied"
             await self._send_text(session_id, f"write {name} {result}")
+            return PromptResponse(stop_reason="end_turn")
+
+        if prompt_text.startswith("fs-write:"):
+            name = prompt_text.split(":", 1)[1]
+            path = self._session_cwds[session_id] / name
+            content = f"written by mock agent: {name}\n"
+            try:
+                await self._conn.write_text_file(
+                    session_id=session_id,
+                    path=str(path),
+                    content=content,
+                )
+            except RequestError as error:
+                result = f"error: {error}"
+            else:
+                result = "done"
+            await self._send_text(session_id, f"fs write {name} {result}")
             return PromptResponse(stop_reason="end_turn")
 
         if prompt_text.startswith("env:"):

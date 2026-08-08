@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from acp import RequestError
 from acp.schema import (
     AgentMessageChunk,
     AgentThoughtChunk,
@@ -34,6 +35,7 @@ from acp.schema import (
 )
 
 from acpc.permissions import (
+    CLIENT_METHOD_CATEGORIES,
     ModeSelectionError,
     PermissionLevel,
     classify_kind,
@@ -47,6 +49,8 @@ from acpc.transcript import Transcript
 _Clock = Callable[[], float]
 _PermissionPrompt = Callable[[str, str], bool | Awaitable[bool]]
 _EndTurn = Callable[[], None]
+# 400 is application-defined because policy refusal is neither invalid params nor internal error.
+CLIENT_PERMISSION_ERROR_CODE = 400
 
 # Real adapters stream word-sized message chunks; one transcript event per
 # chunk turns `log` into a per-fragment view and the cursor into a fragment
@@ -281,13 +285,13 @@ class AcpcClient:
 
         option_id = find_option(options, decision, self.permission_level)
         allowed = bool(decision and option_id is not None)
-        self.transcript.append("permission", kind=kind, decision="allow" if allowed else "deny")
+        reason: str | None = None
         if not allowed:
-            self._denied[category] = self._denied.get(category, 0) + 1
             reason = switch_reason or f"permission denied: {kind}"
             if switch_reason is None and decision and option_id is None:
                 reason += " (no matching allow option)"
-            self.transcript.append("error", message=reason)
+        self._record_permission(kind, category, allowed, reason)
+        if not allowed:
             if switch_reason is not None and self.end_turn is not None:
                 self.end_turn()
                 await self._await_cancellation_dispatch()
@@ -335,6 +339,35 @@ class AcpcClient:
                     return target
         return None
 
+    async def _authorize_client_method(self, kind: str, title: str) -> None:
+        """Apply the policy to an ACP callback outside ``request_permission``."""
+        self.flush()
+        category = CLIENT_METHOD_CATEGORIES[kind]
+        decision = should_allow(self.permission_level, category)
+        if decision is None:
+            decision = await self._ask_permission(kind, title)
+        allowed = bool(decision)
+        reason = None if allowed else f"permission denied: {kind}"
+        self._record_permission(kind, category, allowed, reason)
+        if not allowed:
+            assert reason is not None
+            raise RequestError(CLIENT_PERMISSION_ERROR_CODE, reason, {"category": category})
+
+    def _record_permission(
+        self, kind: str, category: str, allowed: bool, reason: str | None
+    ) -> None:
+        """Append a permission decision and update the denial tally."""
+        self.transcript.append("permission", kind=kind, decision="allow" if allowed else "deny")
+        if not allowed:
+            self._denied[category] = self._denied.get(category, 0) + 1
+            self.transcript.append("error", message=reason or f"permission denied: {kind}")
+
+    def _authorize_existing_terminal(self, method: str, terminal_id: str) -> None:
+        """Keep the terminal callbacks unsupported until terminal ownership exists."""
+        self.flush()
+        del method, terminal_id
+        raise NotImplementedError("Terminal methods are not supported by acpc")
+
     async def read_text_file(
         self,
         path: str,
@@ -344,6 +377,7 @@ class AcpcClient:
         **kwargs: Any,
     ) -> ReadTextFileResponse:
         """Return text requested through ACP's filesystem callback."""
+        await self._authorize_client_method("fs/read_text_file", f"Read {path}")
         del session_id, kwargs
         text = Path(path).read_text(encoding="utf-8")
         if line is not None:
@@ -362,6 +396,7 @@ class AcpcClient:
         **kwargs: Any,
     ) -> WriteTextFileResponse:
         """Write text requested through ACP's filesystem callback."""
+        await self._authorize_client_method("fs/write_text_file", f"Write {path}")
         del session_id, kwargs
         file_path = Path(path)
         file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -378,30 +413,35 @@ class AcpcClient:
         output_byte_limit: int | None = None,
         **kwargs: Any,
     ) -> CreateTerminalResponse:
+        await self._authorize_client_method("terminal/create", f"Create terminal: {command}")
         del command, session_id, args, env, cwd, output_byte_limit, kwargs
         raise NotImplementedError("Terminal methods are not supported by acpc")
 
     async def terminal_output(
         self, session_id: str, terminal_id: str, **kwargs: Any
     ) -> TerminalOutputResponse:
+        self._authorize_existing_terminal("terminal/output", terminal_id)
         del session_id, terminal_id, kwargs
         raise NotImplementedError("Terminal methods are not supported by acpc")
 
     async def release_terminal(
         self, session_id: str, terminal_id: str, **kwargs: Any
     ) -> ReleaseTerminalResponse:
+        self._authorize_existing_terminal("terminal/release", terminal_id)
         del session_id, terminal_id, kwargs
         raise NotImplementedError("Terminal methods are not supported by acpc")
 
     async def wait_for_terminal_exit(
         self, session_id: str, terminal_id: str, **kwargs: Any
     ) -> WaitForTerminalExitResponse:
+        self._authorize_existing_terminal("terminal/wait_for_exit", terminal_id)
         del session_id, terminal_id, kwargs
         raise NotImplementedError("Terminal methods are not supported by acpc")
 
     async def kill_terminal(
         self, session_id: str, terminal_id: str, **kwargs: Any
     ) -> KillTerminalResponse:
+        self._authorize_existing_terminal("terminal/kill", terminal_id)
         del session_id, terminal_id, kwargs
         raise NotImplementedError("Terminal methods are not supported by acpc")
 
