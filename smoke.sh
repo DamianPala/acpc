@@ -30,7 +30,7 @@ declare -A SECTION_READY=(
     [S10-agents]=ready      # agents list/detail/--models/--commands/--check/init, install
     [S11-maintenance]=ready # stop semantics, rm, prune
     [S12-cli]=ready         # help contract, -V, TTY rules, hostile inputs
-    [S13-permissions]=ready # permission tiers visible in log, bypass-mode guard (needs S06+S08)
+    [S13-permissions]=ready # permission tiers visible in log, mode ceiling (needs S06+S08)
     ["S16-skills"]=ready      # bundled skill list/detail views and JSON
 )
 
@@ -251,8 +251,13 @@ command = "${PYTHON_BIN} ${SCRIPT_DIR}/tests/mock_agent.py"
 install_command = "true"
 home = "~/.mock"
 home_env = "MOCK_HOME"
-bypass_modes = ["yolo"]
 efforts = ["low", "medium", "high", "xhigh"]
+
+[modes]
+default = { grants = "read", delegates = true }
+acceptEdits = { grants = "none", delegates = false }
+plan = { grants = "execute", delegates = true }
+yolo = { grants = "all", delegates = false }
 
 [presets]
 fast = { model = "mock-haiku-4-5", effort = "high" }
@@ -925,9 +930,9 @@ if begin_section S09-continue "continue + steer: context, turn rotation, cursor 
         "$CONVO_EXPECTED" "$CONVO_IS"
 
     # A run-only flag on continue names the rule, not a bare unrecognized-argument
-    run_acpc continue "$CONVO_ID" "third turn" --permissions write
+    run_acpc continue "$CONVO_ID" "third turn" --model mock-sonnet-5
     assert_eq "run-only flag on continue is a usage error" "2" "$LAST_RC"
-    assert_contains "the error names the rule" "$LAST_ERR" "--permissions"
+    assert_contains "the error names the rule" "$LAST_ERR" "--model"
 
     run_acpc continue does-not-exist "hi"
     assert_eq "continue on an unknown id is a usage error" "2" "$LAST_RC"
@@ -1141,13 +1146,15 @@ PYEOF
 fi
 
 # ==============================================================================
-# S13-permissions: policy tiers visible in log, bypass-mode guard
+# S13-permissions: policy tiers visible in log, mode ceiling
 # ==============================================================================
-if begin_section S13-permissions "permission tiers in log, bypass-mode rejection"; then
+if begin_section S13-permissions "permission tiers in log, mode ceiling rejection"; then
     # The mock's perm scenario requests: read, edit, execute, delete,
-    # switch_mode->yolo (bypass), switch_mode->plan (ordinary).
+    # switch_mode->yolo (all-granting), switch_mode->plan (ordinary).
     run_acpc run mock "run the perm scenario" --permissions read --quiet --json
     PERM_READ_ID="$(json_field "$LAST_OUT" '.session_id')"
+    assert_eq "read policy selects a read-granting mode" "default" \
+        "$(jq -r '.resolution.resolved.mode.value' "${ACPC_HOME}/sessions/${PERM_READ_ID}/meta.json")"
     run_acpc log "$PERM_READ_ID" --since 0
     assert_contains "read tier: denials are visible in log" "$LAST_OUT" "denied"
     assert_true "read tier: the edit request was denied" \
@@ -1155,33 +1162,38 @@ if begin_section S13-permissions "permission tiers in log, bypass-mode rejection
     assert_true "read tier: the execute request was denied" \
         "$(grep -E 'execute|Bash' <<<"$LAST_OUT" | grep -qE 'denied' && echo 0 || echo 1)"
     ANSWER_READ="$(cat "${ACPC_HOME}/sessions/${PERM_READ_ID}/answer.md")"
+    DENIED_READ="${ANSWER_READ#*Denied:}"
     assert_contains "read tier: read allowed (mock's own summary)" "$ANSWER_READ" \
         "Allowed: read:src/app.py"
-    assert_contains "read tier: ordinary switch_mode allowed" "$ANSWER_READ" "switch_mode:plan"
-    assert_true "read tier: bypass switch_mode denied" \
-        "$(grep -A2 'Denied:' <<<"$ANSWER_READ" | grep -q 'switch_mode:yolo' && echo 0 || echo 1)"
+    assert_contains "read tier: delete denied" "$DENIED_READ" "delete:old_report.md"
+    # S4 turns switch_mode into a re-selection; until then both switches are unknown and denied.
+    assert_contains "read tier: switch_mode denied" "$DENIED_READ" "switch_mode:plan"
 
     run_acpc run mock "run the perm scenario" --permissions write --quiet --json
     PERM_WRITE_ID="$(json_field "$LAST_OUT" '.session_id')"
+    assert_eq "write policy selects an execute-granting mode" "plan" \
+        "$(jq -r '.resolution.resolved.mode.value' "${ACPC_HOME}/sessions/${PERM_WRITE_ID}/meta.json")"
     ANSWER_WRITE="$(cat "${ACPC_HOME}/sessions/${PERM_WRITE_ID}/answer.md")"
     ALLOWED_WRITE="${ANSWER_WRITE%%Denied:*}"
     DENIED_WRITE="${ANSWER_WRITE#*Denied:}"
     assert_contains "write tier: edit allowed" "$ALLOWED_WRITE" "edit:src/app.py"
     assert_contains "write tier: execute allowed" "$ALLOWED_WRITE" "execute:rm -rf build/"
-    assert_contains "write tier: delete still denied" "$DENIED_WRITE" "delete:old_report.md"
-    assert_contains "write tier: bypass switch_mode still denied" "$DENIED_WRITE" \
+    assert_contains "write tier: delete allowed" "$ALLOWED_WRITE" "delete:old_report.md"
+    assert_contains "write tier: restricted switch_mode still denied" "$DENIED_WRITE" \
         "switch_mode:yolo"
 
     run_acpc run mock "run the perm scenario" --permissions none --quiet --json
     PERM_NONE_ID="$(json_field "$LAST_OUT" '.session_id')"
+    assert_eq "none policy selects a none-granting mode" "acceptEdits" \
+        "$(jq -r '.resolution.resolved.mode.value' "${ACPC_HOME}/sessions/${PERM_NONE_ID}/meta.json")"
     ANSWER_NONE="$(cat "${ACPC_HOME}/sessions/${PERM_NONE_ID}/answer.md")"
     assert_contains "none tier: everything denied" "$ANSWER_NONE" "Allowed: none"
 
-    # Bypass mode at parse time: rejected unless --permissions all
+    # An all-granting mode requires the all policy at resolution time.
     run_acpc run mock "hi" --mode yolo --dry-run
-    assert_eq "bypass mode without --permissions all is a usage error" "2" "$LAST_RC"
+    assert_eq "all-granting mode without --permissions all is a usage error" "2" "$LAST_RC"
     run_acpc run mock "hi" --mode yolo --permissions all --dry-run
-    assert_eq "bypass mode with --permissions all is accepted" "0" "$LAST_RC"
+    assert_eq "all-granting mode with --permissions all is accepted" "0" "$LAST_RC"
 
     end_section S13-permissions
 fi
