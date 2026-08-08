@@ -56,6 +56,8 @@ def state_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 def resolve(agent: str = "mock", **overrides: str | None):
+    if overrides.get("permissions") is None:
+        overrides["permissions"] = "read"
     return AgentRegistry().resolve_call(agent, **overrides)
 
 
@@ -289,6 +291,39 @@ def test_a_turn_that_cannot_start_still_leaves_a_finished_session() -> None:
 
 def test_two_entries_on_the_same_adapter_and_home_share_a_target() -> None:
     assert runner.call_target(resolve("mock")) == runner.call_target(resolve("mock"))
+
+
+def test_call_target_includes_the_resolved_policy() -> None:
+    read_target = runner.call_target(resolve("mock", permissions="read"))
+    edit_target = runner.call_target(resolve("mock", permissions="edit"))
+
+    assert read_target != edit_target
+
+
+def test_call_target_rejects_an_unresolved_permission_policy() -> None:
+    with pytest.raises(runner.RunnerError, match="permission policy is unresolved"):
+        runner.call_target(AgentRegistry().resolve_call("mock"))
+
+
+def test_legacy_session_resolution_selects_read_without_policy_facts() -> None:
+    resolution = resolve()
+    legacy_payload = runner.session_resolution(resolution, cwd=None)
+    legacy_payload["resolved"].pop("permissions")
+    for field in ("mode", "grants", "delegates"):
+        legacy_payload["adapter"].pop(field, None)
+    meta = sessions.create_session(
+        entry=resolution.entry.entry,
+        base_adapter=resolution.entry.base_adapter,
+        prompt="legacy session",
+        resolution=legacy_payload,
+        target="mock~legacy-s3-target",
+    )
+
+    rebuilt = runner.resolution_from_session(meta)
+
+    assert rebuilt.permissions == "read"
+    assert rebuilt.mode_spec is None
+    assert runner.call_target(rebuilt) != meta.target
 
 
 # --- call options reach the adapter -----------------------------------------

@@ -17,7 +17,6 @@ from click.testing import CliRunner
 from acpc import cli as cli_module
 from acpc import daemon_client, runner, sessions, vocab
 from acpc.cli import main
-from acpc.registry import AgentRegistry
 
 MOCK_AGENT_SCRIPT = str(Path(__file__).with_name("mock_agent.py"))
 NO_LOAD_AGENT_SCRIPT = str(Path(__file__).with_name("no_load_session_agent.py"))
@@ -186,6 +185,34 @@ def test_continue_normalizes_legacy_stored_write_policy_after_entry_changes(
     assert result.exit_code == vocab.EXIT_OK
     assert "mock-opus-5/xhigh" in result.stdout
     assert sessions.load(session_id).resolution["resolved"]["permissions"]["value"] == "write"
+
+
+def test_continue_migrates_legacy_mode_and_target_metadata(cli: CliRunner) -> None:
+    session_id = start_session(cli)
+    meta = sessions.load(session_id)
+    old_target = "mock~legacy-s3-target"
+    meta.target = old_target
+    meta.resolution["resolved"].pop("permissions")
+    for field in ("mode", "grants", "delegates"):
+        meta.resolution["adapter"].pop(field, None)
+    with sessions.session_lock(session_id):
+        sessions.write_meta(meta)
+
+    result = invoke(cli, "continue", session_id, "turn two", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_OK
+    migrated = sessions.load(session_id)
+    assert migrated.resolution["resolved"]["permissions"]["value"] == "read"
+    assert migrated.resolution["adapter"] == {
+        "home_env": "MOCK_HOME",
+        "effort_config_id": None,
+        "mode": "default",
+        "grants": "read",
+        "delegates": True,
+    }
+    expected_target = runner.call_target(runner.resolution_from_session(migrated))
+    assert migrated.target == expected_target
+    assert migrated.target != old_target
 
 
 def test_continue_preserves_meta_written_after_initial_load(
@@ -402,9 +429,8 @@ def test_continue_rejects_an_adapter_without_load_session(
     session_id = start_session(cli)
 
     async def stop_daemon() -> None:
-        connection = await daemon_client.connect(
-            runner.call_target(AgentRegistry().resolve_call("mock"))
-        )
+        resolution = runner.resolution_from_session(sessions.load(session_id))
+        connection = await daemon_client.connect(runner.call_target(resolution))
         assert connection is not None
         try:
             await connection.stop()
@@ -475,6 +501,24 @@ def test_continue_permissions_apply_and_persist_for_later_turns(
     assert meta.resolution.get("permissions_source") is None
     assert meta.denied == {"execute": 2, "unknown": 1}
     assert "denied:" not in fourth.stderr
+
+
+def test_continuation_clamps_and_persists_an_inherited_ceiling(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ACPC_CEILING", "read")
+    session_id = start_session(cli)
+
+    result = invoke(cli, "continue", session_id, "turn two", "--permissions", "all", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_OK
+    permissions = sessions.load(session_id).resolution["resolved"]["permissions"]
+    assert permissions["value"] == "read"
+    assert permissions["clamp"] == {
+        "requested": "all",
+        "ceiling": "read",
+        "effective": "read",
+    }
 
 
 def test_continue_validation_failure_does_not_rotate_session(cli: CliRunner) -> None:
@@ -649,3 +693,46 @@ def test_a_warm_continue_keeps_the_adapter_history(cli: CliRunner, live_daemon: 
 
     assert result.exit_code == vocab.EXIT_OK
     assert "turn one of the conversation" in result.stdout
+
+
+def test_background_policy_change_updates_wait_and_stop_target(
+    cli: CliRunner, live_daemon: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id = start_session(cli)
+    old_target = sessions.load(session_id).target
+    original_connect = daemon_client.connect
+    connected: list[str] = []
+
+    async def recording_connect(target: str):
+        connected.append(target)
+        return await original_connect(target)
+
+    monkeypatch.setattr(daemon_client, "connect", recording_connect)
+    dispatched = invoke(
+        cli,
+        "continue",
+        session_id,
+        "chunkslow:5 policy change",
+        "--permissions",
+        "edit",
+        "--bg",
+        "--json",
+    )
+
+    assert dispatched.exit_code == vocab.EXIT_OK
+    rotated = sessions.load(session_id)
+    new_target = rotated.target
+    assert new_target is not None
+    assert new_target != old_target
+    assert new_target == runner.call_target(runner.resolution_from_session(rotated))
+
+    connected.clear()
+    waited = invoke(cli, "wait", session_id, "--timeout", "0.1", "--quiet")
+    assert waited.exit_code == vocab.EXIT_TIMEOUT
+    assert connected == [new_target]
+
+    connected.clear()
+    stopped = invoke(cli, "stop", session_id)
+    assert stopped.exit_code == vocab.EXIT_OK
+    assert sessions.load(session_id).state == "cancelled"
+    assert connected == [new_target]

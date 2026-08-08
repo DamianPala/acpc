@@ -603,6 +603,7 @@ def rotate_turn(
     clock: Clock | None = None,
     permissions: str | None = None,
     resolution: Mapping[str, Any] | None = None,
+    target: str | None = None,
 ) -> SessionMeta:
     """Open the next turn: park the finished turn's artifacts, reset per-turn state.
 
@@ -626,6 +627,8 @@ def rotate_turn(
                 raise SessionStateError(f"session {session_id} has no stored permission resolution")
             resolved["permissions"] = {"value": permissions, "source": "call flag"}
             meta.resolution.pop("permissions_source", None)
+        if target is not None:
+            meta.target = target
         turn = meta.turns
         for stem, current in (
             ("prompt", prompt_path(session_id)),

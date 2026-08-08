@@ -39,7 +39,8 @@ def state_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 def target_name() -> str:
-    return runner.call_target(AgentRegistry().resolve_call("mock"))
+    resolution = AgentRegistry().resolve_call("mock", permissions="read")
+    return runner.call_target(resolution)
 
 
 def test_a_cold_target_gets_a_daemon_started_for_it(live_daemon: None) -> None:

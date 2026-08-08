@@ -97,7 +97,8 @@ def _wait_until_state(session_id: str, state: str) -> None:
 
 
 def _target(agent: str = "mock") -> str:
-    return runner.call_target(AgentRegistry().resolve_call(agent))
+    resolution = AgentRegistry().resolve_call(agent, permissions="read")
+    return runner.call_target(resolution)
 
 
 def _start_daemon(target: str) -> None:

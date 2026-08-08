@@ -35,7 +35,7 @@ from acpc import (
     transcript,
     vocab,
 )
-from acpc.permissions import ModeSelectionError, select_mode
+from acpc.permissions import ModeSelectionError, PermissionLevel, select_mode
 from acpc.registry import (
     AgentRegistry,
     CallResolution,
@@ -376,7 +376,18 @@ def _updated_session_resolution(
     current_mode = runner.resolution_payload(resolution, cwd=None)["resolved"]["mode"]
     resolved["mode"] = current_mode
     permission_source = "call flag" if policy_changed else "stored"
-    resolved["permissions"] = {"value": policy, "source": permission_source}
+    permission_payload: dict[str, Any] = {"value": policy, "source": permission_source}
+    if resolution.permissions_clamp is not None:
+        requested, ceiling = resolution.permissions_clamp
+        permission_payload["source"] = (
+            f"{permission_source} (clamped from {requested} by inherited ceiling {ceiling})"
+        )
+        permission_payload["clamp"] = {
+            "requested": requested,
+            "ceiling": ceiling,
+            "effective": policy,
+        }
+    resolved["permissions"] = permission_payload
     if policy_changed:
         payload.pop("permissions_source", None)
     adapter = payload.get("adapter")
@@ -412,7 +423,7 @@ def _resolve_permissions(
     *,
     tty: bool,
     background: bool = False,
-) -> str:
+) -> tuple[str, tuple[str, str] | None]:
     """Apply SPEC's TTY rules to the resolved permission policy.
 
     A background client has already gone away by the time a permission
@@ -424,6 +435,7 @@ def _resolve_permissions(
     policy = explicit if explicit is not None else resolution.permissions
     if policy is None:
         policy = "ask" if interactive else "read"
+    policy, clamp = _clamp_inherited_ceiling(policy)
     if policy == "ask" and not interactive:
         cause = (
             "cannot be used with --bg, which returns before a request could be answered"
@@ -433,7 +445,39 @@ def _resolve_permissions(
         raise UsageProblem(
             f"--permissions ask {cause}; pass --permissions none, read, edit, execute or all"
         )
-    return policy
+    return policy, clamp
+
+
+def _clamp_inherited_ceiling(policy: str) -> tuple[str, tuple[str, str] | None]:
+    """Apply the numeric ceiling exported by the parent acpc session.
+
+    The variable is a guardrail, not a boundary: a callee with a shell can
+    unset ACPC_CEILING, so this is not a security control.
+    """
+    raw_ceiling = os.environ.get("ACPC_CEILING")
+    if raw_ceiling is None:
+        return policy, None
+    numeric_policies = vocab.PERMISSION_VALUES[:-1]
+    if raw_ceiling not in numeric_policies:
+        supported = ", ".join(numeric_policies)
+        raise UsageProblem(f"ACPC_CEILING={raw_ceiling!r} is invalid; expected one of {supported}")
+    ceiling = raw_ceiling
+
+    if policy == "ask":
+        if ceiling != "all":
+            supported = ", ".join(numeric_policies)
+            raise UsageProblem(
+                f"--permissions ask exceeds inherited ceiling {ceiling}; "
+                f"available policies: {supported}"
+            )
+        effective = policy
+    elif PermissionLevel(policy).rank > PermissionLevel(ceiling).rank:
+        effective = ceiling
+    else:
+        effective = policy
+    if effective == policy:
+        return policy, None
+    return effective, (policy, ceiling)
 
 
 def _mode_list(entry: ResolvedEntry) -> str:
@@ -2077,10 +2121,14 @@ def run_command(
         raise UsageProblem(str(error)) from None
 
     defaulted_permissions = permissions is None and resolution.permissions is None
-    policy = _resolve_permissions(permissions, resolution, tty=tty, background=background)
+    policy, permissions_clamp = _resolve_permissions(
+        permissions, resolution, tty=tty, background=background
+    )
     # The TTY-resolved policy is part of the resolved invocation: meta.json
     # stores everything --dry-run shows, and `continue` reuses it verbatim.
-    resolution = _select_resolution(replace(resolution, permissions=policy))
+    resolution = _select_resolution(
+        replace(resolution, permissions=policy, permissions_clamp=permissions_clamp)
+    )
     # Resolved to an absolute path here, at the caller: the adapter receives
     # cwd over session/new, so a relative path would be resolved against
     # whatever process hosts the adapter — the daemon's directory, not the
@@ -2355,6 +2403,7 @@ def _dispatch_follow_up(
     except sessions.SessionError as error:
         raise UsageProblem(str(error)) from None
     policy = permissions if permissions is not None else stored_policy
+    policy, permissions_clamp = _clamp_inherited_ceiling(policy)
     interactive = _stdout_is_tty() and not background
     if policy == "ask" and not interactive:
         # Same split as `run`: the two causes are different situations and
@@ -2373,8 +2422,13 @@ def _dispatch_follow_up(
     except runner.RunnerError as error:
         raise UsageProblem(str(error)) from None
     selection: CallResolution | None = None
-    if permissions is not None or stored_resolution.mode_spec is None:
+    if (
+        permissions is not None
+        or stored_resolution.mode_spec is None
+        or permissions_clamp is not None
+    ):
         selection = _continue_selection(current, policy)
+        selection = replace(selection, permissions_clamp=permissions_clamp)
     updated_resolution = (
         _updated_session_resolution(
             current,
@@ -2401,6 +2455,7 @@ def _dispatch_follow_up(
         rotated = sessions.rotate_turn(
             meta.session_id,
             resolution=updated_resolution,
+            target=runner.call_target(selection or stored_resolution),
         )
         rotated_policy = _stored_permission_policy(rotated)
         request = runner.continue_request(

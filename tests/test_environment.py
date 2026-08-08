@@ -70,5 +70,28 @@ def test_adapter_environment_layers_and_forwards_resolved_acpc_home(
     assert environment["TERM"] == "dumb"
 
 
+def test_adapter_environment_sets_inherited_ceiling() -> None:
+    environment = adapter_environment(
+        {"ACPC_CEILING": "all"},
+        ambient={
+            "ACPC_CEILING": "all",
+        },
+        ceiling="edit",
+    )
+
+    assert environment["ACPC_CEILING"] == "edit"
+
+
+def test_adapter_environment_does_not_forward_stale_inherited_facts() -> None:
+    environment = adapter_environment(
+        {},
+        ambient={
+            "ACPC_CEILING": "edit",
+        },
+    )
+
+    assert "ACPC_CEILING" not in environment
+
+
 def test_passthrough_names_deduplicate_preserving_order() -> None:
     assert passthrough_names(("B", "A", "B")) == ("B", "A")

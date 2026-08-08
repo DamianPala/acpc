@@ -257,6 +257,71 @@ def test_dry_run_reports_the_permission_policy_it_would_use(cli: CliRunner) -> N
     assert json.loads(result.stdout)["resolved"]["permissions"]["value"] == "read"
 
 
+def test_inherited_ceiling_clamps_a_nested_all_policy_and_reports_it(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ACPC_CEILING", "edit")
+
+    result = invoke(cli, "run", "mock", "probe", "--permissions", "all", "--dry-run", "--json")
+
+    permission = json.loads(result.stdout)["resolved"]["permissions"]
+    assert permission["value"] == "edit"
+    assert permission["clamp"] == {
+        "requested": "all",
+        "ceiling": "edit",
+        "effective": "edit",
+    }
+    assert "clamped from all by inherited ceiling edit" in permission["source"]
+
+
+def test_inherited_ceiling_keeps_a_lower_nested_policy(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ACPC_CEILING", "execute")
+
+    result = invoke(cli, "run", "mock", "probe", "--permissions", "read", "--dry-run", "--json")
+
+    permission = json.loads(result.stdout)["resolved"]["permissions"]
+    assert permission["value"] == "read"
+    assert "clamp" not in permission
+
+
+@pytest.mark.parametrize("ceiling", ["edit", "read"])
+def test_nested_ask_is_rejected_by_a_numeric_ceiling(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch, ceiling: str
+) -> None:
+    monkeypatch.setenv("ACPC_CEILING", ceiling)
+
+    result = invoke(cli, "run", "mock", "probe", "--permissions", "ask", "--dry-run")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert f"inherited ceiling {ceiling}" in result.stderr
+    assert "available policies: none, read, edit, execute, all" in result.stderr
+
+
+def test_nested_ask_remains_ask_under_an_all_ceiling(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ACPC_CEILING", "all")
+    monkeypatch.setattr(cli_module, "_stdout_is_tty", lambda: True)
+
+    result = invoke(cli, "run", "mock", "probe", "--permissions", "ask", "--dry-run", "--json")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert json.loads(result.stdout)["resolved"]["permissions"]["value"] == "ask"
+
+
+def test_invalid_inherited_ceiling_is_a_usage_error(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ACPC_CEILING", "not-a-policy")
+
+    result = invoke(cli, "run", "mock", "probe", "--permissions", "all", "--dry-run")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert "ACPC_CEILING='not-a-policy' is invalid" in result.stderr
+
+
 def test_write_alias_matches_execute_and_warns_once_per_process(
     cli: CliRunner, fresh_permission_alias_warnings: None
 ) -> None:

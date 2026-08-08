@@ -411,6 +411,14 @@ def test_call_resolution_delivers_home_through_the_adapter_home_variable(
     assert call.adapter_environment["CODEX_HOME"] == str(Path("~/.codex").expanduser())
 
 
+def test_call_resolution_exports_ask_as_a_read_ceiling(tmp_path: Path) -> None:
+    call = AgentRegistry(tmp_path / "agents").resolve_call("codex", permissions="ask")
+
+    environment = call.adapter_environment
+
+    assert environment["ACPC_CEILING"] == "read"
+
+
 def test_effort_validation_lists_supported_levels(tmp_path: Path) -> None:
     agents = tmp_path / "agents"
     write_entry(agents, "limited", 'command = "python"\nefforts = ["low", "medium"]\n')

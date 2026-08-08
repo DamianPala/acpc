@@ -19,6 +19,8 @@ from urllib.parse import quote
 
 _DIGEST_LENGTH = 16
 _MAX_TARGET_BYTES = 180
+_UNSET = object()
+_PERMISSION_VALUES = ("none", "read", "edit", "execute", "all", "ask")
 
 
 def target_for_call(
@@ -27,6 +29,7 @@ def target_for_call(
     home: str | None = None,
     declared_env: Mapping[str, str] | None = None,
     passthrough_values: Mapping[str, str] | None = None,
+    permissions: str | None | object = _UNSET,
 ) -> str:
     """Build a readable, path-safe, stable daemon target for one resolved call.
 
@@ -35,19 +38,27 @@ def target_for_call(
     entry's literal `[env]` table; `passthrough_values` maps each declared
     `env_passthrough` name present in the caller's environment to the value
     read at call time. Secret values shape the digest only — the returned
-    target never contains them.
+    target never contains them. The resolved permissions join the key because
+    the adapter environment is fixed at spawn. A completely bare entry may
+    omit permissions for the readable-entry optimization; every other call
+    must provide a canonical policy.
     """
     safe_entry = quote(entry, safe="-._~")
     declared_env = dict(declared_env or {})
     passthrough_values = dict(passthrough_values or {})
-    if home is None and not declared_env and not passthrough_values:
-        return safe_entry
-
+    if permissions is _UNSET:
+        if home is None and not declared_env and not passthrough_values:
+            return safe_entry
+        raise ValueError("permissions is required when target inputs need a digest")
+    if not isinstance(permissions, str) or permissions not in _PERMISSION_VALUES:
+        supported = ", ".join(_PERMISSION_VALUES)
+        raise ValueError(f"permissions must be one of: {supported}")
     digest_payload = {
         "entry": entry,
         "home": home,
         "env": dict(sorted(declared_env.items())),
         "passthrough": dict(sorted(passthrough_values.items())),
+        "permissions": permissions,
     }
     digest_input = json.dumps(
         digest_payload,

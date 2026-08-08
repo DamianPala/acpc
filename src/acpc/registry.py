@@ -117,6 +117,7 @@ class CallResolution:
     declared_env: Mapping[str, str]
     env_passthrough: tuple[str, ...]
     provenance: Mapping[str, FieldSource]
+    permissions_clamp: tuple[str, str] | None = None
 
     @property
     def adapter_environment(self) -> dict[str, str]:
@@ -124,7 +125,8 @@ class CallResolution:
         declared = dict(self.declared_env)
         if self.home is not None and self.entry.home_env is not None:
             declared[self.entry.home_env] = str(Path(self.home).expanduser())
-        return adapter_environment(declared, self.env_passthrough)
+        ceiling = "read" if self.permissions == "ask" else self.permissions
+        return adapter_environment(declared, self.env_passthrough, ceiling=ceiling)
 
     @property
     def command(self) -> tuple[str, ...]:

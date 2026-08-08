@@ -22,7 +22,7 @@ _PINNED_TERM = "dumb"
 
 # Name of the env var carrying the daemon's spawn payload; never forwarded.
 DAEMON_ENV_PAYLOAD = "ACPC_DAEMON_ENV_PAYLOAD"
-_INTERNAL_ENV_NAMES = frozenset({DAEMON_ENV_PAYLOAD})
+_INTERNAL_ENV_NAMES = frozenset({DAEMON_ENV_PAYLOAD, "ACPC_PARENT_SESSION"})
 
 _CAPABILITY_BASE = (
     "SSH_AUTH_SOCK",
@@ -45,7 +45,11 @@ def passthrough_names(env_passthrough: Sequence[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(env_passthrough))
 
 
-def base_environment(ambient: Mapping[str, str] | None = None) -> dict[str, str]:
+def base_environment(
+    ambient: Mapping[str, str] | None = None,
+    *,
+    ceiling: str | None = None,
+) -> dict[str, str]:
     """Build the allowlisted environment inherited by an adapter or daemon."""
     ambient = os.environ if ambient is None else ambient
     environment = dict(default_environment())
@@ -55,6 +59,8 @@ def base_environment(ambient: Mapping[str, str] | None = None) -> dict[str, str]
         ) or name in _CAPABILITY_NAMES:
             environment[name] = value
     environment["TERM"] = _PINNED_TERM
+    if ceiling is not None:
+        environment["ACPC_CEILING"] = ceiling
     return environment
 
 
@@ -77,11 +83,21 @@ def adapter_environment(
     declared_environment: Mapping[str, str],
     env_passthrough: Sequence[str] = (),
     ambient: Mapping[str, str] | None = None,
+    *,
+    ceiling: str | None = None,
 ) -> dict[str, str]:
     """Build the complete environment delivered to one adapter process."""
-    environment = base_environment(ambient)
+    environment = base_environment(ambient, ceiling=ceiling)
     environment["ACPC_HOME"] = str(acpc_home().resolve())
     environment.update(
         environment_overrides(declared_environment, env_passthrough, ambient=ambient)
     )
+    # This is an acpc resolved call fact, not an adapter-configurable value.
+    # Remove an inherited value when this caller has no resolved ceiling, so a
+    # stale nested ceiling cannot escape into a fresh adapter.
+    if ceiling is None:
+        environment.pop("ACPC_CEILING", None)
+    else:
+        environment["ACPC_CEILING"] = ceiling
+    environment.pop("ACPC_PARENT_SESSION", None)
     return environment

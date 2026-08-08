@@ -165,6 +165,11 @@ def adapter_command(resolution: CallResolution) -> tuple[str, tuple[str, ...]]:
 
 def call_target(resolution: CallResolution) -> str:
     """Compute the daemon target key for this call (never stores secrets)."""
+    if resolution.permissions is None:
+        raise RunnerError(
+            f"cannot compute daemon target for {resolution.entry.entry}: "
+            "permission policy is unresolved"
+        )
     declared = dict(resolution.declared_env)
     passthrough = {
         name: value
@@ -175,6 +180,7 @@ def call_target(resolution: CallResolution) -> str:
         home=resolution.home,
         declared_env=declared,
         passthrough_values=passthrough,
+        permissions=resolution.permissions,
     )
 
 
@@ -676,6 +682,17 @@ def resolution_payload(resolution: CallResolution, *, cwd: str | None) -> dict[s
         }
         for name, value in fields.items()
     }
+    if resolution.permissions_clamp is not None:
+        requested, ceiling = resolution.permissions_clamp
+        permissions = resolved["permissions"]
+        permissions["source"] = (
+            f"{permissions['source']} (clamped from {requested} by inherited ceiling {ceiling})"
+        )
+        permissions["clamp"] = {
+            "requested": requested,
+            "ceiling": ceiling,
+            "effective": resolution.permissions,
+        }
     if resolution.mode_spec is not None:
         resolved["mode"]["grants"] = resolution.mode_spec.grants
         resolved["mode"]["delegates"] = resolution.mode_spec.delegates
@@ -800,7 +817,7 @@ def resolution_from_session(meta: sessions.SessionMeta) -> CallResolution:
         effort=_stored_value(payload, "effort"),
         mode=stored_mode,
         mode_spec=mode_spec,
-        permissions=vocab.normalize_permission(_stored_value(payload, "permissions")),
+        permissions=vocab.normalize_permission(_stored_value(payload, "permissions")) or "read",
         home=_stored_value(payload, "home"),
         declared_env=dict(declared_env),
         env_passthrough=env_passthrough,
