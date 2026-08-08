@@ -9,7 +9,16 @@ in one dependency-free module lets every layer import them without cycles.
 EFFORT_VALUES = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 
 # Approval policies for ACP permission requests (SPEC.md `run --permissions`).
-PERMISSION_VALUES = ("all", "write", "read", "none", "prompt")
+PERMISSION_VALUES = ("none", "read", "edit", "execute", "all", "ask")
+PERMISSION_ALIASES = {"write": "execute", "prompt": "ask"}
+
+
+def normalize_permission(value: str | None) -> str | None:
+    """Return a canonical permission value, preserving unknown values."""
+    if value is None:
+        return None
+    return PERMISSION_ALIASES.get(value, value)
+
 
 # Session states (SPEC.md *Session states*): one vocabulary, used verbatim.
 SESSION_STATES = (

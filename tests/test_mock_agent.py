@@ -26,7 +26,6 @@ from acpc.permissions import PermissionLevel, classify_kind, find_option, should
 from acpc.spawn import spawn_adapter
 
 MOCK_AGENT_SCRIPT = str(Path(__file__).parent / "mock_agent.py")
-MOCK_BYPASS_MODES = frozenset({"yolo"})
 
 
 async def eventually(predicate, *, timeout: float = 5.0, message: str = "condition") -> None:
@@ -70,8 +69,7 @@ class DriverClient:
         target = raw_input.get("target")
         self.permission_requests.append((tool_call.kind, target))
 
-        bypass = tool_call.kind == "switch_mode" and target in MOCK_BYPASS_MODES
-        category = classify_kind(tool_call.kind, bypass_mode_switch=bypass)
+        category = classify_kind(tool_call.kind)
         decision = should_allow(self.permission_level, category)
         allow = bool(decision)  # None (ask-the-human) counts as deny in this driver
         option_id = find_option(options, allow, self.permission_level)
@@ -234,16 +232,17 @@ def test_perm_scenario_routes_requests_through_the_policy(tmp_path: Path) -> Non
                 message="the permission summary answer",
             )
             answer = "".join(client.message_chunks)
-            assert "Allowed: read:src/app.py, switch_mode:plan" in answer
+            assert "Allowed: read:src/app.py" in answer
             assert "edit:src/app.py" in answer.split("Denied:")[1]
             assert "switch_mode:yolo" in answer.split("Denied:")[1]
+            assert "switch_mode:plan" in answer.split("Denied:")[1]
 
     asyncio.run(scenario())
 
 
-def test_write_tier_allows_edit_and_execute_still_denies_delete(tmp_path: Path) -> None:
+def test_execute_tier_allows_delete_and_denies_unknown_switches(tmp_path: Path) -> None:
     async def scenario() -> None:
-        client = DriverClient(permission_level=PermissionLevel.WRITE)
+        client = DriverClient(permission_level=PermissionLevel.EXECUTE)
         async with _spawn_mock(client, tmp_path) as (conn, _process):
             await conn.initialize(protocol_version=PROTOCOL_VERSION)
             session = await conn.new_session(cwd=str(tmp_path))
@@ -262,8 +261,9 @@ def test_write_tier_allows_edit_and_execute_still_denies_delete(tmp_path: Path) 
             denied_part = answer.split("Denied:")[1]
             assert "edit:src/app.py" in allowed_part
             assert "execute:rm -rf build/" in allowed_part
-            assert "delete:old_report.md" in denied_part
+            assert "delete:old_report.md" in allowed_part
             assert "switch_mode:yolo" in denied_part
+            assert "switch_mode:plan" in denied_part
 
     asyncio.run(scenario())
 
@@ -362,7 +362,7 @@ def test_fail_scenario_returns_refusal(tmp_path: Path) -> None:
 
 def test_write_file_goes_through_permission_and_client_fs(tmp_path: Path) -> None:
     async def scenario() -> None:
-        client = DriverClient(permission_level=PermissionLevel.WRITE)
+        client = DriverClient(permission_level=PermissionLevel.EXECUTE)
         async with _spawn_mock(client, tmp_path) as (conn, _process):
             await conn.initialize(protocol_version=PROTOCOL_VERSION)
             session = await conn.new_session(cwd=str(tmp_path))

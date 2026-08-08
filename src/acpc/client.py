@@ -3,7 +3,7 @@
 import inspect
 import json
 import time
-from collections.abc import Awaitable, Callable, Collection, Mapping
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -82,13 +82,11 @@ class AcpcClient:
         transcript: Transcript,
         permission_level: PermissionLevel,
         *,
-        bypass_modes: Collection[str] = (),
         permission_prompt: _PermissionPrompt | None = None,
         clock: _Clock | None = None,
     ) -> None:
         self.transcript = transcript
         self.permission_level = permission_level
-        self.bypass_modes = frozenset(bypass_modes)
         self.permission_prompt = permission_prompt
         self._clock = time.monotonic if clock is None else clock
         self._pending: _PendingChunks | None = None
@@ -250,10 +248,7 @@ class AcpcClient:
         self.flush()
         kind = getattr(tool_call, "kind", None) or "unknown"
         title = getattr(tool_call, "title", None) or ""
-        raw_input = getattr(tool_call, "raw_input", None)
-        target = raw_input.get("target") if isinstance(raw_input, Mapping) else None
-        bypass_switch = kind == "switch_mode" and target in self.bypass_modes
-        category = classify_kind(kind, bypass_mode_switch=bypass_switch)
+        category = classify_kind(kind)
         decision = should_allow(self.permission_level, category)
         if decision is None:
             decision = await self._ask_permission(kind, title)

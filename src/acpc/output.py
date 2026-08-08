@@ -234,7 +234,7 @@ def _denied_summary(meta: sessions.SessionMeta) -> str | None:
     if not isinstance(default_policy, str):
         return None
     requirements = [permissions.minimum_policy(category) for category in denied]
-    policy_order = {"read": 0, "write": 1, "all": 2}
+    policy_order = {"read": 0, "edit": 1, "execute": 2, "all": 3}
     remedy = max(requirements, key=policy_order.__getitem__)
     counts = " · ".join(f"{count} {category}" for category, count in denied.items())
     return f"denied: {counts} (default {default_policy} policy — pass --permissions {remedy})"

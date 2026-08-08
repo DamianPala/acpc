@@ -608,7 +608,6 @@ class Daemon:
         client = AcpcClient(
             events,
             level,
-            bypass_modes=request.resolution.entry.bypass_modes,
         )
 
         warm = self.host.adapter_sessions.get(session_id)

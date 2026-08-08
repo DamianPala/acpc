@@ -105,6 +105,17 @@ def test_mode_is_unset_without_an_entry_or_call_value(tmp_path: Path) -> None:
     assert resolution.provenance["mode"].kind == "unset"
 
 
+def test_permission_alias_is_accepted_and_stored_canonically(tmp_path: Path) -> None:
+    agents = tmp_path / "agents"
+    write_entry(agents, "legacy", 'command = "python"\npermissions = "write"\n')
+
+    registry = AgentRegistry(agents)
+
+    assert registry.resolve("legacy").permissions == "execute"
+    assert registry.resolve_call("legacy").permissions == "execute"
+    assert registry.resolve_call("legacy", permissions="prompt").permissions == "ask"
+
+
 def test_description_accepts_long_and_multiline_values_for_resolution(tmp_path: Path) -> None:
     agents = tmp_path / "agents"
     long_description = "long " * 100

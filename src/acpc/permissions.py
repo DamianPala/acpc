@@ -1,77 +1,96 @@
-"""Permission-kind classification and approval policy.
+"""Classify ACP permission requests against the ordered policy scale.
 
-Implements SPEC.md *Permissions* exactly:
-
-- `read` allows the read-only kinds (`read`, `search`, `fetch`, `think`) and
-  `switch_mode` — unless the target mode is on the adapter's bypass list, in
-  which case the request is treated like an unknown kind.
-- `write` adds `edit` and `execute`; never `delete`/`move`.
-- `all` allows everything, including `allow_always` options.
-- `none` denies every request.
-- `prompt` auto-allows read kinds and asks the human for everything else.
-
-Unknown kinds are denied under `read`/`write`/`none`, asked under `prompt`,
-allowed under `all`. `read` and `write` answer with `allow_once` only —
-`allow_always` is reserved to `all`.
+The non-interactive policies are ordered as ``none < read < edit < execute <
+all``. ``ask`` is separate from that scale: read requests are allowed
+automatically, while every other category is left for the human to answer.
+Unknown kinds require ``all``. The deprecated ``write`` and ``prompt`` input
+aliases are normalized before a ``PermissionLevel`` is constructed.
 """
 
 from enum import Enum
+from functools import total_ordering
 
 from acp.schema import PermissionOption
 
-READ_KINDS: frozenset[str] = frozenset({"read", "search", "think", "fetch", "switch_mode"})
-WRITE_KINDS: frozenset[str] = frozenset({"edit", "execute"})
-DELETE_KINDS: frozenset[str] = frozenset({"delete", "move"})
+from acpc.vocab import PERMISSION_ALIASES
+
+READ_KINDS: frozenset[str] = frozenset({"read", "search", "think", "fetch"})
+EDIT_KINDS: frozenset[str] = frozenset({"edit"})
+EXECUTE_KINDS: frozenset[str] = frozenset({"execute", "delete", "move"})
 
 
+@total_ordering
 class PermissionLevel(Enum):
-    ALL = "all"
-    WRITE = "write"
-    READ = "read"
     NONE = "none"
-    PROMPT = "prompt"
+    READ = "read"
+    EDIT = "edit"
+    EXECUTE = "execute"
+    ALL = "all"
+    ASK = "ask"
+
+    @classmethod
+    def _missing_(cls, value: object) -> "PermissionLevel | None":
+        # Compatibility net for pre-0.5 meta: aliases become canonical before downstream code.
+        if isinstance(value, str):
+            canonical = PERMISSION_ALIASES.get(value)
+            if canonical is not None:
+                return cls(canonical)
+        return None
+
+    @property
+    def rank(self) -> int:
+        """Return this level's scale rank; ``ask`` has no rank."""
+        if self is PermissionLevel.ASK:
+            raise ValueError("ask is not ordered with the permission scale")
+        return (
+            PermissionLevel.NONE,
+            PermissionLevel.READ,
+            PermissionLevel.EDIT,
+            PermissionLevel.EXECUTE,
+            PermissionLevel.ALL,
+        ).index(self)
+
+    def __lt__(self, other: object) -> bool:
+        if not isinstance(other, PermissionLevel):
+            return NotImplemented
+        return self.rank < other.rank
 
 
-def classify_kind(kind: str | None, *, bypass_mode_switch: bool = False) -> str:
-    """Return a permission category for a ToolKind value.
-
-    A `switch_mode` whose target mode is on the adapter's bypass list is a
-    permission-evasion door (SPEC.md: "the same door exists at runtime") and
-    classifies as unknown — denied below `all`, asked under `prompt`.
-    """
-    if kind == "switch_mode" and bypass_mode_switch:
-        return "unknown"
+def classify_kind(kind: str | None) -> str:
+    """Return the policy category for an ACP tool-call kind."""
     if kind in READ_KINDS:
         return "read"
-    if kind in WRITE_KINDS:
-        return "write"
-    if kind in DELETE_KINDS:
-        return "delete"
+    if kind in EDIT_KINDS:
+        return "edit"
+    if kind in EXECUTE_KINDS:
+        return "execute"
     return "unknown"
 
 
 def should_allow(level: PermissionLevel, category: str) -> bool | None:
     """Return True (allow), False (deny), or None (ask the human)."""
-    if level is PermissionLevel.ALL:
-        return True
-    if level is PermissionLevel.NONE:
-        return False
-    if level is PermissionLevel.READ:
-        return category == "read"
-    if level is PermissionLevel.WRITE:
-        return category not in {"delete", "unknown"}
-    # PROMPT
-    if category == "read":
-        return True
-    return None
+    if level is PermissionLevel.ASK:
+        return True if category == "read" else None
+    if category not in {"read", "edit", "execute"}:
+        return level is PermissionLevel.ALL
+    required = {
+        "read": PermissionLevel.READ,
+        "edit": PermissionLevel.EDIT,
+        "execute": PermissionLevel.EXECUTE,
+    }[category]
+    return level >= required
 
 
 def minimum_policy(category: str) -> str:
     """Return the least non-interactive policy that allows a category."""
-    for level in (PermissionLevel.READ, PermissionLevel.WRITE, PermissionLevel.ALL):
-        if should_allow(level, category) is True:
-            return level.value
-    raise ValueError(f"no policy allows permission category {category!r}")
+    minimums = {
+        "read": PermissionLevel.READ.value,
+        "edit": PermissionLevel.EDIT.value,
+        "execute": PermissionLevel.EXECUTE.value,
+        "unknown": PermissionLevel.ALL.value,
+    }
+    # Unexpected categories are treated like unknown requests and need `all`.
+    return minimums.get(category, PermissionLevel.ALL.value)
 
 
 def find_option(

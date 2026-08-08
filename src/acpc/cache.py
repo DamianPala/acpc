@@ -183,7 +183,6 @@ async def probe_advertised(resolution: CallResolution) -> dict[str, Any]:
         client = AcpcClient(
             transcript,
             PermissionLevel.READ,
-            bypass_modes=resolution.entry.bypass_modes,
         )
         try:
             async with spawn_adapter(

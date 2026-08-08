@@ -8,6 +8,7 @@ import pytest
 from click.testing import CliRunner
 
 from acpc import cache, vocab
+from acpc import cli as cli_module
 from acpc.cli import main
 from acpc.registry import AgentRegistry
 
@@ -60,6 +61,11 @@ def cli() -> CliRunner:
     return CliRunner()
 
 
+@pytest.fixture
+def fresh_permission_alias_warnings(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli_module, "_WARNED_PERMISSION_ALIASES", set())
+
+
 def invoke(cli: CliRunner, *args: str):
     return cli.invoke(main, list(args), catch_exceptions=False)
 
@@ -97,7 +103,7 @@ home = "~/.home-longer-than-the-old-column"
 
     assert header.split() == list(headings)
     assert lines.count(header) == 1
-    assert [row.index(value) for value in (long_entry, long_model, "xhigh", "write")] == [
+    assert [row.index(value) for value in (long_entry, long_model, "xhigh", "execute")] == [
         header.index(value) for value in headings[:4]
     ]
     assert not any(line.startswith("ENTRY") for line in lines)
@@ -207,10 +213,21 @@ def test_agents_detail_shows_mode_and_its_source(cli: CliRunner) -> None:
     assert result.exit_code == vocab.EXIT_OK
     assert "effort       xhigh (entry)" in result.stdout
     assert "mode         plan (entry)" in result.stdout
-    assert "permissions  write (entry)" in result.stdout
+    assert "permissions  execute (entry)" in result.stdout
 
     payload = json.loads(invoke(cli, "agents", "builder", "--json").stdout)
     assert payload["resolved"]["mode"] == {"value": "plan", "source": "entry"}
+
+
+def test_entry_permission_alias_resolves_canonically_and_warns_on_run(
+    cli: CliRunner, fresh_permission_alias_warnings: None
+) -> None:
+    result = invoke(cli, "run", "builder", "probe", "--dry-run", "--json")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert result.stdout
+    assert '"permissions": {"value": "execute"' in result.stdout
+    assert "--permissions write is deprecated; use --permissions execute" in result.stderr
 
 
 def test_agents_detail_renders_an_unset_mode_with_its_source(cli: CliRunner) -> None:
@@ -491,7 +508,7 @@ def test_agents_init_writes_the_requested_variant_fields(cli: CliRunner, state_r
     assert result.exit_code == vocab.EXIT_OK
     created = (state_root / "agents" / "smoke-variant.toml").read_text(encoding="utf-8")
     assert 'extends = "mock"' in created
-    assert 'permissions = "write"' in created
+    assert 'permissions = "execute"' in created
     assert 'mode = "plan"' in created
     assert AgentRegistry(state_root / "agents").resolve("smoke-variant").mode == "plan"
 

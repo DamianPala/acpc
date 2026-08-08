@@ -9,10 +9,12 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 from click.testing import CliRunner
 
+from acpc import cli as cli_module
 from acpc import daemon_client, runner, sessions, vocab
 from acpc.cli import main
 from acpc.registry import AgentRegistry
@@ -49,6 +51,11 @@ def state_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 @pytest.fixture
 def cli() -> CliRunner:
     return CliRunner()
+
+
+@pytest.fixture
+def fresh_permission_alias_warnings(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli_module, "_WARNED_PERMISSION_ALIASES", set())
 
 
 def invoke(cli: CliRunner, *args: str, stdin: str | None = None):
@@ -145,7 +152,7 @@ def test_quiet_continue_suppresses_the_early_line(cli: CliRunner) -> None:
     assert result.stderr == ""
 
 
-def test_continue_uses_the_stored_resolution_after_entry_changes(
+def test_continue_normalizes_legacy_stored_write_policy_after_entry_changes(
     cli: CliRunner, state_root: Path
 ) -> None:
     first = invoke(
@@ -161,6 +168,11 @@ def test_continue_uses_the_stored_resolution_after_entry_changes(
         "--json",
     )
     session_id = json.loads(first.stdout)["session_id"]
+    # Simulate pre-0.5 meta.json; continue must accept it without rewriting it.
+    meta = sessions.load(session_id)
+    meta.resolution["resolved"]["permissions"]["value"] = "write"
+    with sessions.session_lock(session_id):
+        sessions.write_meta(meta)
     (state_root / "agents" / "mock.toml").write_text(
         'name = "Changed"\ncommand = "missing-after-first-turn"\n', encoding="utf-8"
     )
@@ -169,6 +181,89 @@ def test_continue_uses_the_stored_resolution_after_entry_changes(
 
     assert result.exit_code == vocab.EXIT_OK
     assert "mock-opus-5/xhigh" in result.stdout
+    assert sessions.load(session_id).resolution["resolved"]["permissions"]["value"] == "write"
+
+
+def test_continue_preserves_meta_written_after_initial_load(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id = start_session(cli)
+    original_load = cli_module._load_view_session
+
+    def load_then_write(selector: str) -> sessions.SessionMeta:
+        loaded = original_load(selector)
+        current = sessions.read_meta(loaded.session_id)
+        current.name = "concurrent-name"
+        with sessions.session_lock(loaded.session_id):
+            sessions.write_meta(current)
+        return loaded
+
+    monkeypatch.setattr(cli_module, "_load_view_session", load_then_write)
+    result = invoke(cli, "continue", session_id, "turn two", "--permissions", "edit", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert sessions.load(session_id).name == "concurrent-name"
+
+
+def test_continue_uses_policy_returned_by_rotation(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    first = invoke(
+        cli,
+        "run",
+        "mock",
+        "turn one",
+        "--cwd",
+        str(tmp_path),
+        "--quiet",
+        "--json",
+    )
+    session_id = json.loads(first.stdout)["session_id"]
+    original_rotate = sessions.rotate_turn
+
+    def rotate_after_a_concurrent_policy_change(
+        session_id: str, **kwargs: Any
+    ) -> sessions.SessionMeta:
+        current = sessions.read_meta(session_id)
+        current.resolution["resolved"]["permissions"] = {
+            "value": "edit",
+            "source": "call flag",
+        }
+        current.resolution.pop("permissions_source", None)
+        with sessions.session_lock(session_id):
+            sessions.write_meta(current)
+        return original_rotate(session_id, **kwargs)
+
+    monkeypatch.setattr(sessions, "rotate_turn", rotate_after_a_concurrent_policy_change)
+    result = invoke(cli, "continue", session_id, "write-file:raced.md", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert (tmp_path / "raced.md").is_file()
+
+
+def test_continue_post_rotation_failure_finalizes_the_new_turn(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id = start_session(cli)
+    original_rotate = sessions.rotate_turn
+
+    def rotate_after_a_concurrent_corruption(
+        session_id: str, **kwargs: Any
+    ) -> sessions.SessionMeta:
+        current = sessions.read_meta(session_id)
+        current.resolution["cwd"] = 42
+        with sessions.session_lock(session_id):
+            sessions.write_meta(current)
+        return original_rotate(session_id, **kwargs)
+
+    monkeypatch.setattr(sessions, "rotate_turn", rotate_after_a_concurrent_corruption)
+    result = invoke(cli, "continue", session_id, "turn two")
+
+    failed = sessions.load(session_id)
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert failed.state == "failed"
+    assert failed.turns == 2
+    assert failed.stop_reason == "error"
 
 
 def test_continue_reapplies_the_stored_mode(cli: CliRunner) -> None:
@@ -253,14 +348,103 @@ def test_continue_by_name_uses_the_session_alias(cli: CliRunner) -> None:
     assert json.loads(continued.stdout)["session_id"] == session_id
 
 
-def test_continue_rejects_run_only_permissions_with_the_rule(cli: CliRunner) -> None:
-    session_id = start_session(cli)
+def test_continue_permissions_apply_and_persist_for_later_turns(
+    cli: CliRunner, tmp_path: Path
+) -> None:
+    first = invoke(
+        cli,
+        "run",
+        "mock",
+        "turn one",
+        "--cwd",
+        str(tmp_path),
+        "--quiet",
+        "--json",
+    )
+    session_id = json.loads(first.stdout)["session_id"]
 
-    result = invoke(cli, "continue", session_id, "turn two", "--permissions", "write")
+    second = invoke(
+        cli,
+        "continue",
+        session_id,
+        "write-file:first.md",
+        "--permissions",
+        "edit",
+        "--quiet",
+    )
+    third = invoke(cli, "continue", session_id, "write-file:second.md", "--quiet")
+    fourth = invoke(cli, "continue", session_id, "perm scenario")
+
+    assert second.exit_code == vocab.EXIT_OK
+    assert third.exit_code == vocab.EXIT_OK
+    assert fourth.exit_code == vocab.EXIT_OK
+    assert (tmp_path / "first.md").is_file()
+    assert (tmp_path / "second.md").is_file()
+    meta = sessions.load(session_id)
+    assert meta.resolution["resolved"]["permissions"]["value"] == "edit"
+    assert meta.resolution.get("permissions_source") is None
+    assert meta.denied == {"execute": 2, "unknown": 2}
+    assert "denied:" not in fourth.stderr
+
+
+def test_continue_validation_failure_does_not_rotate_session(cli: CliRunner) -> None:
+    session_id = start_session(cli)
+    meta = sessions.load(session_id)
+    meta.adapter_session_id = None
+    with sessions.session_lock(session_id):
+        sessions.write_meta(meta)
+
+    result = invoke(cli, "continue", session_id, "turn two")
+
+    unchanged = sessions.load(session_id)
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert "cannot be continued" in result.stderr
+    assert unchanged.state == "done"
+    assert unchanged.turns == 1
+
+
+def test_continue_rejects_a_malformed_stored_resolution(cli: CliRunner) -> None:
+    session_id = start_session(cli)
+    meta = sessions.load(session_id)
+    meta.resolution["resolved"] = None
+    with sessions.session_lock(session_id):
+        sessions.write_meta(meta)
+
+    result = invoke(cli, "continue", session_id, "turn two")
 
     assert result.exit_code == vocab.EXIT_USAGE
-    assert "continue reuses the session's permissions" in result.stderr
-    assert "--permissions" in result.stderr
+    assert "stored permission resolution" in result.stderr
+
+
+def test_continue_write_alias_is_canonical_and_warns(
+    cli: CliRunner, fresh_permission_alias_warnings: None, tmp_path: Path
+) -> None:
+    first = invoke(
+        cli,
+        "run",
+        "mock",
+        "turn one",
+        "--cwd",
+        str(tmp_path),
+        "--quiet",
+        "--json",
+    )
+    session_id = json.loads(first.stdout)["session_id"]
+
+    result = invoke(
+        cli,
+        "continue",
+        session_id,
+        "write-file:alias.md",
+        "--permissions",
+        "write",
+        "--quiet",
+    )
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert (tmp_path / "alias.md").is_file()
+    assert sessions.load(session_id).resolution["resolved"]["permissions"]["value"] == "execute"
+    assert "--permissions write is deprecated; use --permissions execute" in result.stderr
 
 
 def test_continue_on_a_running_session_is_a_usage_error(cli: CliRunner, live_daemon: None) -> None:
@@ -326,16 +510,16 @@ def test_denial_tally_is_replaced_by_the_following_turn(cli: CliRunner, state_ro
     assert payload["resolution"]["permissions_source"] == "default"
 
 
-def _store_prompt_policy(session_id: str) -> None:
+def _store_ask_policy(session_id: str) -> None:
     meta = sessions.load(session_id)
-    meta.resolution["resolved"]["permissions"]["value"] = "prompt"
+    meta.resolution["resolved"]["permissions"]["value"] = "ask"
     with sessions.session_lock(session_id):
         sessions.write_meta(meta)
 
 
-def test_continue_of_a_prompt_session_needs_a_terminal(cli: CliRunner) -> None:
+def test_continue_of_an_ask_session_needs_a_terminal(cli: CliRunner) -> None:
     session_id = start_session(cli)
-    _store_prompt_policy(session_id)
+    _store_ask_policy(session_id)
 
     result = invoke(cli, "continue", session_id, "turn two")
 
@@ -344,14 +528,14 @@ def test_continue_of_a_prompt_session_needs_a_terminal(cli: CliRunner) -> None:
     assert "--bg" not in result.stderr
 
 
-def test_continue_of_a_prompt_session_rejects_bg_by_name(
+def test_continue_of_an_ask_session_rejects_bg_by_name(
     cli: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from acpc import cli as cli_module
 
     monkeypatch.setattr(cli_module, "_stdout_is_tty", lambda: True)
     session_id = start_session(cli)
-    _store_prompt_policy(session_id)
+    _store_ask_policy(session_id)
 
     result = invoke(cli, "continue", session_id, "turn two", "--bg")
 

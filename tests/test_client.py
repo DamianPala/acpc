@@ -40,7 +40,6 @@ def _make_client(tmp_path: Path, level: PermissionLevel) -> tuple[AcpcClient, Tr
         AcpcClient(
             transcript,
             level,
-            bypass_modes={"yolo"},
             clock=lambda: 100.0,
         ),
         transcript,
@@ -367,11 +366,11 @@ def test_an_oversized_message_buffer_flushes_on_size(tmp_path: Path, monkeypatch
     assert events[0]["text"] == "x" * 5000
 
 
-def test_prompt_policy_without_callback_denies_without_reading_stdin(
+def test_ask_policy_without_callback_denies_without_reading_stdin(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
     monkeypatch.setenv("ACPC_HOME", str(tmp_path / "acpc-state"))
-    client, transcript = _make_client(tmp_path, PermissionLevel.PROMPT)
+    client, transcript = _make_client(tmp_path, PermissionLevel.ASK)
 
     async def scenario() -> Any:
         return await client.request_permission(
@@ -452,14 +451,14 @@ def test_permission_denials_are_answered_and_recorded(tmp_path: Path, monkeypatc
         "deny",
         "deny",
         "deny",
-        "allow",
+        "deny",
     ]
-    assert len(errors) == 4
+    assert len(errors) == 5
     assert all(event["message"].startswith("permission denied:") for event in errors)
     assert "switch_mode:yolo" in client.answer
 
 
-def test_bypass_mode_is_denied_below_all_and_allowed_by_all(
+def test_unknown_switch_mode_is_denied_below_all_and_allowed_by_all(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
     monkeypatch.setenv("ACPC_HOME", str(tmp_path / "acpc-state"))
@@ -478,7 +477,7 @@ def test_bypass_mode_is_denied_below_all_and_allowed_by_all(
 
     assert "switch_mode:yolo" in read_answer.split("Denied:", 1)[1]
     assert "switch_mode:yolo" in all_answer.split("Allowed:", 1)[1].split("Denied:", 1)[0]
-    assert sum(event["type"] == "error" for event in read_events) == 4
+    assert sum(event["type"] == "error" for event in read_events) == 5
     assert sum(event["type"] == "error" for event in all_events) == 0
 
 

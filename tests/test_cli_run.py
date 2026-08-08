@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
+from acpc import cli as cli_module
 from acpc import sessions, vocab
 from acpc.cli import main
 
@@ -55,6 +56,11 @@ def cli() -> CliRunner:
     # stdout is not a tty under CliRunner, which is the non-interactive branch
     # of every TTY rule below.
     return CliRunner()
+
+
+@pytest.fixture
+def fresh_permission_alias_warnings(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli_module, "_WARNED_PERMISSION_ALIASES", set())
 
 
 def invoke(cli: CliRunner, *args: str, stdin: str | None = None):
@@ -232,6 +238,21 @@ def test_dry_run_reports_the_permission_policy_it_would_use(cli: CliRunner) -> N
     assert json.loads(result.stdout)["resolved"]["permissions"]["value"] == "read"
 
 
+def test_write_alias_matches_execute_and_warns_once_per_process(
+    cli: CliRunner, fresh_permission_alias_warnings: None
+) -> None:
+    first = invoke(cli, "run", "mock", "probe", "--permissions", "write", "--dry-run", "--json")
+    second = invoke(cli, "run", "mock", "probe", "--permissions", "write", "--dry-run", "--json")
+    canonical = invoke(
+        cli, "run", "mock", "probe", "--permissions", "execute", "--dry-run", "--json"
+    )
+
+    assert json.loads(first.stdout)["resolved"]["permissions"]["value"] == "execute"
+    assert json.loads(first.stdout) == json.loads(canonical.stdout)
+    assert "--permissions write is deprecated; use --permissions execute" in first.stderr
+    assert "deprecated" not in second.stderr
+
+
 def test_a_raw_model_id_on_the_call_is_labelled_as_a_call_flag(cli: CliRunner) -> None:
     result = invoke(cli, "run", "mock", "probe", "--model", "mock-opus-5", "--dry-run", "--json")
 
@@ -252,11 +273,25 @@ def test_a_tier_name_resolves_through_the_entry_preset_that_defines_it(cli: CliR
 # --- TTY rules --------------------------------------------------------------
 
 
-def test_permissions_prompt_without_a_terminal_is_a_usage_error(cli: CliRunner) -> None:
+def test_permissions_prompt_alias_without_a_terminal_is_a_usage_error(cli: CliRunner) -> None:
     result = invoke(cli, "run", "mock", "probe", "--permissions", "prompt")
 
     assert result.exit_code == vocab.EXIT_USAGE
-    assert "terminal" in result.stderr
+    assert "--permissions ask" in result.stderr
+
+
+def test_prompt_alias_resolves_to_ask_on_a_tty(
+    cli: CliRunner,
+    fresh_permission_alias_warnings: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli_module, "_stdout_is_tty", lambda: True)
+
+    result = invoke(cli, "run", "mock", "probe", "--permissions", "prompt", "--dry-run", "--json")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert json.loads(result.stdout)["resolved"]["permissions"]["value"] == "ask"
+    assert "--permissions prompt is deprecated; use --permissions ask" in result.stderr
 
 
 def _ask_under_a_pty(answer: str) -> tuple[bool, str]:
@@ -303,12 +338,12 @@ def test_default_policy_denials_are_visible_and_persisted(cli: CliRunner, state_
     result = invoke(cli, "run", "mock", "write-file:blocked.md", "--json")
 
     assert result.exit_code == vocab.EXIT_OK
-    assert "denied: 1 write (default read policy — pass --permissions write)" in result.stderr
+    assert "denied: 1 edit (default read policy — pass --permissions edit)" in result.stderr
     session_id = json.loads(result.stdout)["session_id"]
     denied_meta = json.loads(
         (state_root / "sessions" / session_id / "meta.json").read_text(encoding="utf-8")
     )
-    assert denied_meta["denied"] == {"write": 1}
+    assert denied_meta["denied"] == {"edit": 1}
     assert denied_meta["resolution"]["permissions_source"] == "default"
 
 
@@ -346,7 +381,7 @@ def test_default_policy_summary_uses_the_strongest_remedy_for_all_categories(
 
     assert result.exit_code == vocab.EXIT_OK
     assert (
-        "denied: 2 write · 1 delete · 1 unknown (default read policy — pass --permissions all)"
+        "denied: 1 edit · 2 execute · 2 unknown (default read policy — pass --permissions all)"
     ) in result.stderr
 
 
@@ -359,7 +394,7 @@ def test_wait_shows_default_policy_denials_from_disk(cli: CliRunner, live_daemon
     waited = invoke(cli, "wait", session_id)
 
     assert waited.exit_code == vocab.EXIT_OK
-    assert "denied: 1 write (default read policy — pass --permissions write)" in waited.stderr
+    assert "denied: 1 edit (default read policy — pass --permissions edit)" in waited.stderr
 
 
 def test_an_unknown_permission_value_is_a_usage_error(cli: CliRunner) -> None:

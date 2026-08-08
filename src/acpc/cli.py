@@ -6,6 +6,7 @@ delegates everything else to the layer that owns it.
 """
 
 import asyncio
+import contextlib
 import json
 import os
 import subprocess
@@ -33,7 +34,16 @@ from acpc import (
     transcript,
     vocab,
 )
-from acpc.registry import AgentRegistry, CallResolution, FieldSource, RegistryError, ResolvedEntry
+from acpc.registry import (
+    AgentRegistry,
+    CallResolution,
+    FieldSource,
+    RegistryError,
+    ResolvedEntry,
+)
+
+_PERMISSION_CHOICES = (*vocab.PERMISSION_VALUES, *vocab.PERMISSION_ALIASES)
+_WARNED_PERMISSION_ALIASES: set[str] = set()
 
 
 class UsageProblem(click.ClickException):
@@ -88,7 +98,7 @@ Quick reference
 
 Short task (fits your tool-call window — blocks, answer on stdout):
   acpc run <agent> "Explain this code"
-  acpc run <agent> "Implement the fix" --permissions write
+  acpc run <agent> "Implement the fix" --permissions execute
   Dispatch prints `-- session <id> | dir <path>` on stderr right away:
   the id works mid-run with log / stop / steer.
 
@@ -115,7 +125,7 @@ Continue (next turn on a finished session):
   acpc continue <id> "Now fix what you found"
 
 Heredoc prompt:
-  acpc run <agent> - --permissions write <<'PROMPT'
+  acpc run <agent> - --permissions execute <<'PROMPT'
   Review the implementation and make the required edits.
   PROMPT
 
@@ -143,7 +153,8 @@ Common commands:
 Flag → ACP
   --mode         → session/set_mode
   --permissions  → request_permission
-                   all · write (= edit + execute) · read (incl. network fetch) · none · prompt
+                   none · read · edit · execute · all · ask
+                   write and prompt are deprecated aliases for execute and ask
   --model        → session/new (model)
   --effort       → session/new (effort)"""
 
@@ -284,6 +295,47 @@ def _read_prompt(prompt_text: str | None, prompt_file: str | None) -> str:
     return prompt_text or ""
 
 
+def _normalize_permission(value: str | None) -> str | None:
+    """Normalize a CLI permission and emit one note per deprecated alias."""
+    canonical = vocab.normalize_permission(value)
+    if value in vocab.PERMISSION_ALIASES and value not in _WARNED_PERMISSION_ALIASES:
+        _WARNED_PERMISSION_ALIASES.add(value)
+        click.echo(
+            f"--permissions {value} is deprecated; use --permissions {canonical}",
+            err=True,
+        )
+    return canonical
+
+
+def _warn_permission_alias(alias: str | None) -> None:
+    """Warn when an agent entry supplies a deprecated permission alias."""
+    _normalize_permission(alias)
+
+
+def _stored_permission_policy(meta: sessions.SessionMeta) -> str:
+    """Read and normalize the permission policy from a validated session."""
+    resolved = meta.resolution.get("resolved")
+    if not isinstance(resolved, dict):
+        raise UsageProblem(f"session {meta.session_id} has no stored permission resolution")
+    permissions = resolved.get("permissions")
+    if not isinstance(permissions, dict):
+        return "read"
+    return vocab.normalize_permission(permissions.get("value")) or "read"
+
+
+def _finalize_follow_up_failure(session_id: str, error: BaseException) -> None:
+    """Close a rotated turn when request preparation cannot finish."""
+    with contextlib.suppress(OSError, sessions.SessionError):
+        sessions.write_answer(session_id, f"{error}\n")
+    with contextlib.suppress(OSError, sessions.SessionError):
+        sessions.transition(
+            session_id,
+            "failed",
+            exit_code=vocab.EXIT_AGENT_ERROR,
+            stop_reason="error",
+        )
+
+
 def _resolve_permissions(
     explicit: str | None,
     resolution: CallResolution,
@@ -301,15 +353,15 @@ def _resolve_permissions(
     interactive = tty and not background
     policy = explicit if explicit is not None else resolution.permissions
     if policy is None:
-        policy = "prompt" if interactive else "read"
-    if policy == "prompt" and not interactive:
+        policy = "ask" if interactive else "read"
+    if policy == "ask" and not interactive:
         cause = (
             "cannot be used with --bg, which returns before a request could be answered"
             if background
             else "needs a terminal to ask on"
         )
         raise UsageProblem(
-            f"--permissions prompt {cause}; pass --permissions read, write, all or none"
+            f"--permissions ask {cause}; pass --permissions none, read, edit, execute or all"
         )
     return policy
 
@@ -652,7 +704,7 @@ def _render_entry_detail(
         if field == "home":
             rendered = _display_home(value)
         elif field == "permissions" and value is None:
-            rendered = "prompt on TTY, read otherwise"
+            rendered = "ask on TTY, read otherwise"
         else:
             rendered = "·" if value is None else str(value)
         rendered_source = _source_text(resolution.provenance.get(field))
@@ -1065,9 +1117,12 @@ def _agents_check(registry: AgentRegistry, name: str | None, *, json_mode: bool)
 @click.option("--mode", metavar="MODE", help="Default operating mode for the variant.")
 @click.option(
     "--permissions",
-    type=click.Choice(vocab.PERMISSION_VALUES),
+    type=click.Choice(_PERMISSION_CHOICES),
     metavar="P",
-    help="Default permission policy for the variant.",
+    help=(
+        "Default policy: none, read, edit, execute, all or ask; write and prompt are "
+        "deprecated aliases."
+    ),
 )
 @click.option("--home", metavar="DIR", help="Vendor home override for the variant.")
 @click.option("--json", "json_mode", is_flag=True, help="Emit the created entry as JSON.")
@@ -1084,8 +1139,9 @@ def agents_init_command(
 ) -> None:
     """Scaffold a variant entry.
 
-    Example: ``acpc agents init work --extends mock --permissions write``
+    Example: ``acpc agents init work --extends mock --permissions execute``
     """
+    permissions = _normalize_permission(permissions)
     try:
         registry = AgentRegistry()
         registry.resolve(parent)
@@ -1810,11 +1866,11 @@ def _still_running_note(session_id: str, timeout: float | None) -> str:
 @click.option("--effort", metavar="E", help="Reasoning effort level.")
 @click.option(
     "--permissions",
-    type=click.Choice(vocab.PERMISSION_VALUES),
+    type=click.Choice(_PERMISSION_CHOICES),
     help=(
         "\b\n"
-        "Approval policy: all, write (= edit + execute), read (incl. network fetch), none, "
-        "prompt; absent, prompt on a TTY and read otherwise."
+        "Approval policy: none, read, edit, execute, all or ask; absent, ask on a TTY and "
+        "read otherwise. write and prompt are deprecated aliases for execute and ask."
     ),
 )
 @click.option(
@@ -1864,11 +1920,12 @@ def run_command(
 ) -> None:
     """Dispatch one agent; block and print the final answer.
 
-    The default permission policy is ``prompt`` on a TTY and ``read``
+    The default permission policy is ``ask`` on a TTY and ``read``
     otherwise.  Background calls always use the non-TTY rule.
 
-    Example: ``acpc run codex "Fix the failing test" --permissions write``
+    Example: ``acpc run codex "Fix the failing test" --permissions execute``
     """
+    permissions = _normalize_permission(permissions)
     tty = _stdout_is_tty()
 
     try:
@@ -1881,6 +1938,8 @@ def run_command(
             permissions=permissions,
             home=home,
         )
+        if permissions is None:
+            _warn_permission_alias(registry.permission_alias(agent))
     except RegistryError as error:
         raise UsageProblem(str(error)) from None
 
@@ -1938,7 +1997,7 @@ def run_command(
         prompt=prompt,
         cwd=resolved_cwd,
         timeout=timeout,
-        permission_prompt=_tty_permission_prompt if policy == "prompt" else None,
+        permission_prompt=_tty_permission_prompt if policy == "ask" else None,
     )
 
     if background:
@@ -2020,6 +2079,15 @@ def _dispatch_background(session_id: str, request: runner.TurnRequest, *, json_m
 @click.argument("prompt_text", required=False)
 @click.option("--prompt-file", "prompt_file", metavar="FILE", help="Read the prompt from a file.")
 @click.option("-o", "--output", "output_file", metavar="FILE", help="Write the answer to a file.")
+@click.option(
+    "--permissions",
+    type=click.Choice(_PERMISSION_CHOICES),
+    metavar="P",
+    help=(
+        "Permission policy for this and later turns: none, read, edit, execute, all or ask; "
+        "write and prompt are deprecated aliases."
+    ),
+)
 @click.option("--bg", "background", is_flag=True, help="Dispatch and return the session id.")
 @click.option(
     "--timeout",
@@ -2036,12 +2104,6 @@ def _dispatch_background(session_id: str, request: runner.TurnRequest, *, json_m
 )
 @click.option("--quiet", is_flag=True, help="Suppress the stderr summary line.")
 @click.option("--json", "json_mode", is_flag=True, help="Emit this command's output as JSON.")
-@click.option(
-    "--permissions",
-    metavar="P",
-    hidden=True,
-    help="Run-only permission policy; continue reuses the stored policy.",
-)
 @click.option(
     "--model",
     metavar="M",
@@ -2104,8 +2166,8 @@ def continue_command(
 
     Example: ``acpc continue <session-id> "Run the tests again"``
     """
+    permissions = _normalize_permission(permissions)
     run_only = {
-        "--permissions": permissions,
         "--model": model,
         "--effort": effort,
         "--mode": mode,
@@ -2116,7 +2178,7 @@ def continue_command(
     }
     for flag, value in run_only.items():
         if value not in (None, False):
-            rule = "continue reuses the session's permissions — drop --permissions"
+            rule = "continue reuses the session's stored settings"
             raise UsageProblem(f"{rule} (run-only flag: {flag})")
 
     prompt = _read_prompt(prompt_text, prompt_file)
@@ -2129,6 +2191,7 @@ def continue_command(
         meta,
         prompt,
         output_file=output_file,
+        permissions=permissions,
         background=background,
         timeout=timeout,
         max_output=max_output,
@@ -2142,6 +2205,7 @@ def _dispatch_follow_up(
     prompt: str,
     *,
     output_file: str | None,
+    permissions: str | None,
     background: bool,
     timeout: float | None,
     max_output: int,
@@ -2153,9 +2217,14 @@ def _dispatch_follow_up(
     `steer` is `continue` with a cancel in front of it, so both verbs end
     here: one turn on the session's stored resolution, one output contract.
     """
-    stored_policy = meta.resolution.get("resolved", {}).get("permissions", {}).get("value")
+    try:
+        current = sessions.read_meta(meta.session_id)
+        stored_policy = _stored_permission_policy(current)
+    except sessions.SessionError as error:
+        raise UsageProblem(str(error)) from None
+    policy = permissions if permissions is not None else stored_policy
     interactive = _stdout_is_tty() and not background
-    if stored_policy == "prompt" and not interactive:
+    if policy == "ask" and not interactive:
         # Same split as `run`: the two causes are different situations and
         # "needs a terminal" is baffling advice to someone sitting at one.
         cause = (
@@ -2164,21 +2233,41 @@ def _dispatch_follow_up(
             else "needs a terminal to ask on"
         )
         raise UsageProblem(
-            f"this session uses --permissions prompt, which {cause}; "
+            f"this session uses --permissions ask, which {cause}; "
             "continue it from a terminal or start a new session with another policy"
         )
     try:
+        runner.continue_request(
+            current,
+            prompt,
+            timeout=timeout,
+            permissions=policy,
+            permission_prompt=(_tty_permission_prompt if policy == "ask" and interactive else None),
+        )
+    except runner.RunnerError as error:
+        raise UsageProblem(str(error)) from None
+
+    rotated: sessions.SessionMeta | None = None
+    try:
+        rotated = sessions.rotate_turn(
+            meta.session_id,
+            permissions=policy if permissions is not None else None,
+        )
+        rotated_policy = _stored_permission_policy(rotated)
         request = runner.continue_request(
-            meta,
+            rotated,
             prompt,
             timeout=timeout,
             permission_prompt=(
-                _tty_permission_prompt if stored_policy == "prompt" and interactive else None
+                _tty_permission_prompt if rotated_policy == "ask" and interactive else None
             ),
         )
-        rotated = sessions.rotate_turn(meta.session_id)
         sessions.write_prompt(rotated.session_id, prompt)
-    except (runner.RunnerError, sessions.SessionError) as error:
+    except (runner.RunnerError, sessions.SessionError, OSError, UsageProblem) as error:
+        if rotated is not None:
+            _finalize_follow_up_failure(meta.session_id, error)
+        if isinstance(error, UsageProblem):
+            raise
         raise UsageProblem(str(error)) from None
 
     if background:
@@ -2291,6 +2380,7 @@ def steer_command(
         meta,
         _steer_prompt(instruction) if interrupted else instruction,
         output_file=output_file,
+        permissions=None,
         background=background,
         timeout=timeout,
         max_output=max_output,

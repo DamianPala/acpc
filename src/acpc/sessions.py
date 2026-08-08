@@ -597,7 +597,12 @@ def mark_running(
     )
 
 
-def rotate_turn(session_id: str, *, clock: Clock | None = None) -> SessionMeta:
+def rotate_turn(
+    session_id: str,
+    *,
+    clock: Clock | None = None,
+    permissions: str | None = None,
+) -> SessionMeta:
     """Open the next turn: park the finished turn's artifacts, reset per-turn state.
 
     SPEC.md *State on disk*: rotation happens at the *start* of the next turn
@@ -612,6 +617,12 @@ def rotate_turn(session_id: str, *, clock: Clock | None = None) -> SessionMeta:
             raise SessionStateError(
                 f"session {session_id} is {meta.state} — wait for the current turn to finish"
             )
+        if permissions is not None:
+            resolved = meta.resolution.get("resolved")
+            if not isinstance(resolved, dict):
+                raise SessionStateError(f"session {session_id} has no stored permission resolution")
+            resolved["permissions"] = {"value": permissions, "source": "call flag"}
+            meta.resolution.pop("permissions_source", None)
         turn = meta.turns
         for stem, current in (
             ("prompt", prompt_path(session_id)),

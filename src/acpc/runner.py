@@ -23,7 +23,7 @@ import shutil
 import signal
 import sys
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from acp import PROTOCOL_VERSION, RequestError, text_block
@@ -204,7 +204,6 @@ async def _drive_turn(
     client = AcpcClient(
         events,
         level,
-        bypass_modes=resolution.entry.bypass_modes,
         permission_prompt=request.permission_prompt,
     )
 
@@ -419,11 +418,11 @@ def daemon_payload(request: TurnRequest) -> dict[str, Any]:
 def routes_direct(request: TurnRequest) -> str | None:
     """Why this call cannot use the daemon, or None when it can.
 
-    A `prompt` policy needs a terminal to ask on and the daemon has none, so
+    An `ask` policy needs a terminal to ask on and the daemon has none, so
     such a call stays a direct child even when a daemon is available.
     """
-    if request.permission_prompt is not None or request.resolution.permissions == "prompt":
-        return "--permissions prompt needs this terminal"
+    if request.permission_prompt is not None or request.resolution.permissions == "ask":
+        return "--permissions ask needs this terminal"
     return None
 
 
@@ -763,7 +762,7 @@ def resolution_from_session(meta: sessions.SessionMeta) -> CallResolution:
         model=_stored_value(payload, "model"),
         effort=_stored_value(payload, "effort"),
         mode=_stored_value(payload, "mode"),
-        permissions=_stored_value(payload, "permissions"),
+        permissions=vocab.normalize_permission(_stored_value(payload, "permissions")),
         home=_stored_value(payload, "home"),
         declared_env=dict(declared_env),
         env_passthrough=env_passthrough,
@@ -776,6 +775,7 @@ def continue_request(
     prompt: str,
     *,
     timeout: float | None = None,
+    permissions: str | None = None,
     permission_prompt: Callable[[str, str], bool] | None = None,
 ) -> TurnRequest:
     """Build a follow-up turn from the session's persisted resolution."""
@@ -787,8 +787,11 @@ def continue_request(
     cwd = payload.get("cwd")
     if cwd is not None and not isinstance(cwd, str):
         raise RunnerError(f"session {meta.session_id} has an invalid stored working directory")
+    resolution = resolution_from_session(meta)
+    if permissions is not None:
+        resolution = replace(resolution, permissions=vocab.normalize_permission(permissions))
     return TurnRequest(
-        resolution=resolution_from_session(meta),
+        resolution=resolution,
         prompt=prompt,
         cwd=cwd,
         timeout=timeout,

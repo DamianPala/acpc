@@ -20,7 +20,7 @@ from typing import Any, Final, Literal
 
 from acpc.environment import adapter_environment
 from acpc.paths import agents_dir
-from acpc.vocab import EFFORT_VALUES, PERMISSION_VALUES
+from acpc.vocab import EFFORT_VALUES, PERMISSION_ALIASES, PERMISSION_VALUES, normalize_permission
 
 _TIERS: Final = frozenset({"fast", "standard", "max"})
 _NON_INHERITABLE_FIELDS: Final = frozenset({"description"})
@@ -273,7 +273,9 @@ class ResolvedEntry:
         else:
             sources["mode"] = FieldSource("unset")
 
-        resolved_permissions = self.permissions if permissions is None else permissions
+        resolved_permissions = normalize_permission(
+            self.permissions if permissions is None else permissions
+        )
         if resolved_permissions is not None and resolved_permissions not in PERMISSION_VALUES:
             supported = ", ".join(PERMISSION_VALUES)
             raise RegistryError(
@@ -326,6 +328,7 @@ class _ParsedEntry:
     data: Mapping[str, Any]
     source: Path
     provenance: Mapping[str, FieldSource]
+    permission_alias: str | None = None
 
 
 def _flatten_sources(
@@ -354,7 +357,15 @@ def _merge_parsed(parent: _ParsedEntry, child: _ParsedEntry) -> _ParsedEntry:
     data = _merge_values(parent.data, child.data)
     provenance = dict(parent.provenance)
     provenance.update(child.provenance)
-    return _ParsedEntry(data=data, source=child.source, provenance=provenance)
+    permission_alias = (
+        child.permission_alias if "permissions" in child.data else parent.permission_alias
+    )
+    return _ParsedEntry(
+        data=data,
+        source=child.source,
+        provenance=provenance,
+        permission_alias=permission_alias,
+    )
 
 
 def _expect_string(path: Path, key: str, value: Any, *, allow_empty: bool = False) -> str:
@@ -404,9 +415,15 @@ def _parse_entry(
         value = _expect_string(path, "effort", raw["effort"])
         if value not in EFFORT_VALUES:
             raise RegistryError(f"{path}: key 'effort' has unsupported level '{value}'")
-    if "permissions" in raw and raw["permissions"] not in PERMISSION_VALUES:
-        supported = ", ".join(PERMISSION_VALUES)
-        raise RegistryError(f"{path}: key 'permissions' must be one of: {supported}")
+    permission_alias: str | None = None
+    if "permissions" in raw:
+        permission = _expect_string(path, "permissions", raw["permissions"])
+        canonical = normalize_permission(permission)
+        if canonical not in PERMISSION_VALUES:
+            supported = ", ".join(PERMISSION_VALUES)
+            raise RegistryError(f"{path}: key 'permissions' must be one of: {supported}")
+        if permission in PERMISSION_ALIASES:
+            permission_alias = permission
     for key in ("bypass_modes", "efforts", "env_passthrough"):
         if key in raw:
             _expect_string_list(path, key, raw[key])
@@ -442,7 +459,12 @@ def _parse_entry(
     if not allow_partial and "command" not in raw and "extends" not in raw:
         raise RegistryError(f"{path}: an entry must define 'command' or 'extends'")
     source = FieldSource(source_kind, path)
-    return _ParsedEntry(data=raw, source=path, provenance=_flatten_sources(raw, source))
+    return _ParsedEntry(
+        data=raw,
+        source=path,
+        provenance=_flatten_sources(raw, source),
+        permission_alias=permission_alias,
+    )
 
 
 def _resource_path(resource: Any) -> Path:
@@ -522,7 +544,7 @@ def _to_resolved(
         model=string_or_none("model"),
         effort=string_or_none("effort"),
         mode=string_or_none("mode"),
-        permissions=string_or_none("permissions"),
+        permissions=normalize_permission(string_or_none("permissions")),
         env=env,
         presets=presets,
         extends=extends,
@@ -579,6 +601,18 @@ class AgentRegistry:
 
     def resolve(self, name: str) -> ResolvedEntry:
         return self._resolve(name, ())
+
+    def permission_alias(self, name: str) -> str | None:
+        """Return the deprecated permissions alias declared by an entry, if any."""
+        if name not in self._entries:
+            raise RegistryError(f"unknown agent '{name}'")
+        parsed = self._entries[name]
+        if "permissions" in parsed.data:
+            return parsed.permission_alias
+        extends = parsed.data.get("extends")
+        if isinstance(extends, str) and extends:
+            return self.permission_alias(extends)
+        return None
 
     def _resolve(self, name: str, stack: tuple[str, ...]) -> ResolvedEntry:
         if name not in self._entries:

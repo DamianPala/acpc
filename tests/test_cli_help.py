@@ -74,7 +74,7 @@ def test_root_help_is_a_compact_cheat_sheet(runner: CliRunner) -> None:
 
     assert result.exit_code == vocab.EXIT_OK
     assert len(result.stdout.splitlines()) <= 100
-    assert "--permissions write" in result.stdout
+    assert "--permissions execute" in result.stdout
     assert "request_permission" in result.stdout
 
 
@@ -82,8 +82,9 @@ def test_permission_help_names_the_tier_gloss(runner: CliRunner) -> None:
     root_help = invoke(runner, "--help")
     run_help = invoke(runner, "run", "--help")
 
-    assert "write (= edit + execute)" in root_help.stdout
-    assert "write (= edit + execute)" in run_help.stdout
+    assert "none · read · edit · execute · all · ask" in root_help.stdout
+    assert "none, read, edit, execute, all or ask" in run_help.stdout
+    assert "write and prompt are deprecated aliases" in run_help.stdout
 
 
 def test_short_help_matches_root_help(runner: CliRunner) -> None:
@@ -149,7 +150,7 @@ def test_help_names_behavioral_defaults_and_global_output_default(runner: CliRun
     assert "absent, it blocks indefinitely" in wait_help
     assert "absent, it blocks indefinitely" in log_help
     assert "without --since or --tail, show the last 20 events" in log_help
-    assert "absent, prompt on a TTY and read otherwise" in run_help
+    assert "absent, ask on a TTY and read otherwise" in run_help
     assert "[default: 131072" in run_help
     assert "[default: 131072" in wait_help
     assert "[default: 131072" in log_help
