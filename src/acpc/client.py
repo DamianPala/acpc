@@ -1,9 +1,10 @@
 """ACP client callbacks for transcript-backed acpc sessions."""
 
+import asyncio
 import inspect
 import json
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -32,11 +33,20 @@ from acp.schema import (
     WriteTextFileResponse,
 )
 
-from acpc.permissions import PermissionLevel, classify_kind, find_option, should_allow
+from acpc.permissions import (
+    ModeSelectionError,
+    PermissionLevel,
+    classify_kind,
+    find_option,
+    select_mode,
+    should_allow,
+)
+from acpc.registry import ModeSpec
 from acpc.transcript import Transcript
 
 _Clock = Callable[[], float]
 _PermissionPrompt = Callable[[str, str], bool | Awaitable[bool]]
+_EndTurn = Callable[[], None]
 
 # Real adapters stream word-sized message chunks; one transcript event per
 # chunk turns `log` into a per-fragment view and the cursor into a fragment
@@ -47,6 +57,8 @@ _PermissionPrompt = Callable[[str, str], bool | Awaitable[bool]]
 _CHUNK_GAP_SECONDS = 1.0
 _CHUNK_MAX_AGE_SECONDS = 2.0
 _CHUNK_MAX_CHARS = 4096
+# A broken cancellation watcher must not hold an ACP permission response forever.
+_CANCELLATION_DISPATCH_TIMEOUT = 1.0
 
 
 @dataclass(slots=True)
@@ -82,11 +94,17 @@ class AcpcClient:
         transcript: Transcript,
         permission_level: PermissionLevel,
         *,
+        modes: Mapping[str, ModeSpec] | None = None,
+        end_turn: _EndTurn | None = None,
+        cancellation_dispatched: asyncio.Event | None = None,
         permission_prompt: _PermissionPrompt | None = None,
         clock: _Clock | None = None,
     ) -> None:
         self.transcript = transcript
         self.permission_level = permission_level
+        self.modes = {} if modes is None else modes
+        self.end_turn = end_turn
+        self.cancellation_dispatched = cancellation_dispatched
         self.permission_prompt = permission_prompt
         self._clock = time.monotonic if clock is None else clock
         self._pending: _PendingChunks | None = None
@@ -249,24 +267,73 @@ class AcpcClient:
         kind = getattr(tool_call, "kind", None) or "unknown"
         title = getattr(tool_call, "title", None) or ""
         category = classify_kind(kind)
-        decision = should_allow(self.permission_level, category)
-        if decision is None:
-            decision = await self._ask_permission(kind, title)
+        switch_reason: str | None = None
+        if kind == "switch_mode":
+            target = self._switch_mode_target(tool_call)
+            decision, required = self._switch_mode_decision(target)
+            if not decision:
+                display_target = target if target is not None else "<unknown>"
+                switch_reason = self._switch_mode_reason(display_target, required)
+        else:
+            decision = should_allow(self.permission_level, category)
+            if decision is None:
+                decision = await self._ask_permission(kind, title)
 
         option_id = find_option(options, decision, self.permission_level)
         allowed = bool(decision and option_id is not None)
         self.transcript.append("permission", kind=kind, decision="allow" if allowed else "deny")
         if not allowed:
             self._denied[category] = self._denied.get(category, 0) + 1
-            reason = f"permission denied: {kind}"
-            if decision and option_id is None:
+            reason = switch_reason or f"permission denied: {kind}"
+            if switch_reason is None and decision and option_id is None:
                 reason += " (no matching allow option)"
             self.transcript.append("error", message=reason)
+            if switch_reason is not None and self.end_turn is not None:
+                self.end_turn()
+                await self._await_cancellation_dispatch()
             return RequestPermissionResponse(outcome=DeniedOutcome(outcome="cancelled"))
         assert option_id is not None
         return RequestPermissionResponse(
             outcome=AllowedOutcome(outcome="selected", option_id=option_id)
         )
+
+    async def _await_cancellation_dispatch(self) -> None:
+        """Wait until the runner starts ACP cancellation, with a bounded fallback."""
+        if self.cancellation_dispatched is None:
+            return
+        try:
+            await asyncio.wait_for(
+                self.cancellation_dispatched.wait(), timeout=_CANCELLATION_DISPATCH_TIMEOUT
+            )
+        except TimeoutError:
+            return
+
+    def _switch_mode_decision(self, target: str | None) -> tuple[bool, str]:
+        """Resolve a runtime mode switch through the stored policy ceiling."""
+        if target is None:
+            return False, PermissionLevel.ALL.value
+        try:
+            _mode, spec = select_mode(self.modes, self.permission_level, explicit_mode=target)
+        except ModeSelectionError:
+            spec = self.modes.get(target)
+            return False, spec.grants if spec is not None else PermissionLevel.ALL.value
+        return True, spec.grants
+
+    @staticmethod
+    def _switch_mode_reason(target: str, required: str) -> str:
+        """Describe why a runtime mode switch cannot be admitted."""
+        return f"permission denied: switch_mode {target} (requires --permissions {required})"
+
+    @staticmethod
+    def _switch_mode_target(tool_call: Any) -> str | None:
+        """Read the requested mode from ACP's generic tool-call input."""
+        raw_input = getattr(tool_call, "raw_input", None)
+        if isinstance(raw_input, Mapping):
+            for key in ("target", "mode"):
+                target = raw_input.get(key)
+                if isinstance(target, str) and target:
+                    return target
+        return None
 
     async def read_text_file(
         self,

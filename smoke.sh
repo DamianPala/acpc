@@ -1166,8 +1166,9 @@ if begin_section S13-permissions "permission tiers in log, mode ceiling rejectio
     assert_contains "read tier: read allowed (mock's own summary)" "$ANSWER_READ" \
         "Allowed: read:src/app.py"
     assert_contains "read tier: delete denied" "$DENIED_READ" "delete:old_report.md"
-    # S4 turns switch_mode into a re-selection; until then both switches are unknown and denied.
-    assert_contains "read tier: switch_mode denied" "$DENIED_READ" "switch_mode:plan"
+    # S4 makes the above-ceiling yolo switch end the turn before the later plan switch.
+    assert_not_contains "read tier: refused switch ends turn before plan" "$DENIED_READ" \
+        "switch_mode:plan"
 
     run_acpc run mock "run the perm scenario" --permissions write --quiet --json
     PERM_WRITE_ID="$(json_field "$LAST_OUT" '.session_id')"

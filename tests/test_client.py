@@ -2,9 +2,11 @@
 
 import asyncio
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+import pytest
 from acp import PROTOCOL_VERSION, text_block
 from acp.schema import (
     AgentMessageChunk,
@@ -24,13 +26,24 @@ from acp.schema import (
 
 from acpc.client import AcpcClient
 from acpc.permissions import PermissionLevel
+from acpc.registry import ModeSpec
 from acpc.spawn import spawn_adapter
 from acpc.transcript import Transcript
 
 MOCK_AGENT_SCRIPT = str(Path(__file__).with_name("mock_agent.py"))
+MOCK_MODES = {
+    "default": ModeSpec(grants="read", delegates=True),
+    "acceptEdits": ModeSpec(grants="none", delegates=False),
+    "plan": ModeSpec(grants="execute", delegates=True),
+    "yolo": ModeSpec(grants="all", delegates=False),
+}
 
 
-def _make_client(tmp_path: Path, level: PermissionLevel) -> tuple[AcpcClient, Transcript]:
+def _make_client(
+    tmp_path: Path,
+    level: PermissionLevel,
+    modes: Mapping[str, ModeSpec] | None = None,
+) -> tuple[AcpcClient, Transcript]:
     state_root = tmp_path / "acpc-state"
     transcript = Transcript(
         state_root / "sessions" / "abcd" / "transcript.ndjson",
@@ -40,6 +53,7 @@ def _make_client(tmp_path: Path, level: PermissionLevel) -> tuple[AcpcClient, Tr
         AcpcClient(
             transcript,
             level,
+            modes=MOCK_MODES if modes is None else modes,
             clock=lambda: 100.0,
         ),
         transcript,
@@ -458,7 +472,7 @@ def test_permission_denials_are_answered_and_recorded(tmp_path: Path, monkeypatc
     assert "switch_mode:yolo" in client.answer
 
 
-def test_unknown_switch_mode_is_denied_below_all_and_allowed_by_all(
+def test_switch_mode_reselection_denies_above_ceiling_and_allows_all(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
     monkeypatch.setenv("ACPC_HOME", str(tmp_path / "acpc-state"))
@@ -472,13 +486,149 @@ def test_unknown_switch_mode_is_denied_below_all_and_allowed_by_all(
             await _drain_updates(lambda: "Denied:" in client.answer)
         return client.answer, transcript.read().events
 
-    read_answer, read_events = asyncio.run(run(PermissionLevel.READ))
+    _read_answer, read_events = asyncio.run(run(PermissionLevel.READ))
     all_answer, all_events = asyncio.run(run(PermissionLevel.ALL))
 
-    assert "switch_mode:yolo" in read_answer.split("Denied:", 1)[1]
+    read_errors = [event["message"] for event in read_events if event["type"] == "error"]
+    assert any("switch_mode yolo" in message for message in read_errors)
+    assert any("--permissions all" in message for message in read_errors)
     assert "switch_mode:yolo" in all_answer.split("Allowed:", 1)[1].split("Denied:", 1)[0]
+    assert "switch_mode:plan" in all_answer.split("Allowed:", 1)[1].split("Denied:", 1)[0]
     assert sum(event["type"] == "error" for event in read_events) == 5
     assert sum(event["type"] == "error" for event in all_events) == 0
+
+
+def test_switch_mode_at_or_below_ceiling_allows_later_requests(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    monkeypatch.setenv("ACPC_HOME", str(tmp_path / "acpc-state"))
+    modes = {"plan": ModeSpec(grants="read", delegates=True)}
+    client, transcript = _make_client(tmp_path, PermissionLevel.ASK, modes)
+    options = [
+        PermissionOption(option_id="allow", name="Allow", kind="allow_once"),
+        PermissionOption(option_id="deny", name="Deny", kind="reject_once"),
+    ]
+
+    async def scenario() -> None:
+        first = await client.request_permission(
+            "adapter-session",
+            ToolCallUpdate(
+                tool_call_id="switch",
+                kind="switch_mode",
+                title="Switch mode",
+                raw_input={"target": "plan"},
+            ),
+            options,
+        )
+        second = await client.request_permission(
+            "adapter-session",
+            ToolCallUpdate(tool_call_id="read", kind="read", title="Read"),
+            options,
+        )
+        assert isinstance(first.outcome, AllowedOutcome)
+        assert isinstance(second.outcome, AllowedOutcome)
+
+    asyncio.run(scenario())
+
+    assert [event["decision"] for event in transcript.read().events] == ["allow", "allow"]
+
+
+def test_switch_mode_undeclared_target_requires_all_but_allows_at_all(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    monkeypatch.setenv("ACPC_HOME", str(tmp_path / "acpc-state"))
+    modes = {"plan": ModeSpec(grants="read", delegates=True)}
+    options = [
+        PermissionOption(option_id="allow", name="Allow", kind="allow_once"),
+        PermissionOption(option_id="deny", name="Deny", kind="reject_once"),
+    ]
+
+    async def request(level: PermissionLevel, root: Path) -> tuple[Any, list[dict[str, Any]]]:
+        client, transcript = _make_client(root, level, modes)
+        response = await client.request_permission(
+            "adapter-session",
+            ToolCallUpdate(
+                tool_call_id="switch",
+                kind="switch_mode",
+                title="Switch mode",
+                raw_input={"target": "yolo"},
+            ),
+            options,
+        )
+        return response, transcript.read().events
+
+    refused, refused_events = asyncio.run(request(PermissionLevel.READ, tmp_path / "read"))
+    allowed, allowed_events = asyncio.run(request(PermissionLevel.ALL, tmp_path / "all"))
+
+    assert isinstance(refused.outcome, DeniedOutcome)
+    assert refused_events[0]["decision"] == "deny"
+    assert "switch_mode yolo" in refused_events[1]["message"]
+    assert "--permissions all" in refused_events[1]["message"]
+    assert isinstance(allowed.outcome, AllowedOutcome)
+    assert [event["decision"] for event in allowed_events] == ["allow"]
+
+
+@pytest.mark.parametrize("raw_input", [None, "not a mapping", {"target": ""}])
+def test_malformed_switch_mode_target_is_refused_before_lookup(
+    tmp_path: Path, monkeypatch: Any, raw_input: Any
+) -> None:
+    monkeypatch.setenv("ACPC_HOME", str(tmp_path / "acpc-state"))
+    client, transcript = _make_client(
+        tmp_path,
+        PermissionLevel.ALL,
+        {"<unknown>": ModeSpec(grants="none", delegates=True)},
+    )
+
+    async def scenario() -> Any:
+        return await client.request_permission(
+            "adapter-session",
+            ToolCallUpdate(
+                tool_call_id="switch",
+                kind="switch_mode",
+                title="Switch mode",
+                raw_input=raw_input,
+            ),
+            [
+                PermissionOption(option_id="allow", name="Allow", kind="allow_once"),
+                PermissionOption(option_id="deny", name="Deny", kind="reject_once"),
+            ],
+        )
+
+    response = asyncio.run(scenario())
+
+    assert isinstance(response.outcome, DeniedOutcome)
+    events = transcript.read().events
+    assert events[0]["decision"] == "deny"
+    assert "switch_mode <unknown>" in events[1]["message"]
+    assert "--permissions all" in events[1]["message"]
+
+
+def test_declared_unknown_spelling_is_a_real_mode_under_all(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    monkeypatch.setenv("ACPC_HOME", str(tmp_path / "acpc-state"))
+    client, transcript = _make_client(
+        tmp_path,
+        PermissionLevel.ALL,
+        {"<unknown>": ModeSpec(grants="all", delegates=False)},
+    )
+
+    async def scenario() -> Any:
+        return await client.request_permission(
+            "adapter-session",
+            ToolCallUpdate(
+                tool_call_id="switch",
+                kind="switch_mode",
+                title="Switch mode",
+                raw_input={"target": "<unknown>"},
+            ),
+            [PermissionOption(option_id="allow", name="Allow", kind="allow_once")],
+        )
+
+    response = asyncio.run(scenario())
+
+    assert isinstance(response.outcome, AllowedOutcome)
+    assert transcript.read().events[0]["decision"] == "allow"
 
 
 def test_commands_update_replaces_the_advertised_command_list(

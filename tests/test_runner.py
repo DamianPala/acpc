@@ -168,6 +168,31 @@ def test_a_refused_turn_still_writes_the_partial_answer() -> None:
     assert answer == outcome.answer
 
 
+def test_a_switch_above_the_ceiling_ends_the_turn_with_exit_2() -> None:
+    session_id, outcome = start_turn("run the perm scenario", permissions="read")
+
+    assert outcome.state == "failed"
+    assert outcome.stop_reason == "permission_denied"
+    assert outcome.exit_code == vocab.EXIT_USAGE
+    events = transcript_events(session_id)
+    errors = [event["message"] for event in events if event.get("type") == "error"]
+    assert any("switch_mode yolo" in message for message in errors)
+    assert any("--permissions all" in message for message in errors)
+    switch_permissions = [
+        event
+        for event in events
+        if event.get("type") == "permission" and event.get("kind") == "switch_mode"
+    ]
+    # The perm mock requests plan immediately after yolo; cancellation must win that race.
+    assert len(switch_permissions) == 1
+    assert switch_permissions[-1]["decision"] == "deny"
+    assert not any(
+        "switch_mode:plan" in event.get("message", "")
+        for event in events
+        if event.get("type") == "error"
+    )
+
+
 def test_timeout_cancels_the_turn_and_exits_124() -> None:
     session_id, outcome = start_turn("slow:30 timeout probe", timeout=1.0)
 

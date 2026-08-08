@@ -398,9 +398,9 @@ def test_default_policy_summary_uses_the_strongest_remedy_for_all_categories(
 ) -> None:
     result = invoke(cli, "run", "mock", "perm scenario")
 
-    assert result.exit_code == vocab.EXIT_OK
+    assert result.exit_code == vocab.EXIT_USAGE
     assert (
-        "denied: 1 edit · 2 execute · 2 unknown (default read policy — pass --permissions all)"
+        "denied: 1 edit · 2 execute · 1 unknown (default read policy — pass --permissions all)"
     ) in result.stderr
 
 

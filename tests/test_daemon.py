@@ -187,6 +187,34 @@ def test_a_turn_runs_on_the_daemon_and_finishes_the_session(
     assert sessions.read_meta(session_id).state == "done"
 
 
+def test_a_refused_switch_leaves_the_daemon_warm_for_continue(
+    state_root: Path, live_daemon: None
+) -> None:
+    session_id = new_session("run the perm scenario")
+
+    refused = run_turn(session_id, "run the perm scenario")
+
+    assert refused.route_note is None
+    assert refused.state == "failed"
+    assert refused.stop_reason == "permission_denied"
+    assert refused.exit_code == vocab.EXIT_USAGE
+    meta = sessions.read_meta(session_id)
+    assert meta.state == "failed"
+    assert meta.stop_reason == "permission_denied"
+    assert meta.exit_code == vocab.EXIT_USAGE
+    mode = meta.resolution["resolved"]["mode"]
+    assert mode["value"] == "default"
+    assert mode["grants"] == "read"
+    assert mode["delegates"] is True
+
+    continued = next_turn(session_id, "multi:after the refused switch")
+
+    assert continued.route_note is None
+    assert continued.state == "done"
+    assert sessions.read_meta(session_id).state == "done"
+    assert "turn 2: after the refused switch" in sessions.answer_path(session_id).read_text()
+
+
 def test_the_daemon_writes_the_answer_the_client_never_saw(
     state_root: Path, live_daemon: None
 ) -> None:

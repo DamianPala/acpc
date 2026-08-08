@@ -411,7 +411,7 @@ class MockAgent(Agent):
         if scenario == "fail":
             return await self._run_fail(session_id, prompt_text)
         if scenario == "perm":
-            return await self._run_perm(session_id, prompt_text)
+            return await self._run_perm(session_id, prompt_text, cancel_event)
         if scenario == "huge":
             return await self._run_huge(session_id, prompt_text)
         if scenario == "slow":
@@ -564,7 +564,9 @@ class MockAgent(Agent):
         )
         return PromptResponse(stop_reason="refusal")
 
-    async def _run_perm(self, session_id: str, prompt_text: str) -> PromptResponse:
+    async def _run_perm(
+        self, session_id: str, prompt_text: str, cancel_event: asyncio.Event
+    ) -> PromptResponse:
         await self._send_text(session_id, f'Exploring what "{prompt_text.strip()[:100]}" needs.')
 
         decisions: dict[str, str] = {}
@@ -599,17 +601,23 @@ class MockAgent(Agent):
                 session_id=session_id,
                 update=update_tool_call(tool_call_id=tool_id, status=status),
             )
+            if cancel_event.is_set():
+                await self._send_text(session_id, self._perm_summary(decisions))
+                return PromptResponse(stop_reason="cancelled")
 
+        await self._send_text(session_id, self._perm_summary(decisions))
+        return PromptResponse(stop_reason="end_turn")
+
+    @staticmethod
+    def _perm_summary(decisions: dict[str, str]) -> str:
         allowed_keys = [key for key, value in decisions.items() if value == "allowed"]
         denied_keys = [key for key, value in decisions.items() if value == "denied"]
-        await self._send_text(
-            session_id,
+        return (
             "## Permission check summary\n\n"
             f"Requested: {', '.join(decisions)}.\n\n"
             f"Allowed: {', '.join(allowed_keys) or 'none'}.\n\n"
-            f"Denied: {', '.join(denied_keys) or 'none'}.\n",
+            f"Denied: {', '.join(denied_keys) or 'none'}.\n"
         )
-        return PromptResponse(stop_reason="end_turn")
 
     async def _run_huge(self, session_id: str, prompt_text: str) -> PromptResponse:
         await self._completed_tool_call(session_id, "Read big_file.md", "read")

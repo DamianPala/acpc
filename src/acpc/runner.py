@@ -133,8 +133,9 @@ def exit_code_for(state: str, stop_reason: str | None = None) -> int:
     # ended this client"; they differ only in whether the session survives it.
     if state in {"detached", "terminated"}:
         return vocab.EXIT_SIGTERM
+    if stop_reason == "permission_denied":
+        return vocab.EXIT_USAGE
     # failed and orphaned both mean the agent did not deliver an answer.
-    del stop_reason
     return vocab.EXIT_AGENT_ERROR
 
 
@@ -182,12 +183,19 @@ class _CancelSignal:
 
     def __init__(self) -> None:
         self.state: str | None = None
+        self.stop_reason: str | None = None
         self.requested = asyncio.Event()
+        self.cancellation_dispatched = asyncio.Event()
 
-    def request(self, state: str) -> None:
+    def request(self, state: str, *, stop_reason: str | None = None) -> None:
         if self.state is None:
             self.state = state
+            self.stop_reason = stop_reason
         self.requested.set()
+
+    def end_turn(self) -> None:
+        """End a turn through the same cancellation path as external stops."""
+        self.request("failed", stop_reason="permission_denied")
 
 
 async def _drive_turn(
@@ -204,6 +212,9 @@ async def _drive_turn(
     client = AcpcClient(
         events,
         level,
+        modes=resolution.entry.modes,
+        end_turn=cancel.end_turn,
+        cancellation_dispatched=cancel.cancellation_dispatched,
         permission_prompt=request.permission_prompt,
     )
 
@@ -245,6 +256,8 @@ async def _drive_turn(
     finally:
         client.flush()
 
+    if cancel.stop_reason is not None:
+        stop_reason = cancel.stop_reason
     state = cancel.state if cancel.state is not None else _state_for_stop_reason(stop_reason)
     return TurnOutcome(
         state=state,
@@ -346,6 +359,7 @@ async def _await_prompt(
         # Either the timeout expired or a signal asked us to wind down.
         if not cancel.requested.is_set():
             cancel.request("timeout")
+        cancel.cancellation_dispatched.set()
         with contextlib.suppress(Exception):
             await conn.cancel(session_id=adapter_session_id)
         with contextlib.suppress(TimeoutError, asyncio.CancelledError, Exception):

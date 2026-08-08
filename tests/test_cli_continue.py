@@ -467,13 +467,13 @@ def test_continue_permissions_apply_and_persist_for_later_turns(
 
     assert second.exit_code == vocab.EXIT_OK
     assert third.exit_code == vocab.EXIT_OK
-    assert fourth.exit_code == vocab.EXIT_OK
+    assert fourth.exit_code == vocab.EXIT_USAGE
     assert (tmp_path / "first.md").is_file()
     assert (tmp_path / "second.md").is_file()
     meta = sessions.load(session_id)
     assert meta.resolution["resolved"]["permissions"]["value"] == "edit"
     assert meta.resolution.get("permissions_source") is None
-    assert meta.denied == {"execute": 2, "unknown": 2}
+    assert meta.denied == {"execute": 2, "unknown": 1}
     assert "denied:" not in fourth.stderr
 
 

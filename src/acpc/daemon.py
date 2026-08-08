@@ -646,6 +646,9 @@ class Daemon:
         client = AcpcClient(
             events,
             level,
+            modes=request.resolution.entry.modes,
+            end_turn=cancel.end_turn,
+            cancellation_dispatched=cancel.cancellation_dispatched,
         )
 
         warm = self.host.adapter_sessions.get(session_id)
@@ -682,6 +685,8 @@ class Daemon:
         state = (
             cancel.state if cancel.state is not None else runner._state_for_stop_reason(stop_reason)
         )
+        if cancel.stop_reason is not None:
+            stop_reason = cancel.stop_reason
         return runner.TurnOutcome(
             state=state,
             stop_reason=stop_reason,
