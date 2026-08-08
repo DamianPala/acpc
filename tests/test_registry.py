@@ -27,7 +27,6 @@ def test_shipped_adapter_facts_and_presets_are_available(tmp_path: Path) -> None
     assert claude.install_command == "npm install -g @agentclientprotocol/claude-agent-acp"
     assert claude.home == "~/.claude"
     assert claude.home_env == "CLAUDE_CONFIG_DIR"
-    assert "bypassPermissions" in claude.bypass_modes
     assert {
         mode: {"grants": spec.grants, "delegates": spec.delegates}
         for mode, spec in claude.modes.items()
@@ -247,7 +246,7 @@ def test_a_variant_inherits_the_parent_adapter_contract_lists(tmp_path: Path) ->
         agents,
         "base",
         'name = "Base"\ncommand = "python -m base"\n'
-        'efforts = ["low", "high"]\nbypass_modes = ["yolo"]\n'
+        'efforts = ["low", "high"]\n'
         'effort_config_id = "effort"\n'
         'env_passthrough = ["BASE_KEY"]\n',
     )
@@ -257,7 +256,6 @@ def test_a_variant_inherits_the_parent_adapter_contract_lists(tmp_path: Path) ->
     worker = registry.resolve("worker")
 
     assert worker.efforts == ("low", "high")
-    assert worker.bypass_modes == ("yolo",)
     assert worker.effort_config_id == "effort"
     assert worker.env_passthrough == ("BASE_KEY",)
     with pytest.raises(RegistryError, match="low, high"):

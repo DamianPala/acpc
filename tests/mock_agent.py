@@ -10,7 +10,7 @@ match wins, checked after the exact-prefix triggers below):
 
 - ``fail``  -> tool event + msg, then stop_reason=refusal
 - ``perm``  -> six permission requests covering every policy tier:
-  read / edit / execute / delete / switch_mode into the bypass mode ``yolo`` /
+  read / edit / execute / delete / switch_mode into the restricted mode ``yolo`` /
   switch_mode into the ordinary mode ``plan``
 - ``huge``  -> >200 KB of markdown dense with multi-byte UTF-8 (Polish
   diacritics + emoji), with a 4-byte emoji starting at byte 1998 so a
@@ -40,7 +40,7 @@ usage update, and a markdown answer quoting the prompt — history-aware, so a
 continued session's answer references the previous turn.
 
 Advertised dataset: modes ``default``/``acceptEdits``/``plan``/``yolo`` (the
-bypass mode), models ``mock-opus-5``/``mock-sonnet-5``/``mock-haiku-4-5``,
+restricted mode), models ``mock-opus-5``/``mock-sonnet-5``/``mock-haiku-4-5``,
 efforts ``low``/``medium``/``high``/``xhigh`` — any other effort value is
 rejected with a RequestError, giving the client a real "unsupported effort
 level" to surface. A small command list is advertised after session/new.
@@ -111,7 +111,7 @@ DEFAULT_MODEL = "mock-sonnet-5"
 EFFORTS = ("low", "medium", "high", "xhigh")
 DEFAULT_EFFORT = "medium"
 MODES = ("default", "acceptEdits", "plan", "yolo")
-BYPASS_MODE = "yolo"  # the adapter definition's bypass list names this mode
+RESTRICTED_MODE = "yolo"
 
 _HUGE_TARGET_BYTES = 220 * 1024
 _STRADDLE_OFFSET = 1998  # byte offset a 4-byte emoji starts at, see _huge_answer
@@ -123,7 +123,7 @@ PERM_REQUESTS: tuple[tuple[str, ToolKind, str], ...] = (
     ("Write", "edit", "src/app.py"),
     ("Bash", "execute", "rm -rf build/"),
     ("Delete", "delete", "old_report.md"),
-    ("SwitchMode", "switch_mode", BYPASS_MODE),
+    ("SwitchMode", "switch_mode", RESTRICTED_MODE),
     ("SwitchMode", "switch_mode", "plan"),
 )
 

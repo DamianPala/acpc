@@ -40,7 +40,7 @@ from acpc import (
 )
 from acpc.client import AcpcClient
 from acpc.permissions import PermissionLevel
-from acpc.registry import CallResolution, RegistryError, ResolvedEntry
+from acpc.registry import CallResolution, ModeSpec, RegistryError, ResolvedEntry
 from acpc.spawn import spawn_adapter
 
 # SPEC.md `stop`: graceful cancel with a bounded wait for the ack (10s) — if
@@ -266,11 +266,10 @@ _DEFAULT_EFFORT_CONFIG_ID = "reasoning_effort"
 async def apply_call_options(conn: Any, adapter_session_id: str, request: TurnRequest) -> None:
     """Apply resolved mode/model/effort to the adapter session before prompting."""
     resolution = request.resolution
-    if resolution.mode is not None:
-        await _configure(
-            conn.set_session_mode(session_id=adapter_session_id, mode_id=resolution.mode),
-            f"mode {resolution.mode!r}",
-        )
+    await _configure(
+        conn.set_session_mode(session_id=adapter_session_id, mode_id=resolution.mode),
+        f"mode {resolution.mode!r}",
+    )
     if resolution.model is not None:
         await _configure(
             conn.set_config_option(
@@ -406,6 +405,8 @@ def daemon_payload(request: TurnRequest) -> dict[str, Any]:
         "model": resolution.model,
         "effort": resolution.effort,
         "mode": resolution.mode,
+        "grants": resolution.mode_spec.grants if resolution.mode_spec else None,
+        "delegates": resolution.mode_spec.delegates if resolution.mode_spec else None,
         "permissions": resolution.permissions,
         "home": resolution.home,
         "cwd": request.cwd,
@@ -646,6 +647,7 @@ def auto_prune(retention_seconds: float) -> None:
 def resolution_payload(resolution: CallResolution, *, cwd: str | None) -> dict[str, Any]:
     """The `--dry-run` view: every resolved value and where it came from."""
     entry = resolution.entry
+    provenance: Mapping[str, Any] = resolution.provenance
     fields: dict[str, Any] = {
         "model": resolution.model,
         "effort": resolution.effort,
@@ -653,7 +655,16 @@ def resolution_payload(resolution: CallResolution, *, cwd: str | None) -> dict[s
         "permissions": resolution.permissions,
         "home": resolution.home,
     }
-    provenance: Mapping[str, Any] = resolution.provenance
+    resolved: dict[str, dict[str, Any]] = {
+        name: {
+            "value": value,
+            "source": _source_label(provenance.get(name)),
+        }
+        for name, value in fields.items()
+    }
+    if resolution.mode_spec is not None:
+        resolved["mode"]["grants"] = resolution.mode_spec.grants
+        resolved["mode"]["delegates"] = resolution.mode_spec.delegates
     return {
         "entry": entry.entry,
         "base_adapter": entry.base_adapter,
@@ -661,13 +672,7 @@ def resolution_payload(resolution: CallResolution, *, cwd: str | None) -> dict[s
         "cwd": cwd,
         "env": dict(resolution.declared_env),
         "env_passthrough": list(resolution.env_passthrough),
-        "resolved": {
-            name: {
-                "value": value,
-                "source": _source_label(provenance.get(name)),
-            }
-            for name, value in fields.items()
-        },
+        "resolved": resolved,
     }
 
 
@@ -681,11 +686,17 @@ def session_resolution(
     payload = resolution_payload(resolution, cwd=cwd)
     if permissions_source is not None:
         payload["permissions_source"] = permissions_source
-    payload["adapter"] = {
+    adapter: dict[str, Any] = {
         "home_env": resolution.entry.home_env,
-        "bypass_modes": list(resolution.entry.bypass_modes),
         "effort_config_id": resolution.entry.effort_config_id,
     }
+    if resolution.mode is not None and resolution.mode_spec is not None:
+        adapter.update(
+            mode=resolution.mode,
+            grants=resolution.mode_spec.grants,
+            delegates=resolution.mode_spec.delegates,
+        )
+    payload["adapter"] = adapter
     return payload
 
 
@@ -731,8 +742,20 @@ def resolution_from_session(meta: sessions.SessionMeta) -> CallResolution:
     effort_config_id = adapter.get("effort_config_id")
     if effort_config_id is not None and not isinstance(effort_config_id, str):
         raise RunnerError(f"session {meta.session_id} has invalid stored effort config id")
-    bypass_modes = stored_strings("bypass_modes", adapter)
     env_passthrough = stored_strings("env_passthrough", payload)
+
+    stored_mode = adapter.get("mode", _stored_value(payload, "mode"))
+    if stored_mode is not None and not isinstance(stored_mode, str):
+        raise RunnerError(f"session {meta.session_id} has invalid stored mode")
+    grants = adapter.get("grants")
+    delegates = adapter.get("delegates")
+    mode_spec: ModeSpec | None = None
+    if stored_mode is not None and grants is not None and delegates is not None:
+        if not isinstance(grants, str) or grants not in vocab.PERMISSION_VALUES[:-1]:
+            raise RunnerError(f"session {meta.session_id} has invalid stored mode grants")
+        if not isinstance(delegates, bool):
+            raise RunnerError(f"session {meta.session_id} has invalid stored mode delegation")
+        mode_spec = ModeSpec(grants=grants, delegates=delegates)
 
     entry = ResolvedEntry(
         entry=meta.entry,
@@ -743,7 +766,6 @@ def resolution_from_session(meta: sessions.SessionMeta) -> CallResolution:
         install_command=None,
         home=None,
         home_env=home_env,
-        bypass_modes=bypass_modes,
         efforts=(),
         effort_config_id=effort_config_id,
         env_passthrough=env_passthrough,
@@ -753,8 +775,7 @@ def resolution_from_session(meta: sessions.SessionMeta) -> CallResolution:
         mode=None,
         permissions=None,
         env=dict(declared_env),
-        # A later slice persists and restores the adapter's mode facts.
-        modes={},
+        modes={stored_mode: mode_spec} if stored_mode is not None and mode_spec else {},
         presets={},
         extends=None,
         provenance={},
@@ -763,7 +784,8 @@ def resolution_from_session(meta: sessions.SessionMeta) -> CallResolution:
         entry=entry,
         model=_stored_value(payload, "model"),
         effort=_stored_value(payload, "effort"),
-        mode=_stored_value(payload, "mode"),
+        mode=stored_mode,
+        mode_spec=mode_spec,
         permissions=vocab.normalize_permission(_stored_value(payload, "permissions")),
         home=_stored_value(payload, "home"),
         declared_env=dict(declared_env),
@@ -779,6 +801,7 @@ def continue_request(
     timeout: float | None = None,
     permissions: str | None = None,
     permission_prompt: Callable[[str, str], bool] | None = None,
+    resolution: CallResolution | None = None,
 ) -> TurnRequest:
     """Build a follow-up turn from the session's persisted resolution."""
     if meta.adapter_session_id is None:
@@ -789,7 +812,7 @@ def continue_request(
     cwd = payload.get("cwd")
     if cwd is not None and not isinstance(cwd, str):
         raise RunnerError(f"session {meta.session_id} has an invalid stored working directory")
-    resolution = resolution_from_session(meta)
+    resolution = resolution or resolution_from_session(meta)
     if permissions is not None:
         resolution = replace(resolution, permissions=vocab.normalize_permission(permissions))
     return TurnRequest(
@@ -814,6 +837,7 @@ def _source_label(source: Any) -> str:
         "call": "call flag",
         "default": "default",
         "unset": "unset",
+        "selected": "selected",
     }
     label = labels.get(kind, kind)
     if path is not None and kind == "entry":

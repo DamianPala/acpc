@@ -15,7 +15,7 @@ import shutil
 import tempfile
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -23,7 +23,7 @@ from acp import PROTOCOL_VERSION
 
 from acpc import paths
 from acpc.client import AcpcClient
-from acpc.permissions import PermissionLevel
+from acpc.permissions import ModeSelectionError, PermissionLevel, select_mode
 from acpc.spawn import spawn_adapter
 from acpc.transcript import Transcript
 
@@ -201,11 +201,29 @@ async def probe_advertised(resolution: CallResolution) -> dict[str, Any]:
                 # lazily — runner imports this module at load time.
                 from acpc import runner as runner_module
 
-                await runner_module.apply_call_options(
-                    connection,
-                    session.session_id,
-                    runner_module.TurnRequest(resolution=resolution, prompt=""),
-                )
+                if resolution.entry.modes and (
+                    resolution.mode is None or resolution.mode_spec is None
+                ):
+                    try:
+                        mode, spec = select_mode(resolution.entry.modes, "all")
+                    except ModeSelectionError as error:
+                        raise ProbeError(
+                            f"{resolution.entry.entry}: cannot probe without a declared mode: "
+                            f"{error}"
+                        ) from None
+                    resolution = replace(
+                        resolution,
+                        mode=mode,
+                        mode_spec=spec,
+                        permissions="all",
+                    )
+
+                if resolution.mode is not None:
+                    await runner_module.apply_call_options(
+                        connection,
+                        session.session_id,
+                        runner_module.TurnRequest(resolution=resolution, prompt=""),
+                    )
                 deadline = time.monotonic() + _PROBE_UPDATE_WAIT
                 while not client.advertised["commands"] and time.monotonic() < deadline:
                     await asyncio.sleep(0.01)

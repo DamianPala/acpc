@@ -4,18 +4,27 @@ Assertions restate the SPEC.md *Permissions* table, tier by tier.
 """
 
 from itertools import pairwise
+from pathlib import Path
 
 import pytest
 from acp.schema import PermissionOption
 
 from acpc.permissions import (
+    ModeSelectionError,
     PermissionLevel,
     classify_kind,
     find_option,
     minimum_policy,
+    select_mode,
     should_allow,
 )
+from acpc.registry import AgentRegistry, ModeSpec
 from acpc.vocab import normalize_permission
+
+
+@pytest.fixture(autouse=True)
+def isolated_state_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ACPC_HOME", str(tmp_path / "state"))
 
 
 class TestClassifyKind:
@@ -90,6 +99,48 @@ def test_permission_aliases_normalize_and_construct_levels() -> None:
     assert normalize_permission("unsupported") == "unsupported"
     assert PermissionLevel("write") is PermissionLevel.EXECUTE
     assert PermissionLevel("prompt") is PermissionLevel.ASK
+
+
+def test_claude_selection_prefers_delegation_then_grants() -> None:
+    entry = AgentRegistry().resolve("claude")
+
+    assert select_mode(entry.modes, "read") == ("default", entry.modes["default"])
+    assert select_mode(entry.modes, "execute")[0] == "acceptEdits"
+    assert select_mode(entry.modes, "none")[0] == "dontAsk"
+    assert select_mode(entry.modes, "all")[0] == "acceptEdits"
+
+
+@pytest.mark.parametrize("policy", ["read", "none", "ask"])
+def test_codex_has_no_mode_for_a_ceiling_below_edit(policy: str) -> None:
+    entry = AgentRegistry().resolve("codex")
+
+    with pytest.raises(ModeSelectionError) as error:
+        select_mode(entry.modes, policy)
+
+    assert "read-only" in str(error.value)
+    assert "agent-full-access" in str(error.value)
+
+
+def test_mode_selection_keeps_toml_declaration_order_on_a_tie() -> None:
+    modes = {
+        "first": ModeSpec(grants="read", delegates=True),
+        "second": ModeSpec(grants="read", delegates=True),
+    }
+
+    assert select_mode(modes, "read")[0] == "first"
+
+
+def test_explicit_mode_keeps_the_ceiling_and_allows_an_undeclared_mode_only_at_all() -> None:
+    modes = {"safe": ModeSpec(grants="read", delegates=True)}
+
+    with pytest.raises(ModeSelectionError, match="grants execute"):
+        select_mode(
+            {**modes, "runner": ModeSpec(grants="execute", delegates=True)}, "edit", "runner"
+        )
+
+    mode, spec = select_mode(modes, "all", "vendor-new-mode")
+    assert mode == "vendor-new-mode"
+    assert spec == ModeSpec(grants="all", delegates=False)
 
 
 class TestMinimumPolicy:

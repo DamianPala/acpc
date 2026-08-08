@@ -28,8 +28,12 @@ command = "{sys.executable} {MOCK_AGENT_SCRIPT}"
 install_command = "true"
 home = "~/.mock"
 home_env = "MOCK_HOME"
-bypass_modes = ["yolo"]
 efforts = ["low", "medium", "high", "xhigh"]
+
+[modes]
+default = {{ grants = "read", delegates = true }}
+plan = {{ grants = "read", delegates = true }}
+yolo = {{ grants = "all", delegates = false }}
 
 [presets]
 fast = {{ model = "mock-haiku-4-5", effort = "high" }}
@@ -271,7 +275,12 @@ def test_continue_reapplies_the_stored_mode(cli: CliRunner) -> None:
     session_id = json.loads(first.stdout)["session_id"]
 
     stored = sessions.load(session_id).resolution["resolved"]["mode"]
-    assert stored == {"value": "plan", "source": "call flag"}
+    assert stored == {
+        "value": "plan",
+        "source": "call flag",
+        "grants": "read",
+        "delegates": True,
+    }
 
     result = invoke(cli, "continue", session_id, "settings", "--quiet")
 
@@ -279,10 +288,12 @@ def test_continue_reapplies_the_stored_mode(cli: CliRunner) -> None:
     assert "/plan/1/" in result.stdout
 
 
-def test_continue_without_a_stored_mode_sends_no_mode_option(cli: CliRunner) -> None:
+def test_continue_without_a_stored_mode_selects_and_sends_a_mode(cli: CliRunner) -> None:
     session_id = start_session(cli, "settings")
     meta = sessions.load(session_id)
     del meta.resolution["resolved"]["mode"]
+    for key in ("mode", "grants", "delegates"):
+        meta.resolution["adapter"].pop(key, None)
     with sessions.session_lock(session_id):
         sessions.write_meta(meta)
 
@@ -290,8 +301,87 @@ def test_continue_without_a_stored_mode_sends_no_mode_option(cli: CliRunner) -> 
 
     assert result.exit_code == vocab.EXIT_OK
     _model, _effort, mode, _model_calls, mode_calls, _effort_calls = result.stdout.split("/")
-    assert mode == "-"
-    assert mode_calls == "0"
+    assert mode == "default"
+    assert mode_calls == "1"
+
+
+def test_continue_without_permissions_uses_stored_mode_facts_after_registry_edit(
+    cli: CliRunner, state_root: Path
+) -> None:
+    session_id = start_session(cli, "settings")
+    entry = state_root / "agents" / "mock.toml"
+    edited = MOCK_ENTRY.replace(
+        'default = { grants = "read", delegates = true }',
+        'default = { grants = "execute", delegates = false }',
+    ).replace(
+        'plan = { grants = "read", delegates = true }',
+        'plan = { grants = "execute", delegates = true }',
+    )
+    entry.write_text(edited, encoding="utf-8")
+
+    result = invoke(cli, "continue", session_id, "settings", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_OK
+    _model, _effort, mode, _model_calls, mode_calls, _effort_calls = result.stdout.split("/")
+    assert mode == "default"
+    assert mode_calls == "1"
+
+
+def test_continue_with_a_higher_policy_reselects_and_stores_current_mode_facts(
+    cli: CliRunner, state_root: Path
+) -> None:
+    session_id = start_session(cli, "settings")
+    entry = state_root / "agents" / "mock.toml"
+    edited = MOCK_ENTRY.replace(
+        'default = { grants = "read", delegates = true }',
+        'default = { grants = "execute", delegates = false }',
+    ).replace(
+        'plan = { grants = "read", delegates = true }',
+        'plan = { grants = "execute", delegates = true }',
+    )
+    entry.write_text(edited, encoding="utf-8")
+
+    result = invoke(
+        cli,
+        "continue",
+        session_id,
+        "settings",
+        "--permissions",
+        "execute",
+        "--quiet",
+        "--json",
+    )
+
+    assert result.exit_code == vocab.EXIT_OK
+    stored = sessions.load(session_id).resolution
+    assert stored["resolved"]["mode"] == {
+        "value": "plan",
+        "source": "selected",
+        "grants": "execute",
+        "delegates": True,
+    }
+    assert stored["adapter"]["mode"] == "plan"
+    assert stored["adapter"]["grants"] == "execute"
+    assert stored["adapter"]["delegates"] is True
+
+
+def test_pre_05_session_without_mode_selects_once_from_stored_policy(
+    cli: CliRunner,
+) -> None:
+    session_id = start_session(cli, "settings")
+    meta = sessions.load(session_id)
+    del meta.resolution["resolved"]["mode"]
+    for key in ("mode", "grants", "delegates"):
+        meta.resolution["adapter"].pop(key, None)
+    with sessions.session_lock(session_id):
+        sessions.write_meta(meta)
+
+    result = invoke(cli, "continue", session_id, "settings", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_OK
+    stored = sessions.load(session_id).resolution
+    assert stored["resolved"]["mode"]["value"] == "default"
+    assert stored["adapter"]["mode"] == "default"
 
 
 def test_continue_preserves_the_stored_home_environment(cli: CliRunner) -> None:

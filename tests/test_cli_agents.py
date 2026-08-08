@@ -20,7 +20,6 @@ command = "{sys.executable} {MOCK_AGENT_SCRIPT}"
 install_command = "true"
 home = "~/.mock"
 home_env = "MOCK_HOME"
-bypass_modes = ["yolo"]
 efforts = ["low", "medium", "high", "xhigh"]
 
 [presets]

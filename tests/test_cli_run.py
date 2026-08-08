@@ -24,8 +24,12 @@ command = "{sys.executable} {MOCK_AGENT_SCRIPT}"
 install_command = "true"
 home = "~/.mock"
 home_env = "MOCK_HOME"
-bypass_modes = ["yolo"]
 efforts = ["low", "medium", "high", "xhigh"]
+
+[modes]
+default = {{ grants = "read", delegates = true }}
+plan = {{ grants = "read", delegates = true }}
+yolo = {{ grants = "all", delegates = false }}
 
 [presets]
 fast = {{ model = "mock-haiku-4-5", effort = "high" }}
@@ -37,6 +41,9 @@ PHANTOM_ENTRY = """
 name = "Phantom Agent"
 command = "definitely-not-installed-phantom-xyz"
 install_command = "false"
+
+[modes]
+default = { grants = "read", delegates = true }
 """
 
 
@@ -216,7 +223,7 @@ def test_dry_run_reports_mode_for_entry_flag_and_unset_sources(
             "pinned",
             "probe",
             "--mode",
-            "flag-mode",
+            "plan",
             "--dry-run",
             "--json",
         ).stdout
@@ -226,9 +233,21 @@ def test_dry_run_reports_mode_for_entry_flag_and_unset_sources(
     assert entry["resolved"]["mode"] == {
         "value": "plan",
         "source": f"entry ({state_root / 'agents' / 'pinned.toml'})",
+        "grants": "read",
+        "delegates": True,
     }
-    assert flag["resolved"]["mode"] == {"value": "flag-mode", "source": "call flag"}
-    assert unset["resolved"]["mode"] == {"value": None, "source": "unset"}
+    assert flag["resolved"]["mode"] == {
+        "value": "plan",
+        "source": "call flag",
+        "grants": "read",
+        "delegates": True,
+    }
+    assert unset["resolved"]["mode"] == {
+        "value": "default",
+        "source": "selected",
+        "grants": "read",
+        "delegates": True,
+    }
 
 
 def test_dry_run_reports_the_permission_policy_it_would_use(cli: CliRunner) -> None:
@@ -403,17 +422,18 @@ def test_an_unknown_permission_value_is_a_usage_error(cli: CliRunner) -> None:
     assert result.exit_code == vocab.EXIT_USAGE
 
 
-# --- the bypass-mode guard --------------------------------------------------
+# --- explicit mode ceiling ---------------------------------------------------
 
 
-def test_a_bypass_mode_is_rejected_unless_permissions_are_all(cli: CliRunner) -> None:
+def test_an_explicit_mode_is_rejected_above_the_policy(cli: CliRunner) -> None:
     result = invoke(cli, "run", "mock", "probe", "--mode", "yolo", "--permissions", "write")
 
     assert result.exit_code == vocab.EXIT_USAGE
-    assert "yolo" in result.stderr
+    assert "mode yolo grants all, which exceeds permissions execute" in result.stderr
+    assert "lowest policy that admits it is all" in result.stderr
 
 
-def test_an_entry_bypass_mode_is_rejected_at_resolution(cli: CliRunner, state_root: Path) -> None:
+def test_an_entry_mode_is_rejected_at_resolution(cli: CliRunner, state_root: Path) -> None:
     (state_root / "agents" / "unsafe.toml").write_text(
         'extends = "mock"\nmode = "yolo"\n', encoding="utf-8"
     )
@@ -422,16 +442,14 @@ def test_an_entry_bypass_mode_is_rejected_at_resolution(cli: CliRunner, state_ro
 
     assert result.exit_code == vocab.EXIT_USAGE
     assert (
-        f"agent 'unsafe' resolves mode yolo ({state_root / 'agents' / 'unsafe.toml'}), "
-        "which bypasses permission requests on mock; "
-        "it is only accepted with --permissions all"
+        f"agent 'unsafe' resolves mode yolo ({state_root / 'agents' / 'unsafe.toml'}): "
+        "mode yolo grants all, which exceeds permissions execute; "
+        "the lowest policy that admits it is all; edit the mode or permissions in the entry"
     ) in result.stderr
     assert not (state_root / "sessions").exists()
 
 
-def test_an_inherited_bypass_mode_names_the_file_that_pins_it(
-    cli: CliRunner, state_root: Path
-) -> None:
+def test_an_inherited_mode_names_the_file_that_pins_it(cli: CliRunner, state_root: Path) -> None:
     """The entry named on the command line is not where the mode lives."""
     agents = state_root / "agents"
     (agents / "parent.toml").write_text('extends = "mock"\nmode = "yolo"\n', encoding="utf-8")
@@ -443,9 +461,7 @@ def test_an_inherited_bypass_mode_names_the_file_that_pins_it(
     assert f"agent 'child' resolves mode yolo ({agents / 'parent.toml'})" in result.stderr
 
 
-def test_an_entry_bypass_mode_is_accepted_with_permissions_all(
-    cli: CliRunner, state_root: Path
-) -> None:
+def test_an_entry_mode_is_accepted_with_permissions_all(cli: CliRunner, state_root: Path) -> None:
     (state_root / "agents" / "unsafe.toml").write_text(
         'extends = "mock"\nmode = "yolo"\n', encoding="utf-8"
     )
@@ -456,7 +472,7 @@ def test_an_entry_bypass_mode_is_accepted_with_permissions_all(
     assert "/yolo/" in result.stdout
 
 
-def test_a_bypass_mode_is_accepted_with_permissions_all(cli: CliRunner) -> None:
+def test_an_explicit_mode_is_accepted_with_permissions_all(cli: CliRunner) -> None:
     result = invoke(
         cli, "run", "mock", "settings", "--mode", "yolo", "--permissions", "all", "--quiet"
     )
@@ -465,7 +481,7 @@ def test_a_bypass_mode_is_accepted_with_permissions_all(cli: CliRunner) -> None:
     assert "/yolo/" in result.stdout
 
 
-def test_a_non_bypass_mode_needs_no_special_permissions(cli: CliRunner) -> None:
+def test_an_explicit_read_mode_needs_no_special_permissions(cli: CliRunner) -> None:
     result = invoke(cli, "run", "mock", "settings", "--mode", "plan", "--quiet")
 
     assert result.exit_code == vocab.EXIT_OK

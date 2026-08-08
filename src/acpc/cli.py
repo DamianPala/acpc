@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Mapping, Sequence
+from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,7 @@ from acpc import (
     transcript,
     vocab,
 )
+from acpc.permissions import ModeSelectionError, select_mode
 from acpc.registry import (
     AgentRegistry,
     CallResolution,
@@ -323,6 +325,74 @@ def _stored_permission_policy(meta: sessions.SessionMeta) -> str:
     return vocab.normalize_permission(permissions.get("value")) or "read"
 
 
+def _stored_mode_item(meta: sessions.SessionMeta) -> Mapping[str, Any] | None:
+    """Return the persisted mode object, if this session has one."""
+    resolved = meta.resolution.get("resolved")
+    if not isinstance(resolved, Mapping):
+        return None
+    mode = resolved.get("mode")
+    return mode if isinstance(mode, Mapping) else None
+
+
+def _continue_selection(
+    meta: sessions.SessionMeta,
+    policy: str,
+) -> CallResolution:
+    """Select against the current registry for an explicit or legacy continuation."""
+    try:
+        stored = runner.resolution_from_session(meta)
+        entry = AgentRegistry().resolve(meta.entry)
+        stored_mode = _stored_mode_item(meta)
+        source = stored_mode.get("source") if stored_mode is not None else None
+        explicit_mode = stored.mode if stored.mode is not None and source != "selected" else None
+        resolution = entry.resolve_call(
+            model=stored.model,
+            effort=stored.effort,
+            mode=explicit_mode,
+            permissions=policy,
+            home=stored.home,
+        )
+        if explicit_mode is None:
+            provenance = dict(resolution.provenance)
+            provenance["mode"] = FieldSource("unset")
+            resolution = replace(resolution, mode=None, provenance=provenance)
+        return _select_resolution(resolution)
+    except RegistryError as error:
+        raise UsageProblem(str(error)) from None
+
+
+def _updated_session_resolution(
+    meta: sessions.SessionMeta,
+    resolution: CallResolution,
+    *,
+    policy: str,
+    policy_changed: bool,
+) -> dict[str, Any]:
+    """Replace only the resolved policy and mode facts in a session payload."""
+    payload = deepcopy(meta.resolution)
+    resolved = payload.get("resolved")
+    if not isinstance(resolved, dict):
+        raise UsageProblem(f"session {meta.session_id} has no stored resolution object")
+    current_mode = runner.resolution_payload(resolution, cwd=None)["resolved"]["mode"]
+    resolved["mode"] = current_mode
+    permission_source = "call flag" if policy_changed else "stored"
+    resolved["permissions"] = {"value": policy, "source": permission_source}
+    if policy_changed:
+        payload.pop("permissions_source", None)
+    adapter = payload.get("adapter")
+    if not isinstance(adapter, dict):
+        adapter = {}
+    adapter = {key: adapter[key] for key in ("home_env", "effort_config_id") if key in adapter}
+    if resolution.mode is not None and resolution.mode_spec is not None:
+        adapter.update(
+            mode=resolution.mode,
+            grants=resolution.mode_spec.grants,
+            delegates=resolution.mode_spec.delegates,
+        )
+    payload["adapter"] = adapter
+    return payload
+
+
 def _finalize_follow_up_failure(session_id: str, error: BaseException) -> None:
     """Close a rotated turn when request preparation cannot finish."""
     with contextlib.suppress(OSError, sessions.SessionError):
@@ -366,27 +436,66 @@ def _resolve_permissions(
     return policy
 
 
-def _guard_bypass_mode(policy: str, resolution: CallResolution) -> None:
-    """SPEC *Permissions*: a bypass mode evades the policy unless it is `all`."""
-    mode = resolution.mode
-    if mode is None or policy == "all":
-        return
-    if mode in resolution.entry.bypass_modes:
+def _mode_list(entry: ResolvedEntry) -> str:
+    """Render declared modes in their TOML order for a selection error."""
+    if not entry.modes:
+        return "none"
+    return ", ".join(f"{name} (grants {spec.grants})" for name, spec in entry.modes.items())
+
+
+def _mode_selection_error(
+    resolution: CallResolution,
+    error: ModeSelectionError,
+) -> UsageProblem:
+    """Turn a policy/mode mismatch into an actionable CLI usage error."""
+    entry = resolution.entry
+    modes = _mode_list(entry)
+    if error.explicit_mode is not None:
+        mode = error.explicit_mode
+        spec = entry.modes.get(mode)
+        if spec is None:
+            reason = (
+                f"mode {mode} is not declared in {entry.base_adapter}'s [modes] table; "
+                "a vendor-advertised mode omitted there is accepted only with "
+                "--permissions all"
+            )
+        else:
+            reason = (
+                f"mode {mode} grants {spec.grants}, which exceeds permissions {error.policy}; "
+                f"the lowest policy that admits it is {spec.grants}"
+            )
         source = resolution.provenance.get("mode", FieldSource("unset"))
         if source.kind == "call":
-            raise UsageProblem(
-                f"--mode {mode} bypasses permission requests on {resolution.entry.entry}; "
-                "it is only accepted with --permissions all"
-            )
-        # An inherited mode is pinned in a parent's file, not the entry named on
-        # the command line, so naming only the entry sends the reader to the
-        # wrong TOML. Provenance already knows which one to edit.
+            return UsageProblem(f"--mode {mode}: {reason}")
         where = f" ({source.path})" if source.path is not None else ""
-        raise UsageProblem(
-            f"agent '{resolution.entry.entry}' resolves mode {mode}{where}, which bypasses "
-            f"permission requests on {resolution.entry.base_adapter}; "
-            "it is only accepted with --permissions all"
+        return UsageProblem(
+            f"agent '{entry.entry}' resolves mode {mode}{where}: {reason}; "
+            "edit the mode or permissions in the entry"
         )
+
+    if error.policy == "ask":
+        reason = (
+            f"--permissions ask on {entry.entry} is not really asking anything: "
+            "no mode grants at most read, so no permission request can reach acpc"
+        )
+    else:
+        reason = f"no mode on {entry.entry} grants at most permissions {error.policy}"
+    return UsageProblem(f"{reason}; declared modes: {modes}")
+
+
+def _select_resolution(resolution: CallResolution) -> CallResolution:
+    """Attach the policy-selected mode and its measured facts to a resolution."""
+    policy = resolution.permissions
+    if policy is None:
+        raise UsageProblem("mode selection requires a resolved permission policy")
+    try:
+        mode, spec = select_mode(resolution.entry.modes, policy, resolution.mode)
+    except ModeSelectionError as error:
+        raise _mode_selection_error(resolution, error) from None
+    provenance = dict(resolution.provenance)
+    if resolution.mode is None:
+        provenance["mode"] = FieldSource("selected")
+    return replace(resolution, mode=mode, mode_spec=spec, provenance=provenance)
 
 
 def _tty_permission_prompt(kind: str, title: str) -> bool:
@@ -420,7 +529,15 @@ def _emit_dry_run(payload: dict[str, Any], *, json_mode: bool) -> None:
     ]
     for name, item in payload["resolved"].items():
         value = "·" if item["value"] is None else item["value"]
-        lines.append(f"{name:<12} {value} ({item['source']})")
+        if name == "mode" and item["value"] is not None and "delegates" in item:
+            policy = payload["resolved"]["permissions"]["value"]
+            reason = item["source"]
+            if item["source"] == "selected":
+                reason = f"selected for permissions {policy}"
+            delegation = "acpc-delegated" if item["delegates"] else "vendor-decided"
+            lines.append(f"{name:<12} {value} ({reason}) · {delegation}")
+        else:
+            lines.append(f"{name:<12} {value} ({item['source']})")
     if payload["cwd"]:
         lines.append(f"cwd          {payload['cwd']}")
     if payload["env"]:
@@ -1961,10 +2078,9 @@ def run_command(
 
     defaulted_permissions = permissions is None and resolution.permissions is None
     policy = _resolve_permissions(permissions, resolution, tty=tty, background=background)
-    _guard_bypass_mode(policy, resolution)
     # The TTY-resolved policy is part of the resolved invocation: meta.json
     # stores everything --dry-run shows, and `continue` reuses it verbatim.
-    resolution = replace(resolution, permissions=policy)
+    resolution = _select_resolution(replace(resolution, permissions=policy))
     # Resolved to an absolute path here, at the caller: the adapter receives
     # cwd over session/new, so a relative path would be resolved against
     # whatever process hosts the adapter — the daemon's directory, not the
@@ -2253,12 +2369,29 @@ def _dispatch_follow_up(
             "continue it from a terminal or start a new session with another policy"
         )
     try:
+        stored_resolution = runner.resolution_from_session(current)
+    except runner.RunnerError as error:
+        raise UsageProblem(str(error)) from None
+    selection: CallResolution | None = None
+    if permissions is not None or stored_resolution.mode_spec is None:
+        selection = _continue_selection(current, policy)
+    updated_resolution = (
+        _updated_session_resolution(
+            current,
+            selection,
+            policy=policy,
+            policy_changed=permissions is not None,
+        )
+        if selection is not None
+        else None
+    )
+    try:
         runner.continue_request(
             current,
             prompt,
             timeout=timeout,
-            permissions=policy,
             permission_prompt=(_tty_permission_prompt if policy == "ask" and interactive else None),
+            resolution=selection,
         )
     except runner.RunnerError as error:
         raise UsageProblem(str(error)) from None
@@ -2267,7 +2400,7 @@ def _dispatch_follow_up(
     try:
         rotated = sessions.rotate_turn(
             meta.session_id,
-            permissions=policy if permissions is not None else None,
+            resolution=updated_resolution,
         )
         rotated_policy = _stored_permission_policy(rotated)
         request = runner.continue_request(

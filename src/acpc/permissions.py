@@ -7,16 +7,93 @@ Unknown kinds require ``all``. The deprecated ``write`` and ``prompt`` input
 aliases are normalized before a ``PermissionLevel`` is constructed.
 """
 
+from __future__ import annotations
+
+from collections.abc import Mapping
 from enum import Enum
 from functools import total_ordering
 
 from acp.schema import PermissionOption
 
+from acpc.registry import ModeSpec
 from acpc.vocab import PERMISSION_ALIASES
 
 READ_KINDS: frozenset[str] = frozenset({"read", "search", "think", "fetch"})
 EDIT_KINDS: frozenset[str] = frozenset({"edit"})
 EXECUTE_KINDS: frozenset[str] = frozenset({"execute", "delete", "move"})
+
+
+class ModeSelectionError(ValueError):
+    """A permission policy cannot admit the requested or selected mode."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        policy: str,
+        modes: Mapping[str, ModeSpec],
+        explicit_mode: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.policy = policy
+        self.modes = modes
+        self.explicit_mode = explicit_mode
+
+
+def select_mode(
+    modes: Mapping[str, ModeSpec],
+    policy: str | PermissionLevel,
+    explicit_mode: str | None = None,
+) -> tuple[str, ModeSpec]:
+    """Select the strongest safe vendor mode while preserving declaration order."""
+    policy_value = policy.value if isinstance(policy, PermissionLevel) else policy
+    level = PermissionLevel(policy_value)
+    ceiling = PermissionLevel.READ if level is PermissionLevel.ASK else level
+
+    if explicit_mode is not None:
+        spec = modes.get(explicit_mode)
+        if spec is None:
+            if level is PermissionLevel.ALL:
+                # An adapter can advertise a mode not yet measured in its table.
+                # `all` is the only policy allowed to run it, and the conservative
+                # stored facts keep later policy checks from treating it as delegated.
+                return explicit_mode, ModeSpec(grants="all", delegates=False)
+            raise ModeSelectionError(
+                f"mode {explicit_mode} is not declared in the adapter's [modes] table",
+                policy=policy_value,
+                modes=modes,
+                explicit_mode=explicit_mode,
+            )
+        if PermissionLevel(spec.grants).rank > ceiling.rank:
+            raise ModeSelectionError(
+                f"mode {explicit_mode} grants {spec.grants}, above policy {policy_value}",
+                policy=policy_value,
+                modes=modes,
+                explicit_mode=explicit_mode,
+            )
+        return explicit_mode, spec
+
+    survivors = [
+        (name, spec)
+        for name, spec in modes.items()
+        if PermissionLevel(spec.grants).rank <= ceiling.rank
+    ]
+    if not survivors:
+        declared = ", ".join(f"{name} (grants {spec.grants})" for name, spec in modes.items())
+        detail = f"; declared modes: {declared}" if declared else "; the adapter declares no modes"
+        raise ModeSelectionError(
+            f"no mode grants at most policy {policy_value}{detail}",
+            policy=policy_value,
+            modes=modes,
+        )
+
+    # `max` returns the first item on an equal key, so TOML declaration order
+    # remains the final tie-break after delegation and grants.
+    # On claude, `all` therefore chooses `acceptEdits`, keeping requests visible;
+    # on codex, where no mode delegates, it chooses `agent-full-access`.
+    return max(
+        survivors, key=lambda item: (item[1].delegates, PermissionLevel(item[1].grants).rank)
+    )
 
 
 @total_ordering
@@ -29,7 +106,7 @@ class PermissionLevel(Enum):
     ASK = "ask"
 
     @classmethod
-    def _missing_(cls, value: object) -> "PermissionLevel | None":
+    def _missing_(cls, value: object) -> PermissionLevel | None:
         # Compatibility net for pre-0.5 meta: aliases become canonical before downstream code.
         if isinstance(value, str):
             canonical = PERMISSION_ALIASES.get(value)

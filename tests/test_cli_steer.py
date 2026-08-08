@@ -19,8 +19,12 @@ command = "{sys.executable} {MOCK_AGENT_SCRIPT}"
 install_command = "true"
 home = "~/.mock"
 home_env = "MOCK_HOME"
-bypass_modes = ["yolo"]
 efforts = ["low", "medium", "high", "xhigh"]
+
+[modes]
+default = {{ grants = "read", delegates = true }}
+plan = {{ grants = "read", delegates = true }}
+yolo = {{ grants = "all", delegates = false }}
 
 [presets]
 fast = {{ model = "mock-haiku-4-5", effort = "high" }}

@@ -602,6 +602,7 @@ def rotate_turn(
     *,
     clock: Clock | None = None,
     permissions: str | None = None,
+    resolution: Mapping[str, Any] | None = None,
 ) -> SessionMeta:
     """Open the next turn: park the finished turn's artifacts, reset per-turn state.
 
@@ -617,7 +618,9 @@ def rotate_turn(
             raise SessionStateError(
                 f"session {session_id} is {meta.state} — wait for the current turn to finish"
             )
-        if permissions is not None:
+        if resolution is not None:
+            meta.resolution = dict(resolution)
+        elif permissions is not None:
             resolved = meta.resolution.get("resolved")
             if not isinstance(resolved, dict):
                 raise SessionStateError(f"session {session_id} has no stored permission resolution")

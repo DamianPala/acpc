@@ -34,7 +34,6 @@ _ENTRY_KEYS: Final = frozenset(
         "install_command",
         "home",
         "home_env",
-        "bypass_modes",
         "efforts",
         "effort_config_id",
         "env_passthrough",
@@ -57,7 +56,6 @@ _FIELD_NAMES: Final = (
     "install_command",
     "home",
     "home_env",
-    "bypass_modes",
     "efforts",
     "effort_config_id",
     "env_passthrough",
@@ -80,7 +78,7 @@ class RegistryError(ValueError):
 class FieldSource:
     """Where a resolved field value came from."""
 
-    kind: Literal["entry", "adapter-default", "call", "default", "unset"]
+    kind: Literal["entry", "adapter-default", "call", "default", "unset", "selected"]
     path: Path | None = None
 
 
@@ -113,6 +111,7 @@ class CallResolution:
     model: str | None
     effort: str | None
     mode: str | None
+    mode_spec: ModeSpec | None
     permissions: str | None
     home: str | None
     declared_env: Mapping[str, str]
@@ -144,7 +143,6 @@ class ResolvedEntry:
     install_command: str | None
     home: str | None
     home_env: str | None
-    bypass_modes: tuple[str, ...]
     efforts: tuple[str, ...]
     # The session config option id that carries effort — a vendor fact like
     # home_env (codex speaks `reasoning_effort`, claude speaks `effort`).
@@ -314,6 +312,7 @@ class ResolvedEntry:
             model=resolved_model,
             effort=resolved_effort,
             mode=resolved_mode,
+            mode_spec=None,
             permissions=resolved_permissions,
             home=resolved_home,
             declared_env=dict(self.env),
@@ -437,7 +436,7 @@ def _parse_entry(
             raise RegistryError(f"{path}: key 'permissions' must be one of: {supported}")
         if permission in PERMISSION_ALIASES:
             permission_alias = permission
-    for key in ("bypass_modes", "efforts", "env_passthrough"):
+    for key in ("efforts", "env_passthrough"):
         if key in raw:
             _expect_string_list(path, key, raw[key])
     if "env" in raw and (
@@ -569,7 +568,6 @@ def _to_resolved(
     env = dict(raw_env) if isinstance(raw_env, dict) else {}
     provenance = dict(parsed.provenance)
     default_fields = {
-        "bypass_modes",
         "efforts",
         "env_passthrough",
         "env",
@@ -589,7 +587,6 @@ def _to_resolved(
         install_command=string_or_none("install_command"),
         home=string_or_none("home"),
         home_env=string_or_none("home_env"),
-        bypass_modes=strings("bypass_modes"),
         efforts=strings("efforts"),
         effort_config_id=string_or_none("effort_config_id"),
         env_passthrough=strings("env_passthrough"),

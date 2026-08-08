@@ -10,11 +10,13 @@ import asyncio
 import json
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from acpc import daemon, daemon_client, ipc, proc, runner, sessions, vocab
+from acpc.permissions import select_mode
 from acpc.registry import AgentRegistry
 
 MOCK_AGENT_SCRIPT = str(Path(__file__).with_name("mock_agent.py"))
@@ -25,8 +27,13 @@ command = "{sys.executable} {MOCK_AGENT_SCRIPT}"
 install_command = "true"
 home = "~/.mock"
 home_env = "MOCK_HOME"
-bypass_modes = ["yolo"]
 efforts = ["low", "medium", "high", "xhigh"]
+mode = "default"
+
+[modes]
+default = {{ grants = "read", delegates = true }}
+plan = {{ grants = "read", delegates = true }}
+yolo = {{ grants = "all", delegates = false }}
 
 [presets]
 standard = {{ model = "mock-sonnet-5", effort = "high" }}
@@ -48,7 +55,9 @@ def configure(state_root: Path, text: str) -> None:
 
 
 def resolve():
-    return AgentRegistry().resolve_call("mock")
+    resolution = AgentRegistry().resolve_call("mock", permissions="read")
+    mode, spec = select_mode(resolution.entry.modes, "read", resolution.mode)
+    return replace(resolution, mode=mode, mode_spec=spec)
 
 
 def target() -> str:
@@ -92,34 +101,53 @@ def rebuild(payload: dict) -> runner.TurnRequest:
 # --- rebuilding a dispatched turn -------------------------------------------
 
 
-def test_a_rebuilt_turn_ignores_a_mode_the_entry_gained_after_dispatch(
+def test_a_rebuilt_turn_ignores_a_mode_fact_the_entry_gained_after_dispatch(
     state_root: Path,
 ) -> None:
     """SPEC: editing an entry never changes a session mid-conversation.
 
-    `mode` is the only resolved field legitimately `None`, so it is the one an
-    entry can reclaim if the daemon reads `None` as "not set on this call".
+    The selected mode facts travel in the dispatch payload, so an entry cannot
+    reclaim the mode by changing its TOML after dispatch.
     """
     payload = dispatch_payload()
-    assert payload["mode"] is None
+    assert payload["mode"] == "default"
 
     (state_root / "agents" / "mock.toml").write_text(
-        MOCK_ENTRY.replace("[presets]", 'mode = "plan"\n\n[presets]'), encoding="utf-8"
+        MOCK_ENTRY.replace('mode = "default"', 'mode = "plan"'), encoding="utf-8"
     )
 
-    assert rebuild(payload).resolution.mode is None
+    assert rebuild(payload).resolution.mode == "default"
 
 
-def test_a_bypass_mode_reaching_the_daemon_fails_the_turn(state_root: Path) -> None:
+def test_a_mode_above_the_policy_reaching_the_daemon_fails_the_turn(state_root: Path) -> None:
     """Backstop only: arriving here at all means the CLI guard was evaded."""
-    payload = dispatch_payload() | {"mode": "yolo", "permissions": "read"}
+    payload = dispatch_payload() | {
+        "mode": "yolo",
+        "grants": "all",
+        "delegates": False,
+        "permissions": "read",
+    }
 
-    with pytest.raises(daemon.DaemonError, match="bypasses permission requests"):
+    with pytest.raises(daemon.DaemonError, match="grants all"):
         rebuild(payload)
 
 
-def test_a_bypass_mode_under_permissions_all_still_rebuilds(state_root: Path) -> None:
-    payload = dispatch_payload() | {"mode": "yolo", "permissions": "all"}
+def test_a_mode_without_measured_facts_is_rejected_by_the_daemon(state_root: Path) -> None:
+    payload = dispatch_payload() | {"mode": "yolo", "permissions": "edit"}
+    payload.pop("grants")
+    payload.pop("delegates")
+
+    with pytest.raises(daemon.DaemonError, match="missing mode facts"):
+        rebuild(payload)
+
+
+def test_a_mode_at_the_all_ceiling_still_rebuilds(state_root: Path) -> None:
+    payload = dispatch_payload() | {
+        "mode": "yolo",
+        "grants": "all",
+        "delegates": False,
+        "permissions": "all",
+    }
 
     assert rebuild(payload).resolution.mode == "yolo"
 
@@ -133,12 +161,15 @@ def test_a_turn_that_cannot_be_built_is_refused_in_a_reply_not_a_dropped_connect
     sees a socket error rather than the reason, and the session it already
     created stays `starting` until orphan detection finds it.
     """
-    frame = {"session_id": new_session("x"), "payload": dispatch_payload() | {"mode": "yolo"}}
+    frame = {
+        "session_id": new_session("x"),
+        "payload": dispatch_payload() | {"mode": "yolo", "grants": "all", "delegates": False},
+    }
 
     reply = asyncio.run(daemon.Daemon(target())._start(frame))
 
     assert reply["ok"] is False
-    assert "bypasses permission requests" in reply["error"]
+    assert "grants all" in reply["error"]
 
 
 # --- routing ----------------------------------------------------------------

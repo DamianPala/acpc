@@ -14,12 +14,9 @@ env_passthrough = [
     "INITIAL_AGENT_MODE",
 ]
 # Verified live 2026-08-06: codex-acp advertises read-only / agent /
-# agent-full-access. Only agent-full-access is listed here — it edits outside
-# the workspace and reaches the network without ever asking. The default
-# `agent` mode also auto-allows *workspace* edits and commands without a
-# permission request, so a policy below `all` only bites in `read-only` mode;
-# the vendor sandbox is the boundary everywhere else.
-bypass_modes = ["agent-full-access"]
+# agent-full-access. The default `agent` mode also auto-allows *workspace* edits
+# and commands without a permission request, so a policy below `all` only bites
+# in `read-only` mode; the vendor sandbox is the boundary everywhere else.
 # Verified live 2026-08-06: codex-acp rejects minimal/ultra ("Invalid params").
 efforts = ["low", "medium", "high", "xhigh"]
 

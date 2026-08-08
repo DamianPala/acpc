@@ -19,7 +19,6 @@ env_passthrough = [
     "CLAUDE_CODE_USE_MANTLE",
     "CLAUDE_CODE_USE_VERTEX",
 ]
-bypass_modes = ["auto", "bypassPermissions"]
 # Verified live 2026-08-06 against claude-agent-acp 0.64.0: the effort config
 # option id is `effort` (the default `reasoning_effort` returns "Internal
 # error: Unknown config option"), with these advertised values.

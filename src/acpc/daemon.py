@@ -39,7 +39,7 @@ from acp import PROTOCOL_VERSION, text_block
 from acpc import __version__, config, ipc, paths, runner, sessions, transcript, vocab
 from acpc.client import AcpcClient
 from acpc.permissions import PermissionLevel
-from acpc.registry import AgentRegistry
+from acpc.registry import AgentRegistry, ModeSpec
 from acpc.spawn import spawn_adapter
 
 # How often the idle sweep runs. Short enough that a test can set a tiny TTL
@@ -522,7 +522,7 @@ class Daemon:
 
         The entry is looked up here rather than shipped whole — the daemon
         reads the same `ACPC_HOME` as its client, so the adapter contract
-        (command, env, bypass list) is smaller on the wire as a name. The
+        (command, env and provider settings) is smaller on the wire as a name. The
         *resolved* fields are then taken from the payload verbatim, never
         re-derived from the entry: the client already resolved them and
         `meta.json` stored them, and SPEC's "editing an entry never changes a
@@ -533,17 +533,50 @@ class Daemon:
         `None`, silently adopts whatever the entry says at *this* moment.
 
         The lookup is still trusted for everything the payload does not carry,
-        and that list is wider than the five fields: the command, the env and
-        passthrough behind `adapter_environment`, `home_env`, the bypass list,
+        and that list is wider than the resolved values: the command, the env
+        and passthrough behind `adapter_environment`, `home_env`,
         `effort_config_id`, and the effort validation that runs on the entry's
         own value. So an entry edit can still redirect a live session's provider
         mid-conversation, and an entry that grows an unsupported effort makes
         `continue` fail here rather than run on its stored one. Both are the
-        cost of shipping the entry as a name; only SPEC's five are pinned.
+        cost of shipping the entry as a name; the selected mode facts are pinned
+        in the payload.
 
         Provenance is deliberately left as the lookup produced it: nothing on
         this path reads it, `session_resolution` runs client-side at dispatch.
         """
+        mode = payload.get("mode")
+        grants = payload.get("grants")
+        delegates = payload.get("delegates")
+        mode_spec = None
+        policy_level = None
+        if mode is not None:
+            if not isinstance(mode, str):
+                raise DaemonError("dispatched mode has invalid mode facts: mode must be a string")
+            if grants is None or delegates is None:
+                raise DaemonError(
+                    f"mode {mode} has missing mode facts: dispatch must include grants and delegates"
+                )
+            if (
+                not isinstance(grants, str)
+                or grants not in vocab.PERMISSION_VALUES[:-1]
+                or not isinstance(delegates, bool)
+            ):
+                raise DaemonError(
+                    f"mode {mode} has invalid mode facts: grants must be a scale value and "
+                    "delegates must be boolean"
+                )
+            mode_spec = ModeSpec(grants=grants, delegates=delegates)
+            policy = payload.get("permissions")
+            if not isinstance(policy, str):
+                raise DaemonError(
+                    f"mode {mode} has no valid permission policy in the dispatch payload"
+                )
+            policy = vocab.normalize_permission(policy)
+            try:
+                policy_level = PermissionLevel(policy)
+            except ValueError:
+                raise DaemonError(f"mode {mode} has invalid permission policy {policy!r}") from None
         resolution = replace(
             AgentRegistry().resolve_call(payload["entry"]),
             model=payload.get("model"),
@@ -551,15 +584,20 @@ class Daemon:
             mode=payload.get("mode"),
             permissions=payload.get("permissions"),
             home=payload.get("home"),
+            mode_spec=mode_spec,
         )
-        # Backstop, not the gate: the CLI refuses this combination at
-        # resolution time. If one ever reaches a daemon the policy has already
-        # been evaded, so fail the turn rather than set the mode.
-        if resolution.mode in resolution.entry.bypass_modes and resolution.permissions != "all":
-            raise DaemonError(
-                f"mode {resolution.mode} bypasses permission requests on "
-                f"{resolution.entry.entry}; it is only accepted with --permissions all"
-            )
+        # Backstop, not the gate: the CLI selected this mode already. If its
+        # stored facts exceed the policy, fail rather than let the daemon
+        # disagree with the caller's resolution.
+        if mode_spec is not None and policy_level is not None:
+            ceiling = PermissionLevel.READ if policy_level is PermissionLevel.ASK else policy_level
+            if PermissionLevel(mode_spec.grants).rank > ceiling.rank:
+                required = mode_spec.grants
+                policy = policy_level.value
+                raise DaemonError(
+                    f"mode {resolution.mode} grants {required}, exceeding policy {policy}; "
+                    f"the lowest policy that admits it is {required}"
+                )
         return runner.TurnRequest(
             resolution=resolution,
             prompt=payload.get("prompt", ""),

@@ -22,8 +22,13 @@ command = "{sys.executable} {MOCK_AGENT_SCRIPT}"
 install_command = "true"
 home = "~/.mock"
 home_env = "MOCK_HOME"
-bypass_modes = ["yolo"]
 efforts = ["low", "medium", "high", "xhigh"]
+mode = "default"
+
+[modes]
+default = {{ grants = "read", delegates = true }}
+plan = {{ grants = "read", delegates = true }}
+yolo = {{ grants = "all", delegates = false }}
 
 [presets]
 fast = {{ model = "mock-haiku-4-5", effort = "high" }}
@@ -274,14 +279,14 @@ def test_model_and_effort_are_applied_to_the_adapter_session() -> None:
     assert effort_calls == "1"
 
 
-def test_no_mode_value_does_not_call_set_session_mode() -> None:
+def test_a_resolved_mode_is_always_applied_to_the_adapter_session() -> None:
     _, outcome = start_turn("settings")
 
     _model, _effort, mode, _model_calls, mode_calls, _effort_calls = outcome.answer.strip().split(
         "/"
     )
-    assert mode == "-"
-    assert mode_calls == "0"
+    assert mode == "default"
+    assert mode_calls == "1"
 
 
 def test_mode_is_applied_via_set_session_mode() -> None:
