@@ -275,6 +275,33 @@ def test_continue_uses_policy_returned_by_rotation(
 
     assert result.exit_code == vocab.EXIT_OK
     assert (tmp_path / "raced.md").is_file()
+    rotated = sessions.load(session_id)
+    assert rotated.target == runner.call_target(runner.resolution_from_session(rotated))
+
+
+def test_continue_routes_using_the_persisted_environment_snapshot(
+    cli: CliRunner, state_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id = start_session(cli)
+    (state_root / "agents" / "mock.toml").write_text(
+        MOCK_ENTRY + '\n[env]\nTARGET_SHAPE = "changed"\n', encoding="utf-8"
+    )
+    routed_targets: list[str] = []
+    original_execute = runner.execute_turn
+
+    def record_route_target(session_id: str, request: runner.TurnRequest) -> runner.TurnOutcome:
+        routed_targets.append(runner.call_target(request.resolution))
+        return original_execute(session_id, request)
+
+    monkeypatch.setattr(runner, "execute_turn", record_route_target)
+    result = invoke(cli, "continue", session_id, "turn two", "--permissions", "edit", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert len(routed_targets) == 1
+    rotated = sessions.load(session_id)
+    assert rotated.resolution["env"] == {}
+    assert rotated.target == routed_targets[0]
+    assert rotated.target == runner.call_target(runner.resolution_from_session(rotated))
 
 
 def test_continue_post_rotation_failure_finalizes_the_new_turn(

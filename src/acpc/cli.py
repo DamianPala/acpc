@@ -407,6 +407,11 @@ def _updated_session_resolution(
     return payload
 
 
+def _target_for_persisted_resolution(meta: sessions.SessionMeta) -> str:
+    """Key the daemon from the exact resolution the next turn will rebuild."""
+    return runner.call_target(runner.resolution_from_session(meta))
+
+
 def _finalize_follow_up_failure(session_id: str, error: BaseException) -> None:
     """Close a rotated turn when request preparation cannot finish."""
     with contextlib.suppress(OSError, sessions.SessionError):
@@ -2484,7 +2489,7 @@ def _dispatch_follow_up(
         rotated = sessions.rotate_turn(
             meta.session_id,
             resolution=updated_resolution,
-            target=runner.call_target(selection or stored_resolution),
+            target_from_meta=_target_for_persisted_resolution,
         )
         rotated_policy = _stored_permission_policy(rotated)
         request = runner.continue_request(
