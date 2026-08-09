@@ -112,6 +112,7 @@ class SessionMeta:
     tokens: int = 0
     cost: float | None = None
     denied: dict[str, int] = field(default_factory=dict)
+    denial_details: dict[str, dict[str, Any]] = field(default_factory=dict)
     prompt_snippet: str = ""
     resolution: dict[str, Any] = field(default_factory=dict)
     adapter_session_id: str | None = None
@@ -298,6 +299,21 @@ def _coerce_denied(value: Any, key: str, path: Path) -> dict[str, int]:
     return denied
 
 
+def _coerce_denial_details(value: Any, key: str, path: Path) -> dict[str, dict[str, Any]]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise CorruptSessionError(f"{path}: {key} is not an object")
+    details: dict[str, dict[str, Any]] = {}
+    for denial_key, detail in value.items():
+        if not isinstance(denial_key, str) or not denial_key:
+            raise CorruptSessionError(f"{path}: {key} has an invalid denial key")
+        if not isinstance(detail, dict):
+            raise CorruptSessionError(f"{path}: {key}.{denial_key} is not an object")
+        details[denial_key] = dict(detail)
+    return details
+
+
 def meta_from_dict(data: Mapping[str, Any], *, path: Path) -> SessionMeta:
     """Build a `SessionMeta` from parsed JSON, rejecting damaged state.
 
@@ -337,6 +353,7 @@ def meta_from_dict(data: Mapping[str, Any], *, path: Path) -> SessionMeta:
         tokens=_coerce_int(known.get("tokens"), "tokens", path) or 0,
         cost=_coerce_float(known.get("cost"), "cost", path),
         denied=_coerce_denied(known.get("denied"), "denied", path),
+        denial_details=_coerce_denial_details(known.get("denial_details"), "denial_details", path),
         prompt_snippet=_coerce_str(known.get("prompt_snippet"), "prompt_snippet", path) or "",
         resolution=dict(resolution),
         adapter_session_id=_coerce_str(known.get("adapter_session_id"), "adapter_session_id", path),
@@ -646,6 +663,7 @@ def rotate_turn(
         meta.exit_code = None
         meta.stop_reason = None
         meta.denied = {}
+        meta.denial_details = {}
         write_meta(meta)
     return meta
 

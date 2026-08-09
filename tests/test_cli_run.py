@@ -286,6 +286,22 @@ def test_inherited_ceiling_keeps_a_lower_nested_policy(
     assert "clamp" not in permission
 
 
+def test_inherited_ceiling_is_reported_by_a_real_run(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ACPC_CEILING", "edit")
+
+    result = invoke(cli, "run", "mock", "echo:clamped", "--permissions", "all", "--json")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert "permissions clamped from all by inherited ceiling edit" in result.stderr
+    assert json.loads(result.stdout)["permissions_clamp"] == {
+        "requested": "all",
+        "ceiling": "edit",
+        "effective": "edit",
+    }
+
+
 @pytest.mark.parametrize("ceiling", ["edit", "read"])
 def test_nested_ask_is_rejected_by_a_numeric_ceiling(
     cli: CliRunner, monkeypatch: pytest.MonkeyPatch, ceiling: str
@@ -422,7 +438,16 @@ def test_default_policy_denials_are_visible_and_persisted(cli: CliRunner, state_
     result = invoke(cli, "run", "mock", "write-file:blocked.md", "--json")
 
     assert result.exit_code == vocab.EXIT_OK
-    assert "denied: 1 edit (default read policy — pass --permissions edit)" in result.stderr
+    assert "denied: 1 edit (pass --permissions edit)" in result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["denied"] == [
+        {
+            "category": "edit",
+            "count": 1,
+            "minimum_policy": "edit",
+            "remedy": "pass --permissions edit",
+        }
+    ]
     session_id = json.loads(result.stdout)["session_id"]
     denied_meta = json.loads(
         (state_root / "sessions" / session_id / "meta.json").read_text(encoding="utf-8")
@@ -431,16 +456,38 @@ def test_default_policy_denials_are_visible_and_persisted(cli: CliRunner, state_
     assert denied_meta["resolution"]["permissions_source"] == "default"
 
 
-def test_explicit_read_denials_stay_out_of_the_summary(cli: CliRunner, state_root: Path) -> None:
+def test_explicit_read_denials_match_default_reporting(cli: CliRunner, state_root: Path) -> None:
     result = invoke(cli, "run", "mock", "write-file:blocked.md", "--permissions", "read", "--json")
 
     assert result.exit_code == vocab.EXIT_OK
-    assert "denied:" not in result.stderr
+    assert "denied: 1 edit (pass --permissions edit)" in result.stderr
+    assert "default" not in result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["denied"][0]["category"] == "edit"
+    assert payload["denied"][0]["count"] == 1
+    assert payload["denied"][0]["remedy"] == "pass --permissions edit"
     session_id = json.loads(result.stdout)["session_id"]
     denied_meta = json.loads(
         (state_root / "sessions" / session_id / "meta.json").read_text(encoding="utf-8")
     )
     assert denied_meta["resolution"].get("permissions_source") is None
+
+
+def test_default_and_explicit_read_denials_have_the_same_summary_line(
+    cli: CliRunner,
+) -> None:
+    default = invoke(cli, "run", "mock", "write-file:default.md")
+    explicit = invoke(cli, "run", "mock", "write-file:explicit.md", "--permissions", "read")
+
+    default_line = next(line for line in default.stderr.splitlines() if "denied:" in line)
+    explicit_line = next(line for line in explicit.stderr.splitlines() if "denied:" in line)
+
+    assert default_line.split(" | session ", 1)[0].endswith(
+        "denied: 1 edit (pass --permissions edit)"
+    )
+    assert explicit_line.split(" | session ", 1)[0].endswith(
+        "denied: 1 edit (pass --permissions edit)"
+    )
 
 
 def test_default_policy_without_denials_has_no_summary_segment(
@@ -465,7 +512,8 @@ def test_default_policy_summary_uses_the_strongest_remedy_for_all_categories(
 
     assert result.exit_code == vocab.EXIT_USAGE
     assert (
-        "denied: 1 edit · 2 execute · 1 unknown (default read policy — pass --permissions all)"
+        "denied: 1 edit (pass --permissions edit) · 2 execute (pass --permissions execute) · "
+        "1 switch_mode yolo (pass --permissions all)"
     ) in result.stderr
 
 
@@ -478,7 +526,7 @@ def test_wait_shows_default_policy_denials_from_disk(cli: CliRunner, live_daemon
     waited = invoke(cli, "wait", session_id)
 
     assert waited.exit_code == vocab.EXIT_OK
-    assert "denied: 1 edit (default read policy — pass --permissions edit)" in waited.stderr
+    assert "denied: 1 edit (pass --permissions edit)" in waited.stderr
 
 
 def test_an_unknown_permission_value_is_a_usage_error(cli: CliRunner) -> None:

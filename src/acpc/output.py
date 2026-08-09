@@ -84,6 +84,8 @@ def result_envelope(
             "session_id": meta.session_id,
             "state": meta.state,
             "paths": sessions.session_paths(meta.session_id),
+            "denied": _denial_payload(meta),
+            "permissions_clamp": _permissions_clamp(meta),
         }
 
     envelope: dict[str, Any] = {
@@ -94,6 +96,8 @@ def result_envelope(
         "cost": meta.cost,
         "answer": answer,
         "truncated": truncated,
+        "denied": _denial_payload(meta),
+        "permissions_clamp": _permissions_clamp(meta),
     }
     if output_file is not None:
         envelope["output_file"] = str(output_file)
@@ -224,20 +228,80 @@ def format_tokens(tokens: int) -> str:
     return f"{tokens} tok"
 
 
-def _denied_summary(meta: sessions.SessionMeta) -> str | None:
-    denied = {category: count for category, count in meta.denied.items() if count}
-    if not denied or meta.resolution.get("permissions_source") != "default":
-        return None
+def _resolved_permissions(meta: sessions.SessionMeta) -> dict[str, Any]:
     resolved = meta.resolution.get("resolved", {})
     permission = resolved.get("permissions", {}) if isinstance(resolved, dict) else {}
-    default_policy = permission.get("value") if isinstance(permission, dict) else None
-    if not isinstance(default_policy, str):
+    return permission if isinstance(permission, dict) else {}
+
+
+def _permissions_clamp(meta: sessions.SessionMeta) -> dict[str, str] | None:
+    clamp = _resolved_permissions(meta).get("clamp")
+    if not isinstance(clamp, dict):
         return None
-    requirements = [permissions.minimum_policy(category) for category in denied]
-    policy_order = {"read": 0, "edit": 1, "execute": 2, "all": 3}
-    remedy = max(requirements, key=policy_order.__getitem__)
-    counts = " · ".join(f"{count} {category}" for category, count in denied.items())
-    return f"denied: {counts} (default {default_policy} policy — pass --permissions {remedy})"
+    fields = ("requested", "ceiling", "effective")
+    if any(not isinstance(clamp.get(field), str) for field in fields):
+        return None
+    return {field: clamp[field] for field in fields}
+
+
+def _denial_record(meta: sessions.SessionMeta, key: str, count: int) -> dict[str, Any]:
+    details = meta.denial_details.get(key, {})
+    if not isinstance(details, dict):
+        details = {}
+    category = details.get("category")
+    target: str | None = None
+    if key.startswith("switch_mode:"):
+        category = "switch_mode"
+        target = key.removeprefix("switch_mode:")
+    if not isinstance(category, str) or not category:
+        category = key
+    if category == "switch_mode" and isinstance(details.get("target"), str):
+        target = details["target"]
+
+    minimum = details.get("minimum_policy")
+    if minimum is None:
+        minimum = permissions.minimum_policy(category)
+    remedy = details.get("remedy")
+    if not isinstance(remedy, str) or not remedy:
+        remedy = f"pass --permissions {minimum}" if isinstance(minimum, str) else "no policy helps"
+
+    record: dict[str, Any] = {
+        "category": category,
+        "count": count,
+        "minimum_policy": minimum,
+        "remedy": remedy,
+    }
+    if target is not None:
+        record["target"] = target
+    return record
+
+
+def _denial_payload(meta: sessions.SessionMeta) -> list[dict[str, Any]]:
+    return [_denial_record(meta, key, count) for key, count in meta.denied.items() if count]
+
+
+def _denied_summary(meta: sessions.SessionMeta) -> str | None:
+    records = _denial_payload(meta)
+    if not records:
+        return None
+    rendered: list[str] = []
+    for record in records:
+        category = record["category"]
+        label = category
+        if category == "switch_mode":
+            label = f"switch_mode {record.get('target', '<unknown>')}"
+        rendered.append(f"{record['count']} {label} ({record['remedy']})")
+    return "denied: " + " · ".join(rendered)
+
+
+def _clamp_summary(meta: sessions.SessionMeta) -> str | None:
+    clamp = _permissions_clamp(meta)
+    if clamp is None:
+        return None
+    return (
+        f"permissions clamped from {clamp['requested']} by inherited ceiling "
+        f"{clamp['ceiling']} (effective {clamp['effective']})"
+    )
 
 
 def _session_segments(meta: sessions.SessionMeta) -> tuple[str, str]:
@@ -265,6 +329,8 @@ def format_summary(
         parts.append(f"cost ${meta.cost:.2f}")
     if meta.exit_code is not None:
         parts.append(f"exit {meta.exit_code}")
+    if clamp := _clamp_summary(meta):
+        parts.append(clamp)
     if denied := _denied_summary(meta):
         parts.append(denied)
     parts.extend(_session_segments(meta))

@@ -60,8 +60,12 @@ def test_json_envelope_has_pinned_fields_and_truncates_answer_only() -> None:
         "cost",
         "answer",
         "truncated",
+        "denied",
+        "permissions_clamp",
     }
     assert payload["truncated"] is True
+    assert payload["denied"] == []
+    assert payload["permissions_clamp"] is None
     assert "full answer:" in payload["answer"]
     assert result.text.encode("utf-8").decode("utf-8")
 
@@ -77,7 +81,15 @@ def test_background_and_output_file_shapes_are_separate(tmp_path: Path) -> None:
         output.render_result(meta, answer, json_mode=True, output_file=output_file).text
     )
 
-    assert set(background) == {"session_id", "state", "paths"}
+    assert set(background) == {
+        "session_id",
+        "state",
+        "paths",
+        "denied",
+        "permissions_clamp",
+    }
+    assert background["denied"] == []
+    assert background["permissions_clamp"] is None
     assert "answer" not in written_json
     assert written_json["output_file"] == str(output_file)
     assert "answer.md" in written.text
@@ -85,6 +97,71 @@ def test_background_and_output_file_shapes_are_separate(tmp_path: Path) -> None:
     size = output.write_output_file(output_file, answer)
     assert output_file.read_text(encoding="utf-8") == answer
     assert size == len(answer.encode("utf-8"))
+
+
+def test_json_envelope_reports_denials_and_the_inherited_clamp(tmp_path: Path) -> None:
+    meta = make_session(tmp_path)
+    meta.denied = {"edit": 2, "switch_mode:yolo": 1}
+    meta.denial_details = {
+        "edit": {
+            "category": "edit",
+            "minimum_policy": "edit",
+            "remedy": "pass --permissions edit",
+        },
+        "switch_mode:yolo": {
+            "category": "switch_mode",
+            "target": "yolo",
+            "minimum_policy": "all",
+            "remedy": "pass --permissions all",
+        },
+    }
+    meta.resolution = {
+        "resolved": {
+            "permissions": {
+                "value": "edit",
+                "clamp": {"requested": "all", "ceiling": "edit", "effective": "edit"},
+            }
+        }
+    }
+
+    payload = json.loads(output.render_result(meta, "answer", json_mode=True).text)
+
+    assert payload["denied"] == [
+        {
+            "category": "edit",
+            "count": 2,
+            "minimum_policy": "edit",
+            "remedy": "pass --permissions edit",
+        },
+        {
+            "category": "switch_mode",
+            "count": 1,
+            "minimum_policy": "all",
+            "remedy": "pass --permissions all",
+            "target": "yolo",
+        },
+    ]
+    assert payload["permissions_clamp"] == {
+        "requested": "all",
+        "ceiling": "edit",
+        "effective": "edit",
+    }
+
+
+def test_flat_legacy_denials_render_as_self_describing_records() -> None:
+    meta = make_session(Path("."))
+    meta.denied = {"edit": 1}
+
+    payload = json.loads(output.render_result(meta, "answer", json_mode=True).text)
+
+    assert payload["denied"] == [
+        {
+            "category": "edit",
+            "count": 1,
+            "minimum_policy": "edit",
+            "remedy": "pass --permissions edit",
+        }
+    ]
 
 
 def test_summary_is_one_prefixed_stderr_line() -> None:

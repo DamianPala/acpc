@@ -108,6 +108,7 @@ class TurnOutcome:
     tokens: int = 0
     cost: float | None = None
     denied: dict[str, int] = field(default_factory=dict)
+    denial_details: dict[str, dict[str, Any]] = field(default_factory=dict)
     adapter_session_id: str | None = None
     advertised: dict[str, Any] = field(default_factory=dict)
     route_note: str | None = None
@@ -272,6 +273,7 @@ async def _drive_turn(
         tokens=client.tokens,
         cost=client.cost,
         denied=client.denied,
+        denial_details=client.denial_details,
         adapter_session_id=adapter_session_id,
         advertised=client.advertised,
     )
@@ -427,6 +429,7 @@ def daemon_payload(request: TurnRequest) -> dict[str, Any]:
         "mode": resolution.mode,
         "grants": resolution.mode_spec.grants if resolution.mode_spec else None,
         "delegates": resolution.mode_spec.delegates if resolution.mode_spec else None,
+        "modes": mode_catalog_payload(resolution.entry.modes),
         "permissions": resolution.permissions,
         "home": resolution.home,
         "cwd": request.cwd,
@@ -640,6 +643,7 @@ def _finalize(
             tokens=outcome.tokens,
             cost=outcome.cost,
             denied=outcome.denied,
+            denial_details=outcome.denial_details,
             adapter_session_id=outcome.adapter_session_id,
         )
 
@@ -707,6 +711,29 @@ def resolution_payload(resolution: CallResolution, *, cwd: str | None) -> dict[s
     }
 
 
+def mode_catalog_payload(modes: Mapping[str, ModeSpec]) -> dict[str, dict[str, Any]]:
+    """Serialize the measured mode catalog for a session or daemon request."""
+    return {
+        name: {"grants": spec.grants, "delegates": spec.delegates} for name, spec in modes.items()
+    }
+
+
+def mode_catalog_from_payload(raw: object, *, context: str) -> dict[str, ModeSpec]:
+    """Validate and rebuild a serialized measured mode catalog."""
+    if not isinstance(raw, Mapping):
+        raise RunnerError(f"{context} has invalid stored mode catalog")
+    modes: dict[str, ModeSpec] = {}
+    for name, value in raw.items():
+        if not isinstance(name, str) or not name or not isinstance(value, Mapping):
+            raise RunnerError(f"{context} has invalid stored mode catalog")
+        grants = value.get("grants")
+        delegates = value.get("delegates")
+        if grants not in vocab.PERMISSION_VALUES[:-1] or not isinstance(delegates, bool):
+            raise RunnerError(f"{context} has invalid stored mode catalog")
+        modes[name] = ModeSpec(grants=grants, delegates=delegates)
+    return modes
+
+
 def session_resolution(
     resolution: CallResolution,
     *,
@@ -720,6 +747,7 @@ def session_resolution(
     adapter: dict[str, Any] = {
         "home_env": resolution.entry.home_env,
         "effort_config_id": resolution.entry.effort_config_id,
+        "modes": mode_catalog_payload(resolution.entry.modes),
     }
     if resolution.mode is not None and resolution.mode_spec is not None:
         adapter.update(
@@ -742,7 +770,7 @@ def _stored_value(payload: Mapping[str, Any], field: str) -> Any:
 
 
 def resolution_from_session(meta: sessions.SessionMeta) -> CallResolution:
-    """Rebuild a call resolution exclusively from a session's stored data."""
+    """Rebuild stored call facts and the mode catalog snapshot."""
     payload = meta.resolution
     adapter = payload.get("adapter")
     if not isinstance(adapter, Mapping):
@@ -788,6 +816,14 @@ def resolution_from_session(meta: sessions.SessionMeta) -> CallResolution:
             raise RunnerError(f"session {meta.session_id} has invalid stored mode delegation")
         mode_spec = ModeSpec(grants=grants, delegates=delegates)
 
+    raw_modes = adapter.get("modes")
+    if raw_modes is None:
+        modes = {stored_mode: mode_spec} if stored_mode is not None and mode_spec else {}
+    else:
+        modes = mode_catalog_from_payload(raw_modes, context=f"session {meta.session_id}")
+        if stored_mode is not None and mode_spec is not None:
+            modes[stored_mode] = mode_spec
+
     entry = ResolvedEntry(
         entry=meta.entry,
         base_adapter=meta.base_adapter,
@@ -806,7 +842,7 @@ def resolution_from_session(meta: sessions.SessionMeta) -> CallResolution:
         mode=None,
         permissions=None,
         env=dict(declared_env),
-        modes={stored_mode: mode_spec} if stored_mode is not None and mode_spec else {},
+        modes=modes,
         presets={},
         extends=None,
         provenance={},

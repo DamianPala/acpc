@@ -311,6 +311,7 @@ def test_legacy_session_resolution_selects_read_without_policy_facts() -> None:
     legacy_payload["resolved"].pop("permissions")
     for field in ("mode", "grants", "delegates"):
         legacy_payload["adapter"].pop(field, None)
+    legacy_payload["adapter"].pop("modes", None)
     meta = sessions.create_session(
         entry=resolution.entry.entry,
         base_adapter=resolution.entry.base_adapter,

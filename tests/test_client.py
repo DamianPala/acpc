@@ -403,6 +403,7 @@ def test_ask_policy_without_callback_denies_without_reading_stdin(
     events = transcript.read().events
     assert [event["type"] for event in events] == ["permission", "error"]
     assert events[0]["decision"] == "deny"
+    assert events[0]["auto"] is False
     assert events[1]["message"] == "permission denied: edit"
 
 
@@ -467,6 +468,7 @@ def test_permission_denials_are_answered_and_recorded(tmp_path: Path, monkeypatc
         "deny",
         "deny",
     ]
+    assert all(isinstance(event["auto"], bool) for event in permissions)
     assert len(errors) == 5
     assert all(event["message"].startswith("permission denied:") for event in errors)
     assert "switch_mode:yolo" in client.answer
@@ -611,12 +613,17 @@ def test_filesystem_refusal_is_an_acp_error_and_connection_survives(
     events = transcript.read().events
     assert {event["type"] for event in events} >= {"permission", "error", "msg"}
     permission = next(event for event in events if event["type"] == "permission")
-    assert permission == {
-        "type": "permission",
-        "kind": "fs/write_text_file",
-        "decision": "deny",
-        "ts": 100.0,
-        "i": permission["i"],
+    assert permission["type"] == "permission"
+    assert permission["kind"] == "fs/write_text_file"
+    assert permission["decision"] == "deny"
+    assert permission["auto"] is True
+    assert permission["ts"] == 100.0
+    assert client.denial_details == {
+        "edit": {
+            "category": "edit",
+            "minimum_policy": "edit",
+            "remedy": "pass --permissions edit",
+        }
     }
 
 
@@ -707,7 +714,7 @@ def test_switch_mode_at_or_below_ceiling_allows_later_requests(
     assert [event["decision"] for event in transcript.read().events] == ["allow", "allow"]
 
 
-def test_switch_mode_undeclared_target_requires_all_but_allows_at_all(
+def test_switch_mode_undeclared_target_uses_all_as_the_working_remedy(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
     monkeypatch.setenv("ACPC_HOME", str(tmp_path / "acpc-state"))
@@ -717,7 +724,9 @@ def test_switch_mode_undeclared_target_requires_all_but_allows_at_all(
         PermissionOption(option_id="deny", name="Deny", kind="reject_once"),
     ]
 
-    async def request(level: PermissionLevel, root: Path) -> tuple[Any, list[dict[str, Any]]]:
+    async def request(
+        level: PermissionLevel, root: Path
+    ) -> tuple[Any, list[dict[str, Any]], dict[str, dict[str, Any]]]:
         client, transcript = _make_client(root, level, modes)
         response = await client.request_permission(
             "adapter-session",
@@ -729,15 +738,25 @@ def test_switch_mode_undeclared_target_requires_all_but_allows_at_all(
             ),
             options,
         )
-        return response, transcript.read().events
+        return response, transcript.read().events, client.denial_details
 
-    refused, refused_events = asyncio.run(request(PermissionLevel.READ, tmp_path / "read"))
-    allowed, allowed_events = asyncio.run(request(PermissionLevel.ALL, tmp_path / "all"))
+    refused, refused_events, details = asyncio.run(request(PermissionLevel.READ, tmp_path / "read"))
+    allowed, allowed_events, _allowed_details = asyncio.run(
+        request(PermissionLevel.ALL, tmp_path / "all")
+    )
 
     assert isinstance(refused.outcome, DeniedOutcome)
     assert refused_events[0]["decision"] == "deny"
     assert "switch_mode yolo" in refused_events[1]["message"]
-    assert "--permissions all" in refused_events[1]["message"]
+    assert "requires --permissions all" in refused_events[1]["message"]
+    assert details == {
+        "switch_mode:yolo": {
+            "category": "switch_mode",
+            "target": "yolo",
+            "minimum_policy": "all",
+            "remedy": "pass --permissions all",
+        }
+    }
     assert isinstance(allowed.outcome, AllowedOutcome)
     assert [event["decision"] for event in allowed_events] == ["allow"]
 
@@ -774,7 +793,52 @@ def test_malformed_switch_mode_target_is_refused_before_lookup(
     events = transcript.read().events
     assert events[0]["decision"] == "deny"
     assert "switch_mode <unknown>" in events[1]["message"]
-    assert "--permissions all" in events[1]["message"]
+    assert "requires --permissions all" in events[1]["message"]
+
+
+@pytest.mark.parametrize(
+    ("options", "minimum_policy", "remedy"),
+    [
+        (
+            [PermissionOption(option_id="always", name="Always", kind="allow_always")],
+            "all",
+            "pass --permissions all",
+        ),
+        (
+            [PermissionOption(option_id="deny", name="Deny", kind="reject_once")],
+            None,
+            "agent offered no allow option",
+        ),
+    ],
+)
+def test_allowed_policy_without_a_usable_allow_option_has_an_honest_remedy(
+    tmp_path: Path,
+    monkeypatch: Any,
+    options: list[PermissionOption],
+    minimum_policy: str | None,
+    remedy: str,
+) -> None:
+    monkeypatch.setenv("ACPC_HOME", str(tmp_path / "acpc-state"))
+    client, transcript = _make_client(tmp_path, PermissionLevel.EXECUTE)
+
+    async def scenario() -> Any:
+        return await client.request_permission(
+            "adapter-session",
+            ToolCallUpdate(tool_call_id="execute", kind="execute", title="Run command"),
+            options,
+        )
+
+    response = asyncio.run(scenario())
+
+    assert isinstance(response.outcome, DeniedOutcome)
+    assert client.denial_details == {
+        "execute": {
+            "category": "execute",
+            "minimum_policy": minimum_policy,
+            "remedy": remedy,
+        }
+    }
+    assert transcript.read().events[0]["auto"] is True
 
 
 def test_declared_unknown_spelling_is_a_real_mode_under_all(

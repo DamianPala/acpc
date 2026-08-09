@@ -156,9 +156,13 @@ def format_event(
         arguments = f" {args}" if args else ""
         return f"[{timestamp}] {label}{name}{arguments} → {status} ({duration_text})"
     if event_type == "permission":
+        count = event.get("count")
+        repeated = ""
+        if isinstance(count, int) and count > 1:
+            repeated = f" (×{count}, cursor: {_event_index(event, 0)})"
         return (
             f"[{timestamp}] {label}{event.get('kind', 'unknown')} "
-            f"→ {event.get('decision', 'unknown')}"
+            f"→ {event.get('decision', 'unknown')}{repeated}"
         )
     if event_type == "error":
         return f"[{timestamp}] {label}{_single_line(event.get('message', ''))}"
@@ -171,6 +175,44 @@ def format_event(
             cost_text = f" · cost ${cost:.2f}"
         return f"[{timestamp}] {label}{event.get('tokens', 0)} tok{cost_text}"
     return f"[{timestamp}] {label}{_single_line(event)}"
+
+
+def _is_auto_filesystem_permission(event: Mapping[str, Any]) -> bool:
+    return (
+        event.get("type") == "permission"
+        and event.get("auto") is True
+        and event.get("decision") == "allow"
+        and isinstance(event.get("kind"), str)
+        and event["kind"].startswith("fs/")
+    )
+
+
+def _is_groupable_filesystem_permission(event: Mapping[str, Any]) -> bool:
+    return _is_auto_filesystem_permission(event) and (
+        "count" not in event or isinstance(event.get("count"), int)
+    )
+
+
+def condense_events(events: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse adjacent automatic filesystem allows before applying a tail."""
+    condensed: list[dict[str, Any]] = []
+    for event in events:
+        current = dict(event)
+        if condensed and _is_auto_filesystem_permission(current):
+            previous = condensed[-1]
+            if _is_groupable_filesystem_permission(previous) and previous.get(
+                "kind"
+            ) == current.get("kind"):
+                previous.setdefault("_group_start", _event_index(previous, 0))
+                previous["count"] = int(previous.get("count", 1)) + 1
+                previous["i"] = _event_index(current, _event_index(previous, 0))
+                continue
+        condensed.append(current)
+
+    for event in condensed:
+        if "count" in event:
+            event.setdefault("_group_start", _event_index(event, 0))
+    return condensed
 
 
 def _prose_event(event: Mapping[str, Any]) -> str:
@@ -259,6 +301,8 @@ def render_events(
             transcript_path=transcript_path,
             cursor=cursor,
         )
+
+    events = condense_events(events) if not prose else [dict(event) for event in events]
 
     entries: list[tuple[int, str]] = []
     entry_cursor = cursor

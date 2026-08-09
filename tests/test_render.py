@@ -69,6 +69,60 @@ def test_condensed_events_include_tool_details_and_omit_routine_message_length()
     assert result.next_cursor == 3
 
 
+def test_auto_allowed_filesystem_reads_collapse_to_the_final_cursor() -> None:
+    events = [
+        event(1, "permission", kind="fs/read_text_file", decision="allow", auto=True),
+        event(2, "permission", kind="fs/read_text_file", decision="allow", auto=True),
+        event(3, "permission", kind="fs/read_text_file", decision="allow", auto=True),
+    ]
+
+    result = render.render_events(events)
+
+    assert result.text.count("fs/read_text_file") == 1
+    assert "×3" in result.text
+    assert "cursor: 3" in result.text
+    assert result.next_cursor == 3
+
+
+def test_filesystem_read_grouping_stops_at_an_interruption() -> None:
+    events = [
+        event(1, "permission", kind="fs/read_text_file", decision="allow", auto=True),
+        event(2, "msg", text="interruption"),
+        event(3, "permission", kind="fs/read_text_file", decision="allow", auto=True),
+    ]
+
+    result = render.render_events(events)
+
+    assert result.text.count("fs/read_text_file") == 2
+    assert "×2" not in result.text
+
+
+def test_filesystem_read_grouping_stops_at_a_denial() -> None:
+    events = [
+        event(1, "permission", kind="fs/read_text_file", decision="allow", auto=True),
+        event(2, "permission", kind="fs/read_text_file", decision="deny", auto=True),
+        event(3, "permission", kind="fs/read_text_file", decision="allow", auto=True),
+    ]
+
+    result = render.render_events(events)
+
+    assert result.text.count("fs/read_text_file") == 3
+    assert "×2" not in result.text
+    assert "→ deny" in result.text
+
+
+def test_prompted_filesystem_allows_do_not_group() -> None:
+    events = [
+        event(1, "permission", kind="fs/read_text_file", decision="allow", auto=False),
+        event(2, "permission", kind="fs/read_text_file", decision="allow", auto=False),
+    ]
+
+    result = render.render_events(events)
+
+    assert result.text.count("fs/read_text_file") == 2
+    assert "×2" not in result.text
+
+
 def _message_snippet(line: str, label: str = "msg   ") -> str:
     return json.loads(line.split(label, 1)[1])
 

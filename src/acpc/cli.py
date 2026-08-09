@@ -393,7 +393,10 @@ def _updated_session_resolution(
     adapter = payload.get("adapter")
     if not isinstance(adapter, dict):
         adapter = {}
-    adapter = {key: adapter[key] for key in ("home_env", "effort_config_id") if key in adapter}
+    adapter = {
+        key: adapter[key] for key in ("home_env", "effort_config_id", "modes") if key in adapter
+    }
+    adapter["modes"] = runner.mode_catalog_payload(resolution.entry.modes)
     if resolution.mode is not None and resolution.mode_spec is not None:
         adapter.update(
             mode=resolution.mode,
@@ -1634,6 +1637,7 @@ def _wait_for_new_events(
     since: int,
     tail: int | None,
     timeout: float | None,
+    condense: bool = False,
 ) -> transcript.TranscriptPage | None:
     """Wait for transcript activity at the module's fixed polling interval."""
     deadline = None if timeout is None else time.monotonic() + timeout
@@ -1649,7 +1653,7 @@ def _wait_for_new_events(
 
         available = _read_transcript_page(transcript_file, since=since)
         if available.events:
-            return _read_transcript_page(transcript_file, since=since, tail=tail)
+            return _read_transcript_page(transcript_file, since=since, tail=tail, condense=condense)
 
 
 def _read_transcript_page(
@@ -1657,10 +1661,24 @@ def _read_transcript_page(
     *,
     since: int = 0,
     tail: int | None = None,
+    condense: bool = False,
 ) -> transcript.TranscriptPage:
     """Turn damaged transcript state into the CLI's one-line usage error."""
     try:
-        return transcript_file.read(since=since, tail=tail)
+        page = (
+            transcript_file.read(since=since)
+            if condense
+            else transcript_file.read(since=since, tail=tail)
+        )
+        if not condense:
+            return page
+        selected = render.condense_events(page.events)
+        if tail is not None:
+            selected = selected[-tail:] if tail else []
+            next_cursor = int(selected[-1]["i"]) if selected else since
+        else:
+            next_cursor = page.next_cursor
+        return transcript.TranscriptPage(selected, next_cursor)
     except transcript.TranscriptError as error:
         raise UsageProblem(str(error)) from None
 
@@ -1799,12 +1817,18 @@ def log_command(
             timeout=timeout,
             quiet=quiet,
             since_note=since_note,
+            condense=not prose and not json_mode,
         )
         return
 
     if wait_new and not explicit_since:
         cursor = _read_transcript_page(transcript_file).next_cursor
-    page = _read_transcript_page(transcript_file, since=cursor, tail=selection_tail)
+    page = _read_transcript_page(
+        transcript_file,
+        since=cursor,
+        tail=selection_tail,
+        condense=not prose and not json_mode,
+    )
     timed_out = False
     gave_up_waiting = False
     if wait_new and not page.events:
@@ -1819,6 +1843,7 @@ def log_command(
                 since=cursor,
                 tail=selection_tail,
                 timeout=timeout,
+                condense=not prose and not json_mode,
             )
             if waited is None:
                 timed_out = True
@@ -1915,6 +1940,7 @@ def _follow_start_cursor(
     *,
     since: int,
     tail: int | None,
+    condense: bool = False,
 ) -> int:
     """Turn the replay depth into the cursor the follow starts from.
 
@@ -1923,9 +1949,11 @@ def _follow_start_cursor(
     cursor moves to the transcript's current end rather than staying put and
     letting the first page hand back the whole history.
     """
-    replay = _read_transcript_page(transcript_file, since=since, tail=tail)
+    replay = _read_transcript_page(transcript_file, since=since, tail=tail, condense=condense)
     if replay.events:
-        return int(replay.events[0]["i"]) - 1
+        first = replay.events[0]
+        start = first.get("_group_start", first["i"])
+        return int(start) - 1
     return _read_transcript_page(transcript_file, since=since).next_cursor
 
 
@@ -1941,12 +1969,13 @@ def _follow_log(
     timeout: float | None,
     quiet: bool,
     since_note: str | None,
+    condense: bool,
 ) -> None:
     """Collect events until the session ends, the timeout expires, or the
     budget runs out — SPEC `log --follow`'s three endings, one exit code each."""
     transcript_path = sessions.transcript_path(meta.session_id)
     deadline = None if timeout is None else time.monotonic() + timeout
-    cursor = _follow_start_cursor(transcript_file, since=cursor, tail=tail)
+    cursor = _follow_start_cursor(transcript_file, since=cursor, tail=tail, condense=condense)
     used = 0
     exhausted = False
     timed_out = False

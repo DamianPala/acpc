@@ -234,6 +234,48 @@ def test_log_defaults_to_the_last_twenty_events(cli: CliRunner) -> None:
     assert "event-0" not in result.stdout and "event-20" in result.stdout
 
 
+def test_log_groups_reads_before_taking_the_default_tail(cli: CliRunner) -> None:
+    meta = finished_session()
+    transcript_file = transcript.Transcript(sessions.transcript_path(meta.session_id))
+    transcript_file.append("msg", text="agent prose must remain visible")
+    for _ in range(25):
+        transcript_file.append(
+            "permission",
+            kind="fs/read_text_file",
+            decision="allow",
+            auto=True,
+        )
+
+    result = invoke(cli, "log", meta.session_id)
+
+    assert "agent prose must remain visible" in result.stdout
+    assert "fs/read_text_file" in result.stdout
+    assert "×25" in result.stdout
+
+
+def test_log_since_a_group_cursor_resumes_after_the_collapsed_reads(cli: CliRunner) -> None:
+    meta = finished_session()
+    transcript_file = transcript.Transcript(sessions.transcript_path(meta.session_id))
+    transcript_file.append("msg", text="agent prose before reads")
+    for _ in range(25):
+        transcript_file.append(
+            "permission",
+            kind="fs/read_text_file",
+            decision="allow",
+            auto=True,
+        )
+    transcript_file.append("msg", text="agent prose after reads")
+
+    first = invoke(cli, "log", meta.session_id)
+    group_line = next(line for line in first.stdout.splitlines() if "×25" in line)
+    group_cursor = int(group_line.split("cursor: ", 1)[1].split(")", 1)[0])
+
+    resumed = invoke(cli, "log", meta.session_id, "--since", str(group_cursor))
+
+    assert "agent prose after reads" in resumed.stdout
+    assert "fs/read_text_file" not in resumed.stdout
+
+
 def test_wait_accepts_a_suffixed_timeout_on_a_finished_session(cli: CliRunner) -> None:
     session_id = run_mock(cli)
 

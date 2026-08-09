@@ -206,6 +206,11 @@ def test_continue_migrates_legacy_mode_and_target_metadata(cli: CliRunner) -> No
     assert migrated.resolution["adapter"] == {
         "home_env": "MOCK_HOME",
         "effort_config_id": None,
+        "modes": {
+            "default": {"grants": "read", "delegates": True},
+            "plan": {"grants": "read", "delegates": True},
+            "yolo": {"grants": "all", "delegates": False},
+        },
         "mode": "default",
         "grants": "read",
         "delegates": True,
@@ -337,21 +342,35 @@ def test_continue_without_permissions_uses_stored_mode_facts_after_registry_edit
 ) -> None:
     session_id = start_session(cli, "settings")
     entry = state_root / "agents" / "mock.toml"
-    edited = MOCK_ENTRY.replace(
-        'default = { grants = "read", delegates = true }',
-        'default = { grants = "execute", delegates = false }',
-    ).replace(
-        'plan = { grants = "read", delegates = true }',
-        'plan = { grants = "execute", delegates = true }',
+    edited = (
+        MOCK_ENTRY.replace(
+            'default = { grants = "read", delegates = true }',
+            'default = { grants = "execute", delegates = false }',
+        )
+        .replace(
+            'plan = { grants = "read", delegates = true }',
+            'plan = { grants = "execute", delegates = true }',
+        )
+        .replace(
+            'yolo = { grants = "all", delegates = false }',
+            'yolo = { grants = "read", delegates = true }',
+        )
     )
     entry.write_text(edited, encoding="utf-8")
 
-    result = invoke(cli, "continue", session_id, "settings", "--quiet")
+    result = invoke(cli, "continue", session_id, "perm scenario", "--json")
 
-    assert result.exit_code == vocab.EXIT_OK
-    _model, _effort, mode, _model_calls, mode_calls, _effort_calls = result.stdout.split("/")
-    assert mode == "default"
-    assert mode_calls == "1"
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert json.loads(result.stdout)["denied"][-1] == {
+        "category": "switch_mode",
+        "target": "yolo",
+        "count": 1,
+        "minimum_policy": "all",
+        "remedy": "pass --permissions all",
+    }
+
+    stored = sessions.load(session_id).resolution["adapter"]["modes"]
+    assert stored["yolo"] == {"grants": "all", "delegates": False}
 
 
 def test_continue_with_a_higher_policy_reselects_and_stores_current_mode_facts(
@@ -390,6 +409,10 @@ def test_continue_with_a_higher_policy_reselects_and_stores_current_mode_facts(
     assert stored["adapter"]["mode"] == "plan"
     assert stored["adapter"]["grants"] == "execute"
     assert stored["adapter"]["delegates"] is True
+    assert stored["adapter"]["modes"]["default"] == {
+        "grants": "execute",
+        "delegates": False,
+    }
 
 
 def test_pre_05_session_without_mode_selects_once_from_stored_policy(
@@ -499,8 +522,14 @@ def test_continue_permissions_apply_and_persist_for_later_turns(
     meta = sessions.load(session_id)
     assert meta.resolution["resolved"]["permissions"]["value"] == "edit"
     assert meta.resolution.get("permissions_source") is None
-    assert meta.denied == {"execute": 2, "unknown": 1}
-    assert "denied:" not in fourth.stderr
+    assert meta.denied == {"execute": 2, "switch_mode:yolo": 1}
+    assert meta.denial_details["switch_mode:yolo"] == {
+        "category": "switch_mode",
+        "target": "yolo",
+        "minimum_policy": "all",
+        "remedy": "pass --permissions all",
+    }
+    assert "denied:" in fourth.stderr
 
 
 def test_continuation_clamps_and_persists_an_inherited_ceiling(

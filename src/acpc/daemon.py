@@ -577,8 +577,17 @@ class Daemon:
                 policy_level = PermissionLevel(policy)
             except ValueError:
                 raise DaemonError(f"mode {mode} has invalid permission policy {policy!r}") from None
+        resolved_call = AgentRegistry().resolve_call(payload["entry"])
+        if "modes" in payload:
+            try:
+                modes = runner.mode_catalog_from_payload(
+                    payload["modes"], context="daemon dispatch"
+                )
+            except runner.RunnerError as error:
+                raise DaemonError(str(error)) from None
+            resolved_call = replace(resolved_call, entry=replace(resolved_call.entry, modes=modes))
         resolution = replace(
-            AgentRegistry().resolve_call(payload["entry"]),
+            resolved_call,
             model=payload.get("model"),
             effort=payload.get("effort"),
             mode=payload.get("mode"),
@@ -694,6 +703,7 @@ class Daemon:
             tokens=client.tokens,
             cost=client.cost,
             denied=client.denied,
+            denial_details=client.denial_details,
             adapter_session_id=adapter_session_id,
             advertised=client.advertised,
         )

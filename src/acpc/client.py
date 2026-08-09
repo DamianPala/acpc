@@ -40,6 +40,7 @@ from acpc.permissions import (
     PermissionLevel,
     classify_kind,
     find_option,
+    minimum_policy,
     select_mode,
     should_allow,
 )
@@ -118,6 +119,7 @@ class AcpcClient:
         self._tokens = 0
         self._cost: float | None = None
         self._denied: dict[str, int] = {}
+        self._denial_details: dict[str, dict[str, Any]] = {}
         self._advertised: dict[str, Any] = {
             "modes": [],
             "models": [],
@@ -143,6 +145,11 @@ class AcpcClient:
     def denied(self) -> dict[str, int]:
         """Return this turn's permission-denial counts by category."""
         return dict(self._denied)
+
+    @property
+    def denial_details(self) -> dict[str, dict[str, Any]]:
+        """Return remedies and targets for this turn's permission denials."""
+        return {key: dict(detail) for key, detail in self._denial_details.items()}
 
     @property
     def advertised(self) -> dict[str, Any]:
@@ -272,14 +279,20 @@ class AcpcClient:
         title = getattr(tool_call, "title", None) or ""
         category = classify_kind(kind)
         switch_reason: str | None = None
+        denial_key: str | None = None
+        denial_detail: dict[str, Any] | None = None
         if kind == "switch_mode":
             target = self._switch_mode_target(tool_call)
             decision, required = self._switch_mode_decision(target)
+            auto = True
             if not decision:
                 display_target = target if target is not None else "<unknown>"
                 switch_reason = self._switch_mode_reason(display_target, required)
+                denial_key = f"switch_mode:{display_target}"
+                denial_detail = self._switch_mode_denial_detail(display_target, required)
         else:
             decision = should_allow(self.permission_level, category)
+            auto = decision is not None
             if decision is None:
                 decision = await self._ask_permission(kind, title)
 
@@ -290,7 +303,16 @@ class AcpcClient:
             reason = switch_reason or f"permission denied: {kind}"
             if switch_reason is None and decision and option_id is None:
                 reason += " (no matching allow option)"
-        self._record_permission(kind, category, allowed, reason)
+                denial_detail = self._missing_allow_detail(category, options)
+        self._record_permission(
+            kind,
+            category,
+            allowed,
+            reason,
+            auto=auto,
+            denial_key=denial_key,
+            denial_detail=denial_detail,
+        )
         if not allowed:
             if switch_reason is not None and self.end_turn is not None:
                 self.end_turn()
@@ -329,6 +351,16 @@ class AcpcClient:
         return f"permission denied: switch_mode {target} (requires --permissions {required})"
 
     @staticmethod
+    def _switch_mode_denial_detail(target: str, required: str) -> dict[str, Any]:
+        """Keep the target and actionable remedy with the denial tally."""
+        return {
+            "category": "switch_mode",
+            "target": target,
+            "minimum_policy": required,
+            "remedy": f"pass --permissions {required}",
+        }
+
+    @staticmethod
     def _switch_mode_target(tool_call: Any) -> str | None:
         """Read the requested mode from ACP's generic tool-call input."""
         raw_input = getattr(tool_call, "raw_input", None)
@@ -344,23 +376,64 @@ class AcpcClient:
         self.flush()
         category = CLIENT_METHOD_CATEGORIES[kind]
         decision = should_allow(self.permission_level, category)
+        auto = decision is not None
         if decision is None:
             decision = await self._ask_permission(kind, title)
         allowed = bool(decision)
         reason = None if allowed else f"permission denied: {kind}"
-        self._record_permission(kind, category, allowed, reason)
+        self._record_permission(kind, category, allowed, reason, auto=auto)
         if not allowed:
             assert reason is not None
             raise RequestError(CLIENT_PERMISSION_ERROR_CODE, reason, {"category": category})
 
     def _record_permission(
-        self, kind: str, category: str, allowed: bool, reason: str | None
+        self,
+        kind: str,
+        category: str,
+        allowed: bool,
+        reason: str | None,
+        *,
+        auto: bool,
+        denial_key: str | None = None,
+        denial_detail: Mapping[str, Any] | None = None,
     ) -> None:
         """Append a permission decision and update the denial tally."""
-        self.transcript.append("permission", kind=kind, decision="allow" if allowed else "deny")
+        event: dict[str, Any] = {
+            "type": "permission",
+            "kind": kind,
+            "decision": "allow" if allowed else "deny",
+            "auto": auto,
+        }
+        self.transcript.append(event)
         if not allowed:
-            self._denied[category] = self._denied.get(category, 0) + 1
+            key = denial_key or category
+            self._denied[key] = self._denied.get(key, 0) + 1
+            if denial_detail is None:
+                minimum = self._minimum_policy_detail(category)
+                denial_detail = {
+                    "category": category,
+                    "minimum_policy": minimum,
+                    "remedy": f"pass --permissions {minimum}",
+                }
+            self._denial_details[key] = dict(denial_detail)
             self.transcript.append("error", message=reason or f"permission denied: {kind}")
+
+    @staticmethod
+    def _minimum_policy_detail(category: str) -> str:
+        """Return the actionable policy for an ordinary denial category."""
+        return minimum_policy(category)
+
+    @staticmethod
+    def _missing_allow_detail(category: str, options: list[PermissionOption]) -> dict[str, Any]:
+        """Explain why a policy allow could not be represented by the options."""
+        has_allow = any(option.kind in {"allow_once", "allow_always"} for option in options)
+        minimum = PermissionLevel.ALL.value if has_allow else None
+        remedy = "pass --permissions all" if has_allow else "agent offered no allow option"
+        return {
+            "category": category,
+            "minimum_policy": minimum,
+            "remedy": remedy,
+        }
 
     def _authorize_existing_terminal(self, method: str, terminal_id: str) -> None:
         """Keep the terminal callbacks unsupported until terminal ownership exists."""

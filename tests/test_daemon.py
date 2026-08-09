@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from acpc import daemon, daemon_client, ipc, proc, runner, sessions, vocab
+from acpc import daemon, daemon_client, ipc, output, proc, runner, sessions, vocab
 from acpc.permissions import select_mode
 from acpc.registry import AgentRegistry
 
@@ -116,7 +116,9 @@ def test_a_rebuilt_turn_ignores_a_mode_fact_the_entry_gained_after_dispatch(
         MOCK_ENTRY.replace('mode = "default"', 'mode = "plan"'), encoding="utf-8"
     )
 
-    assert rebuild(payload).resolution.mode == "default"
+    rebuilt = rebuild(payload)
+    assert rebuilt.resolution.mode == "default"
+    assert rebuilt.resolution.entry.modes["yolo"].grants == "all"
 
 
 def test_a_mode_above_the_policy_reaching_the_daemon_fails_the_turn(state_root: Path) -> None:
@@ -202,6 +204,20 @@ def test_a_refused_switch_leaves_the_daemon_warm_for_continue(
     assert meta.state == "failed"
     assert meta.stop_reason == "permission_denied"
     assert meta.exit_code == vocab.EXIT_USAGE
+    assert meta.denial_details["switch_mode:yolo"] == {
+        "category": "switch_mode",
+        "target": "yolo",
+        "minimum_policy": "all",
+        "remedy": "pass --permissions all",
+    }
+    envelope = output.result_envelope(meta, sessions.answer_path(session_id).read_text())
+    assert envelope["denied"][-1] == {
+        "category": "switch_mode",
+        "target": "yolo",
+        "count": 1,
+        "minimum_policy": "all",
+        "remedy": "pass --permissions all",
+    }
     mode = meta.resolution["resolved"]["mode"]
     assert mode["value"] == "default"
     assert mode["grants"] == "read"
