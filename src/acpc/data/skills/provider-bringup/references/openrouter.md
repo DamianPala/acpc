@@ -16,7 +16,7 @@ passes through by name.
 extends = "claude"
 model = "deepseek/deepseek-v4-flash"   # ACP session option; enough on its own
 effort = "high"
-permissions = "write"
+permissions = "execute"
 home = "~/.claude-openrouter"
 env_passthrough = ["OPENROUTER_API_KEY"]
 
@@ -40,7 +40,7 @@ CLAUDE_CODE_MAX_CONTEXT_TOKENS = "1000000"
 extends = "codex"
 model = "gpt-5.6-luna"
 effort = "xhigh"
-permissions = "write"
+permissions = "execute"
 home = "~/.codex-openrouter"
 env_passthrough = ["OPENROUTER_API_KEY"]
 ```

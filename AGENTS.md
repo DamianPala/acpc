@@ -17,7 +17,7 @@
 
 ## Dispatching agents
 
-Implementation work dispatched to agent → installed `acpc` → `builder` registry variant — gpt-5.6-luna @ xhigh, `permissions execute`, already set up, works:
+Implementation work dispatched to agent → installed `acpc` → `builder` registry variant — gpt-5.6-luna @ xhigh, `permissions all` (agent-full-access; sandbox seccomp blocks test suite), already set up, works:
 
 ```bash
 acpc run builder --prompt-file <task-prompt.md> --cwd <this worktree>

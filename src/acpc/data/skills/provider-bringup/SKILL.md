@@ -138,7 +138,7 @@ Never `daemon stop` to fix something here: other sessions may be running.
 ```toml
 extends = "claude"
 description = "..."
-permissions = "write"
+permissions = "execute"
 model = "deepseek/deepseek-v4-flash"
 effort = "high"
 home = "~/.claude-openrouter"
