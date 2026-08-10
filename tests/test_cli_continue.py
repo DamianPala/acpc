@@ -494,16 +494,80 @@ def test_continue_rejects_an_adapter_without_load_session(
     result = invoke(cli, "continue", session_id, "turn two", "--quiet")
 
     assert result.exit_code == vocab.EXIT_AGENT_ERROR
-    assert "continue requires an adapter with the loadSession capability" in result.stderr
+    assert "continue requires an adapter that can restore a session" in result.stderr
+    assert "session/resume or session/load" in result.stderr
 
 
-def test_continue_cold_resume_does_not_replay_adapter_history(cli: CliRunner) -> None:
+def test_continue_cold_resume_does_not_replay_adapter_history(
+    cli: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     session_id = start_session(cli, "turn one of the conversation")
+    method_file = tmp_path / "session-method"
+    monkeypatch.setenv("ACPC_MOCK_SESSION_METHOD_FILE", str(method_file))
+    meta = sessions.load(session_id)
+    meta.adapter_session_id = "load-history"
+    with sessions.session_lock(session_id):
+        sessions.write_meta(meta)
 
     result = invoke(cli, "continue", session_id, "turn two", "--quiet")
 
     assert result.exit_code == vocab.EXIT_OK
-    assert "turn one of the conversation" not in result.stdout
+    answer = sessions.answer_path(session_id).read_text(encoding="utf-8")
+    assert method_file.read_text(encoding="utf-8") == "load\n"
+    assert not answer.startswith("history")
+    assert 'You asked: "turn two"' in answer
+
+
+def test_cold_load_resume_reapplies_model_and_effort(
+    cli: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    method_file = tmp_path / "session-method"
+    monkeypatch.setenv("ACPC_MOCK_SESSION_METHOD_FILE", str(method_file))
+    first = invoke(
+        cli,
+        "run",
+        "mock",
+        "settings",
+        "--model",
+        "mock-opus-5",
+        "--effort",
+        "xhigh",
+        "--quiet",
+        "--json",
+    )
+    session_id = json.loads(first.stdout)["session_id"]
+    meta = sessions.load(session_id)
+    meta.adapter_session_id = "load-history"
+    with sessions.session_lock(session_id):
+        sessions.write_meta(meta)
+
+    result = invoke(cli, "continue", session_id, "settings", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert method_file.read_text(encoding="utf-8") == "load\n"
+    answer = sessions.answer_path(session_id).read_text(encoding="utf-8")
+    assert "mock-opus-5/xhigh" in answer
+
+
+def test_cold_resume_prefers_session_resume_when_advertised(
+    cli: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    method_file = tmp_path / "session-method"
+    monkeypatch.setenv("ACPC_MOCK_ADVERTISE_RESUME", "1")
+    monkeypatch.setenv("ACPC_MOCK_SESSION_METHOD_FILE", str(method_file))
+    session_id = start_session(cli, "turn one")
+    meta = sessions.load(session_id)
+    meta.adapter_session_id = "load-history"
+    with sessions.session_lock(session_id):
+        sessions.write_meta(meta)
+
+    result = invoke(cli, "continue", session_id, "turn two", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert method_file.read_text(encoding="utf-8") == "resume\n"
+    answer = sessions.answer_path(session_id).read_text(encoding="utf-8")
+    assert not answer.startswith("history")
+    assert 'You asked: "turn two"' in answer
 
 
 def test_continue_by_name_uses_the_session_alias(cli: CliRunner) -> None:

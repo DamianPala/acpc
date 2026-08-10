@@ -22,6 +22,8 @@ from acp.schema import (
     ToolCallProgress,
     ToolCallStart,
     ToolCallUpdate,
+    UsageUpdate,
+    UserMessageChunk,
 )
 
 from acpc.client import AcpcClient
@@ -114,6 +116,95 @@ def test_answer_is_only_agent_messages_and_transcript_keeps_stream_order(
     assert events[0]["text"] == "private thought"
     assert events[1]["text"] == "firstsecond"
     assert "private thought" not in client.answer
+
+
+def test_replay_is_silent_and_collects_user_messages_without_flushing_pending_prose(
+    tmp_path: Path,
+) -> None:
+    client, transcript = _make_client(tmp_path, PermissionLevel.READ)
+
+    async def scenario() -> tuple[list[str], int]:
+        await client.session_update(
+            "adapter-session",
+            UsageUpdate(session_update="usage_update", used=7, size=100),
+        )
+        await client.session_update(
+            "adapter-session",
+            AgentMessageChunk(content=text_block("before"), session_update="agent_message_chunk"),
+        )
+        events_before = transcript.read()
+        async with client.replaying() as sink:
+            await client.session_update(
+                "adapter-session",
+                AgentMessageChunk(
+                    content=text_block("replayed answer"), session_update="agent_message_chunk"
+                ),
+            )
+            await client.session_update(
+                "adapter-session",
+                UserMessageChunk(
+                    content=text_block("first "),
+                    message_id="user-1",
+                    session_update="user_message_chunk",
+                ),
+            )
+            await client.session_update(
+                "adapter-session",
+                UserMessageChunk(
+                    content=text_block("message"),
+                    message_id="user-1",
+                    session_update="user_message_chunk",
+                ),
+            )
+            await client.session_update(
+                "adapter-session",
+                UserMessageChunk(
+                    content=text_block("second"),
+                    message_id="user-2",
+                    session_update="user_message_chunk",
+                ),
+            )
+            await client.session_update(
+                "adapter-session",
+                UserMessageChunk(
+                    content=text_block("anonymous "), session_update="user_message_chunk"
+                ),
+            )
+            await client.session_update(
+                "adapter-session",
+                UserMessageChunk(content=text_block("run"), session_update="user_message_chunk"),
+            )
+            await client.session_update(
+                "adapter-session",
+                AgentMessageChunk(
+                    content=text_block("separator"), session_update="agent_message_chunk"
+                ),
+            )
+            await client.session_update(
+                "adapter-session",
+                UserMessageChunk(
+                    content=text_block("new run"), session_update="user_message_chunk"
+                ),
+            )
+            await client.session_update(
+                "adapter-session",
+                UsageUpdate(session_update="usage_update", used=999, size=1000),
+            )
+        return sink.user_messages, events_before.next_cursor
+
+    messages, cursor_before = asyncio.run(scenario())
+    assert messages == ["first message", "second", "anonymous run", "new run"]
+    assert client.answer == "before"
+    assert client.tokens == 7
+    assert client.cost is None
+    events_after = transcript.read()
+    assert events_after.events == [
+        {"type": "usage", "tokens": 7, "cost": None, "ts": 100.0, "i": 1}
+    ]
+    assert events_after.next_cursor == cursor_before
+
+    client.flush()
+    assert transcript.read().events[1]["text"] == "before"
 
 
 def test_answer_keeps_interleaved_narration_and_excludes_tool_events(

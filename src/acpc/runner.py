@@ -76,14 +76,38 @@ def describe_error(error: BaseException) -> str:
 
 
 LOAD_SESSION_CAPABILITY_ERROR = (
-    "continue requires an adapter with the loadSession capability (ACP session/load)"
+    "continue requires an adapter that can restore a session (ACP session/resume or session/load)"
 )
 
 
 def require_load_session_capability(capabilities: Any) -> None:
     """Raise the user-facing error when an adapter cannot resume a session."""
-    if not getattr(capabilities, "load_session", False):
+    if not has_resume_session_capability(capabilities) and not getattr(
+        capabilities, "load_session", False
+    ):
         raise RunnerError(LOAD_SESSION_CAPABILITY_ERROR)
+
+
+def has_resume_session_capability(capabilities: Any) -> bool:
+    """Return whether initialize advertised ACP ``session/resume``."""
+    session_capabilities = getattr(capabilities, "session_capabilities", None)
+    return getattr(session_capabilities, "resume", None) is not None
+
+
+async def restore_adapter_session(
+    conn: Any, capabilities: Any, adapter_session_id: str, cwd: str
+) -> None:
+    """Restore an adapter session, preferring ``session/resume`` when offered."""
+    require_load_session_capability(capabilities)
+    request = {
+        "session_id": adapter_session_id,
+        "cwd": cwd,
+        "mcp_servers": [],
+    }
+    if has_resume_session_capability(capabilities):
+        await conn.resume_session(**request)
+    else:
+        await conn.load_session(**request)
 
 
 @dataclass(frozen=True, slots=True)
@@ -237,18 +261,19 @@ async def _drive_turn(
             initialize = await conn.initialize(protocol_version=PROTOCOL_VERSION)
 
             if request.resume_adapter_session is not None:
-                require_load_session_capability(getattr(initialize, "agent_capabilities", None))
                 adapter_session_id = request.resume_adapter_session
-                await conn.load_session(
-                    session_id=adapter_session_id,
-                    cwd=request.cwd or os.getcwd(),
-                    mcp_servers=[],
-                )
+                capabilities = getattr(initialize, "agent_capabilities", None)
+                async with client.replaying():
+                    await restore_adapter_session(
+                        conn, capabilities, adapter_session_id, request.cwd or os.getcwd()
+                    )
             else:
                 session = await conn.new_session(cwd=request.cwd or os.getcwd(), mcp_servers=[])
                 adapter_session_id = session.session_id
                 client.capture_advertised(session)
 
+            # After the restore, never before it: codex-acp#343 resets model and
+            # effort during session/load, so applying them first would be lost.
             await apply_call_options(conn, adapter_session_id, request)
 
             prompt_task = asyncio.create_task(

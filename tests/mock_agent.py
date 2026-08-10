@@ -88,11 +88,13 @@ from acp.schema import (
     PermissionOption,
     ResourceContentBlock,
     ResumeSessionResponse,
+    SessionCapabilities,
     SessionConfigOptionBoolean,
     SessionConfigOptionSelect,
     SessionConfigSelectOption,
     SessionMode,
     SessionModeState,
+    SessionResumeCapabilities,
     SetSessionConfigOptionResponse,
     SetSessionModeResponse,
     SseMcpServer,
@@ -233,9 +235,15 @@ class MockAgent(Agent):
         **kwargs: Any,
     ) -> InitializeResponse:
         self._initialized = True
+        capabilities = AgentCapabilities(load_session=True)
+        if os.environ.get("ACPC_MOCK_ADVERTISE_RESUME") == "1":
+            capabilities = AgentCapabilities(
+                load_session=True,
+                session_capabilities=SessionCapabilities(resume=SessionResumeCapabilities()),
+            )
         return InitializeResponse(
             protocol_version=protocol_version,
-            agent_capabilities=AgentCapabilities(load_session=True),
+            agent_capabilities=capabilities,
             agent_info=Implementation(name="mock-agent", title="Mock Agent", version="0.1.0"),
         )
 
@@ -330,6 +338,13 @@ class MockAgent(Agent):
     ) -> LoadSessionResponse | None:
         if not self._initialized:
             raise RuntimeError("initialize must run before session/load")
+        self._record_session_method("load")
+        # Vendor-faithful to codex-acp#343: session/load resets the session's
+        # model and effort to the adapter's defaults. acpc survives only because
+        # it re-applies both *after* restoring, so the reset has to be modelled
+        # here or that ordering is untested.
+        self._models.pop(session_id, None)
+        self._efforts.pop(session_id, None)
         if session_id == "load-fail":
             raise RuntimeError("load failed")
         if session_id not in self._sessions:
@@ -791,8 +806,18 @@ class MockAgent(Agent):
         | None = None,
         **kwargs: Any,
     ) -> ResumeSessionResponse:
+        self._record_session_method("resume")
         self._session_cwds[session_id] = Path(cwd)
         return ResumeSessionResponse()
+
+    @staticmethod
+    def _record_session_method(method: str) -> None:
+        path = os.environ.get("ACPC_MOCK_SESSION_METHOD_FILE")
+        if path:
+            # Append, so a test that expects exactly one restore can see a
+            # second one rather than have it overwrite the first.
+            with Path(path).open("a", encoding="utf-8") as handle:
+                handle.write(f"{method}\n")
 
     async def authenticate(self, method_id: str, **kwargs: Any) -> AuthenticateResponse | None:
         return AuthenticateResponse()
@@ -805,7 +830,9 @@ class MockAgent(Agent):
 
 
 async def main() -> None:
-    await run_agent(MockAgent())
+    await run_agent(
+        MockAgent(), use_unstable_protocol=os.environ.get("ACPC_MOCK_ADVERTISE_RESUME") == "1"
+    )
 
 
 if __name__ == "__main__":

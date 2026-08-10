@@ -291,6 +291,53 @@ def test_a_cold_resume_cannot_recover_what_the_adapter_forgot(state_root: Path) 
     assert "turn one of the conversation" not in answer
 
 
+def test_a_daemon_cold_resume_consumes_replayed_history_silently(
+    state_root: Path, live_daemon: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    method_file = tmp_path / "session-method"
+    monkeypatch.setenv("ACPC_MOCK_SESSION_METHOD_FILE", str(method_file))
+    session_id = new_session("turn one of the conversation")
+    run_turn(session_id, "turn one of the conversation")
+    asyncio.run(_stop_target())
+
+    meta = sessions.read_meta(session_id)
+    meta.adapter_session_id = "load-history"
+    with sessions.session_lock(session_id):
+        sessions.write_meta(meta)
+
+    next_turn(session_id, "turn two, please build on turn one")
+
+    answer = sessions.answer_path(session_id).read_text(encoding="utf-8")
+    assert method_file.read_text(encoding="utf-8") == "load\n"
+    assert not answer.startswith("history")
+    assert 'You asked: "turn two, please build on turn one"' in answer
+    events = sessions.transcript_path(session_id).read_text(encoding="utf-8").splitlines()
+    assert not any('"text": "history"' in line for line in events)
+
+
+def test_a_daemon_cold_resume_prefers_session_resume(
+    state_root: Path, live_daemon: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    method_file = tmp_path / "session-method"
+    monkeypatch.setenv("ACPC_MOCK_ADVERTISE_RESUME", "1")
+    monkeypatch.setenv("ACPC_MOCK_SESSION_METHOD_FILE", str(method_file))
+    session_id = new_session("turn one")
+    run_turn(session_id, "turn one")
+    asyncio.run(_stop_target())
+
+    meta = sessions.read_meta(session_id)
+    meta.adapter_session_id = "load-history"
+    with sessions.session_lock(session_id):
+        sessions.write_meta(meta)
+
+    next_turn(session_id, "turn two")
+
+    answer = sessions.answer_path(session_id).read_text(encoding="utf-8")
+    assert method_file.read_text(encoding="utf-8") == "resume\n"
+    assert not answer.startswith("history")
+    assert 'You asked: "turn two"' in answer
+
+
 # --- stopping ---------------------------------------------------------------
 
 

@@ -4,7 +4,8 @@ import asyncio
 import inspect
 import json
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,7 @@ from acp.schema import (
     ToolCallProgress,
     ToolCallStart,
     UsageUpdate,
+    UserMessageChunk,
     WaitForTerminalExitResponse,
     WriteTextFileResponse,
 )
@@ -85,6 +87,48 @@ class _PendingChunks:
     last_at: float
 
 
+class ReplaySink:
+    """Collect user messages delivered while an adapter restores a session.
+
+    The collected messages are what verified resume compares against the
+    session's stored `prompt.md`/`prompt.<n>.md`, as an ordered subsequence.
+    Until that check ships, the sink's job is only to keep replay out of the
+    turn: nothing in production reads `user_messages` yet.
+    """
+
+    def __init__(self) -> None:
+        self._messages: list[str] = []
+        self._message_indices: dict[str, int] = {}
+        self._anonymous_message_index: int | None = None
+
+    @property
+    def user_messages(self) -> list[str]:
+        """Return replayed user messages in their first-seen order."""
+        return list(self._messages)
+
+    def consume(self, update: Any) -> None:
+        if not isinstance(update, UserMessageChunk):
+            self._anonymous_message_index = None
+            return
+        text = getattr(update.content, "text", None)
+        if not isinstance(text, str):
+            return
+        message_id = getattr(update, "message_id", None)
+        if isinstance(message_id, str) and message_id:
+            message_index = self._message_indices.get(message_id)
+            if message_index is None:
+                message_index = len(self._messages)
+                self._message_indices[message_id] = message_index
+                self._messages.append("")
+            self._messages[message_index] += text
+            self._anonymous_message_index = None
+            return
+        if self._anonymous_message_index is None:
+            self._anonymous_message_index = len(self._messages)
+            self._messages.append("")
+        self._messages[self._anonymous_message_index] += text
+
+
 class AcpcClient:
     """Implement the ACP client callbacks used by a single session turn.
 
@@ -120,6 +164,7 @@ class AcpcClient:
         self._cost: float | None = None
         self._denied: dict[str, int] = {}
         self._denial_details: dict[str, dict[str, Any]] = {}
+        self._replay_sink: ReplaySink | None = None
         self._advertised: dict[str, Any] = {
             "modes": [],
             "models": [],
@@ -168,6 +213,22 @@ class AcpcClient:
         ]
         self._advertised["models"] = self._models_from_options(session.config_options or [])
 
+    @asynccontextmanager
+    async def replaying(self) -> AsyncIterator[ReplaySink]:
+        """Consume session-restore updates without changing turn-visible state."""
+        previous = self._replay_sink
+        sink = ReplaySink()
+        self._replay_sink = sink
+        try:
+            yield sink
+        finally:
+            try:
+                # ACP dispatches notifications in background tasks. Let the
+                # ordered replay callbacks run before releasing the guard.
+                await asyncio.sleep(0)
+            finally:
+                self._replay_sink = previous
+
     def on_connect(self, conn: Any) -> None:
         """Satisfy the ACP connection hook; no client-side setup is needed."""
         del conn
@@ -206,6 +267,9 @@ class AcpcClient:
     async def session_update(self, session_id: str, update: Any, **kwargs: Any) -> None:
         """Record one ACP session update in the public transcript format."""
         del session_id, kwargs
+        if self._replay_sink is not None:
+            self._replay_sink.consume(update)
+            return
         update_type = getattr(update, "session_update", None)
 
         if update_type == "agent_message_chunk" and isinstance(update, AgentMessageChunk):

@@ -668,11 +668,18 @@ class Daemon:
             # adapter treat the turn as a resume and lose that continuity.
             adapter_session_id = warm
         elif request.resume_adapter_session is not None:
-            runner.require_load_session_capability(self.host.agent_capabilities)
             adapter_session_id = request.resume_adapter_session
-            await conn.load_session(
-                session_id=adapter_session_id, cwd=request.cwd or os.getcwd(), mcp_servers=[]
-            )
+            self.host.mux.bind(adapter_session_id, client)
+            try:
+                async with client.replaying():
+                    await runner.restore_adapter_session(
+                        conn,
+                        self.host.agent_capabilities,
+                        adapter_session_id,
+                        request.cwd or os.getcwd(),
+                    )
+            finally:
+                self.host.mux.release(adapter_session_id)
         else:
             session = await conn.new_session(cwd=request.cwd or os.getcwd(), mcp_servers=[])
             adapter_session_id = session.session_id
