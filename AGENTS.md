@@ -23,7 +23,7 @@ Implementation work dispatched to agent → installed `acpc` → `builder` regis
 acpc run builder --prompt-file <task-prompt.md> --cwd <this worktree>
 ```
 
-- **Reviews = Opus** — orchestrator itself or Opus subagent, never registry `reviewer` variant (different stack).
+- **Reviews = registry `reviewer` variant** via `acpc run reviewer --prompt-file <prompt>` (convention since 2026-08-10). Same isolated-root dispatch shape as builder.
 - Specs + long prompts via `--prompt-file`, never positional arg. Argv visible in `ps`/`/proc/*/cmdline`; on 2026-08-04 dispatch got SIGKILLed — spec text in argv matched cleanup helper's `pgrep -f` pattern.
 - Select provider/home by naming registry variant; never export `CODEX_HOME`/`CLAUDE_CONFIG_DIR` around dispatch. Daemons keyed on entry's declared environment, not ambient env — exporting home binds wrong provider into shared daemon.
 
