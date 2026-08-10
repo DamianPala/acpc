@@ -1208,10 +1208,11 @@ if begin_section S12-cli "help contract, -V, TTY rules, hostile inputs"; then
     HELP_MAIN="$LAST_OUT"
     HELP_LINES=$(wc -l <<<"$HELP_MAIN")
     assert_true "--help is <= 100 lines" "$((HELP_LINES <= 100 ? 0 : 1))"
-    assert_contains "cheat sheet has a write-task example with --permissions write" \
-        "$HELP_MAIN" "--permissions write"
+    assert_contains "cheat sheet has an execute-task example with --permissions execute" \
+        "$HELP_MAIN" "--permissions execute"
     assert_contains "cheat sheet ends with a flag -> ACP mapping" "$HELP_MAIN" "request_permission"
-    assert_contains "cheat sheet explains write permissions" "$HELP_MAIN" "write (= edit + execute)"
+    assert_contains "cheat sheet explains execute permissions" \
+        "$HELP_MAIN" "execute permits read, edit and execute"
     for group in "Short task" "Long or uncertain task" "Checking on a run" \
         "Steering a running session" "Context care" "Maintenance and setup" "Common commands"; do
         assert_contains "cheat sheet groups by task: '$group'" "$HELP_MAIN" "$group"
@@ -1231,7 +1232,8 @@ if begin_section S12-cli "help contract, -V, TTY rules, hostile inputs"; then
     assert_true "run --help is its own reference, not the root page" \
         "$([[ "$LAST_OUT" != "$HELP_MAIN" ]] && echo 0 || echo 1)"
     assert_contains "run --help documents --max-output" "$LAST_OUT" "--max-output"
-    assert_contains "run --help explains write permissions" "$LAST_OUT" "write (= edit + execute)"
+    assert_contains "run --help explains execute permissions" \
+        "$LAST_OUT" "execute permits read, edit and execute"
     run_acpc log --help
     assert_contains "log --help documents --wait-new" "$LAST_OUT" "--wait-new"
     assert_contains "log --help documents --follow" "$LAST_OUT" "--follow"
@@ -1332,7 +1334,7 @@ base = ["uv", "run", "--project", project, "acpc"]
 try:
     rc, out = run_in_pty(base + ["run", "mock", "pty dry run check", "--dry-run"])
     report("pty_dry_run_exit0", rc == 0, f"rc={rc}")
-    report("pty_permissions_default_prompt", "prompt" in out, out[-300:])
+    report("pty_permissions_default_ask", "ask" in out, out[-300:])
 except Exception as exc:  # pty is platform-sensitive; skip, don't fail
     print(f"PTY_SKIP {exc!r}")
 PYEOF

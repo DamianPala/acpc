@@ -14,7 +14,7 @@ acpc is built for a specific primary user: **another agent calling it through a 
 
 ```bash
 # 90% of usage is this:
-acpc run codex "fix the failing test in tests/test_auth.py" --cwd ~/repo --permissions write
+acpc run codex "fix the failing test in tests/test_auth.py" --cwd ~/repo --permissions execute
 
 # Background + collect later. --bg prints the session id, then its dir:
 acpc run codex "run the full suite and summarize" --bg
@@ -24,7 +24,7 @@ acpc wait x7k2
 acpc continue x7k2 "now apply the same fix to the v2 API"
 
 # Long prompts via heredoc:
-acpc run claude - --permissions write <<'PROMPT'
+acpc run claude - --permissions execute <<'PROMPT'
 Review the implementation against SPEC.md and make the required edits.
 PROMPT
 ```
@@ -81,23 +81,24 @@ $ acpc log x7k2 --since 42
 
 ## Permissions
 
-`--permissions all|write|read|none|prompt` decides how acpc answers ACP permission requests, classified by tool-call kind. Default: `prompt` on a TTY, `read` otherwise (`--bg` counts as non-TTY).
+`--permissions none|read|edit|execute|all|ask` names a ceiling for ACP permission requests, classified by tool-call kind. `ask` is off the scale: reads are allowed and other categories ask on `/dev/tty`. Default: `ask` on a TTY, `read` otherwise (`--bg` counts as non-TTY). `write` and `prompt` remain accepted as deprecated aliases for `execute` and `ask`.
 
-Two edges worth internalizing:
+Three edges worth internalizing:
 
-- **The non-TTY default is a silent read-only trap.** A caller that passes no `--permissions` gets a read-only callee — write requests are denied without an error and the turn exits 0. Pass `--permissions write` whenever the task should modify anything.
-- **This is an approval policy, not a sandbox.** It answers the requests the adapter emits; it cannot stop an adapter that never asks. Concretely: codex's default `agent` mode auto-allows edits inside the workspace without asking, so a policy below `all` only bites in its `read-only` mode. A vendor mode that suppresses requests entirely (`agent-full-access`) is rejected at resolution time unless `--permissions all`, whether it came from `--mode` or an entry. A real boundary means confining the adapter itself: a container, a dedicated user, or the vendor's own sandbox.
+- **The non-TTY default is a silent read-only trap.** A caller that passes no `--permissions` gets a read-only callee — write requests are denied without an error and the turn exits 0. Pass `edit` for file changes, or `execute` when the task must also run commands.
+- **The policy selects the vendor mode.** Adapter `[modes]` tables measure each mode's `grants` and whether it `delegates`; acpc always sends `session/set_mode`, and refuses a mode that grants more than the policy. An advertised mode missing from `[modes]` is admitted only under `all`. `--mode` is normally unnecessary, but an explicit value is checked by the same ceiling and comes from `acpc agents <name>`.
+- **This is an approval policy, not a sandbox.** It answers the requests the adapter emits; a delegating mode can still classify some work as safe and emit no request. A real boundary means confining the adapter itself: a container, a dedicated user, or the vendor's own sandbox.
 
 ## Agent variants
 
-A named TOML entry bundles model, effort, mode, permissions, home and environment, so `run builder "task"` replaces five flags:
+A named TOML entry bundles model, effort, permissions, an optional mode override, home and environment, so `run builder "task"` replaces five flags:
 
 ```toml
 # ~/.acpc/agents/builder.toml — hand-editable; `agents init` scaffolds this
 extends = "codex"
 model = "gpt-5.6-luna"
 effort = "xhigh"
-permissions = "write"
+permissions = "execute"
 home = "~/.codex-openrouter"
 env_passthrough = ["OPENROUTER_API_KEY"]   # names read from the caller's env, never stored
 

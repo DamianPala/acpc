@@ -101,6 +101,7 @@ Quick reference
 Short task (fits your tool-call window — blocks, answer on stdout):
   acpc run <agent> "Explain this code"
   acpc run <agent> "Implement the fix" --permissions execute
+  execute permits read, edit and execute; edit permits read and edit only
   Dispatch prints `-- session <id> | dir <path>` on stderr right away:
   the id works mid-run with log / stop / steer.
 
@@ -154,8 +155,9 @@ Common commands:
 
 Flag → ACP
   --mode         → session/set_mode
-  --permissions  → request_permission
+  --permissions  → session/set_mode + request_permission
                    none · read · edit · execute · all · ask
+                   execute permits read, edit and execute
                    write and prompt are deprecated aliases for execute and ask
   --model        → session/new (model)
   --effort       → session/new (effort)"""
@@ -1539,6 +1541,7 @@ def stop_command(selector: str, json_mode: bool) -> None:
 
     Stopping an already-finished session is a successful no-op that
     reports the state it found; an unknown id is a usage error.
+    A session stopped this way is finished and can resume with ``acpc continue``.
 
     Example: ``acpc stop q7x2``
     """
@@ -2080,14 +2083,18 @@ def _still_running_note(session_id: str, timeout: float | None) -> str:
     type=click.Choice(_PERMISSION_CHOICES),
     help=(
         "\b\n"
-        "Approval policy: none, read, edit, execute, all or ask; absent, ask on a TTY and "
-        "read otherwise. write and prompt are deprecated aliases for execute and ask."
+        "Permission scale: none, read, edit, execute, all or ask; absent, ask on a TTY and "
+        "read otherwise (--bg counts as non-TTY). execute permits read, edit and execute; "
+        "write and prompt are deprecated aliases for execute and ask."
     ),
 )
 @click.option(
     "--mode",
     metavar="M",
-    help="Callee's operating mode (ACP session/set_mode); overrides the entry's mode.",
+    help=(
+        "Vendor mode override; normally unnecessary because --permissions selects the mode. "
+        "Refused when it grants more than the policy; values from agents <name>."
+    ),
 )
 @click.option("--home", metavar="DIR", help="Vendor home override.")
 @click.option("-o", "--output", "output_file", metavar="FILE", help="Write the answer to a file.")
@@ -2298,8 +2305,11 @@ def _dispatch_background(session_id: str, request: runner.TurnRequest, *, json_m
     type=click.Choice(_PERMISSION_CHOICES),
     metavar="P",
     help=(
-        "Permission policy for this and later turns: none, read, edit, execute, all or ask; "
-        "write and prompt are deprecated aliases."
+        "Permission scale for this and later turns: none, read, edit, execute, all or ask; "
+        "the run default is ask on a TTY and read otherwise (--bg counts as non-TTY). "
+        "Without this flag, continue reuses its stored policy. write and prompt are "
+        "deprecated aliases for execute and ask; --permissions re-runs mode selection against "
+        "the adapter's current [modes]."
     ),
 )
 @click.option("--bg", "background", is_flag=True, help="Dispatch and return the session id.")
@@ -2334,7 +2344,11 @@ def _dispatch_background(session_id: str, request: runner.TurnRequest, *, json_m
     "--mode",
     metavar="M",
     hidden=True,
-    help="Run-only operating mode; continue reuses the stored mode.",
+    help=(
+        "Run-only vendor mode override; normally unnecessary because --permissions selects "
+        "the mode. On run, refused when it grants more than the policy; values from "
+        "agents <name>."
+    ),
 )
 @click.option(
     "--cwd",
@@ -2377,6 +2391,11 @@ def continue_command(
     dry_run: bool,
 ) -> None:
     """Continue a finished session using its stored adapter resolution.
+
+    A session cancelled by ``stop`` is the pause/resume path; its adapter context is
+    preserved for ``continue``.
+    On ``run``, ``--mode`` is normally unnecessary because ``--permissions`` selects it;
+    a mode granting more than the policy is refused, and values come from ``agents <name>``.
 
     Example: ``acpc continue <session-id> "Run the tests again"``
     """
