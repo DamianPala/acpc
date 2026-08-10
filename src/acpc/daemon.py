@@ -448,6 +448,7 @@ class Daemon:
     def _status(self) -> dict[str, Any]:
         return {
             "ok": True,
+            "version": __version__,
             "target": self.target,
             "pid": os.getpid(),
             "uptime": time.time() - self.started_at,

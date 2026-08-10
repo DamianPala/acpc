@@ -182,3 +182,24 @@ def test_summary_is_one_prefixed_stderr_line() -> None:
     assert "exit 0" in line
     assert "41k tok" in line
     assert f"dir {sessions.session_dir(meta.session_id)}" in line
+    assert f"continue: acpc continue {meta.session_id}" in line
+
+
+def test_summary_places_continue_command_before_route_note() -> None:
+    meta = make_session(Path("."))
+    meta = sessions.transition(
+        meta.session_id,
+        "done",
+        clock=lambda: 112.0,
+        exit_code=0,
+        stop_reason="end_turn",
+    )
+
+    segments = output.format_summary(
+        meta, runtime=12.0, route_note="queued for a daemon slot"
+    ).split(" | ")
+
+    assert segments[-2:] == [
+        f"continue: acpc continue {meta.session_id}",
+        "queued for a daemon slot",
+    ]

@@ -141,8 +141,8 @@ Context care (agent callers):
   Every --timeout takes seconds (90) or a duration (90s, 5m, 1h).
 
 Maintenance and setup:
-  status            all sessions
-  stop <id>         cancel a running session
+  status            running + the 5 most recent finished (--all for every session)
+  stop <id>         stop a running session; it stays resumable with continue
   rm <id>           delete a finished session's on-disk state
   prune             delete finished sessions older than retention (--older-than D)
   install <agent>   install the agent's adapter
@@ -1537,11 +1537,13 @@ def _maintenance_json(payload: Mapping[str, Any]) -> None:
 @click.option("--json", "json_mode", is_flag=True, help="Emit the result as JSON.")
 @click.help_option("-h", "--help")
 def stop_command(selector: str, json_mode: bool) -> None:
-    """Cancel a running session (ACP session/cancel).
+    """Stop a running session; it stays resumable with ``acpc continue``.
 
-    Stopping an already-finished session is a successful no-op that
-    reports the state it found; an unknown id is a usage error.
-    A session stopped this way is finished and can resume with ``acpc continue``.
+    Cancels the turn in flight (ACP ``session/cancel``) and waits up to 10s for the
+    ack; past that the connection is torn down anyway. Transcript, meta and the
+    partial answer stay on disk for post-mortem. Stopping an already-finished
+    session is a successful no-op that reports the state it found; an unknown id is
+    a usage error.
 
     Example: ``acpc stop q7x2``
     """
@@ -1593,7 +1595,13 @@ def rm_command(selector: str, json_mode: bool) -> None:
 @click.option("--json", "json_mode", is_flag=True, help="Emit the result as JSON.")
 @click.help_option("-h", "--help")
 def prune_command(older_than: str | None, dry_run: bool, json_mode: bool) -> None:
-    """Delete finished sessions older than the configured retention period.
+    """Delete finished sessions older than the retention period.
+
+    Bare ``prune`` uses the ``retention`` key in the global config
+    (``~/.acpc/config.toml``, default 90d; ``ACPC_HOME`` moves the root) — it is
+    never "delete everything". ``--older-than`` overrides it for this call, and
+    deleting every finished session takes an explicit ``--older-than 0d``. Age is
+    measured from when the session finished. Running sessions are never touched.
 
     Example: ``acpc prune --older-than 7d --dry-run``
     """
@@ -1693,11 +1701,21 @@ def _read_transcript_page(
 
 @main.command(name="status")
 @click.argument("selector", required=False)
-@click.option("--all", "all_sessions", is_flag=True, help="Show every session.")
+@click.option(
+    "--all",
+    "all_sessions",
+    is_flag=True,
+    help="Show every session, not just running + the 5 most recent finished.",
+)
 @click.option("--json", "json_mode", is_flag=True, help="Emit a JSON status object.")
 @click.help_option("-h", "--help")
 def status_command(selector: str | None, all_sessions: bool, json_mode: bool) -> None:
     """Show liveness-verified session metadata without reading transcripts.
+
+    With no id and no ``--all``: every running session plus the 5 most recent
+    finished ones. With an id: that session's vitals. State is verified against the
+    process behind it, so a ``running`` session whose process is gone reads
+    ``orphaned`` rather than a stale ``running``.
 
     Example: ``acpc status <session-id> --json``
     """
@@ -2081,6 +2099,7 @@ def _still_running_note(session_id: str, timeout: float | None) -> str:
 @click.option(
     "--permissions",
     type=click.Choice(_PERMISSION_CHOICES),
+    metavar="P",
     help=(
         "\b\n"
         "Permission scale: none, read, edit, execute, all or ask; absent, ask on a TTY and "
@@ -2392,10 +2411,11 @@ def continue_command(
 ) -> None:
     """Continue a finished session using its stored adapter resolution.
 
-    A session cancelled by ``stop`` is the pause/resume path; its adapter context is
-    preserved for ``continue``.
-    On ``run``, ``--mode`` is normally unnecessary because ``--permissions`` selects it;
-    a mode granting more than the policy is refused, and values come from ``agents <name>``.
+    Model, effort, mode, permissions and home come from the session, not from
+    re-resolving the agent entry — editing an entry never changes a session
+    mid-conversation. A session cancelled by ``stop`` is the pause/resume path; its
+    adapter context is preserved. ``--permissions`` is the one ``run`` resolution
+    flag ``continue`` accepts: it applies to this turn and every turn after it.
 
     Example: ``acpc continue <session-id> "Run the tests again"``
     """
@@ -2612,7 +2632,9 @@ def steer_command(
 
     Cancels the turn in flight (ACP session/cancel), waits for the ack, then
     starts the next turn with the instruction under a fixed preamble. The
-    interrupted turn's partial answer is kept as that turn's answer file.
+    interrupted turn's partial answer is kept as that turn's answer file. A
+    finished session is a usage error: there is no turn to interrupt, and the
+    follow-up verb for it is ``acpc continue``.
 
     Example: ``acpc steer x7k2 "Stop editing; diagnose only"``
     """
@@ -2653,7 +2675,7 @@ def steer_command(
     type=TimeoutParamType(allow_zero=True),
     default=None,
     metavar="S",
-    help="Stop waiting after this duration; absent, it blocks indefinitely.",
+    help="Stop waiting after this duration (exit 124; the session keeps running); absent, it blocks indefinitely.",
 )
 @click.option("-o", "--output", "output_file", metavar="FILE", help="Write the answer to a file.")
 @click.option(
@@ -2675,6 +2697,11 @@ def wait_command(
     json_mode: bool,
 ) -> None:
     """Block until a background session finishes, then print its answer.
+
+    The exit code mirrors the session result. On an already-finished session it
+    returns immediately — the free way to reprint an answer. ``--timeout`` stops
+    the waiting only and exits 124: the session keeps running, unlike ``run --timeout``,
+    which cancels it.
 
     Example: ``acpc wait <session-id> --timeout 120``
     """
@@ -2732,7 +2759,7 @@ def daemon_group() -> None:
 @click.option("--json", "json_mode", is_flag=True, help="Emit the status as JSON.")
 @click.help_option("-h", "--help")
 def daemon_status_command(agent: str | None, json_mode: bool) -> None:
-    """Report each live daemon with its pid, uptime, idle age and log path.
+    """Report each live daemon with its acpc version, pid, uptime, idle age and log path.
 
     Example: ``acpc daemon status --json``
     """
@@ -2750,6 +2777,7 @@ def daemon_status_command(agent: str | None, json_mode: bool) -> None:
     rows = [
         (
             str(item["target"]),
+            f"acpc {item['version']}",
             f"pid {item['pid']}",
             f"up {output.format_duration(item['uptime'])}",
             f"· {_daemon_idle_column(item['idle_seconds'])}",

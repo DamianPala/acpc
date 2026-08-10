@@ -16,7 +16,7 @@ import pytest
 from click.testing import CliRunner
 
 import acpc.cli as cli_module
-from acpc import daemon, daemon_client, proc, runner, sessions, vocab
+from acpc import __version__, daemon, daemon_client, proc, runner, sessions, vocab
 from acpc.cli import main
 from acpc.registry import AgentRegistry
 
@@ -192,6 +192,20 @@ def test_daemon_status_idle_age_grows_between_clock_reads(
 
     assert "idle 0m10s" in _daemon_status_line(first, target)
     assert "idle 0m20s" in _daemon_status_line(second, target)
+
+
+def test_daemon_status_renders_the_acpc_version(cli: CliRunner, live_daemon: None) -> None:
+    target = _target()
+    _start_daemon(target)
+
+    text_result = invoke(cli, "daemon", "status", "mock")
+    json_result = invoke(cli, "daemon", "status", "mock", "--json")
+    row = _daemon_status_line(text_result, target)
+    entry = json.loads(json_result.stdout)["daemons"][0]
+
+    assert row.startswith(f"{target}  acpc {__version__}  pid ")
+    assert row.count(f"acpc {__version__}") == 1
+    assert entry["version"] == __version__
 
 
 def test_daemon_status_aligns_rows_without_a_header(

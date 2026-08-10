@@ -80,6 +80,14 @@ def test_root_help_is_a_compact_cheat_sheet(runner: CliRunner) -> None:
     assert len(result.stdout.splitlines()) <= 100
     assert "--permissions execute" in result.stdout
     assert "request_permission" in result.stdout
+    assert (
+        "status            running + the 5 most recent finished (--all for every session)"
+        in result.stdout
+    )
+    assert (
+        "stop <id>         stop a running session; it stays resumable with continue"
+        in result.stdout
+    )
 
 
 def test_permission_help_names_the_tier_gloss(runner: CliRunner) -> None:
@@ -158,6 +166,55 @@ def test_help_names_behavioral_defaults_and_global_output_default(runner: CliRun
     assert "[default: 131072" in run_help
     assert "[default: 131072" in wait_help
     assert "[default: 131072" in log_help
+
+
+def test_help_explains_session_lifecycle_and_retention(runner: CliRunner) -> None:
+    def normalized(text: str) -> str:
+        return " ".join(text.split()).replace("mid- conversation", "mid-conversation")
+
+    stop_help = normalized(invoke(runner, "stop", "--help").stdout)
+    status_help = normalized(invoke(runner, "status", "--help").stdout)
+    wait_help = normalized(invoke(runner, "wait", "--help").stdout)
+    continue_help = normalized(invoke(runner, "continue", "--help").stdout)
+    steer_help = normalized(invoke(runner, "steer", "--help").stdout)
+    prune_help = normalized(invoke(runner, "prune", "--help").stdout)
+
+    assert "Stop a running session; it stays resumable with ``acpc continue``." in stop_help
+    assert "Cancels the turn in flight (ACP ``session/cancel``)" in stop_help
+    assert "Show every session, not just running + the 5 most recent finished." in status_help
+    assert (
+        "With no id and no ``--all``: every running session plus the 5 most recent finished ones."
+        in status_help
+    )
+    assert (
+        "Stop waiting after this duration (exit 124; the session keeps running); absent, it blocks indefinitely."
+        in wait_help
+    )
+    assert "The exit code mirrors the session result." in wait_help
+    assert "the free way to reprint an answer." in wait_help
+    assert "editing an entry never changes a session mid-conversation." in continue_help
+    assert (
+        "``--permissions`` is the one ``run`` resolution flag ``continue`` accepts" in continue_help
+    )
+    assert "A finished session is a usage error: there is no turn to interrupt" in steer_help
+    assert "the follow-up verb for it is ``acpc continue``." in steer_help
+    assert (
+        "the ``retention`` key in the global config (``~/.acpc/config.toml``, default 90d; ``ACPC_HOME`` moves the root)"
+        in prune_help
+    )
+    assert "deleting every finished session takes an explicit ``--older-than 0d``." in prune_help
+
+
+def test_run_help_uses_a_neutral_permission_metavar(runner: CliRunner) -> None:
+    result = invoke(runner, "run", "--help")
+
+    option_line = next(
+        line for line in result.stdout.splitlines() if line.lstrip().startswith("--permissions")
+    )
+    option_usage = option_line.strip().split("  ", maxsplit=1)[0]
+    assert option_usage == "--permissions P"
+    assert "write" not in option_usage
+    assert "prompt" not in option_usage
 
 
 def test_run_help_is_a_distinct_reference_page(runner: CliRunner) -> None:

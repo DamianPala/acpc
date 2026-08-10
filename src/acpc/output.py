@@ -334,6 +334,7 @@ def format_summary(
     if denied := _denied_summary(meta):
         parts.append(denied)
     parts.extend(_session_segments(meta))
+    parts.append(f"continue: acpc continue {meta.session_id}")
     if route_note:
         parts.append(route_note)
     return "-- " + " | ".join(parts)
