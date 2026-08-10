@@ -24,7 +24,7 @@ from acpc.vocab import EFFORT_VALUES, PERMISSION_ALIASES, PERMISSION_VALUES, nor
 
 _TIERS: Final = frozenset({"fast", "standard", "max"})
 _NON_INHERITABLE_FIELDS: Final = frozenset({"description"})
-_MODE_KEYS: Final = frozenset({"grants", "delegates"})
+_MODE_KEYS: Final = frozenset({"grants", "delegates", "escalates"})
 _MODE_GRANTS: Final = frozenset(PERMISSION_VALUES[:-1])
 _ENTRY_KEYS: Final = frozenset(
     {
@@ -101,6 +101,7 @@ class ModeSpec:
 
     grants: str
     delegates: bool
+    escalates: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -490,6 +491,8 @@ def _parse_entry(
                 raise RegistryError(f"{path}: [modes.{mode}] requires delegates")
             if not isinstance(spec["delegates"], bool):
                 raise RegistryError(f"{path}: [modes.{mode}].delegates must be a boolean")
+            if "escalates" in spec and not isinstance(spec["escalates"], bool):
+                raise RegistryError(f"{path}: [modes.{mode}].escalates must be a boolean")
 
     if not allow_partial and "command" not in raw and "extends" not in raw:
         raise RegistryError(f"{path}: an entry must define 'command' or 'extends'")
@@ -554,6 +557,7 @@ def _to_resolved(
         modes[mode] = ModeSpec(
             grants=str(raw_mode["grants"]),
             delegates=bool(raw_mode["delegates"]),
+            escalates=bool(raw_mode.get("escalates", False)),
         )
 
     def string_or_none(key: str) -> str | None:
@@ -694,7 +698,11 @@ class AgentRegistry:
                 for tier, item in parent.presets.items()
             }
             parent_data["modes"] = {
-                mode: {"grants": spec.grants, "delegates": spec.delegates}
+                mode: {
+                    "grants": spec.grants,
+                    "delegates": spec.delegates,
+                    "escalates": spec.escalates,
+                }
                 for mode, spec in parent.modes.items()
             }
             parent_data["env"] = dict(parent.env)

@@ -59,9 +59,9 @@ run measured `head` instead of acpc. Capture the code before piping.
 | # | Do | Expect |
 |---|---|---|
 | A1 | `acpc agents` | Every adapter with install status. On a fresh `ACPC_HOME` there are no variants yet, so no variant rows and no header — the header appears at B4, once a variant exists |
-| A2 | `acpc agents codex` | Resolved model, effort, permissions, home, each with provenance; a `modes` line naming every mode's `grants`, with a ` · delegates` marker on any mode that delegates (on codex none do, so the marker is absent everywhere — that is the pass) |
+| A2 | `acpc agents codex` | Resolved model, effort, permissions, home, each with provenance; a `modes` line naming every mode's `grants`, plus a ` · delegates` marker on any mode that delegates and a ` · escalates` marker on any that escalates. On codex none delegate, so that marker is absent everywhere, and only `read-only` carries `escalates` — both are the pass |
 | A3 | `acpc run codex "x" --dry-run` | Exit 2: the non-TTY default `read` fits no codex mode, and the error names the adapter's declared modes. This is the real first-contact experience, not a defect |
-| A4 | `acpc run codex "x" --permissions edit --dry-run` | Full resolution, including the mode line naming why that mode was selected and whether it delegates |
+| A4 | `acpc run codex "x" --permissions edit --dry-run` | Full resolution, including the mode line naming why that mode was selected, whether it delegates, and whether it escalates (`read-only … · vendor-decided · escalates`) |
 | A5 | `acpc run codex "x" --permissions prompt --dry-run` | A one-time deprecation warning naming `ask`, then `ask` on non-TTY is a usage error listing the alternatives |
 | A6 | `acpc run codex "x" --help` and `acpc --help` | Defaults stated as rules where they depend on the caller; the usage line for `--permissions` does not offer `write`/`prompt` as first-class choices |
 

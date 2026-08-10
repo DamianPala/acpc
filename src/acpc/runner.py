@@ -700,6 +700,7 @@ def resolution_payload(resolution: CallResolution, *, cwd: str | None) -> dict[s
     if resolution.mode_spec is not None:
         resolved["mode"]["grants"] = resolution.mode_spec.grants
         resolved["mode"]["delegates"] = resolution.mode_spec.delegates
+        resolved["mode"]["escalates"] = resolution.mode_spec.escalates
     return {
         "entry": entry.entry,
         "base_adapter": entry.base_adapter,

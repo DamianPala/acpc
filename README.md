@@ -86,7 +86,7 @@ $ acpc log x7k2 --since 42
 Three edges worth internalizing:
 
 - **The non-TTY default is a silent read-only trap.** A caller that passes no `--permissions` gets a read-only callee — write requests are denied without an error and the turn exits 0. Pass `edit` for file changes, or `execute` when the task must also run commands.
-- **The policy selects the vendor mode.** Adapter `[modes]` tables measure each mode's `grants` and whether it `delegates`; acpc always sends `session/set_mode`, and refuses a mode that grants more than the policy. An advertised mode missing from `[modes]` is admitted only under `all`. `--mode` is normally unnecessary, but an explicit value is checked by the same ceiling and comes from `acpc agents <name>`.
+- **The policy selects the vendor mode.** Adapter `[modes]` tables measure each mode's `grants`, whether it `delegates`, and whether it `escalates` — the last being informational, a flag that an in-vendor auto-approver can raise that mode's ceiling unasked, so its `grants` is a measurement rather than a bound. acpc always sends `session/set_mode`, and refuses a mode that grants more than the policy. An advertised mode missing from `[modes]` is admitted only under `all`. `--mode` is normally unnecessary, but an explicit value is checked by the same ceiling and comes from `acpc agents <name>`.
 - **This is an approval policy, not a sandbox.** It answers the requests the adapter emits; a delegating mode can still classify some work as safe and emit no request. A real boundary means confining the adapter itself: a container, a dedicated user, or the vendor's own sandbox.
 
 ## Agent variants

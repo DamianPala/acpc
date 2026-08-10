@@ -39,10 +39,13 @@ efforts = ["default", "low", "medium", "high", "xhigh", "max"]
 #   not delegate — never treat it as a read-ceiling mode.
 # - `plan` wrote an arbitrary file with no permission request after nudging;
 #   it resists but is not a boundary. `edit` is the honest ceiling.
+# `escalates = true` on auto records exactly that: the classifier can raise the
+# effective ceiling with nothing reaching acpc, so `grants` there is a measurement
+# and not a bound.
 [modes]
 default = { grants = "read", delegates = true }
 plan = { grants = "edit", delegates = true }
-auto = { grants = "all", delegates = false }
+auto = { grants = "all", delegates = false, escalates = true }
 acceptEdits = { grants = "execute", delegates = true }
 dontAsk = { grants = "none", delegates = false }
 bypassPermissions = { grants = "all", delegates = false }

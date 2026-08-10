@@ -56,7 +56,7 @@ With name: the resolved definition, field by field with provenance — the entry
 Advertised data — modes, models, slash commands — is adapter-level (variants inherit their parent's):
 
 - It appears in the adapter's detail view only; a variant's view ends with a pointer instead of repeating the catalogs.
-- Model and command lists are capped in the adapter view (first 3 + count); modes always print in full, each with its `grants` and whether it delegates — the list is short, and this view is the only place a caller can see which modes a given policy admits. Model lists are short and curated, so `--models` prints them in full. Commands can be 50+ with paragraph-length descriptions, so each truncates to its first sentence; complete text lives in the cache file the footer names.
+- Model and command lists are capped in the adapter view (first 3 + count); modes always print in full, each with its `grants`, whether it delegates and whether it escalates — the list is short, and this view is the only place a caller can see which modes a given policy admits. Model lists are short and curated, so `--models` prints them in full. Commands can be 50+ with paragraph-length descriptions, so each truncates to its first sentence; complete text lives in the cache file the footer names.
 - `agents --models` without a name: cross-agent overview, variants collapsed to one line each.
 - All of it is cached and refreshed on every real run (ACP announces it only after session creation); a run whose merged catalogs are unchanged leaves the cache file and its age untouched. On a cache miss — `agents <name>` before the first ever run — the live probe runs automatically instead of printing empty fields.
 - Every view that prints advertised data ends with one cache-age footer; views built from live state alone (the bare list, a variant's resolution) have none.
@@ -97,7 +97,7 @@ effort       high (adapter default)
 permissions  ask on TTY, read otherwise (unset)
 home         ~/.claude (default)
 modes        6 · default (read · delegates) · acceptEdits (execute · delegates) · plan (edit · delegates)
-             auto (all) · dontAsk (none) · bypassPermissions (all)
+             auto (all · escalates) · dontAsk (none) · bypassPermissions (all)
 models       4 · claude-opus-5 · claude-sonnet-5 · claude-haiku-4-5 · …   (--models for all)
 commands     52 · /review · /init · /compact · …          (--commands for all)
 variants     none
@@ -282,19 +282,19 @@ EOF
 ```
 
 ```
-$ acpc run codex "probe" --dry-run
+$ acpc run codex "probe" --permissions edit --cwd ~/repo --dry-run
 entry        codex (codex)
 command      codex-acp
 model        gpt-5.6-terra (adapter default)
 effort       xhigh (adapter default)
-mode         read-only (selected for permissions edit) · vendor-decided
+mode         read-only (selected for permissions edit) · vendor-decided · escalates
 permissions  edit (call flag)
 home         ~/.codex (adapter default)
 cwd          ~/repo
 passthrough  CODEX_HOME · CODEX_PATH · CODEX_CONFIG · MODEL_PROVIDER · CODEX_API_KEY · OPENAI_API_KEY · INITIAL_AGENT_MODE
 
-$ acpc run codex "probe" --permissions edit --dry-run --json
-{"entry": "codex", "base_adapter": "codex", "command": "codex-acp", "cwd": "~/repo", "env": {}, "env_passthrough": ["CODEX_HOME", "CODEX_PATH", "CODEX_CONFIG", "MODEL_PROVIDER", "CODEX_API_KEY", "OPENAI_API_KEY", "INITIAL_AGENT_MODE"], "resolved": {"model": {"value": "gpt-5.6-terra", "source": "adapter default"}, "effort": {"value": "xhigh", "source": "adapter default"}, "mode": {"value": "read-only", "source": "selected", "grants": "edit", "delegates": false}, "permissions": {"value": "edit", "source": "call flag"}, "home": {"value": "~/.codex", "source": "adapter default"}}}
+$ acpc run codex "probe" --permissions edit --cwd ~/repo --dry-run --json
+{"entry": "codex", "base_adapter": "codex", "command": "codex-acp", "cwd": "~/repo", "env": {}, "env_passthrough": ["CODEX_HOME", "CODEX_PATH", "CODEX_CONFIG", "MODEL_PROVIDER", "CODEX_API_KEY", "OPENAI_API_KEY", "INITIAL_AGENT_MODE"], "resolved": {"model": {"value": "gpt-5.6-terra", "source": "adapter default"}, "effort": {"value": "xhigh", "source": "adapter default"}, "mode": {"value": "read-only", "source": "selected", "grants": "edit", "delegates": false, "escalates": true}, "permissions": {"value": "edit", "source": "call flag"}, "home": {"value": "~/.codex", "source": "adapter default"}}}
 ```
 
 | Option | Purpose |
@@ -310,7 +310,7 @@ $ acpc run codex "probe" --permissions edit --dry-run --json
 | `--bg` | Return immediately with session ID + session dir path. With `-o`, the file is written when the session finishes |
 | `--timeout <s>` | Cancels the session on expiry (state `timeout`, exit 124). No default — wall-clock limits belong to the calling harness. A bare number is seconds; a suffixed value is a duration (`90s`, `5m`, `1h`, `1h30m`), the vocabulary the config file already uses. Every `--timeout` in the CLI reads the same way |
 | `--name <alias>` | Human-typeable handle for `continue`/`status`/`log`. Reusing a name rebinds it to the new session with a warning — hard error while the old session is `running`. `last` is reserved |
-| `--dry-run` | Print what this call would resolve to (model, effort, mode, permissions, home, declared env, cwd — and where each value came from), then exit. The mode line names why that mode was selected and whether it delegates to acpc |
+| `--dry-run` | Print what this call would resolve to (model, effort, mode, permissions, home, declared env, cwd — and where each value came from), then exit. The mode line names why that mode was selected, whether it delegates to acpc, and whether it escalates in-vendor |
 | `--max-output <bytes>` | Cap on stdout bytes (default 128 KiB, 0 disables). Truncation keeps the head, cuts on a UTF-8 boundary, and ends with a marker line naming the full answer path. The marker sits at the tail, which some harness previews clip — the stderr summary repeats the session dir, so the path always survives. Shapes stdout only: `-o` files and `answer.md` are always complete. With `--json`, truncation applies to the `answer` field and sets `truncated: true`; the envelope is always valid JSON |
 | `--quiet` | Suppress acpc's own stderr lines for this call — the early session line and the end-of-run summary (see *Output contract*) |
 
@@ -338,15 +338,29 @@ selection (below). Allowing answers `allow_once`; `allow_always` only under `all
 `reject_always` is never sent. Every decision lands in the transcript as a `permission`
 event.
 
-**Modes carry two facts**, neither declared by ACP, both from probing the adapter.
+**Modes carry three facts**, none declared by ACP, all from probing the adapter.
 `grants` is the ceiling of what a mode permits with no request reaching acpc, by effect;
-`delegates` says whether anything above it arrives at all.
+`delegates` says whether anything above it arrives at all; `escalates` says whether an
+in-vendor auto-approver can raise that ceiling with no request reaching acpc either.
+
+`escalates` is optional and defaults to false where a mode is declared fresh; on a mode
+inherited through `extends`, omitting it keeps the parent's value rather than resetting it,
+so a variant cannot quietly drop the flag. It is informational: mode selection
+reads `grants` and `delegates` exactly as it always has, and an escalating mode is neither
+preferred nor discarded for it. What it records is that `grants` for that mode is a
+measurement and not a bound — codex's `read-only` runs writes that its own in-vendor
+reviewer approves, and claude's `auto` approves silently with no marker at all — so a caller reading
+`agents <name>` or `--dry-run` can see where the recorded ceiling is least trustworthy.
+It is a label on a measurement, not a second scale: a mode that escalates is one whose
+`grants` the next adapter release is most likely to move.
 
 ```toml
 # claude.toml
 [modes]
 default           = { grants = "read",    delegates = true }
+plan              = { grants = "edit",    delegates = true }
 acceptEdits       = { grants = "execute", delegates = true }
+auto              = { grants = "all",     delegates = false, escalates = true }
 dontAsk           = { grants = "none",    delegates = false }
 bypassPermissions = { grants = "all",     delegates = false }
 ```
@@ -512,7 +526,7 @@ $ acpc run builder "implement the parser per SPEC.md"
 
 A variant sets `permissions`, not `mode`: the policy selects the mode (see *Permissions*). An entry may still pin `mode` as an override, subject to the same ceiling as `--mode` — an entry cannot become the way around the policy.
 
-An adapter definition declares its modes in a `[modes]` table: for each vendor mode, what it permits with no request reaching acpc (`grants`) and whether anything above that arrives at all (`delegates`). These are adapter facts established by probing the adapter; ACP declares neither. A mode the running adapter advertises but the table omits is refused unless the policy is `all`, so a vendor that adds a mode cannot quietly widen what acpc allows.
+An adapter definition declares its modes in a `[modes]` table: for each vendor mode, what it permits with no request reaching acpc (`grants`), whether anything above that arrives at all (`delegates`), and optionally whether an in-vendor auto-approver can raise that ceiling unasked (`escalates`, default false — informational only, see *Permissions*). These are adapter facts established by probing the adapter; ACP declares none of them. A mode the running adapter advertises but the table omits is refused unless the policy is `all`, so a vendor that adds a mode cannot quietly widen what acpc allows.
 
 The `home` field is also the provider dimension: OpenAI vs OpenRouter vs a local endpoint is just a different vendor home (own config, own credentials). A variant is the named, permanent form; `--home` on `run` the one-off form.
 

@@ -46,6 +46,13 @@ def test_shipped_adapter_facts_and_presets_are_available(tmp_path: Path) -> None
         "agent": {"grants": "execute", "delegates": False},
         "agent-full-access": {"grants": "all", "delegates": False},
     }
+    assert claude.modes["auto"].escalates is True
+    assert codex.modes["read-only"].escalates is True
+    assert all(
+        not spec.escalates
+        for name, spec in (*claude.modes.items(), *codex.modes.items())
+        if name not in {"auto", "read-only"}
+    )
     assert claude.presets["max"].model == "claude-opus-5"
     assert codex.presets["standard"].effort == "xhigh"
     # claude CLI >=2.1.224 offers no effort option for haiku; see claude.toml.
@@ -130,10 +137,11 @@ def test_variant_merges_modes_by_name_and_mode_field(tmp_path: Path) -> None:
         "base",
         'command = "python -m base"\n'
         "[modes]\n"
-        'default = { grants = "read", delegates = true }\n'
+        'default = { grants = "read", delegates = true, escalates = true }\n'
         "[modes.plan]\n"
         'grants = "read"\n'
-        "delegates = true\n",
+        "delegates = true\n"
+        "escalates = true\n",
     )
     write_entry(
         agents,
@@ -145,8 +153,41 @@ def test_variant_merges_modes_by_name_and_mode_field(tmp_path: Path) -> None:
 
     assert modes["default"].grants == "read"
     assert modes["default"].delegates
+    assert modes["default"].escalates is True
     assert modes["plan"].grants == "execute"
     assert modes["plan"].delegates
+    assert modes["plan"].escalates is True
+
+
+def test_mode_escalation_defaults_false_and_round_trips_true(tmp_path: Path) -> None:
+    agents = tmp_path / "agents"
+    write_entry(
+        agents,
+        "facts",
+        'command = "python"\n'
+        "[modes]\n"
+        'escalating = { grants = "edit", delegates = false, escalates = true }\n'
+        'plain = { grants = "read", delegates = true }\n',
+    )
+
+    modes = AgentRegistry(agents).resolve("facts").modes
+
+    assert modes["escalating"].escalates is True
+    assert modes["plain"].escalates is False
+
+
+def test_mode_escalation_rejects_non_boolean_values(tmp_path: Path) -> None:
+    agents = tmp_path / "agents"
+    write_entry(
+        agents,
+        "invalid",
+        'command = "python"\n'
+        "[modes]\n"
+        'default = { grants = "read", delegates = false, escalates = "yes" }\n',
+    )
+
+    with pytest.raises(RegistryError, match=r"\[modes\.default\]\.escalates must be a boolean"):
+        AgentRegistry(agents)
 
 
 def test_mode_grants_reject_ask_and_name_the_source_file(tmp_path: Path) -> None:

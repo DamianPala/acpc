@@ -589,7 +589,8 @@ def _emit_dry_run(payload: dict[str, Any], *, json_mode: bool) -> None:
             if item["source"] == "selected":
                 reason = f"selected for permissions {policy}"
             delegation = "acpc-delegated" if item["delegates"] else "vendor-decided"
-            lines.append(f"{name:<12} {value} ({reason}) · {delegation}")
+            escalation = " · escalates" if item.get("escalates") else ""
+            lines.append(f"{name:<12} {value} ({reason}) · {delegation}{escalation}")
         else:
             lines.append(f"{name:<12} {value} ({item['source']})")
     if payload["cwd"]:
@@ -806,7 +807,8 @@ def _mode_display(name: str, entry: ResolvedEntry) -> str:
     if spec is None:
         return f"{name} (undeclared)"
     delegates = " · delegates" if spec.delegates else ""
-    return f"{name} ({spec.grants}{delegates})"
+    escalates = " · escalates" if spec.escalates else ""
+    return f"{name} ({spec.grants}{delegates}{escalates})"
 
 
 def _advertised_payload(record: cache.CachedAdvertised | None) -> dict[str, Any]:
@@ -855,7 +857,11 @@ def _render_advertised_detail(
             "modes": modes,
             "mode_specs": {
                 mode: (
-                    {"grants": entry.modes[mode].grants, "delegates": entry.modes[mode].delegates}
+                    {
+                        "grants": entry.modes[mode].grants,
+                        "delegates": entry.modes[mode].delegates,
+                        "escalates": entry.modes[mode].escalates,
+                    }
                     if mode in entry.modes
                     else None
                 )

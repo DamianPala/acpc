@@ -30,7 +30,7 @@ max = {{ model = "mock-opus-5", effort = "xhigh" }}
 [modes]
 default = {{ grants = "read", delegates = true }}
 acceptEdits = {{ grants = "execute", delegates = true }}
-plan = {{ grants = "read", delegates = true }}
+plan = {{ grants = "read", delegates = true, escalates = true }}
 '''
 
 BUILDER_ENTRY = """
@@ -234,6 +234,47 @@ def test_entry_permission_alias_resolves_canonically_and_warns_on_run(
     assert "--permissions write is deprecated; use --permissions execute" in result.stderr
 
 
+def test_dry_run_renders_and_serializes_mode_escalation(cli: CliRunner) -> None:
+    text_result = invoke(cli, "run", "builder", "probe", "--dry-run")
+
+    assert text_result.exit_code == vocab.EXIT_OK
+    mode_line = next(
+        line for line in text_result.stdout.splitlines() if line.startswith("mode         ")
+    )
+    assert "plan (entry (" in mode_line
+    assert " · acpc-delegated · escalates" in mode_line
+
+    # The false case has to be pinned on the text view too: an unconditional
+    # marker would claim in-vendor escalation for every mode and stay green.
+    plain_text = invoke(
+        cli, "run", "mock", "probe", "--mode", "default", "--permissions", "read", "--dry-run"
+    )
+    plain_mode_line = next(
+        line for line in plain_text.stdout.splitlines() if line.startswith("mode         ")
+    )
+    assert " · acpc-delegated" in plain_mode_line
+    assert "escalates" not in plain_mode_line
+
+    escalating = json.loads(invoke(cli, "run", "builder", "probe", "--dry-run", "--json").stdout)
+    plain = json.loads(
+        invoke(
+            cli,
+            "run",
+            "mock",
+            "probe",
+            "--mode",
+            "default",
+            "--permissions",
+            "read",
+            "--dry-run",
+            "--json",
+        ).stdout
+    )
+
+    assert escalating["resolved"]["mode"]["escalates"] is True
+    assert plain["resolved"]["mode"]["escalates"] is False
+
+
 def test_agents_detail_renders_an_unset_mode_with_its_source(cli: CliRunner) -> None:
     result = invoke(cli, "agents", "mock")
 
@@ -414,7 +455,7 @@ def test_adapter_detail_caps_models_and_commands_but_never_modes(cli: CliRunner)
     assert result.exit_code == vocab.EXIT_OK
     assert (
         "modes        5 · default (read · delegates) · acceptEdits (execute · delegates) · "
-        "plan (read · delegates) · yolo (undeclared) · extra-mode (undeclared)"
+        "plan (read · delegates · escalates) · yolo (undeclared) · extra-mode (undeclared)"
     ) in result.stdout
     assert "models       4 · model-1 · model-2 · model-3 · …" in result.stdout
     assert "commands     4 · /command-1 · /command-2 · /command-3 · …" in result.stdout
@@ -428,9 +469,9 @@ def test_adapter_detail_caps_models_and_commands_but_never_modes(cli: CliRunner)
         "extra-mode",
     ]
     assert payload["advertised"]["mode_specs"] == {
-        "default": {"grants": "read", "delegates": True},
-        "acceptEdits": {"grants": "execute", "delegates": True},
-        "plan": {"grants": "read", "delegates": True},
+        "default": {"grants": "read", "delegates": True, "escalates": False},
+        "acceptEdits": {"grants": "execute", "delegates": True, "escalates": False},
+        "plan": {"grants": "read", "delegates": True, "escalates": True},
         "yolo": None,
         "extra-mode": None,
     }

@@ -339,6 +339,7 @@ def test_continue_reapplies_the_stored_mode(cli: CliRunner) -> None:
         "source": "call flag",
         "grants": "read",
         "delegates": True,
+        "escalates": False,
     }
 
     result = invoke(cli, "continue", session_id, "settings", "--quiet")
@@ -432,6 +433,7 @@ def test_continue_with_a_higher_policy_reselects_and_stores_current_mode_facts(
         "source": "selected",
         "grants": "execute",
         "delegates": True,
+        "escalates": False,
     }
     assert stored["adapter"]["mode"] == "plan"
     assert stored["adapter"]["grants"] == "execute"

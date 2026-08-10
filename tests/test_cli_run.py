@@ -235,18 +235,21 @@ def test_dry_run_reports_mode_for_entry_flag_and_unset_sources(
         "source": f"entry ({state_root / 'agents' / 'pinned.toml'})",
         "grants": "read",
         "delegates": True,
+        "escalates": False,
     }
     assert flag["resolved"]["mode"] == {
         "value": "plan",
         "source": "call flag",
         "grants": "read",
         "delegates": True,
+        "escalates": False,
     }
     assert unset["resolved"]["mode"] == {
         "value": "default",
         "source": "selected",
         "grants": "read",
         "delegates": True,
+        "escalates": False,
     }
 
 
