@@ -35,6 +35,10 @@ Exact-prefix triggers (donor design, for precise timing control in tests):
 - ``env:NAME``       answer with the value of environment variable NAME
 - ``settings``       answer with model/effort/mode state and call counts
 - ``stderr:TEXT``    print TEXT to stderr, then echo it
+- ``auth:``          fail the turn with a JSON-RPC authentication error
+- ``crash-late:TEXT``stream TEXT, then fail the turn with a JSON-RPC error
+- ``stderr-crash:TEXT`` print TEXT to stderr, then fail the turn
+- ``auth-data:``     fail with an auth error marked in ``data``, not in the text
 
 Anything else runs the default scenario: three tool events, a progress msg, a
 usage update, and a markdown answer quoting the prompt — history-aware, so a
@@ -553,6 +557,26 @@ class MockAgent(Agent):
             print(prompt_text.split(":", 1)[1], file=sys.stderr, flush=True)
             await self._send_text(session_id, prompt_text.split(":", 1)[1])
             return PromptResponse(stop_reason="end_turn")
+
+        if prompt_text.startswith("auth:"):
+            raise RequestError(-32000, "Authentication required")
+
+        if prompt_text.startswith("auth-data:"):
+            # The refusal is machine-readable in `data` and says nothing
+            # recognizable in the message, which is the shape acpc must not
+            # depend on text matching to classify.
+            raise RequestError(-32000, "Internal error", {"code": "auth_required"})
+
+        if prompt_text.startswith("stderr-crash:"):
+            print(prompt_text.split(":", 1)[1], file=sys.stderr, flush=True)
+            # Let the host drain the pipe before the failure travels over stdout:
+            # the two are separate channels with no ordering between them.
+            await asyncio.sleep(0.3)
+            raise RequestError(-32603, "Internal error", {"details": "died after complaining"})
+
+        if prompt_text.startswith("crash-late:"):
+            await self._send_text(session_id, prompt_text.split(":", 1)[1])
+            raise RequestError(-32603, "Internal error", {"details": "upstream connection reset"})
 
         return None
 

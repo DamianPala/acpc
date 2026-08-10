@@ -417,13 +417,14 @@ def _target_for_persisted_resolution(meta: sessions.SessionMeta) -> str:
 def _finalize_follow_up_failure(session_id: str, error: BaseException) -> None:
     """Close a rotated turn when request preparation cannot finish."""
     with contextlib.suppress(OSError, sessions.SessionError):
-        sessions.write_answer(session_id, f"{error}\n")
-    with contextlib.suppress(OSError, sessions.SessionError):
-        sessions.transition(
+        runner._finalize(
             session_id,
-            "failed",
-            exit_code=vocab.EXIT_AGENT_ERROR,
-            stop_reason="error",
+            runner.TurnOutcome(
+                state="failed",
+                answer="",
+                stop_reason="error",
+            ),
+            error=error,
         )
 
 
@@ -1705,6 +1706,18 @@ def _read_transcript_page(
         raise UsageProblem(str(error)) from None
 
 
+def _latest_failure_message(session_id: str) -> str | None:
+    """Read the recorded cause for a failed wait summary, if one exists."""
+    try:
+        events = transcript.Transcript(sessions.transcript_path(session_id)).read().events
+    except (OSError, transcript.TranscriptError):
+        return None
+    for event in reversed(events):
+        if event.get("type") == "error" and isinstance(event.get("message"), str):
+            return " ".join(event["message"].split())
+    return None
+
+
 @main.command(name="status")
 @click.argument("selector", required=False)
 @click.option(
@@ -2707,7 +2720,8 @@ def wait_command(
     The exit code mirrors the session result. On an already-finished session it
     returns immediately — the free way to reprint an answer. ``--timeout`` stops
     the waiting only and exits 124: the session keeps running, unlike ``run --timeout``,
-    which cancels it.
+    which cancels it. A session that failed adds a ``failure:`` segment to the stderr
+    summary, naming what acpc observed and the next step to take.
 
     Example: ``acpc wait <session-id> --timeout 120``
     """
@@ -2733,7 +2747,12 @@ def wait_command(
     )
     _write_stdout(result.text)
     if not quiet:
-        _echo_metadata(output.format_summary(final))
+        summary = output.format_summary(final)
+        if final.state == "failed" and (
+            failure_message := _latest_failure_message(final.session_id)
+        ):
+            summary += f" | failure: {failure_message}"
+        _echo_metadata(summary)
     raise SystemExit(runner.exit_code_for(final.state, final.stop_reason))
 
 

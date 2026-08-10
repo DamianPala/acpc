@@ -120,6 +120,7 @@ def test_a_successful_turn_finishes_the_session_on_disk() -> None:
     assert outcome.state == "done"
     assert outcome.exit_code == vocab.EXIT_OK
     assert "summarize the module layout" in outcome.answer
+    assert not any(event.get("type") == "error" for event in transcript_events(session_id))
 
     meta = sessions.read_meta(session_id)
     assert meta.state == "done"
@@ -160,6 +161,11 @@ def test_a_refused_turn_is_a_failure_with_exit_1() -> None:
     assert outcome.state == "failed"
     assert outcome.exit_code == vocab.EXIT_AGENT_ERROR
     assert sessions.read_meta(session_id).state == "failed"
+    errors = [event for event in transcript_events(session_id) if event.get("type") == "error"]
+    assert errors
+    # Direct path: nothing was written to a daemon log, so nothing points there.
+    assert "daemon log" not in errors[-1]["next_step"]
+    assert "adapter_log_tail" not in errors[-1]
 
 
 def test_a_refused_turn_still_writes_the_partial_answer() -> None:
@@ -180,6 +186,10 @@ def test_a_switch_above_the_ceiling_ends_the_turn_with_exit_2() -> None:
     errors = [event["message"] for event in events if event.get("type") == "error"]
     assert any("switch_mode yolo" in message for message in errors)
     assert any("--permissions all" in message for message in errors)
+    # acpc refused this; the adapter did not fail. A second, contradictory
+    # "inspect the daemon log" remedy would send the caller the wrong way.
+    assert not any("adapter failure" in message for message in errors)
+    assert not any("next step: inspect" in message for message in errors)
     switch_permissions = [
         event
         for event in events
@@ -209,6 +219,60 @@ def test_a_timed_out_turn_leaves_an_answer_file_behind() -> None:
     session_id, _ = start_turn("slow:30 timeout probe", timeout=1.0)
 
     assert sessions.answer_path(session_id).exists()
+
+
+def test_authentication_refusal_records_the_login_remedy() -> None:
+    session_id, outcome = start_turn("auth:vendor rejected the request")
+
+    assert outcome.state == "failed"
+    assert outcome.exit_code == vocab.EXIT_AGENT_ERROR
+    errors = [event for event in transcript_events(session_id) if event.get("type") == "error"]
+    assert errors
+    event = errors[-1]
+    assert "authentication was refused" in event["message"]
+    assert event["next_step"] == "run 'mock login'"
+    assert "mock login" in sessions.answer_path(session_id).read_text(encoding="utf-8")
+
+
+def test_a_late_adapter_failure_keeps_the_partial_answer() -> None:
+    session_id, outcome = start_turn("crash-late:half of the report was written")
+
+    assert outcome.state == "failed"
+    answer = sessions.answer_path(session_id).read_text(encoding="utf-8")
+    assert "half of the report was written" in answer
+    errors = [event for event in transcript_events(session_id) if event.get("type") == "error"]
+    assert errors
+    assert "upstream connection reset" in errors[-1]["message"]
+
+
+def test_a_huge_adapter_log_does_not_flood_the_failure_message(tmp_path: Path) -> None:
+    """The message rides `answer.md` and `wait`'s one-line summary, so it stays small."""
+    log_file = tmp_path / "target.log"
+    log_file.write_bytes(b"x" * (4 * runner.ADAPTER_LOG_TAIL_BYTES))
+
+    tail = runner._read_adapter_log_tail(log_file, 0)
+
+    assert tail is not None
+    assert len(tail) <= runner.ADAPTER_LOG_TAIL_BYTES
+    assert len(runner._single_line(tail)[: runner.MESSAGE_TAIL_CHARS]) <= runner.MESSAGE_TAIL_CHARS
+
+
+def test_adapter_start_failure_records_an_error_event() -> None:
+    resolution = resolve("phantom")
+    meta = sessions.create_session(
+        entry="phantom",
+        base_adapter="phantom",
+        prompt="start failure",
+        resolution=runner.resolution_payload(resolution, cwd=None),
+        target=runner.call_target(resolution),
+    )
+
+    with pytest.raises(runner.RunnerError):
+        runner.execute_turn(meta.session_id, runner.TurnRequest(resolution=resolution, prompt="x"))
+
+    errors = [event for event in transcript_events(meta.session_id) if event.get("type") == "error"]
+    assert errors
+    assert "not installed" in errors[-1]["message"]
 
 
 def deliver_after(delay: float, signal_number: int) -> None:

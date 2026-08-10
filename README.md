@@ -153,7 +153,7 @@ Keep it to purpose only. Models, efforts and flags belong to the tool — `acpc 
     answer.md                # final answer (earlier turns: answer.<n>.md)
 ```
 
-File-based state is a feature: grep it, read fragments selectively, depend on nothing but the filesystem. `answer.md` exists whatever the final state — partial answers for failed or cancelled turns, a placeholder naming what died for orphaned ones. Session states are verified, not trusted: a `running` session whose process is gone reports `orphaned`, never a stale `running`.
+File-based state is a feature: grep it, read fragments selectively, depend on nothing but the filesystem. `answer.md` exists whatever the final state — partial answers for failed or cancelled turns, a placeholder naming what died for orphaned ones. A failed session also records why it failed: an `error` event carrying what acpc observed, one next step, and — for a turn that ran under a daemon — the tail that turn added to the target's log, surfaced by `log` and by `wait`. Session states are verified, not trusted: a `running` session whose process is gone reports `orphaned`, never a stale `running`.
 
 ## The daemon
 

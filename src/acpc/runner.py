@@ -24,6 +24,7 @@ import signal
 import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any
 
 from acp import PROTOCOL_VERSION, RequestError, text_block
@@ -47,12 +48,27 @@ from acpc.spawn import spawn_adapter
 # the callee does not wind down in time, the connection is torn down anyway.
 CANCEL_ACK_TIMEOUT = 10.0
 
+# Failure events are part of the transcript and may be copied into a caller's
+# context. Eight KiB is large enough for the useful tail of normal adapter
+# diagnostics while keeping one unusually large stderr line bounded.
+ADAPTER_LOG_TAIL_BYTES = 8 * 1024
+
+# How much of that tail is spliced into the one-line failure message.
+MESSAGE_TAIL_CHARS = 300
+
 # ACP stop reasons that mean the turn failed rather than completed.
 _FAILURE_STOP_REASONS = frozenset({"refusal", "max_tokens", "max_turn_requests"})
+
+# ...of those, the ones where the adapter hit a ceiling rather than broke.
+_ADAPTER_LIMIT_STOP_REASONS = frozenset({"max_tokens", "max_turn_requests"})
 
 
 class RunnerError(Exception):
     """A turn could not be started; the message is one actionable line."""
+
+
+class TurnEndedByAcpc(RunnerError):
+    """acpc itself ended a running turn — a daemon stop, not an adapter fault."""
 
 
 def describe_error(error: BaseException) -> str:
@@ -136,6 +152,9 @@ class TurnOutcome:
     adapter_session_id: str | None = None
     advertised: dict[str, Any] = field(default_factory=dict)
     route_note: str | None = None
+    # The adapter's own failure, when the turn died in `session/prompt`. Carried
+    # on the outcome rather than raised so the prose streamed before it survives.
+    error: BaseException | None = None
     # Set when the daemon owns the session and has already written it out;
     # finalizing again here would overwrite the daemon's own result.
     finalized_elsewhere: bool = False
@@ -248,6 +267,7 @@ async def _drive_turn(
         cancellation_dispatched=cancel.cancellation_dispatched,
         permission_prompt=request.permission_prompt,
     )
+    turn_error: BaseException | None = None
 
     try:
         async with spawn_adapter(
@@ -282,9 +302,16 @@ async def _drive_turn(
                     prompt=[text_block(request.prompt)],
                 )
             )
-            stop_reason = await _await_prompt(
-                conn, adapter_session_id, prompt_task, request, cancel
-            )
+            try:
+                stop_reason = await _await_prompt(
+                    conn, adapter_session_id, prompt_task, request, cancel
+                )
+            except Exception as caught:  # noqa: BLE001
+                # The adapter failed the turn itself. Whatever prose it streamed
+                # first is still the answer SPEC promises for a failed session,
+                # so the cause travels on the outcome instead of unwinding here.
+                turn_error = caught
+                stop_reason = "error"
     finally:
         client.flush()
 
@@ -301,6 +328,7 @@ async def _drive_turn(
         denial_details=client.denial_details,
         adapter_session_id=adapter_session_id,
         advertised=client.advertised,
+        error=turn_error,
     )
 
 
@@ -408,12 +436,12 @@ async def _await_prompt(
 
 
 def _stop_reason_of(prompt_task: "asyncio.Task[Any]") -> str | None:
-    """Read a finished prompt task's stop reason, mapping a crash to a failure."""
+    """Read a finished prompt task's stop reason, preserving adapter errors."""
     error = prompt_task.exception() if not prompt_task.cancelled() else None
     if prompt_task.cancelled():
         return "cancelled"
     if error is not None:
-        return "error"
+        raise error
     return getattr(prompt_task.result(), "stop_reason", None)
 
 
@@ -614,8 +642,12 @@ def execute_turn(session_id: str, request: TurnRequest) -> TurnOutcome:
     """Run one turn synchronously and leave the session finalized on disk."""
     try:
         outcome = asyncio.run(_execute(session_id, request))
-    except RunnerError:
-        _finalize(session_id, TurnOutcome(state="failed", stop_reason="error", answer=""))
+    except RunnerError as error:
+        _finalize(
+            session_id,
+            TurnOutcome(state="failed", stop_reason="error", answer=""),
+            error=error,
+        )
         raise
     except Exception as error:  # noqa: BLE001
         # Deliberately broad: an adapter crash, a protocol error and a spawn
@@ -626,7 +658,7 @@ def execute_turn(session_id: str, request: TurnRequest) -> TurnOutcome:
         _finalize(session_id, outcome, error=error)
         return outcome
     if not outcome.finalized_elsewhere:
-        _finalize(session_id, outcome)
+        _finalize(session_id, outcome, error=outcome.error)
     return outcome
 
 
@@ -635,23 +667,54 @@ def _finalize(
     outcome: TurnOutcome,
     *,
     error: BaseException | None = None,
+    adapter_log_from: int | None = None,
 ) -> None:
     """Write the answer and close out `meta.json`, whatever happened.
 
     SPEC.md *State on disk*: `answer.md` is written whatever the final state —
     for a failed or cancelled turn it holds the partial answer.
     """
+    try:
+        current = sessions.read_meta(session_id)
+        # A daemon has already finalized a failed turn when its client receives
+        # the failure reply. Do not overwrite its answer or append a duplicate
+        # event from the client-side error path.
+        if current.is_finished and outcome.state == "failed":
+            return
+    except sessions.SessionError:
+        current = None
+
+    # A policy denial is not an adapter failure: acpc refused it, the summary
+    # already names the policy that would admit it, and a second "inspect the
+    # daemon log" would contradict that remedy.
+    diagnosable = outcome.state == "failed" and outcome.stop_reason != "permission_denied"
+    failure = (
+        _failure_details(session_id, outcome, error=error, adapter_log_from=adapter_log_from)
+        if diagnosable
+        else None
+    )
     answer = outcome.answer
-    if error is not None and not answer:
-        answer = f"{describe_error(error)}\n"
+    if failure is not None and not answer:
+        answer = f"{failure.message}\n"
+        outcome.answer = answer
     sessions.write_answer(session_id, answer)
 
     events_path = sessions.transcript_path(session_id)
     with contextlib.suppress(Exception):
         events = transcript.Transcript(events_path)
-        if error is not None:
-            events.append("error", message=describe_error(error))
-        events.append("state", **{"from": "running", "to": outcome.state})
+        if failure is not None:
+            fields: dict[str, Any] = {
+                "message": failure.message,
+                "observation": failure.observation,
+                "next_step": failure.next_step,
+            }
+            if failure.adapter_log is not None:
+                fields["adapter_log"] = failure.adapter_log
+            if failure.adapter_log_tail is not None:
+                fields["adapter_log_tail"] = failure.adapter_log_tail
+            events.append("error", **fields)
+        from_state = current.state if current is not None else "running"
+        events.append("state", **{"from": from_state, "to": outcome.state})
 
     state = outcome.state
     if state == "terminated":
@@ -675,6 +738,160 @@ def _finalize(
     if outcome.advertised:
         with contextlib.suppress(Exception):
             cache.refresh_advertised(_agent_of(session_id), outcome.advertised)
+
+
+@dataclass(frozen=True, slots=True)
+class _FailureDetails:
+    """The observable diagnosis recorded for a failed turn."""
+
+    message: str
+    observation: str
+    next_step: str
+    adapter_log: str | None = None
+    adapter_log_tail: str | None = None
+
+
+def _failure_details(
+    session_id: str,
+    outcome: TurnOutcome,
+    *,
+    error: BaseException | None,
+    adapter_log_from: int | None,
+) -> _FailureDetails:
+    """Build one bounded, actionable explanation for a failed session.
+
+    `adapter_log_from` is the offset this turn's output starts at in the
+    per-target daemon log, and is None when the turn did not run under a
+    daemon — a directly spawned adapter forwards its stderr to acpc's own
+    stderr and writes to no log at all, so there is nothing to point at.
+    """
+    try:
+        meta = sessions.read_meta(session_id)
+    except sessions.SessionError:
+        meta = None
+
+    error_text = describe_error(error).strip() if error is not None else ""
+    authentication_refused = _is_authentication_failure(error)
+    observation = _failure_observation(
+        error_text,
+        outcome.stop_reason,
+        authentication_refused=authentication_refused,
+        ended_by_acpc=isinstance(error, TurnEndedByAcpc),
+    )
+    adapter_log = _adapter_log_path(meta) if adapter_log_from is not None else None
+    adapter_log_tail = _read_adapter_log_tail(adapter_log, adapter_log_from or 0)
+    if authentication_refused and meta is not None:
+        next_step = f"run '{meta.base_adapter} login'"
+    elif outcome.stop_reason in _ADAPTER_LIMIT_STOP_REASONS:
+        next_step = "split the task into smaller turns, or raise the adapter's own limit"
+    elif adapter_log is not None:
+        next_step = f"inspect the daemon log at {adapter_log}"
+    else:
+        next_step = "re-run the turn: a directly spawned adapter's stderr comes back on stderr"
+
+    parts = [observation]
+    if adapter_log_tail:
+        # Bounded far tighter than the stored field: this string is spliced into
+        # answer.md and into `wait`'s single-line summary, where 8 KiB on one
+        # line would bury the summary. `log` renders the full field.
+        parts.append(f"adapter log tail: {_single_line(adapter_log_tail)[:MESSAGE_TAIL_CHARS]}")
+    parts.append(f"next step: {next_step}")
+    return _FailureDetails(
+        message="; ".join(parts),
+        observation=observation,
+        next_step=next_step,
+        adapter_log=str(adapter_log) if adapter_log is not None else None,
+        adapter_log_tail=adapter_log_tail,
+    )
+
+
+def _failure_observation(
+    error_text: str,
+    stop_reason: str | None,
+    *,
+    authentication_refused: bool,
+    ended_by_acpc: bool = False,
+) -> str:
+    if ended_by_acpc:
+        # Never "the adapter failed": acpc ended this turn, and saying otherwise
+        # sends the reader hunting for a vendor problem that does not exist.
+        return f"acpc ended the turn: {error_text}"
+    if authentication_refused:
+        return f"authentication was refused by the adapter: {error_text}"
+    if error_text:
+        lowered = error_text.lower()
+        if any(marker in lowered for marker in ("connection closed", "broken pipe", "eof")):
+            return f"the adapter connection was torn down: {error_text}"
+        return f"acpc observed an adapter failure: {error_text}"
+    if stop_reason in _ADAPTER_LIMIT_STOP_REASONS:
+        return f"the adapter stopped at its own limit (stop reason: {stop_reason})"
+    if stop_reason:
+        return f"acpc observed a failed adapter turn (stop reason: {stop_reason})"
+    return "acpc observed the adapter exit without a result"
+
+
+def _is_authentication_failure(error: BaseException | None) -> bool:
+    """Recognize the narrow ACP auth refusal shape used by vendor adapters."""
+    if not isinstance(error, RequestError) or error.code != -32000:
+        return False
+    data = error.data
+    if isinstance(data, Mapping):
+        for key in ("code", "type", "kind", "reason"):
+            marker = data.get(key)
+            if isinstance(marker, str) and marker.lower() in {
+                "auth_required",
+                "authentication_required",
+                "not_authenticated",
+            }:
+                return True
+    text = describe_error(error).lower()
+    return "authentication required" in text or "not authenticated" in text
+
+
+def adapter_log_offset(target: str) -> int:
+    """Current size of a target's log, to mark where a turn's output begins."""
+    from acpc import daemon as daemon_module
+
+    try:
+        return daemon_module.log_path_for_target(target).stat().st_size
+    except OSError:
+        return 0
+
+
+def _adapter_log_path(meta: sessions.SessionMeta | None) -> Path | None:
+    if meta is None or meta.target is None:
+        return None
+    from acpc import daemon as daemon_module
+
+    return daemon_module.log_path_for_target(meta.target)
+
+
+def _read_adapter_log_tail(path: Path | None, start: int) -> str | None:
+    """Read this turn's own bytes from ``start``, bounded; never fail finalization.
+
+    Everything before ``start`` belongs to earlier turns on the same target —
+    quoting it would attribute a stranger's stderr to this failure.
+    """
+    if path is None:
+        return None
+    try:
+        with path.open("rb") as log_file:
+            log_file.seek(0, os.SEEK_END)
+            size = log_file.tell()
+            if size <= start:
+                return None
+            log_file.seek(max(start, size - ADAPTER_LOG_TAIL_BYTES))
+            raw = log_file.read(ADAPTER_LOG_TAIL_BYTES)
+    except (OSError, ValueError):
+        return None
+    if not raw:
+        return None
+    decoded = raw.decode("utf-8", errors="ignore").strip()
+    return decoded or None
+
+
+def _single_line(text: str) -> str:
+    return " ".join(text.split())
 
 
 def _agent_of(session_id: str) -> str:

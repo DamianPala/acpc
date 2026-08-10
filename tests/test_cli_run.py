@@ -532,6 +532,24 @@ def test_wait_shows_default_policy_denials_from_disk(cli: CliRunner, live_daemon
     assert "denied: 1 edit (pass --permissions edit)" in waited.stderr
 
 
+def test_a_daemon_routed_failure_still_reports_the_result(
+    cli: CliRunner, live_daemon: None
+) -> None:
+    """A turn that ran and failed is a result, not an aborted command.
+
+    The daemon has already finalized it on disk, so a blocking client must
+    mirror that — answer, summary line, `--json` envelope — instead of raising
+    the adapter's error and printing nothing an agent caller can parse.
+    """
+    result = invoke(cli, "run", "mock", "auth:vendor rejected the request", "--json")
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    payload = json.loads(result.stdout)
+    assert payload["state"] == "failed"
+    assert "mock login" in payload["answer"]
+    assert "-- failed" in result.stderr
+
+
 def test_an_unknown_permission_value_is_a_usage_error(cli: CliRunner) -> None:
     result = invoke(cli, "run", "mock", "probe", "--permissions", "sudo-everything")
 

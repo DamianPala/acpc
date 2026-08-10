@@ -359,6 +359,149 @@ def test_daemon_stop_fails_its_active_sessions_rather_than_orphaning_them(
     assert meta.state == "failed"
     assert meta.stop_reason
     assert meta.exit_code == vocab.EXIT_AGENT_ERROR
+    error_events = [event for event in _events(session_id) if event.get("type") == "error"]
+    assert error_events
+    assert "daemon was stopped" in error_events[-1]["message"]
+    # acpc ended this turn. Blaming the adapter would send the reader hunting
+    # for a vendor problem that never happened.
+    assert error_events[-1]["observation"].startswith("acpc ended the turn")
+    assert "adapter failure" not in error_events[-1]["message"]
+
+
+def test_killed_adapter_records_a_failure_event(state_root: Path, live_daemon: None) -> None:
+    import os
+    import signal
+
+    session_id = new_session("slow:30 killed adapter")
+    problem = asyncio.run(
+        runner.dispatch_background(
+            session_id,
+            runner.TurnRequest(resolution=resolve(), prompt="slow:30 killed adapter"),
+        )
+    )
+    assert problem is None
+    _wait_for(session_id, "running")
+
+    daemon_pid = asyncio.run(_daemon_pid())
+    children_path = Path(f"/proc/{daemon_pid}/task/{daemon_pid}/children")
+    if not children_path.exists():  # pragma: no cover - non-Linux
+        pytest.skip("requires /proc/<pid>/children")
+    adapters = [int(pid) for pid in children_path.read_text().split()]
+    assert len(adapters) == 1
+    os.kill(adapters[0], signal.SIGKILL)
+
+    meta = _wait_for_finished(session_id)
+    assert meta.state == "failed"
+    error_events = [event for event in _events(session_id) if event.get("type") == "error"]
+    assert error_events
+    assert "adapter" in error_events[-1]["message"].lower(), error_events
+    assert error_events[-1]["observation"]
+    assert error_events[-1]["next_step"].startswith("inspect the daemon log at")
+
+
+def test_authentication_refusal_records_the_remedy_even_with_an_empty_log(
+    state_root: Path, live_daemon: None
+) -> None:
+    session_id = new_session("auth:vendor needs credentials")
+    # "Empty log" is the condition under test, so establish it rather than
+    # inherit it: an earlier daemon in this root leaves its own shutdown note
+    # behind, and the assertion below would then be measuring test order.
+    resolution = resolve()
+    log_file = daemon.log_path_for_target(runner.call_target(resolution))
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    log_file.write_bytes(b"")
+    problem = asyncio.run(
+        runner.dispatch_background(
+            session_id,
+            runner.TurnRequest(resolution=resolution, prompt="auth:vendor needs credentials"),
+        )
+    )
+    assert problem is None
+
+    meta = _wait_for_finished(session_id)
+    assert meta.state == "failed"
+    error_events = [event for event in _events(session_id) if event.get("type") == "error"]
+    assert error_events
+    event = error_events[-1]
+    assert "authentication was refused" in event["message"]
+    assert event["next_step"] == "run 'mock login'"
+    assert "adapter_log" in event
+    assert "adapter_log_tail" not in event
+
+
+def test_a_failure_quotes_its_own_turn_and_not_an_earlier_one(
+    state_root: Path, live_daemon: None
+) -> None:
+    """The per-target log is shared and append-only across every session.
+
+    So a failure may quote only what its own turn wrote: attributing an earlier
+    session's stderr to this one would be a confident, wrong diagnosis.
+    """
+    earlier = new_session("stderr:words from an earlier session")
+    run_turn(earlier, "stderr:words from an earlier session")
+    log_file = daemon.log_path_for_target(target())
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if "words from an earlier session" in log_file.read_text(encoding="utf-8"):
+            break
+        time.sleep(0.1)
+    else:
+        pytest.fail("adapter stderr never reached the log")
+
+    session_id = new_session("stderr-crash:words from the failing turn")
+    problem = asyncio.run(
+        runner.dispatch_background(
+            session_id,
+            runner.TurnRequest(
+                resolution=resolve(), prompt="stderr-crash:words from the failing turn"
+            ),
+        )
+    )
+    assert problem is None
+
+    assert _wait_for_finished(session_id).state == "failed"
+    event = [event for event in _events(session_id) if event.get("type") == "error"][-1]
+    assert "words from the failing turn" in event["adapter_log_tail"]
+    assert "words from an earlier session" not in event["adapter_log_tail"]
+    assert "words from an earlier session" not in event["message"]
+
+
+def test_an_auth_refusal_is_recognized_from_its_data_not_its_text(
+    state_root: Path, live_daemon: None
+) -> None:
+    """Adapters mark auth failures in `data`; the message may say nothing."""
+    session_id = new_session("auth-data:no readable text")
+    problem = asyncio.run(
+        runner.dispatch_background(
+            session_id,
+            runner.TurnRequest(resolution=resolve(), prompt="auth-data:no readable text"),
+        )
+    )
+    assert problem is None
+
+    assert _wait_for_finished(session_id).state == "failed"
+    event = [event for event in _events(session_id) if event.get("type") == "error"][-1]
+    assert "authentication was refused" in event["message"]
+    assert event["next_step"] == "run 'mock login'"
+
+
+def test_adapter_refusal_without_an_exception_records_a_failure_event(
+    state_root: Path, live_daemon: None
+) -> None:
+    session_id = new_session("please fail this on purpose")
+    problem = asyncio.run(
+        runner.dispatch_background(
+            session_id,
+            runner.TurnRequest(resolution=resolve(), prompt="please fail this on purpose"),
+        )
+    )
+    assert problem is None
+
+    meta = _wait_for_finished(session_id)
+    assert meta.state == "failed"
+    error_events = [event for event in _events(session_id) if event.get("type") == "error"]
+    assert error_events
+    assert "stop reason: refusal" in error_events[-1]["message"]
 
 
 def test_daemon_stop_leaves_an_already_finished_session_alone(
@@ -585,6 +728,11 @@ def _transcript_text(session_id: str) -> str:
         for line in path.read_text(encoding="utf-8").splitlines()
         if line
     )
+
+
+def _events(session_id: str) -> list[dict]:
+    path = sessions.transcript_path(session_id)
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
 
 
 def _wait_for(session_id: str, state: str, timeout: float = 20.0) -> None:

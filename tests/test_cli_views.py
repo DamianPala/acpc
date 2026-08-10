@@ -225,6 +225,26 @@ def test_log_keeps_events_on_stdout_and_footer_on_stderr(cli: CliRunner) -> None
     assert "cursor:" in result.stderr and "cursor:" not in result.stdout
 
 
+def test_failed_log_and_wait_surface_the_recorded_cause(cli: CliRunner) -> None:
+    run_result = invoke(cli, "run", "mock", "auth:missing credentials", "--quiet", "--json")
+    assert run_result.exit_code == vocab.EXIT_AGENT_ERROR
+    session_id = json.loads(run_result.stdout)["session_id"]
+
+    log_result = invoke(cli, "log", session_id, "--quiet")
+    wait_result = invoke(cli, "wait", session_id, "--quiet")
+
+    assert log_result.exit_code == vocab.EXIT_OK
+    assert "authentication was refused" in log_result.stdout
+    assert wait_result.exit_code == vocab.EXIT_AGENT_ERROR
+    assert "run 'mock login'" in wait_result.stdout
+
+    # Without --quiet the same cause rides the stderr summary, so a poller that
+    # discards the answer still learns why the session failed.
+    loud_result = invoke(cli, "wait", session_id)
+    assert "| failure: " in loud_result.stderr
+    assert "run 'mock login'" in loud_result.stderr
+
+
 def test_log_defaults_to_the_last_twenty_events(cli: CliRunner) -> None:
     """A log without --since selects the last twenty events."""
     meta = session_with_messages(21)

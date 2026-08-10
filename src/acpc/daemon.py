@@ -368,18 +368,22 @@ class Daemon:
         to `failed` with the reason recorded in meta — never orphans.
         """
         for turn in list(self.turns.values()):
-            turn.cancel.request("failed")
+            turn.cancel.request("failed", stop_reason=reason)
             turn.task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await turn.task
             with contextlib.suppress(sessions.SessionError):
                 meta = sessions.read_meta(turn.session_id)
                 if meta.is_active:
-                    sessions.transition(
-                        turn.session_id,
-                        "failed",
-                        exit_code=vocab.EXIT_AGENT_ERROR,
+                    outcome = runner.TurnOutcome(
+                        state="failed",
                         stop_reason=reason,
+                        answer="",
+                    )
+                    runner._finalize(
+                        turn.session_id,
+                        outcome,
+                        error=runner.TurnEndedByAcpc(reason),
                     )
             self._resolve_waiters(turn, {"state": "failed", "exit_code": vocab.EXIT_AGENT_ERROR})
         self.turns.clear()
@@ -624,6 +628,10 @@ class Daemon:
             events = transcript.Transcript(sessions.transcript_path(session_id))
             outcome = runner.TurnOutcome(state="failed", stop_reason="error", answer="")
             error: BaseException | None = None
+            # Where this turn's own output starts in the shared per-target log:
+            # the file is append-only across every session the target ever ran,
+            # so without this mark a failure would quote a stranger's stderr.
+            log_from = runner.adapter_log_offset(self.target)
             try:
                 sessions.mark_running(session_id, pid=os.getpid())
                 events.append("state", **{"from": "starting", "to": "running"})
@@ -632,14 +640,20 @@ class Daemon:
                 # Same reasoning as the direct path: a crash must still leave a
                 # finished session, never a meta.json stuck on `running`.
                 error = caught
-                runner._finalize(session_id, outcome, error=error)
+                runner._finalize(session_id, outcome, error=error, adapter_log_from=log_from)
                 # If the crash was the adapter dying, heal the target now
                 # rather than on the next turn's ensure().
                 with contextlib.suppress(Exception):
                     await self.host.reset_if_dead()
             else:
-                runner._finalize(session_id, outcome)
+                runner._finalize(
+                    session_id, outcome, error=outcome.error, adapter_log_from=log_from
+                )
             finally:
+                # Only a turn that could not be *started* travels back as an
+                # error: the client raises on it. A turn that ran and failed is
+                # already finalized on disk, and the client mirrors that result
+                # so the caller still gets the answer, the summary and --json.
                 self._finish(session_id, outcome, error=error)
             return outcome
 
@@ -661,6 +675,7 @@ class Daemon:
             cancellation_dispatched=cancel.cancellation_dispatched,
         )
 
+        turn_error: BaseException | None = None
         warm = self.host.adapter_sessions.get(session_id)
         if warm is not None:
             # The adapter still holds this session, so its own history is
@@ -692,9 +707,15 @@ class Daemon:
             prompt_task = asyncio.create_task(
                 conn.prompt(session_id=adapter_session_id, prompt=[text_block(request.prompt)])
             )
-            stop_reason = await runner._await_prompt(
-                conn, adapter_session_id, prompt_task, request, cancel
-            )
+            try:
+                stop_reason = await runner._await_prompt(
+                    conn, adapter_session_id, prompt_task, request, cancel
+                )
+            except Exception as caught:  # noqa: BLE001
+                # Same bargain as the direct path: keep the streamed prose as the
+                # failed session's answer and carry the cause on the outcome.
+                turn_error = caught
+                stop_reason = "error"
         finally:
             self.host.mux.release(adapter_session_id)
             client.flush()
@@ -714,6 +735,7 @@ class Daemon:
             denial_details=client.denial_details,
             adapter_session_id=adapter_session_id,
             advertised=client.advertised,
+            error=turn_error,
         )
 
     def _finish(
