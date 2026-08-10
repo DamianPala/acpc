@@ -393,6 +393,41 @@ def test_status_list_limits_finished_sessions_and_json_preserves_fields() -> Non
     assert payload["sessions"][0]["prompt_snippet"] == "active prompt"
 
 
+def test_status_keeps_the_last_finished_session_even_if_it_started_first() -> None:
+    """SPEC `status`: the 5 most recent *finished*, by when they finished.
+
+    A long `--bg` run started before everything else and finished after
+    everything else is the most recent finished session there is; ordering the
+    bucket by start time would cut exactly that one.
+    """
+    long_run = sessions.create_session(
+        entry="mock", base_adapter="mock", prompt="long run", clock=lambda: 10.0
+    )
+    sessions.transition(long_run.session_id, "done", clock=lambda: 900.0, exit_code=0)
+    short_runs = [
+        sessions.create_session(
+            entry="mock",
+            base_adapter="mock",
+            prompt=f"short run {index}",
+            clock=lambda index=index: 100.0 + index,
+        )
+        for index in range(5)
+    ]
+    for index, meta in enumerate(short_runs):
+        sessions.transition(
+            meta.session_id, "done", clock=lambda index=index: 200.0 + index, exit_code=0
+        )
+
+    # As `list_sessions` hands them over: most recently started first.
+    ordered = [sessions.read_meta(meta.session_id) for meta in reversed(short_runs)]
+    ordered.append(sessions.read_meta(long_run.session_id))
+
+    text = render.render_status_list(ordered, clock=lambda: 1000.0)
+
+    assert "long run" in text
+    assert "short run 0" not in text  # finished first, so it is the one cut
+
+
 def test_status_list_has_one_lowercase_header_and_aligns_long_columns() -> None:
     short = sessions.create_session(
         entry="tiny",

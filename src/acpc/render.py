@@ -446,7 +446,18 @@ def _status_selection(
     if all_sessions:
         return list(sessions_in)
     active = [meta for meta in sessions_in if meta.is_active]
-    finished = [meta for meta in sessions_in if meta.is_finished][:5]
+    # SPEC `status`: the 5 most recent *finished*. The incoming order is by
+    # start time, under which a long run that finished last is cut while a
+    # shorter one started after it survives — so this bucket re-sorts by
+    # finish time. `prune` measures age from the same field.
+    finished = sorted(
+        (meta for meta in sessions_in if meta.is_finished),
+        key=lambda meta: (
+            meta.finished_at if meta.finished_at is not None else (meta.created_at or 0.0),
+            meta.session_id,
+        ),
+        reverse=True,
+    )[:5]
     return active + finished
 
 
