@@ -32,8 +32,8 @@ def test_shipped_adapter_facts_and_presets_are_available(tmp_path: Path) -> None
         for mode, spec in claude.modes.items()
     } == {
         "default": {"grants": "read", "delegates": True},
-        "plan": {"grants": "read", "delegates": True},
-        "auto": {"grants": "read", "delegates": True},
+        "plan": {"grants": "edit", "delegates": True},
+        "auto": {"grants": "all", "delegates": False},
         "acceptEdits": {"grants": "execute", "delegates": True},
         "dontAsk": {"grants": "none", "delegates": False},
         "bypassPermissions": {"grants": "all", "delegates": False},

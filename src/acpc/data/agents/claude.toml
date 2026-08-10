@@ -30,10 +30,19 @@ env_passthrough = [
 effort_config_id = "effort"
 efforts = ["default", "low", "medium", "high", "xhigh", "max"]
 
+# Measured by probe spike 2026-08-10 against claude-agent-acp 0.64.0 /
+# Claude Code 2.1.226 (docs/plans/0.6/spike-probe/REPORT.md). Two corrections
+# to the 2026-08-08 hand-written table:
+# - `auto` ("model classifier approves permission prompts") answers in-vendor
+#   and silently: it wrote inside and outside the workspace, ran shell and
+#   reached the network with zero permission requests. It is `all` and does
+#   not delegate — never treat it as a read-ceiling mode.
+# - `plan` wrote an arbitrary file with no permission request after nudging;
+#   it resists but is not a boundary. `edit` is the honest ceiling.
 [modes]
 default = { grants = "read", delegates = true }
-plan = { grants = "read", delegates = true }
-auto = { grants = "read", delegates = true }
+plan = { grants = "edit", delegates = true }
+auto = { grants = "all", delegates = false }
 acceptEdits = { grants = "execute", delegates = true }
 dontAsk = { grants = "none", delegates = false }
 bypassPermissions = { grants = "all", delegates = false }

@@ -13,10 +13,14 @@ env_passthrough = [
     "OPENAI_API_KEY",
     "INITIAL_AGENT_MODE",
 ]
-# Verified live 2026-08-06: codex-acp advertises read-only / agent /
-# agent-full-access. The default `agent` mode also auto-allows *workspace* edits
-# and commands without a permission request, so a policy below `all` only bites
-# in `read-only` mode; the vendor sandbox is the boundary everywhere else.
+# Measured by probe spike 2026-08-10 against codex-acp 1.1.9 / codex-cli
+# 0.147.0 (docs/plans/0.6/spike-probe/REPORT.md). No mode delegates: zero
+# request_permission calls across six runs. read-only is NOT a read-only
+# boundary — writes land with nothing asked when the model routes through
+# apply_patch (an in-vendor reviewer, "Guardian", approves them and the client
+# sees only a `think` tool call); the same write through a shell redirect is
+# denied by the sandbox. Treat `edit` as the measured floor, not a guarantee:
+# read-only is the mode with the least predictable ceiling, not the safe one.
 # Verified live 2026-08-06: codex-acp rejects minimal/ultra ("Invalid params").
 efforts = ["low", "medium", "high", "xhigh"]
 
