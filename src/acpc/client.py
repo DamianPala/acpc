@@ -92,28 +92,29 @@ class ReplaySink:
 
     The collected messages are what verified resume compares against the
     session's stored `prompt.md`/`prompt.<n>.md`, as an ordered subsequence.
-    Until that check ships, the sink's job is only to keep replay out of the
-    turn: nothing in production reads `user_messages` yet.
+    The sink keeps replay out of the active turn while its ordered messages
+    feed resume verification.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, replay_available: bool = False) -> None:
         self._messages: list[str] = []
         self._message_indices: dict[str, int] = {}
         self._anonymous_message_index: int | None = None
+        self._replay_available = replay_available
+
+    @property
+    def replay_available(self) -> bool:
+        """Return whether collection was ordered by a transport observer."""
+        return self._replay_available
 
     @property
     def user_messages(self) -> list[str]:
         """Return replayed user messages in their first-seen order."""
         return list(self._messages)
 
-    def consume(self, update: Any) -> None:
-        if not isinstance(update, UserMessageChunk):
-            self._anonymous_message_index = None
-            return
-        text = getattr(update.content, "text", None)
+    def _consume_text(self, text: Any, message_id: Any) -> None:
         if not isinstance(text, str):
             return
-        message_id = getattr(update, "message_id", None)
         if isinstance(message_id, str) and message_id:
             message_index = self._message_indices.get(message_id)
             if message_index is None:
@@ -127,6 +128,22 @@ class ReplaySink:
             self._anonymous_message_index = len(self._messages)
             self._messages.append("")
         self._messages[self._anonymous_message_index] += text
+
+    def consume(self, update: Any) -> None:
+        if not isinstance(update, UserMessageChunk):
+            self._anonymous_message_index = None
+            return
+        text = getattr(update.content, "text", None)
+        self._consume_text(text, getattr(update, "message_id", None))
+
+    def consume_raw(self, update: Mapping[str, Any]) -> None:
+        """Collect a user replay directly from an ordered ACP frame."""
+        if update.get("sessionUpdate") != "user_message_chunk":
+            self._anonymous_message_index = None
+            return
+        content = update.get("content")
+        text = content.get("text") if isinstance(content, Mapping) else None
+        self._consume_text(text, update.get("messageId"))
 
 
 class AcpcClient:
@@ -165,6 +182,9 @@ class AcpcClient:
         self._denied: dict[str, int] = {}
         self._denial_details: dict[str, dict[str, Any]] = {}
         self._replay_sink: ReplaySink | None = None
+        self._raw_connection: Any | None = None
+        self._raw_replay_active = False
+        self._replay_frame_counts: dict[tuple[str, str], int] = {}
         self._advertised: dict[str, Any] = {
             "modes": [],
             "models": [],
@@ -214,24 +234,78 @@ class AcpcClient:
         self._advertised["models"] = self._models_from_options(session.config_options or [])
 
     @asynccontextmanager
-    async def replaying(self) -> AsyncIterator[ReplaySink]:
+    async def replaying(
+        self, expected_session_id: str, connection: Any | None = None
+    ) -> AsyncIterator[ReplaySink]:
         """Consume session-restore updates without changing turn-visible state."""
         previous = self._replay_sink
-        sink = ReplaySink()
+        previous_raw = self._raw_replay_active
+        raw_connection = getattr(connection, "_conn", None) or self._raw_connection
+        add_observer = getattr(raw_connection, "add_observer", None)
+        uses_raw_frames = callable(add_observer)
+        sink = ReplaySink(replay_available=uses_raw_frames)
         self._replay_sink = sink
+        self._raw_replay_active = uses_raw_frames
+        if uses_raw_frames:
+
+            def observe(event: Any) -> None:
+                if self._replay_sink is not sink or not self._raw_replay_active:
+                    return
+                if getattr(getattr(event, "direction", None), "value", None) != "incoming":
+                    return
+                message = getattr(event, "message", {})
+                if not isinstance(message, Mapping) or message.get("method") != "session/update":
+                    return
+                params = message.get("params")
+                if not isinstance(params, Mapping):
+                    return
+                session_id = params.get("sessionId")
+                update = params.get("update")
+                if session_id != expected_session_id or not isinstance(update, Mapping):
+                    return
+                self._record_replay_frame(expected_session_id, update)
+                sink.consume_raw(update)
+
+            add_observer(observe)
         try:
             yield sink
         finally:
-            try:
-                # ACP dispatches notifications in background tasks. Let the
-                # ordered replay callbacks run before releasing the guard.
-                await asyncio.sleep(0)
-            finally:
-                self._replay_sink = previous
+            self._raw_replay_active = previous_raw
+            self._replay_sink = previous
 
     def on_connect(self, conn: Any) -> None:
-        """Satisfy the ACP connection hook; no client-side setup is needed."""
-        del conn
+        """Keep the raw connection for ordered replay-frame observation."""
+        self._raw_connection = getattr(conn, "_conn", None)
+
+    @staticmethod
+    def _raw_update_key(session_id: str, update: Mapping[str, Any]) -> tuple[str, str]:
+        serialized = json.dumps(dict(update), sort_keys=True, separators=(",", ":"))
+        return session_id, serialized
+
+    def _record_replay_frame(self, session_id: str, update: Mapping[str, Any]) -> None:
+        key = self._raw_update_key(session_id, update)
+        self._replay_frame_counts[key] = self._replay_frame_counts.get(key, 0) + 1
+
+    def _consume_delayed_replay_frame(self, session_id: str, update: Any) -> bool:
+        if not isinstance(session_id, str):
+            return False
+        try:
+            serialized = update.model_dump(
+                mode="json", by_alias=True, exclude_none=True, exclude_unset=True
+            )
+        except AttributeError:
+            return False
+        if not isinstance(serialized, Mapping):
+            return False
+        key = self._raw_update_key(session_id, serialized)
+        count = self._replay_frame_counts.get(key, 0)
+        if count == 0:
+            return False
+        if count == 1:
+            del self._replay_frame_counts[key]
+        else:
+            self._replay_frame_counts[key] = count - 1
+        return True
 
     def flush(self) -> None:
         """Write buffered agent prose to the transcript as one event.
@@ -266,9 +340,12 @@ class AcpcClient:
 
     async def session_update(self, session_id: str, update: Any, **kwargs: Any) -> None:
         """Record one ACP session update in the public transcript format."""
-        del session_id, kwargs
+        del kwargs
         if self._replay_sink is not None:
-            self._replay_sink.consume(update)
+            if not self._raw_replay_active:
+                self._replay_sink.consume(update)
+            return
+        if self._consume_delayed_replay_frame(session_id, update):
             return
         update_type = getattr(update, "session_update", None)
 

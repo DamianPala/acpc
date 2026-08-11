@@ -404,6 +404,53 @@ class TestTurnRotation:
         sessions.write_prompt(session_id, "now apply the same fix to v2")
         assert sessions.read_meta(session_id).prompt_snippet == "now apply the same fix to v2"
 
+    def test_rotation_callbacks_see_the_locked_meta_snapshot(self) -> None:
+        session_id = finished_session()
+        current = sessions.read_meta(session_id)
+        current.resolution["resolved"] = {
+            "model": current.resolution.get("model", {}),
+            "permissions": {
+                "value": "edit",
+                "source": "concurrent update",
+            },
+        }
+        with sessions.session_lock(session_id):
+            sessions.write_meta(current)
+
+        rotated = sessions.rotate_turn(
+            session_id,
+            permissions_from_meta=lambda meta: meta.resolution["resolved"]["permissions"]["value"],
+            clock=at(100.0),
+        )
+
+        assert rotated.resolution["resolved"]["permissions"]["value"] == "edit"
+
+    def test_finalization_token_cannot_write_into_a_replacement_turn(self) -> None:
+        session_id = finished_session()
+        sessions.write_answer(session_id, "answer one")
+        sessions.rotate_turn(session_id, prompt="replacement", clock=at(100.0))
+        sessions.write_answer(session_id, "replacement answer")
+        transcript_path = sessions.transcript_path(session_id)
+        transcript_before = transcript_path.read_bytes() if transcript_path.exists() else None
+
+        finalized = sessions.finalize_turn(
+            session_id,
+            "done",
+            answer="stale answer",
+            expected_turn=1,
+            exit_code=0,
+            clock=at(101.0),
+            error_event={"message": "stale explanation"},
+        )
+
+        assert finalized is None
+        assert sessions.read_meta(session_id).state == "starting"
+        assert sessions.answer_path(session_id).read_text() == "replacement answer"
+        if transcript_before is None:
+            assert not transcript_path.exists()
+        else:
+            assert transcript_path.read_bytes() == transcript_before
+
 
 class TestNamesAndSelectors:
     def test_a_free_name_needs_no_warning(self) -> None:

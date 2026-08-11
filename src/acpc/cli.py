@@ -6,7 +6,6 @@ delegates everything else to the layer that owns it.
 """
 
 import asyncio
-import contextlib
 import json
 import os
 import subprocess
@@ -407,25 +406,6 @@ def _updated_session_resolution(
         )
     payload["adapter"] = adapter
     return payload
-
-
-def _target_for_persisted_resolution(meta: sessions.SessionMeta) -> str:
-    """Key the daemon from the exact resolution the next turn will rebuild."""
-    return runner.call_target(runner.resolution_from_session(meta))
-
-
-def _finalize_follow_up_failure(session_id: str, error: BaseException) -> None:
-    """Close a rotated turn when request preparation cannot finish."""
-    with contextlib.suppress(OSError, sessions.SessionError):
-        runner._finalize(
-            session_id,
-            runner.TurnOutcome(
-                state="failed",
-                answer="",
-                stop_reason="error",
-            ),
-            error=error,
-        )
 
 
 def _resolve_permissions(
@@ -2328,6 +2308,9 @@ def _dispatch_background(session_id: str, request: runner.TurnRequest, *, json_m
         import json
 
         payload = {"session_id": session_id, "paths": sessions.session_paths(session_id)}
+        resume = sessions.read_meta(session_id).extra.get("resume")
+        if isinstance(resume, str):
+            payload["resume"] = resume
         _write_stdout(json.dumps(payload, ensure_ascii=False) + "\n")
         return
     _write_stdout(f"{session_id}\n{sessions.session_dir(session_id)}\n")
@@ -2531,37 +2514,22 @@ def _dispatch_follow_up(
         if selection is not None
         else None
     )
+    request_resolution = (
+        runner.resolution_from_session(replace(current, resolution=updated_resolution))
+        if updated_resolution is not None
+        else None
+    )
     try:
-        runner.continue_request(
+        request = runner.continue_request(
             current,
             prompt,
             timeout=timeout,
             permission_prompt=(_tty_permission_prompt if policy == "ask" and interactive else None),
-            resolution=selection,
+            resolution=request_resolution,
+            defer_rotation=True,
+            rotation_resolution=updated_resolution,
         )
-    except runner.RunnerError as error:
-        raise UsageProblem(str(error)) from None
-
-    rotated: sessions.SessionMeta | None = None
-    try:
-        rotated = sessions.rotate_turn(
-            meta.session_id,
-            resolution=updated_resolution,
-            target_from_meta=_target_for_persisted_resolution,
-        )
-        rotated_policy = _stored_permission_policy(rotated)
-        request = runner.continue_request(
-            rotated,
-            prompt,
-            timeout=timeout,
-            permission_prompt=(
-                _tty_permission_prompt if rotated_policy == "ask" and interactive else None
-            ),
-        )
-        sessions.write_prompt(rotated.session_id, prompt)
     except (runner.RunnerError, sessions.SessionError, OSError, UsageProblem) as error:
-        if rotated is not None:
-            _finalize_follow_up_failure(meta.session_id, error)
         if isinstance(error, UsageProblem):
             raise
         raise UsageProblem(str(error)) from None
@@ -2571,10 +2539,12 @@ def _dispatch_follow_up(
         return
 
     if not quiet:
-        _echo_metadata(output.format_session_line(rotated))
+        _echo_metadata(output.format_session_line(current))
 
     try:
         outcome = runner.execute_turn(meta.session_id, request)
+    except runner.ResumeRotationError as error:
+        raise UsageProblem(str(error)) from None
     except runner.RunnerError as error:
         raise AgentProblem(str(error)) from None
 

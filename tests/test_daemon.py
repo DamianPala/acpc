@@ -8,6 +8,7 @@ boundaries, so mocking them out would test nothing.
 
 import asyncio
 import json
+import os
 import sys
 import time
 from dataclasses import replace
@@ -189,6 +190,56 @@ def test_a_turn_runs_on_the_daemon_and_finishes_the_session(
     assert sessions.read_meta(session_id).state == "done"
 
 
+def test_claimed_turn_is_finalized_if_daemon_task_registration_fails(
+    state_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id = new_session("turn one")
+    run_turn(session_id, "turn one")
+    meta = sessions.read_meta(session_id)
+    assert meta.adapter_session_id is not None
+    request = runner.TurnRequest(
+        resolution=resolve(),
+        prompt="must not prompt",
+        resume_adapter_session=meta.adapter_session_id,
+        defer_rotation=True,
+    )
+    instance = daemon.Daemon(target())
+
+    async def prepare(_session_id: str, incoming: runner.TurnRequest) -> runner.TurnRequest:
+        rotated = sessions.rotate_turn(
+            session_id,
+            prompt=incoming.prompt,
+            resume_status="verified",
+            pid=os.getpid(),
+        )
+        return replace(
+            incoming,
+            defer_rotation=False,
+            resume_prepared=True,
+            turn_token=rotated.turns,
+        )
+
+    def fail_task_registration(*args: object, **kwargs: object) -> None:
+        raise OSError("injected task registration failure")
+
+    monkeypatch.setattr(instance, "_prepare_turn", prepare)
+    monkeypatch.setattr(daemon.asyncio, "create_task", fail_task_registration)
+
+    reply = asyncio.run(
+        instance._start(
+            {
+                "session_id": session_id,
+                "payload": runner.daemon_payload(request),
+            }
+        )
+    )
+
+    assert reply["ok"] is False
+    failed = sessions.read_meta(session_id)
+    assert failed.state == "failed"
+    assert failed.turns == 2
+
+
 def test_a_refused_switch_leaves_the_daemon_warm_for_continue(
     state_root: Path, live_daemon: None
 ) -> None:
@@ -277,18 +328,15 @@ def test_a_warm_second_turn_still_knows_the_first(state_root: Path, live_daemon:
     assert "turn one of the conversation" in answer
 
 
-def test_a_cold_resume_cannot_recover_what_the_adapter_forgot(state_root: Path) -> None:
-    """Without a daemon each turn gets a fresh adapter, and `session/load`
-    only restores what the adapter itself persisted — which for this one is
-    nothing. This is why `continue` needs the warm path.
-    """
+def test_a_cold_resume_restores_the_adapter_persisted_history(state_root: Path) -> None:
+    """Without a daemon, `session/load` restores the adapter's durable history."""
     session_id = new_session("turn one of the conversation")
     run_turn(session_id, "turn one of the conversation")
 
     next_turn(session_id, "turn two, please build on turn one")
 
     answer = sessions.answer_path(session_id).read_text(encoding="utf-8")
-    assert "turn one of the conversation" not in answer
+    assert "turn one of the conversation" in answer
 
 
 def test_a_daemon_cold_resume_consumes_replayed_history_silently(
@@ -299,11 +347,6 @@ def test_a_daemon_cold_resume_consumes_replayed_history_silently(
     session_id = new_session("turn one of the conversation")
     run_turn(session_id, "turn one of the conversation")
     asyncio.run(_stop_target())
-
-    meta = sessions.read_meta(session_id)
-    meta.adapter_session_id = "load-history"
-    with sessions.session_lock(session_id):
-        sessions.write_meta(meta)
 
     next_turn(session_id, "turn two, please build on turn one")
 
@@ -324,11 +367,6 @@ def test_a_daemon_cold_resume_prefers_session_resume(
     session_id = new_session("turn one")
     run_turn(session_id, "turn one")
     asyncio.run(_stop_target())
-
-    meta = sessions.read_meta(session_id)
-    meta.adapter_session_id = "load-history"
-    with sessions.session_lock(session_id):
-        sessions.write_meta(meta)
 
     next_turn(session_id, "turn two")
 
@@ -499,9 +537,20 @@ def test_adapter_refusal_without_an_exception_records_a_failure_event(
 
     meta = _wait_for_finished(session_id)
     assert meta.state == "failed"
-    error_events = [event for event in _events(session_id) if event.get("type") == "error"]
+    events = _events(session_id)
+    error_events = [event for event in events if event.get("type") == "error"]
     assert error_events
     assert "stop reason: refusal" in error_events[-1]["message"]
+    failed_state_index = next(
+        index
+        for index, event in enumerate(events)
+        if event.get("type") == "state" and event.get("to") == "failed"
+    )
+    assert all(
+        index < failed_state_index
+        for index, event in enumerate(events)
+        if event.get("type") == "error"
+    )
 
 
 def test_daemon_stop_leaves_an_already_finished_session_alone(

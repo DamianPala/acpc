@@ -22,7 +22,8 @@ import os
 import shutil
 import signal
 import sys
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -65,6 +66,34 @@ _ADAPTER_LIMIT_STOP_REASONS = frozenset({"max_tokens", "max_turn_requests"})
 
 class RunnerError(Exception):
     """A turn could not be started; the message is one actionable line."""
+
+
+class ResumePreparationError(RunnerError):
+    """A cold resume failed before acpc opened the next turn on disk."""
+
+
+class ResumeVerificationError(ResumePreparationError):
+    """The adapter's identity or replay did not match the stored session."""
+
+
+class ResumeRotationError(RunnerError):
+    """The verified continuation could not be opened on the session store."""
+
+    def __init__(self, message: str, *, turn_token: int | None = None) -> None:
+        super().__init__(message)
+        self.turn_token = turn_token
+
+
+class ResumeSetupError(RunnerError):
+    """A claimed continuation failed before its prompt could be dispatched."""
+
+    def __init__(self, message: str, *, turn_token: int) -> None:
+        super().__init__(message)
+        self.turn_token = turn_token
+
+
+class PromptDeliveryError(RunnerError):
+    """The ACP prompt crossed the wire but its durable delivery marker failed."""
 
 
 class TurnEndedByAcpc(RunnerError):
@@ -110,7 +139,103 @@ def has_resume_session_capability(capabilities: Any) -> bool:
     return getattr(session_capabilities, "resume", None) is not None
 
 
-async def restore_adapter_session(
+def has_list_session_capability(capabilities: Any) -> bool:
+    """Return whether initialize advertised ACP ``session/list``."""
+    session_capabilities = getattr(capabilities, "session_capabilities", None)
+    return getattr(session_capabilities, "list", None) is not None
+
+
+async def verify_listed_adapter_session(
+    conn: Any, capabilities: Any, adapter_session_id: str, cwd: str
+) -> bool:
+    """Verify the adapter id and cwd, walking every advertised list page."""
+    if not has_list_session_capability(capabilities):
+        return False
+
+    cursor: str | None = None
+    while True:
+        response = await conn.list_sessions(cursor=cursor)
+        for info in getattr(response, "sessions", []):
+            if getattr(info, "session_id", None) != adapter_session_id:
+                continue
+            listed_cwd = getattr(info, "cwd", None)
+            if listed_cwd != cwd:
+                raise ResumeVerificationError(
+                    f"resume verification failed for adapter session {adapter_session_id!r}: "
+                    f"cwd is {listed_cwd!r}, expected {cwd!r}"
+                )
+            return True
+
+        next_cursor = getattr(response, "next_cursor", None)
+        if not next_cursor:
+            raise ResumeVerificationError(
+                f"resume verification failed: adapter session id {adapter_session_id!r} "
+                "was not found by session/list"
+            )
+        cursor = next_cursor
+
+
+def verify_replayed_prompts(
+    adapter_session_id: str, expected: Sequence[tuple[Path, str]], replayed: Sequence[str]
+) -> None:
+    """Require stored prompts to occur in order in the adapter's user replay."""
+    replay_index = 0
+    for prompt_path, prompt in expected:
+        try:
+            found_at = replayed.index(prompt, replay_index)
+        except ValueError:
+            reason = "arrived out of order" if prompt in replayed else "was not found"
+            raise ResumeVerificationError(
+                f"resume verification failed for adapter session {adapter_session_id!r}: "
+                f"stored prompt {prompt_path} {reason} in the replay"
+            ) from None
+        replay_index = found_at + 1
+
+
+def _resume_status(*, list_checked: bool, replay_checked: bool) -> str:
+    """Render the persisted resume confidence for summaries and JSON."""
+    if list_checked or replay_checked:
+        return "verified"
+    unavailable = []
+    if not list_checked:
+        unavailable.append("session/list unavailable")
+    if not replay_checked:
+        unavailable.append("conversation replay unavailable")
+    return "unverified — " + "; ".join(unavailable)
+
+
+def _stored_prompt_items(session_id: str) -> list[tuple[Path, str]]:
+    """Read only prompts whose outgoing request crossed the ACP boundary."""
+    meta = sessions.read_meta(session_id)
+    records = meta.extra.get("delivered_prompts")
+    if not isinstance(records, list):
+        return []
+    delivered_turns = {
+        record.get("turn")
+        for record in records
+        if isinstance(record, Mapping) and isinstance(record.get("turn"), int)
+    }
+    items: list[tuple[Path, str]] = []
+    for turn in range(1, meta.turns + 1):
+        if turn not in delivered_turns:
+            continue
+        prompt_path = (
+            sessions.prompt_path(session_id)
+            if turn == meta.turns
+            else sessions.turn_path(session_id, "prompt", turn)
+        )
+        try:
+            prompt = prompt_path.read_text(encoding="utf-8")
+        except OSError as error:
+            raise ResumePreparationError(
+                f"cannot verify resume for session {session_id}: "
+                f"stored prompt {prompt_path} is unreadable ({error})"
+            ) from None
+        items.append((prompt_path, prompt))
+    return items
+
+
+async def _restore_adapter_session(
     conn: Any, capabilities: Any, adapter_session_id: str, cwd: str
 ) -> None:
     """Restore an adapter session, preferring ``session/resume`` when offered."""
@@ -126,6 +251,114 @@ async def restore_adapter_session(
         await conn.load_session(**request)
 
 
+async def restore_adapter_session(
+    conn: Any, capabilities: Any, adapter_session_id: str, cwd: str
+) -> bool:
+    """Verify the listed identity, then restore the adapter session."""
+    list_checked = await verify_listed_adapter_session(conn, capabilities, adapter_session_id, cwd)
+    await _restore_adapter_session(conn, capabilities, adapter_session_id, cwd)
+    return list_checked
+
+
+async def verify_adapter_resume(
+    conn: Any,
+    client: AcpcClient,
+    capabilities: Any,
+    adapter_session_id: str,
+    cwd: str,
+    session_id: str,
+) -> str:
+    """Restore and independently run the adapter identity and replay checks."""
+    expected_prompts = _stored_prompt_items(session_id)
+    list_checked = False
+    list_error: ResumeVerificationError | None = None
+    if has_list_session_capability(capabilities):
+        try:
+            list_checked = await verify_listed_adapter_session(
+                conn, capabilities, adapter_session_id, cwd
+            )
+        except ResumeVerificationError as error:
+            list_error = error
+    async with client.replaying(adapter_session_id, conn) as sink:
+        await _restore_adapter_session(conn, capabilities, adapter_session_id, cwd)
+    replay_checked = sink.replay_available and bool(sink.user_messages)
+    if replay_checked:
+        verify_replayed_prompts(adapter_session_id, expected_prompts, sink.user_messages)
+    if list_error is not None:
+        raise list_error
+    return _resume_status(list_checked=list_checked, replay_checked=replay_checked)
+
+
+_PROMPT_MARKER_ATTEMPTS = 3
+
+
+class PromptDelivery:
+    """Track a sent prompt until its durable delivery marker is persisted."""
+
+    def __init__(self, session_id: str, adapter_session_id: str, prompt: str) -> None:
+        self.session_id = session_id
+        self.adapter_session_id = adapter_session_id
+        self.prompt = prompt
+        self.available = False
+        self.seen = False
+        self.persisted = False
+        self.error: Exception | None = None
+
+    def observe(self, event: Any) -> None:
+        if getattr(getattr(event, "direction", None), "value", None) != "outgoing":
+            return
+        message = getattr(event, "message", {})
+        params = message.get("params", {}) if isinstance(message, Mapping) else {}
+        if (
+            not isinstance(message, Mapping)
+            or message.get("method") != "session/prompt"
+            or not isinstance(params, Mapping)
+            or params.get("sessionId") != self.adapter_session_id
+        ):
+            return
+        self.seen = True
+        try:
+            sessions.mark_prompt_delivered(self.session_id, self.prompt)
+        except (OSError, sessions.SessionError) as error:
+            self.error = error
+        else:
+            self.persisted = True
+
+    async def ensure_persisted(self) -> None:
+        """Retry marker persistence before the turn can be finalized."""
+        if not self.available or not self.seen or self.persisted:
+            return
+        last_error = self.error
+        for _attempt in range(_PROMPT_MARKER_ATTEMPTS):
+            try:
+                sessions.mark_prompt_delivered(self.session_id, self.prompt)
+            except (OSError, sessions.SessionError) as error:
+                last_error = error
+                continue
+            self.persisted = True
+            self.error = None
+            return
+        detail = str(last_error) if last_error is not None else "unknown persistence error"
+        raise PromptDeliveryError(
+            f"could not persist delivered-prompt marker for session {self.session_id} "
+            f"after {_PROMPT_MARKER_ATTEMPTS} retries: {detail}"
+        ) from last_error
+
+
+def register_prompt_delivery(
+    conn: Any, session_id: str, adapter_session_id: str, prompt: str
+) -> PromptDelivery:
+    """Record a prompt after ACP has accepted its outgoing wire frame."""
+    delivery = PromptDelivery(session_id, adapter_session_id, prompt)
+    raw_connection = getattr(conn, "_conn", None)
+    add_observer = getattr(raw_connection, "add_observer", None)
+    if not callable(add_observer):
+        return delivery
+    delivery.available = True
+    add_observer(delivery.observe)
+    return delivery
+
+
 @dataclass(frozen=True, slots=True)
 class TurnRequest:
     """Everything one turn needs that is not already in `meta.json`."""
@@ -136,6 +369,10 @@ class TurnRequest:
     timeout: float | None = None
     permission_prompt: Callable[[str, str], bool] | None = None
     resume_adapter_session: str | None = None
+    defer_rotation: bool = False
+    rotation_resolution: Mapping[str, Any] | None = None
+    resume_prepared: bool = False
+    turn_token: int | None = None
 
 
 @dataclass(slots=True)
@@ -159,6 +396,7 @@ class TurnOutcome:
     # finalizing again here would overwrite the daemon's own result.
     finalized_elsewhere: bool = False
     queued: bool = False
+    turn_token: int | None = None
 
     @property
     def exit_code(self) -> int:
@@ -283,10 +521,26 @@ async def _drive_turn(
             if request.resume_adapter_session is not None:
                 adapter_session_id = request.resume_adapter_session
                 capabilities = getattr(initialize, "agent_capabilities", None)
-                async with client.replaying():
-                    await restore_adapter_session(
-                        conn, capabilities, adapter_session_id, request.cwd or os.getcwd()
+                try:
+                    resume_status = await verify_adapter_resume(
+                        conn,
+                        client,
+                        capabilities,
+                        adapter_session_id,
+                        request.cwd or os.getcwd(),
+                        session_id,
                     )
+                except ResumePreparationError:
+                    raise
+                except Exception as error:
+                    if request.defer_rotation:
+                        raise ResumePreparationError(str(error)) from None
+                    raise
+                request = _prepare_resumed_turn(
+                    session_id, request, events, resume_status=resume_status
+                )
+                client.permission_level = PermissionLevel(request.resolution.permissions or "read")
+                client.modes = request.resolution.entry.modes
             else:
                 session = await conn.new_session(cwd=request.cwd or os.getcwd(), mcp_servers=[])
                 adapter_session_id = session.session_id
@@ -294,14 +548,28 @@ async def _drive_turn(
 
             # After the restore, never before it: codex-acp#343 resets model and
             # effort during session/load, so applying them first would be lost.
-            await apply_call_options(conn, adapter_session_id, request)
-
-            prompt_task = asyncio.create_task(
-                conn.prompt(
-                    session_id=adapter_session_id,
-                    prompt=[text_block(request.prompt)],
+            try:
+                await apply_call_options(conn, adapter_session_id, request)
+                delivery = register_prompt_delivery(
+                    conn, session_id, adapter_session_id, request.prompt
                 )
-            )
+                prompt_task = asyncio.create_task(
+                    conn.prompt(
+                        session_id=adapter_session_id,
+                        prompt=[text_block(request.prompt)],
+                    )
+                )
+            except BaseException as error:
+                if request.turn_token is None:
+                    raise
+                _finalize_claimed_setup_failure(
+                    session_id, request.turn_token, error, adapter_session_id
+                )
+                if isinstance(error, asyncio.CancelledError):
+                    raise
+                raise ResumeSetupError(
+                    describe_error(error), turn_token=request.turn_token
+                ) from None
             try:
                 stop_reason = await _await_prompt(
                     conn, adapter_session_id, prompt_task, request, cancel
@@ -311,6 +579,11 @@ async def _drive_turn(
                 # first is still the answer SPEC promises for a failed session,
                 # so the cause travels on the outcome instead of unwinding here.
                 turn_error = caught
+                stop_reason = "error"
+            try:
+                await delivery.ensure_persisted()
+            except Exception as caught:  # noqa: BLE001
+                turn_error = caught if turn_error is None else turn_error
                 stop_reason = "error"
     finally:
         client.flush()
@@ -329,6 +602,92 @@ async def _drive_turn(
         adapter_session_id=adapter_session_id,
         advertised=client.advertised,
         error=turn_error,
+        turn_token=request.turn_token,
+    )
+
+
+def _prepare_resumed_turn(
+    session_id: str,
+    request: TurnRequest,
+    events: transcript.Transcript,
+    *,
+    resume_status: str | None = None,
+    pid: int | None = None,
+) -> TurnRequest:
+    """Atomically claim a verified continuation before it can prompt."""
+    if not request.defer_rotation:
+        return request
+
+    def resolution_from_meta(meta: sessions.SessionMeta) -> Mapping[str, Any]:
+        if request.rotation_resolution is None:
+            return meta.resolution
+        updated = deepcopy(meta.resolution)
+        candidate = request.rotation_resolution
+        for key in ("resolved", "adapter"):
+            if key in candidate:
+                updated[key] = deepcopy(candidate[key])
+        if "permissions_source" in candidate:
+            updated["permissions_source"] = candidate["permissions_source"]
+        else:
+            updated.pop("permissions_source", None)
+        return updated
+
+    try:
+        rotated = sessions.rotate_turn(
+            session_id,
+            resolution_from_meta=resolution_from_meta,
+            target_from_meta=lambda meta: call_target(resolution_from_session(meta)),
+            prompt=request.prompt,
+            resume_status=resume_status,
+            pid=pid if pid is not None else _host_pid(),
+        )
+    except (RunnerError, sessions.SessionError) as error:
+        raise ResumeRotationError(str(error)) from None
+    try:
+        resolution = resolution_from_session(rotated)
+        cwd = rotated.resolution.get("cwd")
+        if cwd is not None and not isinstance(cwd, str):
+            raise RunnerError(f"session {session_id} has an invalid stored working directory")
+    except RunnerError as error:
+        _finalize_claimed_setup_failure(session_id, rotated.turns, error)
+        raise ResumeRotationError(str(error), turn_token=rotated.turns) from None
+    try:
+        events.append("state", **{"from": "starting", "to": "running"})
+        return replace(
+            request,
+            resolution=resolution,
+            cwd=cwd,
+            defer_rotation=False,
+            rotation_resolution=None,
+            resume_prepared=True,
+            turn_token=rotated.turns,
+        )
+    except BaseException as error:
+        _finalize_claimed_setup_failure(session_id, rotated.turns, error)
+        if isinstance(error, asyncio.CancelledError):
+            raise
+        raise ResumeSetupError(describe_error(error), turn_token=rotated.turns) from None
+
+
+def _finalize_claimed_setup_failure(
+    session_id: str,
+    turn_token: int,
+    error: BaseException,
+    adapter_session_id: str | None = None,
+) -> None:
+    """Close a claimed turn when setup failed before an owner was installed."""
+    _finalize(
+        session_id,
+        TurnOutcome(
+            state="failed",
+            stop_reason="error",
+            answer="",
+            adapter_session_id=adapter_session_id,
+            error=error,
+            turn_token=turn_token,
+        ),
+        error=error,
+        expected_turn=turn_token,
     )
 
 
@@ -489,6 +848,12 @@ def daemon_payload(request: TurnRequest) -> dict[str, Any]:
         "timeout": request.timeout,
         "prompt": request.prompt,
         "resume_adapter_session": request.resume_adapter_session,
+        "defer_rotation": request.defer_rotation,
+        "rotation_resolution": dict(request.rotation_resolution)
+        if request.rotation_resolution is not None
+        else None,
+        "resume_prepared": request.resume_prepared,
+        "turn_token": request.turn_token,
     }
 
 
@@ -515,17 +880,36 @@ async def _route(request: TurnRequest) -> tuple[Any | None, str | None]:
 
 
 async def _execute(session_id: str, request: TurnRequest) -> TurnOutcome:
-    cancel = _CancelSignal()
     daemon, route_note = await _route(request)
+    cancel = _CancelSignal()
     _install_signal_handlers(asyncio.get_running_loop(), cancel, daemon_routed=daemon is not None)
 
     if daemon is not None:
         target = call_target(request.resolution)
         return await _execute_via_daemon(session_id, request, daemon, cancel, target)
 
+    if request.defer_rotation:
+        try:
+            async with sessions.session_reservation(session_id):
+                return await _execute_direct(session_id, request, cancel, route_note=route_note)
+        except sessions.SessionStateError as error:
+            raise ResumePreparationError(str(error)) from None
+
+    return await _execute_direct(session_id, request, cancel, route_note=route_note)
+
+
+async def _execute_direct(
+    session_id: str,
+    request: TurnRequest,
+    cancel: _CancelSignal,
+    *,
+    route_note: str | None,
+) -> TurnOutcome:
+    """Run the direct path after routing and, for continue, reservation."""
     events = transcript.Transcript(sessions.transcript_path(session_id))
-    sessions.mark_running(session_id, pid=_host_pid())
-    events.append("state", **{"from": "starting", "to": "running"})
+    if not request.defer_rotation:
+        sessions.mark_running(session_id, pid=_host_pid())
+        events.append("state", **{"from": "starting", "to": "running"})
     outcome = await _drive_turn(session_id, request, events, cancel)
     outcome.route_note = route_note
     return outcome
@@ -547,6 +931,10 @@ async def _execute_via_daemon(
     try:
         started = await daemon.start_turn(session_id, daemon_payload(request))
         if not started.get("ok"):
+            if started.get("preserve_session"):
+                raise ResumePreparationError(
+                    str(started.get("error", "the daemon refused the turn"))
+                )
             raise RunnerError(str(started.get("error", "the daemon refused the turn")))
         queued = bool(started.get("queued"))
 
@@ -642,6 +1030,31 @@ def execute_turn(session_id: str, request: TurnRequest) -> TurnOutcome:
     """Run one turn synchronously and leave the session finalized on disk."""
     try:
         outcome = asyncio.run(_execute(session_id, request))
+    except ResumePreparationError as error:
+        # Verification happens before a deferred continuation rotates the
+        # session, so preserve the finished session exactly as it was.
+        if request.defer_rotation:
+            raise
+        _finalize(
+            session_id,
+            TurnOutcome(state="failed", stop_reason="error", answer=""),
+            error=error,
+        )
+        raise
+    except ResumeSetupError as error:
+        _finalize_claimed_setup_failure(session_id, error.turn_token, error)
+        raise
+    except ResumeRotationError as error:
+        # A competing continuation may have claimed this session first. It has
+        # no turn token, so it must not finalize the winner's active turn.
+        if error.turn_token is not None:
+            _finalize(
+                session_id,
+                TurnOutcome(state="failed", stop_reason="error", answer=""),
+                error=error,
+                expected_turn=error.turn_token,
+            )
+        raise
     except RunnerError as error:
         _finalize(
             session_id,
@@ -658,7 +1071,7 @@ def execute_turn(session_id: str, request: TurnRequest) -> TurnOutcome:
         _finalize(session_id, outcome, error=error)
         return outcome
     if not outcome.finalized_elsewhere:
-        _finalize(session_id, outcome, error=outcome.error)
+        _finalize(session_id, outcome, error=outcome.error, expected_turn=outcome.turn_token)
     return outcome
 
 
@@ -668,6 +1081,7 @@ def _finalize(
     *,
     error: BaseException | None = None,
     adapter_log_from: int | None = None,
+    expected_turn: int | None = None,
 ) -> None:
     """Write the answer and close out `meta.json`, whatever happened.
 
@@ -680,6 +1094,8 @@ def _finalize(
         # the failure reply. Do not overwrite its answer or append a duplicate
         # event from the client-side error path.
         if current.is_finished and outcome.state == "failed":
+            return
+        if expected_turn is not None and current.turns != expected_turn:
             return
     except sessions.SessionError:
         current = None
@@ -697,43 +1113,47 @@ def _finalize(
     if failure is not None and not answer:
         answer = f"{failure.message}\n"
         outcome.answer = answer
-    sessions.write_answer(session_id, answer)
-
-    events_path = sessions.transcript_path(session_id)
-    with contextlib.suppress(Exception):
-        events = transcript.Transcript(events_path)
-        if failure is not None:
-            fields: dict[str, Any] = {
-                "message": failure.message,
-                "observation": failure.observation,
-                "next_step": failure.next_step,
-            }
-            if failure.adapter_log is not None:
-                fields["adapter_log"] = failure.adapter_log
-            if failure.adapter_log_tail is not None:
-                fields["adapter_log_tail"] = failure.adapter_log_tail
-            events.append("error", **fields)
-        from_state = current.state if current is not None else "running"
-        events.append("state", **{"from": from_state, "to": outcome.state})
-
     state = outcome.state
     if state == "terminated":
         state = "cancelled"
     if state == "detached":
         state = "running"
 
-    with contextlib.suppress(sessions.SessionError):
-        sessions.transition(
+    error_event: dict[str, Any] | None = None
+    if failure is not None:
+        error_event = {
+            "message": failure.message,
+            "observation": failure.observation,
+            "next_step": failure.next_step,
+        }
+        if failure.adapter_log is not None:
+            error_event["adapter_log"] = failure.adapter_log
+        if failure.adapter_log_tail is not None:
+            error_event["adapter_log_tail"] = failure.adapter_log_tail
+
+    try:
+        finalized = sessions.finalize_turn(
             session_id,
             state,
+            answer=answer,
+            expected_turn=expected_turn,
             exit_code=outcome.exit_code,
             stop_reason=outcome.stop_reason,
             tokens=outcome.tokens,
             cost=outcome.cost,
             denied=outcome.denied,
             denial_details=outcome.denial_details,
-            adapter_session_id=outcome.adapter_session_id,
+            error_event=error_event,
+            adapter_session_id=(
+                outcome.adapter_session_id
+                if outcome.adapter_session_id is not None
+                else (current.adapter_session_id if current is not None else None)
+            ),
         )
+    except sessions.SessionError:
+        return
+    if finalized is None:
+        return
 
     if outcome.advertised:
         with contextlib.suppress(Exception):
@@ -1112,6 +1532,8 @@ def continue_request(
     permissions: str | None = None,
     permission_prompt: Callable[[str, str], bool] | None = None,
     resolution: CallResolution | None = None,
+    defer_rotation: bool = False,
+    rotation_resolution: Mapping[str, Any] | None = None,
 ) -> TurnRequest:
     """Build a follow-up turn from the session's persisted resolution."""
     if meta.adapter_session_id is None:
@@ -1132,6 +1554,9 @@ def continue_request(
         timeout=timeout,
         permission_prompt=permission_prompt,
         resume_adapter_session=meta.adapter_session_id,
+        defer_rotation=defer_rotation,
+        rotation_resolution=rotation_resolution,
+        resume_prepared=False,
     )
 
 

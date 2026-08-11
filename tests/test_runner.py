@@ -1,5 +1,6 @@
 """Behavioral tests for one turn end to end on the direct path."""
 
+import asyncio
 import json
 import os
 import signal
@@ -7,12 +8,17 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
-from acp import RequestError
+from acp import RequestError, text_block
+from acp.schema import UserMessageChunk
 
 from acpc import cache, runner, sessions, vocab
+from acpc.client import AcpcClient
+from acpc.permissions import PermissionLevel
 from acpc.registry import AgentRegistry
+from acpc.transcript import Transcript
 
 MOCK_AGENT_SCRIPT = str(Path(__file__).with_name("mock_agent.py"))
 
@@ -130,6 +136,178 @@ def test_a_successful_turn_finishes_the_session_on_disk() -> None:
     assert sessions.answer_path(session_id).read_text(encoding="utf-8") == outcome.answer
     prompt = sessions.prompt_path(session_id).read_text(encoding="utf-8")
     assert prompt == "summarize the module layout"
+
+
+class _NoObserverResumeConnection:
+    """Restore stub whose callbacks finish after the restore response."""
+
+    def __init__(self, client: AcpcClient, *, list_available: bool) -> None:
+        self._conn = object()
+        self._client = client
+        self._list_available = list_available
+        self.suffix_ready = asyncio.Event()
+        self.suffix_sent = asyncio.Event()
+        self.late_task: asyncio.Task[None] | None = None
+
+    async def load_session(self, session_id: str, **kwargs: object) -> None:
+        del kwargs
+        await self._client.session_update(
+            session_id,
+            UserMessageChunk(
+                session_update="user_message_chunk",
+                content=text_block("stored prompt"),
+                message_id="replay-1",
+            ),
+        )
+
+        async def send_late_suffix() -> None:
+            await self.suffix_ready.wait()
+            await self._client.session_update(
+                session_id,
+                UserMessageChunk(
+                    session_update="user_message_chunk",
+                    content=text_block(" + mismatched suffix"),
+                    message_id="replay-1",
+                ),
+            )
+            self.suffix_sent.set()
+
+        self.late_task = asyncio.create_task(send_late_suffix())
+
+    async def list_sessions(self, **kwargs: object) -> SimpleNamespace:
+        del kwargs
+        if not self._list_available:
+            raise AssertionError("session/list must not be called when unavailable")
+        return SimpleNamespace(
+            sessions=[SimpleNamespace(session_id="adapter-session", cwd="/tmp")],
+            next_cursor=None,
+        )
+
+
+def _resume_test_client(tmp_path: Path) -> AcpcClient:
+    return AcpcClient(Transcript(tmp_path / "transcript.ndjson"), PermissionLevel.READ)
+
+
+def _resume_test_capabilities(*, list_available: bool) -> SimpleNamespace:
+    return SimpleNamespace(
+        load_session=True,
+        session_capabilities=SimpleNamespace(list=object() if list_available else None),
+    )
+
+
+async def _run_no_observer_resume(
+    tmp_path: Path, *, list_available: bool
+) -> tuple[str, _NoObserverResumeConnection]:
+    client = _resume_test_client(tmp_path)
+    connection = _NoObserverResumeConnection(client, list_available=list_available)
+    status = await runner.verify_adapter_resume(
+        connection,
+        client,
+        _resume_test_capabilities(list_available=list_available),
+        "adapter-session",
+        "/tmp",
+        "session-id",
+    )
+    assert connection.late_task is not None
+    connection.suffix_ready.set()
+    await connection.late_task
+    return status, connection
+
+
+def test_no_observer_replay_is_unverified_until_late_chunks_finish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        runner,
+        "_stored_prompt_items",
+        lambda _session_id: [(Path("prompt.md"), "stored prompt")],
+    )
+
+    status, connection = asyncio.run(_run_no_observer_resume(tmp_path, list_available=False))
+
+    assert connection.suffix_sent.is_set()
+    assert status == "unverified — session/list unavailable; conversation replay unavailable"
+
+
+def test_no_observer_replay_does_not_block_independent_listing_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        runner,
+        "_stored_prompt_items",
+        lambda _session_id: [(Path("prompt.md"), "stored prompt")],
+    )
+
+    status, connection = asyncio.run(_run_no_observer_resume(tmp_path, list_available=True))
+
+    assert connection.suffix_sent.is_set()
+    assert status == "verified"
+
+
+def test_failed_state_is_observable_only_after_its_explanation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_write_meta = sessions.write_meta
+    observations: list[tuple[sessions.SessionMeta, list[dict]]] = []
+
+    def observe_after_publish(meta: sessions.SessionMeta) -> None:
+        original_write_meta(meta)
+        if meta.state != "failed":
+            return
+        observed_meta = sessions.read_meta(meta.session_id)
+        observed_events = transcript_events(meta.session_id)
+        observations.append((observed_meta, observed_events))
+
+    monkeypatch.setattr(sessions, "write_meta", observe_after_publish)
+    _, outcome = start_turn("please fail this on purpose")
+
+    assert outcome.state == "failed"
+    assert observations
+    observed_meta, observed_events = observations[-1]
+    assert observed_meta.state == "failed"
+    assert any(event.get("type") == "error" for event in observed_events)
+    assert any(
+        event.get("type") == "state" and event.get("to") == "failed" for event in observed_events
+    )
+
+
+def test_prompt_marker_is_retried_before_a_successful_finalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = sessions.mark_prompt_delivered
+    attempts = 0
+
+    def fail_once(session_id: str, prompt: str) -> sessions.SessionMeta:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("marker storage temporarily unavailable")
+        return original(session_id, prompt)
+
+    monkeypatch.setattr(sessions, "mark_prompt_delivered", fail_once)
+    session_id, outcome = start_turn("persist the outgoing prompt")
+
+    assert outcome.state == "done"
+    assert attempts >= 2
+    delivered = sessions.read_meta(session_id).extra["delivered_prompts"]
+    assert [record["turn"] for record in delivered] == [1]
+
+
+def test_prompt_marker_failure_fails_the_turn_without_claiming_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def always_fail(session_id: str, prompt: str) -> sessions.SessionMeta:
+        raise OSError(f"cannot persist marker for {session_id}: {prompt}")
+
+    monkeypatch.setattr(sessions, "mark_prompt_delivered", always_fail)
+    session_id, outcome = start_turn("marker must not disappear")
+
+    assert outcome.state == "failed"
+    meta = sessions.read_meta(session_id)
+    assert meta.state == "failed"
+    assert "delivered_prompts" not in meta.extra
+    errors = [event for event in transcript_events(session_id) if event.get("type") == "error"]
+    assert "could not persist delivered-prompt marker" in errors[-1]["message"]
 
 
 def test_a_turn_records_its_start_and_end_as_state_events() -> None:

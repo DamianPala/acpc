@@ -7,6 +7,9 @@ The Stage 1 acceptance test: spawn the mock through the harvested
 """
 
 import asyncio
+import json
+import multiprocessing
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -24,8 +27,17 @@ from acp.schema import (
 
 from acpc.permissions import PermissionLevel, classify_kind, find_option, should_allow
 from acpc.spawn import spawn_adapter
+from tests.mock_agent import MockAgent
 
 MOCK_AGENT_SCRIPT = str(Path(__file__).parent / "mock_agent.py")
+
+
+def _persist_store_record(store_path: str, session_id: str) -> None:
+    os.environ["ACPC_MOCK_SESSION_STORE"] = store_path
+    agent = MockAgent()
+    agent._session_cwds[session_id] = Path.cwd()
+    agent._sessions[session_id] = [session_id]
+    agent._persist_session(session_id)
 
 
 async def eventually(predicate, *, timeout: float = 5.0, message: str = "condition") -> None:
@@ -156,6 +168,23 @@ def test_initialize_prompt_answer_round_trip(tmp_path: Path) -> None:
             )
 
     asyncio.run(scenario())
+
+
+def test_durable_store_updates_are_process_safe(tmp_path: Path) -> None:
+    store_path = tmp_path / "mock-sessions.json"
+    context = multiprocessing.get_context("spawn")
+    processes = [
+        context.Process(target=_persist_store_record, args=(str(store_path), session_id))
+        for session_id in ("first", "second")
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=10)
+        assert process.exitcode == 0
+
+    store = json.loads(store_path.read_text(encoding="utf-8"))
+    assert set(store) == {"first", "second"}
 
 
 def test_advertised_dataset_modes_models_efforts_commands(tmp_path: Path) -> None:

@@ -67,6 +67,27 @@ def process_liveness(pid: int, process_token: str | None = None) -> ProcessLiven
         return "dead"
     except PermissionError:
         pass
+    if sys.platform == "linux":
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return "dead"
+        except OSError:
+            return "unverifiable"
+        try:
+            fields = stat.rsplit(")", 1)[1].split()
+            state = fields[0]
+        except (IndexError, ValueError):
+            return "unverifiable"
+        if state == "Z":
+            return "dead"
+        if process_token is None:
+            return "unverifiable"
+        try:
+            current_token = fields[19]
+        except IndexError:
+            return "unverifiable"
+        return "verified" if current_token == process_token else "dead"
     if process_token is None:
         return "unverifiable"
     current_token = process_start_time(pid)

@@ -155,6 +155,8 @@ Keep it to purpose only. Models, efforts and flags belong to the tool — `acpc 
 
 File-based state is a feature: grep it, read fragments selectively, depend on nothing but the filesystem. `answer.md` exists whatever the final state — partial answers for failed or cancelled turns, a placeholder naming what died for orphaned ones. A failed session also records why it failed: an `error` event carrying what acpc observed, one next step, and — for a turn that ran under a daemon — the tail that turn added to the target's log, surfaced by `log` and by `wait`. Session states are verified, not trusted: a `running` session whose process is gone reports `orphaned`, never a stale `running`.
 
+A cold `continue` reports whether the adapter session was verified: the summary and `--json` contain `resume: verified` when a check passes, or `resume: unverified — ...` when neither available check could run. An unverified resume still runs, but is visible to callers.
+
 ## The daemon
 
 A performance cache, nothing more: it keeps adapters warm so the next turn starts in ~2 s instead of a cold start. Auto-managed — starts on first use, expires after 30 min idle, restarts itself on version skew, heals itself if its adapter dies. One daemon per *target* (agent + home + declared env), so different providers or credentials never share a process. If a daemon cannot start at all, `run` falls back to a direct child and says so on stderr.

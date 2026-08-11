@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import queue
+import signal
 import subprocess
 import sys
 import threading
@@ -15,7 +16,7 @@ import pytest
 from click.testing import CliRunner
 
 from acpc import cli as cli_module
-from acpc import daemon_client, runner, sessions, vocab
+from acpc import daemon_client, runner, sessions, transcript, vocab
 from acpc.cli import main
 
 MOCK_AGENT_SCRIPT = str(Path(__file__).with_name("mock_agent.py"))
@@ -63,6 +64,28 @@ def fresh_permission_alias_warnings(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def invoke(cli: CliRunner, *args: str, stdin: str | None = None):
     return cli.invoke(main, list(args), input=stdin, catch_exceptions=False)
+
+
+def continue_subprocess(
+    session_id: str, prompt: str, *options: str
+) -> subprocess.CompletedProcess[str]:
+    command = [
+        sys.executable,
+        "-c",
+        "from acpc.cli import main; raise SystemExit(main())",
+        "continue",
+        session_id,
+        prompt,
+        *options,
+    ]
+    return subprocess.run(
+        command,
+        env=os.environ.copy(),
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
 
 
 def run_cli_until_early_line(*args: str) -> tuple[int, str, str, str, bool]:
@@ -329,6 +352,52 @@ def test_continue_post_rotation_failure_finalizes_the_new_turn(
     assert failed.stop_reason == "error"
 
 
+def test_fault_after_claim_before_owner_finalizes_the_turn(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id = start_session(cli)
+    original_append = transcript.Transcript.append
+
+    def fail_running_event(
+        self: transcript.Transcript, event_type: str, **fields: Any
+    ) -> dict[str, Any]:
+        if event_type == "state" and fields.get("to") == "running":
+            raise OSError("injected state-event failure")
+        return original_append(self, event_type, **fields)
+
+    monkeypatch.setattr(transcript.Transcript, "append", fail_running_event)
+
+    result = invoke(cli, "continue", session_id, "must not prompt", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    failed = sessions.load(session_id)
+    assert failed.state == "failed"
+    assert failed.turns == 2
+    assert sessions.prompt_path(session_id).read_text(encoding="utf-8") == "must not prompt"
+
+
+def test_fault_before_prompt_dispatch_finalizes_the_claimed_turn(
+    cli: CliRunner, state_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id = start_session(cli, "turn one")
+
+    async def fail_options(*args: Any, **kwargs: Any) -> None:
+        raise OSError("injected pre-prompt failure")
+
+    monkeypatch.setattr(runner, "apply_call_options", fail_options)
+
+    result = invoke(cli, "continue", session_id, "must not prompt", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    failed = sessions.load(session_id)
+    assert failed.state == "failed"
+    assert failed.turns == 2
+    store = json.loads((state_root / "mock-sessions.json").read_text(encoding="utf-8"))
+    adapter_session_id = failed.adapter_session_id
+    assert adapter_session_id is not None
+    assert "must not prompt" not in store[adapter_session_id]["history"]
+
+
 def test_continue_reapplies_the_stored_mode(cli: CliRunner) -> None:
     first = invoke(cli, "run", "mock", "settings", "--mode", "plan", "--quiet", "--json")
     session_id = json.loads(first.stdout)["session_id"]
@@ -504,10 +573,6 @@ def test_continue_cold_resume_does_not_replay_adapter_history(
     session_id = start_session(cli, "turn one of the conversation")
     method_file = tmp_path / "session-method"
     monkeypatch.setenv("ACPC_MOCK_SESSION_METHOD_FILE", str(method_file))
-    meta = sessions.load(session_id)
-    meta.adapter_session_id = "load-history"
-    with sessions.session_lock(session_id):
-        sessions.write_meta(meta)
 
     result = invoke(cli, "continue", session_id, "turn two", "--quiet")
 
@@ -536,10 +601,6 @@ def test_cold_load_resume_reapplies_model_and_effort(
         "--json",
     )
     session_id = json.loads(first.stdout)["session_id"]
-    meta = sessions.load(session_id)
-    meta.adapter_session_id = "load-history"
-    with sessions.session_lock(session_id):
-        sessions.write_meta(meta)
 
     result = invoke(cli, "continue", session_id, "settings", "--quiet")
 
@@ -556,10 +617,6 @@ def test_cold_resume_prefers_session_resume_when_advertised(
     monkeypatch.setenv("ACPC_MOCK_ADVERTISE_RESUME", "1")
     monkeypatch.setenv("ACPC_MOCK_SESSION_METHOD_FILE", str(method_file))
     session_id = start_session(cli, "turn one")
-    meta = sessions.load(session_id)
-    meta.adapter_session_id = "load-history"
-    with sessions.session_lock(session_id):
-        sessions.write_meta(meta)
 
     result = invoke(cli, "continue", session_id, "turn two", "--quiet")
 
@@ -568,6 +625,629 @@ def test_cold_resume_prefers_session_resume_when_advertised(
     answer = sessions.answer_path(session_id).read_text(encoding="utf-8")
     assert not answer.startswith("history")
     assert 'You asked: "turn two"' in answer
+
+
+def test_resume_without_list_or_replay_is_explicitly_unverified(
+    cli: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    method_file = tmp_path / "session-method"
+    monkeypatch.setenv("ACPC_MOCK_ADVERTISE_LIST", "0")
+    monkeypatch.setenv("ACPC_MOCK_ADVERTISE_RESUME", "1")
+    monkeypatch.setenv("ACPC_MOCK_SESSION_METHOD_FILE", str(method_file))
+    session_id = start_session(cli, "turn one")
+
+    result = invoke(cli, "continue", session_id, "turn two", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert method_file.read_text(encoding="utf-8") == "resume\n"
+    assert "turn two" in sessions.answer_path(session_id).read_text(encoding="utf-8")
+
+
+def test_cold_resume_reports_unverified_in_json_and_summary(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ACPC_MOCK_ADVERTISE_LIST", "0")
+    monkeypatch.setenv("ACPC_MOCK_ADVERTISE_RESUME", "1")
+    session_id = start_session(cli, "turn one")
+
+    result = invoke(cli, "continue", session_id, "turn two", "--json")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert (
+        json.loads(result.stdout)["resume"]
+        == "unverified — session/list unavailable; conversation replay unavailable"
+    )
+    assert "resume: unverified" in result.stderr
+
+
+def test_list_without_replay_is_verified_on_the_direct_path(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id = start_session(cli, "turn one")
+    monkeypatch.setenv("ACPC_MOCK_REPLAY_USER_MESSAGES", "0")
+
+    result = invoke(cli, "continue", session_id, "turn two", "--json")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert json.loads(result.stdout)["resume"] == "verified"
+    assert "resume: verified" in result.stderr
+
+
+def test_replay_only_verification_is_verified_when_session_list_is_unavailable(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ACPC_MOCK_ADVERTISE_LIST", "0")
+    session_id = start_session(cli, "turn one")
+
+    result = invoke(cli, "continue", session_id, "turn two", "--json")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert json.loads(result.stdout)["resume"] == "verified"
+
+
+def test_replay_only_mismatch_fails_before_rotation(
+    cli: CliRunner, state_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ACPC_MOCK_ADVERTISE_LIST", "0")
+    session_id = start_session(cli, "recorded context")
+    store_path = state_root / "mock-sessions.json"
+    store = json.loads(store_path.read_text(encoding="utf-8"))
+    adapter_session_id = sessions.read_meta(session_id).adapter_session_id
+    assert adapter_session_id is not None
+    store[adapter_session_id]["history"] = ["different context"]
+    store_path.write_text(json.dumps(store), encoding="utf-8")
+    before = sessions.read_meta(session_id)
+
+    result = invoke(cli, "continue", session_id, "must not run", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    after = sessions.read_meta(session_id)
+    assert after.state == before.state == "done"
+    assert after.turns == before.turns == 1
+    assert sessions.prompt_path(session_id).read_text(encoding="utf-8") == "recorded context"
+
+
+def test_advertised_list_without_the_stored_adapter_id_fails_before_restore(
+    cli: CliRunner, state_root: Path
+) -> None:
+    session_id = start_session(cli, "recorded context")
+    store_path = state_root / "mock-sessions.json"
+    store = json.loads(store_path.read_text(encoding="utf-8"))
+    adapter_session_id = sessions.read_meta(session_id).adapter_session_id
+    assert adapter_session_id is not None
+    store.pop(adapter_session_id)
+    store_path.write_text(json.dumps(store), encoding="utf-8")
+
+    result = invoke(cli, "continue", session_id, "must not run", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    assert sessions.read_meta(session_id).turns == 1
+    assert "was not found by session/list" in result.stderr
+
+
+def test_list_mismatch_fails_even_when_replay_matches(cli: CliRunner, state_root: Path) -> None:
+    session_id = start_session(cli, "recorded context")
+    store_path = state_root / "mock-sessions.json"
+    store = json.loads(store_path.read_text(encoding="utf-8"))
+    adapter_session_id = sessions.read_meta(session_id).adapter_session_id
+    assert adapter_session_id is not None
+    store[adapter_session_id]["cwd"] = "/different/cwd"
+    store_path.write_text(json.dumps(store), encoding="utf-8")
+
+    result = invoke(cli, "continue", session_id, "must not run", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    assert "cwd" in result.stderr
+    assert sessions.read_meta(session_id).turns == 1
+
+
+def test_replay_ignores_agent_text_thoughts_and_tools(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ACPC_MOCK_ADVERTISE_LIST", "0")
+    monkeypatch.setenv("ACPC_MOCK_REPLAY_EXTRA_EVENTS", "1")
+    session_id = start_session(cli, "turn one")
+
+    result = invoke(cli, "continue", session_id, "turn two", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_OK
+    transcript = sessions.transcript_path(session_id).read_text(encoding="utf-8")
+    assert "replayed agent text" not in transcript
+    assert "replayed thought" not in transcript
+    assert "replayed tool" not in transcript
+
+
+def test_a_stored_but_undelivered_prompt_is_not_required_on_later_resume(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id = start_session(cli, "turn one")
+    monkeypatch.setenv("ACPC_MOCK_DISCONNECT_BEFORE_PROMPT", "1")
+
+    failed = invoke(cli, "continue", session_id, "must not reach adapter", "--quiet")
+
+    assert failed.exit_code == vocab.EXIT_AGENT_ERROR
+    assert sessions.load(session_id).state == "failed"
+    assert sessions.load(session_id).turns == 2
+    delivered = sessions.load(session_id).extra["delivered_prompts"]
+    assert [record["turn"] for record in delivered] == [1]
+
+    monkeypatch.delenv("ACPC_MOCK_DISCONNECT_BEFORE_PROMPT")
+    resumed = invoke(cli, "continue", session_id, "later prompt", "--quiet")
+
+    assert resumed.exit_code == vocab.EXIT_OK
+    assert sessions.load(session_id).state == "done"
+    assert "later prompt" in sessions.answer_path(session_id).read_text(encoding="utf-8")
+
+
+def test_process_death_after_claim_is_orphaned_and_can_be_cold_resumed(
+    cli: CliRunner, state_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id = start_session(cli, "turn one")
+    release = tmp_path / "release-before-prompt"
+    ready = tmp_path / "before-prompt-ready"
+    monkeypatch.setenv("ACPC_MOCK_BLOCK_BEFORE_PROMPT", str(release))
+    monkeypatch.setenv("ACPC_MOCK_BLOCK_BEFORE_PROMPT_READY", str(ready))
+    command = [
+        sys.executable,
+        "-c",
+        "from acpc.cli import main; raise SystemExit(main())",
+        "continue",
+        session_id,
+        "must not cross the wire",
+        "--quiet",
+    ]
+    process = subprocess.Popen(
+        command,
+        env=os.environ.copy(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and not ready.exists():
+        time.sleep(0.02)
+    assert ready.exists()
+    running = sessions.read_meta(session_id)
+    assert running.state == "running"
+    assert running.turns == 2
+    store = json.loads((state_root / "mock-sessions.json").read_text(encoding="utf-8"))
+    adapter_session_id = running.adapter_session_id
+    assert adapter_session_id is not None
+    assert "must not cross the wire" not in store[adapter_session_id]["history"]
+    assert running.pid is not None
+    os.kill(process.pid, signal.SIGKILL)
+    os.kill(running.pid, signal.SIGKILL)
+    release.touch()
+    _stdout, _stderr = process.communicate(timeout=10)
+    assert process.returncode == -9
+
+    deadline = time.monotonic() + 5
+    orphaned = sessions.load(session_id)
+    while orphaned.state == "running" and time.monotonic() < deadline:
+        time.sleep(0.05)
+        orphaned = sessions.load(session_id)
+    assert orphaned.state == "orphaned"
+    monkeypatch.delenv("ACPC_MOCK_BLOCK_BEFORE_PROMPT")
+    monkeypatch.delenv("ACPC_MOCK_BLOCK_BEFORE_PROMPT_READY")
+
+    resumed = invoke(cli, "continue", session_id, "cold follow-up", "--quiet")
+
+    assert resumed.exit_code == vocab.EXIT_OK
+    assert sessions.load(session_id).state == "done"
+    assert "cold follow-up" in sessions.answer_path(session_id).read_text(encoding="utf-8")
+
+
+def test_load_without_list_or_replay_is_also_unverified(
+    cli: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    method_file = tmp_path / "session-method"
+    monkeypatch.setenv("ACPC_MOCK_ADVERTISE_LIST", "0")
+    monkeypatch.setenv("ACPC_MOCK_REPLAY_USER_MESSAGES", "0")
+    monkeypatch.setenv("ACPC_MOCK_SESSION_METHOD_FILE", str(method_file))
+    session_id = start_session(cli, "turn one")
+
+    result = invoke(cli, "continue", session_id, "turn two", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert method_file.read_text(encoding="utf-8") == "load\n"
+
+
+def test_a_cwd_mismatch_fails_before_rotation_or_prompt_dispatch(
+    cli: CliRunner, state_root: Path, tmp_path: Path
+) -> None:
+    session_id = start_session(cli, "the recorded context")
+    before = {
+        name: path.read_bytes()
+        for name, path in {
+            "meta": sessions.meta_path(session_id),
+            "prompt": sessions.prompt_path(session_id),
+            "answer": sessions.answer_path(session_id),
+            "transcript": sessions.transcript_path(session_id),
+        }.items()
+        if path.exists()
+    }
+    wrong_cwd = tmp_path / "wrong-cwd"
+    wrong_cwd.mkdir()
+    meta = sessions.read_meta(session_id)
+    meta.resolution["cwd"] = str(wrong_cwd)
+    with sessions.session_lock(session_id):
+        sessions.write_meta(meta)
+    before["meta"] = sessions.meta_path(session_id).read_bytes()
+
+    result = invoke(cli, "continue", session_id, "must not run", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    assert "cwd" in result.stderr
+    assert "must not run" not in sessions.prompt_path(session_id).read_text(encoding="utf-8")
+    assert sessions.read_meta(session_id).state == "done"
+    for name, content in before.items():
+        assert {
+            "meta": sessions.meta_path(session_id),
+            "prompt": sessions.prompt_path(session_id),
+            "answer": sessions.answer_path(session_id),
+            "transcript": sessions.transcript_path(session_id),
+        }[name].read_bytes() == content
+    assert "must not run" not in (state_root / "mock-sessions.json").read_text(encoding="utf-8")
+
+
+def test_a_replay_prompt_mismatch_fails_before_the_new_prompt(
+    cli: CliRunner, state_root: Path
+) -> None:
+    session_id = start_session(cli, "the recorded context")
+    store_path = state_root / "mock-sessions.json"
+    store = json.loads(store_path.read_text(encoding="utf-8"))
+    adapter_session_id = sessions.read_meta(session_id).adapter_session_id
+    assert adapter_session_id is not None
+    store[adapter_session_id]["history"] = ["a different context"]
+    store_path.write_text(json.dumps(store), encoding="utf-8")
+    before_prompt = sessions.prompt_path(session_id).read_bytes()
+    before_answer = sessions.answer_path(session_id).read_bytes()
+    before_transcript = sessions.transcript_path(session_id).read_bytes()
+
+    result = invoke(cli, "continue", session_id, "must not run", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    assert "stored prompt" in result.stderr
+    assert sessions.read_meta(session_id).state == "done"
+    assert sessions.prompt_path(session_id).read_bytes() == before_prompt
+    assert sessions.answer_path(session_id).read_bytes() == before_answer
+    assert sessions.transcript_path(session_id).read_bytes() == before_transcript
+    assert store[adapter_session_id]["history"] == ["a different context"]
+
+
+def test_significant_whitespace_is_part_of_the_replayed_prompt(
+    cli: CliRunner, state_root: Path
+) -> None:
+    session_id = start_session(cli, "if ready:\n    deploy()")
+    store_path = state_root / "mock-sessions.json"
+    store = json.loads(store_path.read_text(encoding="utf-8"))
+    adapter_session_id = sessions.read_meta(session_id).adapter_session_id
+    assert adapter_session_id is not None
+    store[adapter_session_id]["history"] = ["if ready: deploy()"]
+    store_path.write_text(json.dumps(store), encoding="utf-8")
+
+    result = invoke(cli, "continue", session_id, "must not run", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    assert "was not found" in result.stderr
+    assert sessions.read_meta(session_id).turns == 1
+
+
+def test_reordered_replayed_prompts_name_order_not_absence(
+    cli: CliRunner, state_root: Path
+) -> None:
+    session_id = start_session(cli, "first recorded context")
+    assert invoke(cli, "continue", session_id, "second recorded context", "--quiet").exit_code == 0
+    store_path = state_root / "mock-sessions.json"
+    store = json.loads(store_path.read_text(encoding="utf-8"))
+    adapter_session_id = sessions.read_meta(session_id).adapter_session_id
+    assert adapter_session_id is not None
+    store[adapter_session_id]["history"] = ["second recorded context", "first recorded context"]
+    store_path.write_text(json.dumps(store), encoding="utf-8")
+
+    result = invoke(cli, "continue", session_id, "must not run", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    assert "out of order" in result.stderr
+    assert sessions.read_meta(session_id).turns == 2
+
+
+def test_replayed_user_prompts_are_checked_as_an_ordered_subsequence(
+    cli: CliRunner, state_root: Path
+) -> None:
+    session_id = start_session(cli, "first recorded context")
+    assert invoke(cli, "continue", session_id, "second recorded context", "--quiet").exit_code == 0
+
+    store_path = state_root / "mock-sessions.json"
+    store = json.loads(store_path.read_text(encoding="utf-8"))
+    adapter_session_id = sessions.read_meta(session_id).adapter_session_id
+    assert adapter_session_id is not None
+    store[adapter_session_id]["history"].insert(1, "adapter-only rolled-back turn")
+    store_path.write_text(json.dumps(store), encoding="utf-8")
+
+    result = invoke(cli, "continue", session_id, "third recorded context", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert "third recorded context" in sessions.answer_path(session_id).read_text(encoding="utf-8")
+
+
+def test_two_background_sessions_resume_only_their_own_context(
+    cli: CliRunner, live_daemon: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cursor_file = tmp_path / "list-cursors"
+    monkeypatch.setenv("ACPC_MOCK_SESSION_LIST_CURSOR_FILE", str(cursor_file))
+    first = json.loads(invoke(cli, "run", "mock", "alpha context", "--bg", "--json").stdout)[
+        "session_id"
+    ]
+    second = json.loads(invoke(cli, "run", "mock", "beta context", "--bg", "--json").stdout)[
+        "session_id"
+    ]
+    assert first != second
+
+    assert invoke(cli, "wait", first, "--quiet").exit_code == vocab.EXIT_OK
+    assert invoke(cli, "wait", second, "--quiet").exit_code == vocab.EXIT_OK
+    resolution = runner.resolution_from_session(sessions.read_meta(first))
+
+    async def stop_target() -> None:
+        connection = await daemon_client.connect(runner.call_target(resolution))
+        assert connection is not None
+        try:
+            await connection.stop()
+        finally:
+            await connection.close()
+
+    asyncio.run(stop_target())
+
+    first_resume = invoke(cli, "continue", first, "what was my context?", "--quiet")
+    second_resume = invoke(cli, "continue", second, "what was my context?", "--quiet")
+
+    assert first_resume.exit_code == vocab.EXIT_OK
+    assert second_resume.exit_code == vocab.EXIT_OK
+    first_answer = sessions.answer_path(first).read_text(encoding="utf-8")
+    second_answer = sessions.answer_path(second).read_text(encoding="utf-8")
+    assert "alpha context" in first_answer
+    assert "beta context" not in first_answer
+    assert "beta context" in second_answer
+    assert "alpha context" not in second_answer
+    assert "1\n" in cursor_file.read_text(encoding="utf-8")
+
+
+def test_inherited_ceiling_clamps_a_background_continue_and_stop_uses_new_target(
+    cli: CliRunner, live_daemon: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id = json.loads(
+        invoke(cli, "run", "mock", "turn one", "--permissions", "all", "--quiet", "--json").stdout
+    )["session_id"]
+    original = sessions.load(session_id)
+    monkeypatch.setenv("ACPC_CEILING", "read")
+
+    dispatched = invoke(cli, "continue", session_id, "chunkslow:5 clamped", "--bg", "--json")
+
+    assert dispatched.exit_code == vocab.EXIT_OK
+    meta = sessions.load(session_id)
+    assert meta.resolution["resolved"]["permissions"]["value"] == "read"
+    assert meta.resolution["resolved"]["permissions"]["clamp"] == {
+        "requested": "all",
+        "ceiling": "read",
+        "effective": "read",
+    }
+    assert meta.target != original.target
+    assert meta.target == runner.call_target(runner.resolution_from_session(meta))
+
+    stopped = invoke(cli, "stop", session_id)
+
+    assert stopped.exit_code == vocab.EXIT_OK
+    assert sessions.load(session_id).state == "cancelled"
+
+
+def test_a_daemon_cold_resume_reports_list_verification_without_replay(
+    cli: CliRunner, live_daemon: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id = start_session(cli, "turn one")
+    resolution = runner.resolution_from_session(sessions.load(session_id))
+
+    async def stop_target() -> None:
+        connection = await daemon_client.connect(runner.call_target(resolution))
+        assert connection is not None
+        try:
+            await connection.stop()
+        finally:
+            await connection.close()
+
+    asyncio.run(stop_target())
+    monkeypatch.setenv("ACPC_MOCK_REPLAY_USER_MESSAGES", "0")
+
+    result = invoke(cli, "continue", session_id, "turn two", "--bg", "--json")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert json.loads(result.stdout)["resume"] == "verified"
+    assert invoke(cli, "wait", session_id, "--quiet").exit_code == vocab.EXIT_OK
+
+
+def test_background_json_reports_the_exact_unverified_resume_status(
+    cli: CliRunner, live_daemon: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id = start_session(cli, "turn one")
+    resolution = runner.resolution_from_session(sessions.load(session_id))
+
+    async def stop_target() -> None:
+        connection = await daemon_client.connect(runner.call_target(resolution))
+        assert connection is not None
+        try:
+            await connection.stop()
+        finally:
+            await connection.close()
+
+    asyncio.run(stop_target())
+    monkeypatch.setenv("ACPC_MOCK_ADVERTISE_LIST", "0")
+    monkeypatch.setenv("ACPC_MOCK_REPLAY_USER_MESSAGES", "0")
+
+    result = invoke(cli, "continue", session_id, "turn two", "--bg", "--json")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert json.loads(result.stdout)["resume"] == (
+        "unverified — session/list unavailable; conversation replay unavailable"
+    )
+    assert invoke(cli, "wait", session_id, "--quiet").exit_code == vocab.EXIT_OK
+
+
+def test_a_daemon_verification_failure_preserves_the_finished_session(
+    cli: CliRunner, live_daemon: None, state_root: Path
+) -> None:
+    session_id = start_session(cli, "recorded context")
+    resolution = runner.resolution_from_session(sessions.load(session_id))
+
+    async def stop_target() -> None:
+        connection = await daemon_client.connect(runner.call_target(resolution))
+        assert connection is not None
+        try:
+            await connection.stop()
+        finally:
+            await connection.close()
+
+    asyncio.run(stop_target())
+
+    store_path = state_root / "mock-sessions.json"
+    store = json.loads(store_path.read_text(encoding="utf-8"))
+    adapter_session_id = sessions.read_meta(session_id).adapter_session_id
+    assert adapter_session_id is not None
+    store[adapter_session_id]["history"] = ["different context"]
+    store_path.write_text(json.dumps(store), encoding="utf-8")
+    before = {
+        path: path.read_bytes()
+        for path in (
+            sessions.meta_path(session_id),
+            sessions.prompt_path(session_id),
+            sessions.answer_path(session_id),
+            sessions.transcript_path(session_id),
+        )
+    }
+
+    result = invoke(cli, "continue", session_id, "must not run", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    assert sessions.read_meta(session_id).state == "done"
+    assert sessions.read_meta(session_id).turns == 1
+    assert {path: path.read_bytes() for path in before} == before
+
+
+def test_a_queued_warm_background_continue_returns_before_the_slot_opens(
+    cli: CliRunner, live_daemon: None, state_root: Path
+) -> None:
+    (state_root / "config.toml").write_text("daemon_max_concurrent = 1\n", encoding="utf-8")
+    finished = start_session(cli, "turn one")
+    blocker = json.loads(
+        invoke(cli, "run", "mock", "chunkslow:3 blocker", "--bg", "--json").stdout
+    )["session_id"]
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and sessions.load(blocker).state != "running":
+        time.sleep(0.05)
+    assert sessions.load(blocker).state == "running"
+
+    started_at = time.monotonic()
+    result = invoke(cli, "continue", finished, "queued warm turn", "--bg", "--json")
+    elapsed = time.monotonic() - started_at
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert elapsed < 1.0
+    assert invoke(cli, "wait", blocker, "--quiet").exit_code == vocab.EXIT_OK
+    assert invoke(cli, "wait", finished, "--quiet").exit_code == vocab.EXIT_OK
+
+
+def test_concurrent_continuations_have_one_atomic_winner(cli: CliRunner, live_daemon: None) -> None:
+    session_id = start_session(cli, "turn one")
+    environment = os.environ.copy()
+    command = [
+        sys.executable,
+        "-c",
+        "from acpc.cli import main; raise SystemExit(main())",
+        "continue",
+        session_id,
+    ]
+    first = subprocess.Popen(
+        command + ["chunkslow:3 first winner", "--permissions", "edit", "--quiet", "--json"],
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    second = subprocess.Popen(
+        command + ["chunkslow:3 second contender", "--permissions", "all", "--quiet", "--json"],
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    first_output, first_error = first.communicate(timeout=15)
+    second_output, second_error = second.communicate(timeout=15)
+    outcomes = [
+        (first.returncode, first_output, first_error),
+        (second.returncode, second_output, second_error),
+    ]
+
+    assert sum(returncode == vocab.EXIT_OK for returncode, _output, _error in outcomes) == 1
+    assert sum(returncode != vocab.EXIT_OK for returncode, _output, _error in outcomes) == 1
+    meta = sessions.load(session_id)
+    assert meta.state == "done"
+    assert meta.turns == 2
+    prompt = sessions.prompt_path(session_id).read_text(encoding="utf-8")
+    assert "first winner" in prompt or "second contender" in prompt
+
+
+def test_same_target_cold_continuations_cannot_steal_replay(
+    cli: CliRunner, live_daemon: None, state_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id = start_session(cli, "recorded context")
+    resolution = runner.resolution_from_session(sessions.load(session_id))
+
+    async def stop_target() -> None:
+        connection = await daemon_client.connect(runner.call_target(resolution))
+        assert connection is not None
+        try:
+            await connection.stop()
+        finally:
+            await connection.close()
+
+    asyncio.run(stop_target())
+    store_path = state_root / "mock-sessions.json"
+    store = json.loads(store_path.read_text(encoding="utf-8"))
+    adapter_session_id = sessions.read_meta(session_id).adapter_session_id
+    assert adapter_session_id is not None
+    store[adapter_session_id]["history"] = [f"wrong context {index}" for index in range(500)]
+    store_path.write_text(json.dumps(store), encoding="utf-8")
+    monkeypatch.setenv("ACPC_MOCK_ADVERTISE_LIST", "0")
+    monkeypatch.setenv("ACPC_MOCK_RESUME_DELAY", "0.2")
+
+    command = [
+        sys.executable,
+        "-c",
+        "from acpc.cli import main; raise SystemExit(main())",
+        "continue",
+        session_id,
+    ]
+    environment = os.environ.copy()
+    first = subprocess.Popen(
+        command + ["must not run first", "--quiet"],
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    second = subprocess.Popen(
+        command + ["must not run second", "--quiet"],
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    first_output, first_error = first.communicate(timeout=20)
+    second_output, second_error = second.communicate(timeout=20)
+
+    assert first.returncode != vocab.EXIT_OK, (first_output, first_error)
+    assert second.returncode != vocab.EXIT_OK, (second_output, second_error)
+    assert sessions.read_meta(session_id).state == "done"
+    assert sessions.read_meta(session_id).turns == 1
+    assert "must not run" not in store_path.read_text(encoding="utf-8")
 
 
 def test_continue_by_name_uses_the_session_alias(cli: CliRunner) -> None:

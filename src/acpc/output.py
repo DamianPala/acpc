@@ -80,13 +80,16 @@ def result_envelope(
 ) -> dict[str, Any]:
     """Build the pinned JSON shape for an answer-printing command."""
     if background:
-        return {
+        envelope = {
             "session_id": meta.session_id,
             "state": meta.state,
             "paths": sessions.session_paths(meta.session_id),
             "denied": _denial_payload(meta),
             "permissions_clamp": _permissions_clamp(meta),
         }
+        if resume := _resume_status(meta):
+            envelope["resume"] = resume
+        return envelope
 
     envelope: dict[str, Any] = {
         "state": meta.state,
@@ -99,6 +102,8 @@ def result_envelope(
         "denied": _denial_payload(meta),
         "permissions_clamp": _permissions_clamp(meta),
     }
+    if resume := _resume_status(meta):
+        envelope["resume"] = resume
     if output_file is not None:
         envelope["output_file"] = str(output_file)
         envelope.pop("answer")
@@ -244,6 +249,12 @@ def _permissions_clamp(meta: sessions.SessionMeta) -> dict[str, str] | None:
     return {field: clamp[field] for field in fields}
 
 
+def _resume_status(meta: sessions.SessionMeta) -> str | None:
+    """Return the cold-resume confidence persisted for the current turn."""
+    value = meta.extra.get("resume")
+    return value if isinstance(value, str) else None
+
+
 def _denial_record(meta: sessions.SessionMeta, key: str, count: int) -> dict[str, Any]:
     details = meta.denial_details.get(key, {})
     if not isinstance(details, dict):
@@ -333,6 +344,8 @@ def format_summary(
         parts.append(clamp)
     if denied := _denied_summary(meta):
         parts.append(denied)
+    if resume := _resume_status(meta):
+        parts.append(f"resume: {resume}")
     parts.extend(_session_segments(meta))
     parts.append(f"continue: acpc continue {meta.session_id}")
     if route_note:

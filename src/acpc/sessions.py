@@ -21,6 +21,7 @@ retention ages without sleeping.
 """
 
 import contextlib
+import errno
 import json
 import os
 import random
@@ -28,12 +29,12 @@ import re
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
-from acpc import paths, proc, vocab
+from acpc import paths, proc, transcript, vocab
 
 Clock = Callable[[], float]
 
@@ -231,6 +232,38 @@ def _release_file_lock(fd: int) -> None:
     fcntl.flock(fd, fcntl.LOCK_UN)
 
 
+def _try_acquire_file_lock(fd: int) -> bool:
+    """Acquire a lock without waiting, returning false when it is occupied."""
+    if sys.platform == "win32":
+        import msvcrt
+
+        os.lseek(fd, 0, os.SEEK_SET)
+        if os.fstat(fd).st_size == 0:
+            os.write(fd, b"0")
+        os.lseek(fd, 0, os.SEEK_SET)
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        except OSError as error:
+            if error.errno in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                return False
+            raise
+        return True
+    import fcntl
+
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    return True
+
+
+def _session_busy(session_id: str) -> SessionStateError:
+    """Use continue's existing actionable message for a preparation collision."""
+    return SessionStateError(
+        f"session {session_id} is running — wait for the current turn to finish"
+    )
+
+
 @contextlib.contextmanager
 def session_lock(session_id: str) -> Iterator[None]:
     """Serialize turns and state writes on one session, across processes.
@@ -252,6 +285,37 @@ def session_lock(session_id: str) -> Iterator[None]:
             _lock_depth.held.discard(session_id)
             _release_file_lock(fd)
     finally:
+        os.close(fd)
+
+
+@contextlib.asynccontextmanager
+async def session_reservation(session_id: str) -> AsyncIterator[None]:
+    """Reserve a finished session across asynchronous resume preparation.
+
+    The lock is deliberately non-blocking and ephemeral. A failed verification
+    therefore releases only an OS lock and leaves the session files untouched;
+    a competing continuation gets the same busy error as an active turn.
+    """
+    if session_id in _lock_depth.held:
+        raise _session_busy(session_id)
+    directory = paths.ensure_private_dir(session_dir(session_id))
+    fd = os.open(directory / LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o600)
+    acquired = False
+    try:
+        if not _try_acquire_file_lock(fd):
+            raise _session_busy(session_id)
+        acquired = True
+        _lock_depth.held.add(session_id)
+        meta = read_meta(session_id)
+        if meta.is_active:
+            raise SessionStateError(
+                f"session {session_id} is {meta.state} — wait for the current turn to finish"
+            )
+        yield
+    finally:
+        if acquired:
+            _lock_depth.held.discard(session_id)
+            _release_file_lock(fd)
         os.close(fd)
 
 
@@ -525,6 +589,22 @@ def write_prompt(session_id: str, prompt: str) -> SessionMeta:
     return meta
 
 
+def mark_prompt_delivered(session_id: str, prompt: str) -> SessionMeta:
+    """Persist that the current turn's prompt crossed the ACP boundary."""
+    with session_lock(session_id):
+        meta = read_meta(session_id)
+        records = meta.extra.get("delivered_prompts")
+        delivered = list(records) if isinstance(records, list) else []
+        marker = {"turn": meta.turns, "prompt": prompt}
+        if not any(
+            isinstance(record, Mapping) and record.get("turn") == meta.turns for record in delivered
+        ):
+            delivered.append(marker)
+        meta.extra["delivered_prompts"] = delivered
+        write_meta(meta)
+    return meta
+
+
 def write_answer(session_id: str, answer: str) -> None:
     """Write the current turn's `answer.md` atomically."""
     with session_lock(session_id):
@@ -589,6 +669,56 @@ def transition(
     return meta
 
 
+def finalize_turn(
+    session_id: str,
+    to_state: str,
+    *,
+    answer: str,
+    expected_turn: int | None = None,
+    clock: Clock | None = None,
+    error_event: Mapping[str, Any] | None = None,
+    **changes: Any,
+) -> SessionMeta | None:
+    """Publish a turn answer and terminal state as one token-checked claim.
+
+    ``continue`` can rotate a finished turn immediately after a stop. Keeping
+    the answer write and terminal transition under this lock prevents a stale
+    owner from writing its answer into the replacement turn.
+    """
+    resolved_clock = _resolve_clock(clock)
+    if to_state not in vocab.SESSION_STATES:
+        raise ValueError(f"unknown session state {to_state!r}")
+    unknown = set(changes) - set(_META_FIELDS)
+    if unknown:
+        raise ValueError(f"unknown meta fields: {', '.join(sorted(unknown))}")
+    with session_lock(session_id):
+        meta = read_meta(session_id)
+        if expected_turn is not None and meta.turns != expected_turn:
+            return None
+        if meta.is_finished and to_state == "failed":
+            return None
+        allowed = _ALLOWED_TRANSITIONS.get(meta.state, frozenset())
+        if to_state not in allowed:
+            raise SessionStateError(
+                f"session {session_id} is {meta.state}, which cannot become {to_state}"
+            )
+        paths.atomic_write(answer_path(session_id), answer)
+        events = transcript.Transcript(transcript_path(session_id))
+        if error_event is not None:
+            events.append("error", **dict(error_event))
+        events.append("state", **{"from": meta.state, "to": to_state})
+        meta.state = to_state
+        for key, value in changes.items():
+            setattr(meta, key, value)
+        now = resolved_clock()
+        if to_state == "running" and meta.started_at is None:
+            meta.started_at = now
+        if to_state in vocab.FINISHED_STATES and meta.finished_at is None:
+            meta.finished_at = now
+        write_meta(meta)
+        return meta
+
+
 def mark_running(
     session_id: str,
     *,
@@ -618,9 +748,12 @@ def rotate_turn(
     session_id: str,
     *,
     clock: Clock | None = None,
-    permissions: str | None = None,
-    resolution: Mapping[str, Any] | None = None,
+    permissions_from_meta: Callable[[SessionMeta], str | None] | None = None,
+    resolution_from_meta: Callable[[SessionMeta], Mapping[str, Any]] | None = None,
     target_from_meta: Callable[[SessionMeta], str] | None = None,
+    prompt: str | None = None,
+    resume_status: str | None = None,
+    pid: int | None = None,
 ) -> SessionMeta:
     """Open the next turn: park the finished turn's artifacts, reset per-turn state.
 
@@ -636,9 +769,19 @@ def rotate_turn(
             raise SessionStateError(
                 f"session {session_id} is {meta.state} — wait for the current turn to finish"
             )
-        if resolution is not None:
-            meta.resolution = dict(resolution)
-        elif permissions is not None:
+        # Any value derived from session state must be a callback. The callback
+        # receives this locked re-read, so a caller cannot accidentally compute
+        # a snapshot value before the lock and write it after the lock.
+        if resolution_from_meta is not None and permissions_from_meta is not None:
+            raise SessionStateError(
+                f"session {session_id} received both resolution and permissions updates"
+            )
+        if resolution_from_meta is not None:
+            meta.resolution = dict(resolution_from_meta(meta))
+        elif permissions_from_meta is not None:
+            permissions = permissions_from_meta(meta)
+            if permissions is None:
+                raise SessionStateError(f"session {session_id} has no permission update")
             resolved = meta.resolution.get("resolved")
             if not isinstance(resolved, dict):
                 raise SessionStateError(f"session {session_id} has no stored permission resolution")
@@ -664,6 +807,16 @@ def rotate_turn(
         meta.stop_reason = None
         meta.denied = {}
         meta.denial_details = {}
+        meta.extra.pop("resume", None)
+        if prompt is not None:
+            paths.atomic_write(prompt_path(session_id), prompt)
+            meta.prompt_snippet = prompt_snippet(prompt)
+        if resume_status is not None:
+            meta.extra["resume"] = resume_status
+        if pid is not None:
+            meta.state = "running"
+            meta.pid = pid
+            meta.process_start_time = proc.process_start_time(pid)
         write_meta(meta)
     return meta
 

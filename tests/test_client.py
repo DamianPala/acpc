@@ -4,6 +4,7 @@ import asyncio
 import sys
 from collections.abc import Mapping
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -29,6 +30,7 @@ from acp.schema import (
 from acpc.client import AcpcClient
 from acpc.permissions import PermissionLevel
 from acpc.registry import ModeSpec
+from acpc.runner import verify_replayed_prompts
 from acpc.spawn import spawn_adapter
 from acpc.transcript import Transcript
 
@@ -133,7 +135,7 @@ def test_replay_is_silent_and_collects_user_messages_without_flushing_pending_pr
             AgentMessageChunk(content=text_block("before"), session_update="agent_message_chunk"),
         )
         events_before = transcript.read()
-        async with client.replaying() as sink:
+        async with client.replaying("adapter-session") as sink:
             await client.session_update(
                 "adapter-session",
                 AgentMessageChunk(
@@ -202,9 +204,144 @@ def test_replay_is_silent_and_collects_user_messages_without_flushing_pending_pr
         {"type": "usage", "tokens": 7, "cost": None, "ts": 100.0, "i": 1}
     ]
     assert events_after.next_cursor == cursor_before
-
     client.flush()
     assert transcript.read().events[1]["text"] == "before"
+
+
+def test_replay_collection_uses_ordered_frames_before_delayed_callbacks(tmp_path: Path) -> None:
+    """A restore response must not outrun a delayed session/update callback."""
+    client, transcript = _make_client(tmp_path, PermissionLevel.READ)
+
+    class RawConnection:
+        def __init__(self) -> None:
+            self.observers: list[Any] = []
+
+        def add_observer(self, observer: Any) -> None:
+            self.observers.append(observer)
+
+        def emit(self, message: Mapping[str, Any]) -> None:
+            event = SimpleNamespace(
+                direction=SimpleNamespace(value="incoming"), message=dict(message)
+            )
+            for observer in self.observers:
+                observer(event)
+
+    raw = RawConnection()
+    client.on_connect(SimpleNamespace(_conn=raw))
+    frame = {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": "adapter-session",
+            "update": {
+                "sessionUpdate": "user_message_chunk",
+                "content": {"type": "text", "text": "stored prompt"},
+                "messageId": "replay-1",
+            },
+        },
+    }
+
+    async def restore_response() -> None:
+        """Model restore sending replay frames before its response arrives."""
+        raw.emit(frame)
+        await asyncio.sleep(0)
+
+    async def scenario() -> list[str]:
+        async with client.replaying("adapter-session") as sink:
+            await restore_response()
+
+            async def delayed_callback() -> None:
+                await asyncio.sleep(0.05)
+                await client.session_update(
+                    "adapter-session",
+                    UserMessageChunk(
+                        session_update="user_message_chunk",
+                        content=text_block("stored prompt"),
+                        message_id="replay-1",
+                    ),
+                )
+
+            callback = asyncio.create_task(delayed_callback())
+        await callback
+        return sink.user_messages
+
+    assert asyncio.run(scenario()) == ["stored prompt"]
+    assert transcript.read().events == []
+
+
+def test_simultaneous_replays_scope_frames_to_their_adapter_sessions(tmp_path: Path) -> None:
+    """A shared raw connection cannot feed one cold resume another's history."""
+    client_a, _ = _make_client(tmp_path / "a", PermissionLevel.READ)
+    client_b, _ = _make_client(tmp_path / "b", PermissionLevel.READ)
+
+    class SharedRawConnection:
+        def __init__(self) -> None:
+            self.observers: list[Any] = []
+
+        def add_observer(self, observer: Any) -> None:
+            self.observers.append(observer)
+
+        def emit(self, session_id: str, text: str) -> None:
+            event = SimpleNamespace(
+                direction=SimpleNamespace(value="incoming"),
+                message={
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "user_message_chunk",
+                            "content": {"type": "text", "text": text},
+                            "messageId": f"replay-{session_id}",
+                        },
+                    },
+                },
+            )
+            for observer in self.observers:
+                observer(event)
+
+    raw = SharedRawConnection()
+    client_a.on_connect(SimpleNamespace(_conn=raw))
+    client_b.on_connect(SimpleNamespace(_conn=raw))
+
+    async def scenario() -> tuple[list[str], list[str]]:
+        a_ready = asyncio.Event()
+        b_ready = asyncio.Event()
+        start = asyncio.Event()
+        foreign_sent = asyncio.Event()
+        b_finished = asyncio.Event()
+
+        async def resume_a() -> None:
+            a_ready.set()
+            await start.wait()
+            await b_ready.wait()
+            raw.emit("adapter-b", "wrong")
+            foreign_sent.set()
+            await b_finished.wait()
+            raw.emit("adapter-a", "alpha")
+
+        async def resume_b() -> None:
+            b_ready.set()
+            await start.wait()
+            await foreign_sent.wait()
+            b_finished.set()
+
+        async with (
+            client_a.replaying("adapter-a", raw) as sink_a,
+            client_b.replaying("adapter-b", raw) as sink_b,
+        ):
+            task_a = asyncio.create_task(resume_a())
+            task_b = asyncio.create_task(resume_b())
+            await asyncio.gather(a_ready.wait(), b_ready.wait())
+            start.set()
+            await asyncio.gather(task_a, task_b)
+            return sink_a.user_messages, sink_b.user_messages
+
+    a_messages, b_messages = asyncio.run(scenario())
+    assert a_messages == ["alpha"]
+    assert b_messages == ["wrong"]
+    verify_replayed_prompts("adapter-a", [(Path("a-prompt"), "alpha")], a_messages)
+    verify_replayed_prompts("adapter-b", [(Path("b-prompt"), "wrong")], b_messages)
 
 
 def test_answer_keeps_interleaved_narration_and_excludes_tool_events(

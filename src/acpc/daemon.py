@@ -481,16 +481,54 @@ class Daemon:
             # `_rebuild_request` and escaped it: an uncaught one here leaves the
             # connection with no reply at all, so the caller sees a socket error
             # instead of the reason. Nothing else is scoped in this try.
-            return {"ok": False, "error": str(error)}
+            return {
+                "ok": False,
+                "error": str(error),
+                "preserve_session": bool((frame.get("payload") or {}).get("defer_rotation")),
+            }
 
-        queued = self._slots.locked()
-        cancel = runner._CancelSignal()
-        task = asyncio.create_task(
-            self._run_turn(session_id, request, cancel), name=f"acpc.turn.{session_id}"
-        )
-        self.turns[session_id] = _Turn(session_id=session_id, task=task, cancel=cancel)
-        self._last_busy = time.monotonic()
-        return {"ok": True, "queued": queued, "max_concurrent": self.max_concurrent}
+        claimed_turn: int | None = None
+        try:
+            async with contextlib.AsyncExitStack() as stack:
+                if request.defer_rotation:
+                    await stack.enter_async_context(sessions.session_reservation(session_id))
+                    request = await self._prepare_turn(session_id, request)
+                claimed_turn = request.turn_token
+                queued = self._slots.locked()
+                cancel = runner._CancelSignal()
+                turn_coro = self._run_turn(session_id, request, cancel)
+                try:
+                    task = asyncio.create_task(
+                        turn_coro,
+                        name=f"acpc.turn.{session_id}",
+                    )
+                except BaseException:
+                    turn_coro.close()
+                    raise
+                turn = _Turn(session_id=session_id, task=task, cancel=cancel)
+                self.turns[session_id] = turn
+                self._last_busy = time.monotonic()
+                return {"ok": True, "queued": queued, "max_concurrent": self.max_concurrent}
+        except runner.ResumeRotationError as error:
+            if error.turn_token is not None:
+                runner._finalize_claimed_setup_failure(session_id, error.turn_token, error)
+            return {
+                "ok": False,
+                "error": runner.describe_error(error),
+                "preserve_session": True,
+            }
+        except asyncio.CancelledError as error:
+            if claimed_turn is not None:
+                runner._finalize_claimed_setup_failure(session_id, claimed_turn, error)
+            raise
+        except BaseException as error:  # noqa: BLE001
+            if claimed_turn is not None:
+                runner._finalize_claimed_setup_failure(session_id, claimed_turn, error)
+            return {
+                "ok": False,
+                "error": runner.describe_error(error),
+                "preserve_session": True,
+            }
 
     async def _await(self, frame: dict[str, Any]) -> dict[str, Any]:
         session_id = frame.get("session_id", "")
@@ -618,10 +656,60 @@ class Daemon:
             cwd=payload.get("cwd"),
             timeout=payload.get("timeout"),
             resume_adapter_session=payload.get("resume_adapter_session"),
+            defer_rotation=bool(payload.get("defer_rotation", False)),
+            rotation_resolution=payload.get("rotation_resolution"),
+            resume_prepared=bool(payload.get("resume_prepared", False)),
+            turn_token=payload.get("turn_token"),
         )
 
+    async def _prepare_turn(
+        self, session_id: str, request: runner.TurnRequest
+    ) -> runner.TurnRequest:
+        """Verify and claim a continuation before it joins the prompt queue."""
+        events = transcript.Transcript(sessions.transcript_path(session_id))
+        conn = await self.host.ensure(request.resolution)
+        warm = self.host.adapter_sessions.get(session_id)
+        if warm is not None:
+            return runner._prepare_resumed_turn(session_id, request, events, pid=os.getpid())
+
+        adapter_session_id = request.resume_adapter_session
+        if adapter_session_id is None:
+            raise runner.ResumePreparationError("continued turn has no adapter session id")
+        client = AcpcClient(
+            events,
+            PermissionLevel(request.resolution.permissions or "read"),
+            modes=request.resolution.entry.modes,
+        )
+        self.host.mux.bind(adapter_session_id, client)
+        try:
+            try:
+                resume_status = await runner.verify_adapter_resume(
+                    conn,
+                    client,
+                    self.host.agent_capabilities,
+                    adapter_session_id,
+                    request.cwd or os.getcwd(),
+                    session_id,
+                )
+            except runner.ResumePreparationError:
+                raise
+            except Exception as error:  # noqa: BLE001
+                raise runner.ResumePreparationError(str(error)) from None
+            return runner._prepare_resumed_turn(
+                session_id,
+                request,
+                events,
+                resume_status=resume_status,
+                pid=os.getpid(),
+            )
+        finally:
+            self.host.mux.release(adapter_session_id)
+
     async def _run_turn(
-        self, session_id: str, request: runner.TurnRequest, cancel: runner._CancelSignal
+        self,
+        session_id: str,
+        request: runner.TurnRequest,
+        cancel: runner._CancelSignal,
     ) -> runner.TurnOutcome:
         """Run one turn on the warm adapter and finalize it on disk."""
         async with self._slots:
@@ -633,21 +721,54 @@ class Daemon:
             # so without this mark a failure would quote a stranger's stderr.
             log_from = runner.adapter_log_offset(self.target)
             try:
-                sessions.mark_running(session_id, pid=os.getpid())
-                events.append("state", **{"from": "starting", "to": "running"})
+                if not request.defer_rotation and not request.resume_prepared:
+                    sessions.mark_running(session_id, pid=os.getpid())
+                    events.append("state", **{"from": "starting", "to": "running"})
                 outcome = await self._drive(session_id, request, events, cancel)
-            except Exception as caught:  # noqa: BLE001
+            except runner.ResumePreparationError as caught:
+                # A deferred continuation has not rotated the session yet, so
+                # verification failure must leave its finished state untouched.
+                error = caught
+                outcome = runner.TurnOutcome(state="failed", stop_reason="error", answer="")
+                if not request.defer_rotation:
+                    runner._finalize(session_id, outcome, error=error, adapter_log_from=log_from)
+            except BaseException as caught:
                 # Same reasoning as the direct path: a crash must still leave a
                 # finished session, never a meta.json stuck on `running`.
-                error = caught
-                runner._finalize(session_id, outcome, error=error, adapter_log_from=log_from)
+                ended_by_acpc = isinstance(caught, asyncio.CancelledError) and (
+                    cancel.stop_reason is not None
+                )
+                error = (
+                    runner.TurnEndedByAcpc(cancel.stop_reason or "the daemon ended the turn")
+                    if ended_by_acpc
+                    else caught
+                )
+                outcome = runner.TurnOutcome(
+                    state=cancel.state or "failed",
+                    stop_reason=cancel.stop_reason or "error",
+                    answer="",
+                    turn_token=request.turn_token,
+                )
+                runner._finalize(
+                    session_id,
+                    outcome,
+                    error=error,
+                    adapter_log_from=log_from,
+                    expected_turn=outcome.turn_token,
+                )
                 # If the crash was the adapter dying, heal the target now
                 # rather than on the next turn's ensure().
                 with contextlib.suppress(Exception):
                     await self.host.reset_if_dead()
+                if isinstance(caught, asyncio.CancelledError):
+                    raise
             else:
                 runner._finalize(
-                    session_id, outcome, error=outcome.error, adapter_log_from=log_from
+                    session_id,
+                    outcome,
+                    error=outcome.error,
+                    adapter_log_from=log_from,
+                    expected_turn=outcome.turn_token,
                 )
             finally:
                 # Only a turn that could not be *started* travels back as an
@@ -682,17 +803,28 @@ class Daemon:
             # intact: prompt it directly. Re-loading here would make the
             # adapter treat the turn as a resume and lose that continuity.
             adapter_session_id = warm
+        elif request.resume_prepared and request.resume_adapter_session is not None:
+            adapter_session_id = request.resume_adapter_session
         elif request.resume_adapter_session is not None:
             adapter_session_id = request.resume_adapter_session
             self.host.mux.bind(adapter_session_id, client)
             try:
-                async with client.replaying():
-                    await runner.restore_adapter_session(
+                try:
+                    await runner.verify_adapter_resume(
                         conn,
+                        client,
                         self.host.agent_capabilities,
                         adapter_session_id,
                         request.cwd or os.getcwd(),
+                        session_id,
                     )
+                except runner.ResumePreparationError:
+                    raise
+                except Exception as error:
+                    if request.defer_rotation:
+                        raise runner.ResumePreparationError(str(error)) from None
+                    raise
+                request = runner._prepare_resumed_turn(session_id, request, events, pid=os.getpid())
             finally:
                 self.host.mux.release(adapter_session_id)
         else:
@@ -703,10 +835,20 @@ class Daemon:
         self.host.adapter_sessions[session_id] = adapter_session_id
         self.host.mux.bind(adapter_session_id, client)
         try:
-            await runner.apply_call_options(conn, adapter_session_id, request)
-            prompt_task = asyncio.create_task(
-                conn.prompt(session_id=adapter_session_id, prompt=[text_block(request.prompt)])
-            )
+            try:
+                await runner.apply_call_options(conn, adapter_session_id, request)
+                delivery = runner.register_prompt_delivery(
+                    conn, session_id, adapter_session_id, request.prompt
+                )
+                prompt_task = asyncio.create_task(
+                    conn.prompt(session_id=adapter_session_id, prompt=[text_block(request.prompt)])
+                )
+            except BaseException as error:
+                if request.turn_token is None:
+                    raise
+                raise runner.ResumeSetupError(
+                    runner.describe_error(error), turn_token=request.turn_token
+                ) from None
             try:
                 stop_reason = await runner._await_prompt(
                     conn, adapter_session_id, prompt_task, request, cancel
@@ -715,6 +857,11 @@ class Daemon:
                 # Same bargain as the direct path: keep the streamed prose as the
                 # failed session's answer and carry the cause on the outcome.
                 turn_error = caught
+                stop_reason = "error"
+            try:
+                await delivery.ensure_persisted()
+            except Exception as caught:  # noqa: BLE001
+                turn_error = caught if turn_error is None else turn_error
                 stop_reason = "error"
         finally:
             self.host.mux.release(adapter_session_id)
@@ -736,6 +883,7 @@ class Daemon:
             adapter_session_id=adapter_session_id,
             advertised=client.advertised,
             error=turn_error,
+            turn_token=request.turn_token,
         )
 
     def _finish(

@@ -5,6 +5,7 @@ import signal
 import subprocess
 import sys
 import time
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -64,6 +65,35 @@ class TestProcessIdentity:
             assert token is not None
             assert process_liveness(process.pid, token) == "verified"
             assert process_liveness(process.pid, "not-the-token") == "dead"
+        finally:
+            process.kill()
+            process.wait()
+
+    @pytest.mark.skipif(sys.platform != "linux", reason="Linux /proc zombie state")
+    def test_liveness_of_a_zombie_without_a_token_is_dead(self) -> None:
+        process = subprocess.Popen([sys.executable, "-c", "pass"])
+        try:
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                try:
+                    stat = Path(f"/proc/{process.pid}/stat").read_text(encoding="utf-8")
+                    state = stat.rsplit(")", 1)[1].split()[0]
+                except FileNotFoundError:
+                    state = "gone"
+                if state == "Z":
+                    assert process_liveness(process.pid) == "dead"
+                    return
+                time.sleep(0.01)
+            pytest.fail("child did not exit while its parent kept it unreaped")
+        finally:
+            process.wait()
+
+    @pytest.mark.skipif(sys.platform != "linux", reason="Linux /proc access semantics")
+    def test_liveness_stays_unverifiable_when_proc_stat_is_inaccessible(self) -> None:
+        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            with patch("acpc.proc.Path.read_text", side_effect=PermissionError("denied")):
+                assert process_liveness(process.pid, "recorded-token") == "unverifiable"
         finally:
             process.kill()
             process.wait()

@@ -1,6 +1,7 @@
 """Behavioral tests for the ``steer`` verb: cancel, then redirect."""
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -74,6 +75,13 @@ def mid_turn_session(cli: CliRunner, prompt: str = "turn one") -> str:
     sessions.rotate_turn(session_id)
     sessions.write_prompt(session_id, "the instruction being interrupted")
     sessions.write_answer(session_id, PARTIAL_ANSWER)
+    meta = sessions.read_meta(session_id)
+    adapter_session_id = meta.adapter_session_id
+    assert adapter_session_id is not None
+    store_path = Path(os.environ["ACPC_HOME"]) / "mock-sessions.json"
+    store = json.loads(store_path.read_text(encoding="utf-8"))
+    store[adapter_session_id]["history"].append("the instruction being interrupted")
+    store_path.write_text(json.dumps(store), encoding="utf-8")
     sessions.transition(session_id, "running", pid=None)
     assert sessions.load(session_id).state == "running"
     return session_id
