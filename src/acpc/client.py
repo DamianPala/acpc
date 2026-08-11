@@ -3,12 +3,17 @@
 import asyncio
 import inspect
 import json
+import logging
 import time
+import uuid
+import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
+from weakref import WeakKeyDictionary
 
 from acp import RequestError
 from acp.schema import (
@@ -146,6 +151,346 @@ class ReplaySink:
         self._consume_text(text, update.get("messageId"))
 
 
+REPLAY_GENERATION_KEY = "acpc_replay_generation"
+VALIDATED_SESSION_ID_KEY = "acpc_validated_session_id"
+_REPLAY_SUPPRESSION_LOG = logging.getLogger(__name__)
+
+# This is a memory-versus-leak-window tradeoff. Healthy generations release by
+# accounting, so this is only a backstop; eviction is safe because an evicted
+# tag reads as unknown and leaks stale output rather than swallowing live
+# output. G5 beats G1 when the two conflict.
+MAX_RETAINED_CLOSED_REPLAY_GENERATIONS = 64
+
+
+class ReplayError(RuntimeError):
+    """A replay generation violated its connection or binding lifecycle."""
+
+
+@dataclass(slots=True)
+class _ReplayGeneration:
+    """One restore window owned by a raw connection and adapter session."""
+
+    generation_id: int
+    session_id: str
+    sink: ReplaySink | None
+    active: bool = True
+    received: int = 0
+    tagged_frame_ids: set[int] = dataclass_field(default_factory=set)
+    seen_frame_ids: set[int] = dataclass_field(default_factory=set)
+
+
+class ReplayTracker:
+    """Keep replay suppression state on one connection, not on a client."""
+
+    _trackers: WeakKeyDictionary[Any, "ReplayTracker"] = WeakKeyDictionary()
+
+    def __init__(self, raw_connection: Any) -> None:
+        try:
+            self._raw_connection = weakref.ref(raw_connection)
+        except TypeError:
+            self._raw_connection = None
+        self._next_generation = 0
+        self._next_frame_id = 0
+        self._active: dict[str, _ReplayGeneration] = {}
+        self._generations: dict[int, _ReplayGeneration] = {}
+        self._connection_token = uuid.uuid4().hex
+        self._tagging_available = False
+        self._close_task: asyncio.Task[Any] | None = None
+        self._install()
+
+    @classmethod
+    def for_connection(cls, raw_connection: Any | None) -> "ReplayTracker | None":
+        """Return the tracker attached to one raw connection, if available."""
+        if raw_connection is None:
+            return None
+        try:
+            tracker = cls._trackers.get(raw_connection)
+        except TypeError:
+            tracker = getattr(raw_connection, "_acpc_replay_tracker", None)
+        if tracker is not None:
+            return tracker
+        tracker = cls(raw_connection)
+        try:
+            cls._trackers[raw_connection] = tracker
+        except TypeError:
+            with suppress(AttributeError, TypeError):
+                raw_connection._acpc_replay_tracker = tracker
+        return tracker
+
+    def open(self, session_id: str, sink: ReplaySink) -> int:
+        """Open a restore generation for one adapter session."""
+        previous = self._active.get(session_id)
+        if previous is not None:
+            self._warn_open_generation(previous, "a new restore started")
+            raise ReplayError(
+                f"replay generation {previous.generation_id} for session {session_id} is still open"
+            )
+        self._next_generation += 1
+        generation = _ReplayGeneration(
+            generation_id=self._next_generation,
+            session_id=session_id,
+            sink=sink,
+        )
+        self._active[session_id] = generation
+        self._generations[generation.generation_id] = generation
+        return generation.generation_id
+
+    def close(self, session_id: str, generation_id: int) -> None:
+        """Close a restore generation while retaining its suppression history."""
+        generation = self._generations.get(generation_id)
+        if generation is None or generation.session_id != session_id:
+            return
+        generation.active = False
+        if self._active.get(session_id) is generation:
+            del self._active[session_id]
+        generation.sink = None
+        if not self._tagging_available and generation.received:
+            _REPLAY_SUPPRESSION_LOG.warning(
+                "replay suppression unavailable for %s: received frames cannot be "
+                "phase-attributed and may leak",
+                self._warning_name(generation),
+            )
+        if not self._tagging_available:
+            self._generations.pop(generation.generation_id, None)
+        else:
+            self._release_if_accounted(generation)
+            self._evict_closed_generations()
+
+    def active_generation_id(self, session_id: str) -> int | None:
+        """Return the active generation for a session, if restore is in progress."""
+        generation = self._active.get(session_id)
+        return generation.generation_id if generation is not None else None
+
+    def tag_message(self, message: Any) -> None:
+        """Capture identity and tag restore updates before ACP dispatches them."""
+        if not isinstance(message, Mapping) or message.get("method") != "session/update":
+            return
+        params = message.get("params")
+        if not isinstance(params, Mapping):
+            return
+        session_id = params.get("sessionId")
+        if not isinstance(session_id, str):
+            return
+        metadata = params.get("_meta")
+        if not isinstance(metadata, dict):
+            metadata = {}
+            params["_meta"] = metadata  # type: ignore[index]
+        # Capture the validated envelope identity for every update. ACP merges
+        # peer metadata into callback kwargs after this seam, so routing must
+        # consume this value rather than the potentially overwritten argument.
+        metadata[VALIDATED_SESSION_ID_KEY] = session_id
+        generation = self._active.get(session_id)
+        if generation is None:
+            return
+        frame_id = self._next_frame_id
+        self._next_frame_id += 1
+        generation.received += 1
+        generation.tagged_frame_ids.add(frame_id)
+        metadata[REPLAY_GENERATION_KEY] = self._tag_value(generation, frame_id)
+
+    def consume_tag(self, generation_id: Any) -> str:
+        """Account for a tagged callback and return its suppression status."""
+        generation = self._generation_for(generation_id)
+        if generation is None:
+            _REPLAY_SUPPRESSION_LOG.warning(
+                "replay suppression: frame arrived for unknown generation tag %r",
+                generation_id,
+            )
+            return "unknown"
+        frame_id = generation_id.get("frame") if isinstance(generation_id, Mapping) else None
+        if not isinstance(frame_id, int) or isinstance(frame_id, bool):
+            _REPLAY_SUPPRESSION_LOG.warning(
+                "replay suppression: frame arrived with unknown frame identity for %s",
+                self._warning_name(generation),
+            )
+            return "unknown"
+        if frame_id not in generation.tagged_frame_ids:
+            _REPLAY_SUPPRESSION_LOG.warning(
+                "replay suppression: frame identity %r was not tagged for %s",
+                frame_id,
+                self._warning_name(generation),
+            )
+            return "unknown"
+        generation.seen_frame_ids.add(frame_id)
+        status = "active" if generation.active else "closed"
+        self._release_if_accounted(generation)
+        return status
+
+    def session_for_tag(self, generation_id: Any) -> str | None:
+        """Return the validated top-level session captured in a replay tag."""
+        if not isinstance(generation_id, Mapping):
+            return None
+        if generation_id.get("connection") != self._connection_token:
+            return None
+        session_id = generation_id.get("session_id")
+        return session_id if isinstance(session_id, str) else None
+
+    def _generation_for(self, generation_id: Any) -> _ReplayGeneration | None:
+        if not isinstance(generation_id, Mapping):
+            return None
+        if generation_id.get("connection") != self._connection_token:
+            return None
+        number = generation_id.get("generation")
+        if not isinstance(number, int) or isinstance(number, bool):
+            return None
+        generation = self._generations.get(number)
+        if generation is None or generation.session_id != generation_id.get("session_id"):
+            return None
+        return generation
+
+    def _install(self) -> None:
+        raw_connection = self._connection()
+        if raw_connection is None:
+            return
+        add_observer = getattr(raw_connection, "add_observer", None)
+        if callable(add_observer):
+            add_observer(self._observe)
+        self._install_close_hook(raw_connection)
+        process_message = getattr(raw_connection, "_process_message", None)
+        if not callable(process_message):
+            return
+        try:
+            if getattr(raw_connection, "_acpc_replay_tagging", False):
+                self._tagging_available = True
+                return
+
+            # ACP observers receive a deep-copied snapshot, so they cannot put
+            # the tag on the message that the router will later parse. Wrap the
+            # receive-to-dispatch seam instead, before that original message
+            # enters the notification queue.
+            async def tagged_process(message: Any) -> Any:
+                self.tag_message(message)
+                return await cast(Awaitable[Any], process_message(message))
+
+            raw_connection._process_message = tagged_process
+            raw_connection._acpc_replay_tagging = True
+        except (AttributeError, TypeError):
+            return
+        self._tagging_available = True
+
+    def _connection(self) -> Any | None:
+        return self._raw_connection() if self._raw_connection is not None else None
+
+    def _install_close_hook(self, raw_connection: Any) -> None:
+        close = getattr(raw_connection, "close", None)
+        if callable(close) and not getattr(raw_connection, "_acpc_replay_close", False):
+
+            async def closed(*args: Any, **kwargs: Any) -> Any:
+                if self._close_task is None:
+
+                    async def shutdown() -> Any:
+                        try:
+                            result = await cast(Awaitable[Any], close(*args, **kwargs))
+                        except Exception as error:
+                            # The waiters are shielded, so a failure here reaches
+                            # nobody unless a later caller retries. Say so once,
+                            # here, rather than leaving a silent dead task.
+                            _REPLAY_SUPPRESSION_LOG.warning(
+                                "replay suppression: closing the connection failed (%s); "
+                                "replay records are kept because callbacks may still run",
+                                error,
+                            )
+                            raise
+                        self.invalidate_connection()
+                        return result
+
+                    self._close_task = asyncio.create_task(shutdown())
+                return await asyncio.shield(self._close_task)
+
+            try:
+                raw_connection.close = closed
+                raw_connection._acpc_replay_close = True
+            except (AttributeError, TypeError):
+                return
+
+    def invalidate_connection(self) -> None:
+        """Invalidate every generation when its transport can no longer drain it."""
+        for generation in tuple(self._active.values()):
+            self._warn_open_generation(generation, "the connection dropped")
+            generation.active = False
+            generation.sink = None
+        self._active.clear()
+        self._generations.clear()
+
+    def _observe(self, event: Any) -> None:
+        direction = getattr(getattr(event, "direction", None), "value", None)
+        message = getattr(event, "message", {})
+        if direction == "outgoing":
+            return
+        if direction != "incoming":
+            return
+        if not isinstance(message, Mapping) or message.get("method") != "session/update":
+            return
+        params = message.get("params")
+        if not isinstance(params, Mapping):
+            return
+        session_id = params.get("sessionId")
+        if not isinstance(session_id, str):
+            return
+        generation = self._active.get(session_id)
+        update = params.get("update")
+        if generation is None or generation.sink is None or not isinstance(update, Mapping):
+            return
+        if not self._tagging_available:
+            generation.received += 1
+        generation.sink.consume_raw(update)
+
+    @staticmethod
+    def _warning_name(generation: _ReplayGeneration) -> str:
+        return f"generation {generation.generation_id} for session {generation.session_id}"
+
+    def _warn_unaccounted(self, generation: _ReplayGeneration) -> None:
+        unaccounted = (
+            len(generation.tagged_frame_ids - generation.seen_frame_ids)
+            if generation.tagged_frame_ids
+            else generation.received
+        )
+        if unaccounted:
+            _REPLAY_SUPPRESSION_LOG.warning(
+                "replay suppression: %d frames unaccounted for %s",
+                unaccounted,
+                self._warning_name(generation),
+            )
+
+    def _warn_open_generation(self, generation: _ReplayGeneration, reason: str) -> None:
+        _REPLAY_SUPPRESSION_LOG.warning(
+            "replay suppression: %s was still open when %s",
+            self._warning_name(generation),
+            reason,
+        )
+        self._warn_unaccounted(generation)
+
+    def _tag_value(self, generation: _ReplayGeneration, frame_id: int) -> dict[str, Any]:
+        return {
+            "connection": self._connection_token,
+            "session_id": generation.session_id,
+            "generation": generation.generation_id,
+            "frame": frame_id,
+        }
+
+    def _release_if_accounted(self, generation: _ReplayGeneration) -> None:
+        if generation.active or generation.tagged_frame_ids != generation.seen_frame_ids:
+            return
+        self._generations.pop(generation.generation_id, None)
+
+    def _evict_closed_generations(self) -> None:
+        retained = sum(not generation.active for generation in self._generations.values())
+        if retained <= MAX_RETAINED_CLOSED_REPLAY_GENERATIONS:
+            return
+        for generation_id, generation in tuple(self._generations.items()):
+            if retained <= MAX_RETAINED_CLOSED_REPLAY_GENERATIONS:
+                break
+            if generation.active:
+                continue
+            self._generations.pop(generation_id, None)
+            retained -= 1
+            _REPLAY_SUPPRESSION_LOG.warning(
+                "replay suppression: evicted %s with %d unaccounted frame(s)",
+                self._warning_name(generation),
+                len(generation.tagged_frame_ids - generation.seen_frame_ids),
+            )
+
+
 class AcpcClient:
     """Implement the ACP client callbacks used by a single session turn.
 
@@ -184,7 +529,6 @@ class AcpcClient:
         self._replay_sink: ReplaySink | None = None
         self._raw_connection: Any | None = None
         self._raw_replay_active = False
-        self._replay_frame_counts: dict[tuple[str, str], int] = {}
         self._advertised: dict[str, Any] = {
             "modes": [],
             "models": [],
@@ -240,72 +584,29 @@ class AcpcClient:
         """Consume session-restore updates without changing turn-visible state."""
         previous = self._replay_sink
         previous_raw = self._raw_replay_active
-        raw_connection = getattr(connection, "_conn", None) or self._raw_connection
+        raw_connection = getattr(connection, "_conn", None)
+        if raw_connection is None:
+            raw_connection = connection or self._raw_connection
+        tracker = ReplayTracker.for_connection(raw_connection)
         add_observer = getattr(raw_connection, "add_observer", None)
         uses_raw_frames = callable(add_observer)
         sink = ReplaySink(replay_available=uses_raw_frames)
-        self._replay_sink = sink
-        self._raw_replay_active = uses_raw_frames
-        if uses_raw_frames:
-
-            def observe(event: Any) -> None:
-                if self._replay_sink is not sink or not self._raw_replay_active:
-                    return
-                if getattr(getattr(event, "direction", None), "value", None) != "incoming":
-                    return
-                message = getattr(event, "message", {})
-                if not isinstance(message, Mapping) or message.get("method") != "session/update":
-                    return
-                params = message.get("params")
-                if not isinstance(params, Mapping):
-                    return
-                session_id = params.get("sessionId")
-                update = params.get("update")
-                if session_id != expected_session_id or not isinstance(update, Mapping):
-                    return
-                self._record_replay_frame(expected_session_id, update)
-                sink.consume_raw(update)
-
-            add_observer(observe)
+        generation_id: int | None = None
         try:
+            if tracker is not None:
+                generation_id = tracker.open(expected_session_id, sink)
+            self._replay_sink = sink
+            self._raw_replay_active = uses_raw_frames
             yield sink
         finally:
+            if tracker is not None and generation_id is not None:
+                tracker.close(expected_session_id, generation_id)
             self._raw_replay_active = previous_raw
             self._replay_sink = previous
 
     def on_connect(self, conn: Any) -> None:
         """Keep the raw connection for ordered replay-frame observation."""
         self._raw_connection = getattr(conn, "_conn", None)
-
-    @staticmethod
-    def _raw_update_key(session_id: str, update: Mapping[str, Any]) -> tuple[str, str]:
-        serialized = json.dumps(dict(update), sort_keys=True, separators=(",", ":"))
-        return session_id, serialized
-
-    def _record_replay_frame(self, session_id: str, update: Mapping[str, Any]) -> None:
-        key = self._raw_update_key(session_id, update)
-        self._replay_frame_counts[key] = self._replay_frame_counts.get(key, 0) + 1
-
-    def _consume_delayed_replay_frame(self, session_id: str, update: Any) -> bool:
-        if not isinstance(session_id, str):
-            return False
-        try:
-            serialized = update.model_dump(
-                mode="json", by_alias=True, exclude_none=True, exclude_unset=True
-            )
-        except AttributeError:
-            return False
-        if not isinstance(serialized, Mapping):
-            return False
-        key = self._raw_update_key(session_id, serialized)
-        count = self._replay_frame_counts.get(key, 0)
-        if count == 0:
-            return False
-        if count == 1:
-            del self._replay_frame_counts[key]
-        else:
-            self._replay_frame_counts[key] = count - 1
-        return True
 
     def flush(self) -> None:
         """Write buffered agent prose to the transcript as one event.
@@ -340,12 +641,22 @@ class AcpcClient:
 
     async def session_update(self, session_id: str, update: Any, **kwargs: Any) -> None:
         """Record one ACP session update in the public transcript format."""
-        del kwargs
+        generation_id = kwargs.pop(REPLAY_GENERATION_KEY, None)
+        tracker = ReplayTracker.for_connection(self._raw_connection)
+        if generation_id is not None:
+            if tracker is not None:
+                generation_status = tracker.consume_tag(generation_id)
+                if generation_status in {"active", "closed"}:
+                    return
+            else:
+                _REPLAY_SUPPRESSION_LOG.warning(
+                    "replay suppression: frame arrived with generation tag for session %s "
+                    "but its connection tracker is unavailable",
+                    session_id,
+                )
         if self._replay_sink is not None:
             if not self._raw_replay_active:
                 self._replay_sink.consume(update)
-            return
-        if self._consume_delayed_replay_frame(session_id, update):
             return
         update_type = getattr(update, "session_update", None)
 

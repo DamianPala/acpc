@@ -11,14 +11,23 @@ import json
 import os
 import sys
 import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
+from acp import text_block
+from acp.client import ClientSideConnection
+from acp.schema import AgentMessageChunk
 
 from acpc import daemon, daemon_client, ipc, output, proc, runner, sessions, vocab
-from acpc.permissions import select_mode
+from acpc.client import REPLAY_GENERATION_KEY, AcpcClient
+from acpc.permissions import PermissionLevel, select_mode
 from acpc.registry import AgentRegistry
+from acpc.transcript import Transcript
 
 MOCK_AGENT_SCRIPT = str(Path(__file__).with_name("mock_agent.py"))
 
@@ -97,6 +106,34 @@ def dispatch_payload(prompt: str = "x") -> dict:
 
 def rebuild(payload: dict) -> runner.TurnRequest:
     return daemon.Daemon(target())._rebuild_request(payload)
+
+
+@asynccontextmanager
+async def real_client_connection(client: Any) -> AsyncIterator[ClientSideConnection]:
+    """Use ACP's real dispatcher and router without starting an adapter."""
+    accepted: asyncio.Future[tuple[asyncio.StreamReader, asyncio.StreamWriter]] = (
+        asyncio.get_running_loop().create_future()
+    )
+
+    async def accept(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        if not accepted.done():
+            accepted.set_result((reader, writer))
+        else:
+            writer.close()
+
+    server = await asyncio.start_server(accept, "127.0.0.1", 0)
+    address = server.sockets[0].getsockname()
+    client_reader, client_writer = await asyncio.open_connection(address[0], address[1])
+    _server_reader, server_writer = await accepted
+    connection = ClientSideConnection(client, client_writer, client_reader, listening=False)
+    try:
+        yield connection
+    finally:
+        await connection.close()
+        server_writer.close()
+        await server_writer.wait_closed()
+        server.close()
+        await server.wait_closed()
 
 
 # --- rebuilding a dispatched turn -------------------------------------------
@@ -188,6 +225,365 @@ def test_a_turn_runs_on_the_daemon_and_finishes_the_session(
     assert outcome.state == "done"
     assert outcome.route_note is None
     assert sessions.read_meta(session_id).state == "done"
+
+
+def test_daemon_replay_tag_survives_restore_client_release_and_live_rebind(
+    state_root: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A late restore callback is dropped after the daemon binds the live client."""
+
+    class RawConnection:
+        def __init__(self) -> None:
+            self.observers: list[object] = []
+
+        def add_observer(self, observer: object) -> None:
+            self.observers.append(observer)
+
+        async def _process_message(self, message: object) -> None:
+            del message
+
+        async def receive(self, message: dict) -> None:
+            event = SimpleNamespace(direction=SimpleNamespace(value="incoming"), message=message)
+            for observer in self.observers:
+                assert callable(observer)
+                observer(event)
+            await self._process_message(message)
+
+    raw = RawConnection()
+    mux = daemon._MultiplexClient()
+    mux.on_connect(SimpleNamespace(_conn=raw))
+    session_id = new_session("same")
+    restore_transcript = Transcript(state_root / "restore.ndjson")
+    live_transcript = Transcript(sessions.transcript_path(session_id))
+    restore_client = AcpcClient(restore_transcript, PermissionLevel.READ)
+    live_client = AcpcClient(live_transcript, PermissionLevel.READ)
+    adapter_session_id = "adapter-session"
+    frame = {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": adapter_session_id,
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "same"},
+                "messageId": "replay-message",
+            },
+        },
+    }
+    replay_update = AgentMessageChunk(
+        content=text_block("same"),
+        message_id="replay-message",
+        session_update="agent_message_chunk",
+    )
+
+    async def scenario() -> None:
+        mux.bind(adapter_session_id, restore_client)
+        async with restore_client.replaying(adapter_session_id, raw):
+            await raw.receive(frame)
+        generation = frame["params"]["_meta"][REPLAY_GENERATION_KEY]
+
+        mux.release(adapter_session_id)
+        mux.bind(adapter_session_id, live_client)
+        await mux.session_update(
+            adapter_session_id,
+            replay_update,
+            **{REPLAY_GENERATION_KEY: generation},
+        )
+        await mux.session_update(adapter_session_id, replay_update)
+        live_client.flush()
+
+    with caplog.at_level("WARNING", logger="acpc.client"):
+        asyncio.run(scenario())
+    sessions.write_answer(session_id, live_client.answer)
+
+    assert live_client.answer == "same"
+    assert sessions.answer_path(session_id).read_text(encoding="utf-8") == "same"
+    assert [event["text"] for event in live_transcript.read().events] == ["same"]
+    assert restore_transcript.read().events == []
+    assert not any("replay suppression:" in record.getMessage() for record in caplog.records)
+
+
+def test_daemon_live_routing_uses_top_level_session_id_not_peer_metadata(
+    state_root: Path,
+) -> None:
+    mux = daemon._MultiplexClient()
+    client_a = AcpcClient(Transcript(state_root / "a.ndjson"), PermissionLevel.READ)
+    client_b = AcpcClient(Transcript(state_root / "b.ndjson"), PermissionLevel.READ)
+    frame = {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": "adapter-a",
+            "_meta": {"session_id": "adapter-b"},
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "ROUTED_STALE"},
+            },
+        },
+    }
+
+    async def scenario() -> None:
+        async with real_client_connection(mux) as connection:
+            mux.bind("adapter-a", client_a)
+            mux.bind("adapter-b", client_b)
+            await connection._conn._process_message(frame)
+            assert REPLAY_GENERATION_KEY not in frame["params"]["_meta"]
+            for _ in range(1000):
+                if client_a.answer == "ROUTED_STALE":
+                    break
+                await asyncio.sleep(0)
+            client_a.flush()
+            client_b.flush()
+
+    asyncio.run(scenario())
+    assert client_a.answer == "ROUTED_STALE"
+    assert client_b.answer == ""
+    assert [event["text"] for event in client_a.transcript.read().events] == ["ROUTED_STALE"]
+    assert client_b.transcript.read().events == []
+
+
+def test_duplicate_replay_callback_does_not_spend_another_frame_identity(
+    state_root: Path,
+) -> None:
+    class RawConnection:
+        def __init__(self) -> None:
+            self.observers: list[object] = []
+
+        def add_observer(self, observer: object) -> None:
+            self.observers.append(observer)
+
+        async def _process_message(self, message: object) -> None:
+            del message
+
+        async def receive(self, message: dict) -> None:
+            event = SimpleNamespace(direction=SimpleNamespace(value="incoming"), message=message)
+            for observer in self.observers:
+                assert callable(observer)
+                observer(event)
+            await self._process_message(message)
+
+    raw = RawConnection()
+    mux = daemon._MultiplexClient()
+    mux.on_connect(SimpleNamespace(_conn=raw))
+    tracker = mux._replay_tracker
+    assert tracker is not None
+    restore_client = AcpcClient(Transcript(state_root / "restore.ndjson"), PermissionLevel.READ)
+    live_client = AcpcClient(Transcript(state_root / "live.ndjson"), PermissionLevel.READ)
+    frames = [
+        {
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "adapter-session",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "ONE"},
+                },
+            },
+        },
+        {
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "adapter-session",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "TWO"},
+                },
+            },
+        },
+    ]
+
+    async def scenario() -> None:
+        mux.bind("adapter-session", restore_client)
+        async with restore_client.replaying("adapter-session", raw):
+            for frame in frames:
+                await raw.receive(frame)
+        first_tag = frames[0]["params"]["_meta"][REPLAY_GENERATION_KEY]
+        second_tag = frames[1]["params"]["_meta"][REPLAY_GENERATION_KEY]
+        mux.release("adapter-session")
+        mux.bind("adapter-session", live_client)
+        update = AgentMessageChunk(
+            content=text_block("stale"), session_update="agent_message_chunk"
+        )
+        await mux.session_update("adapter-session", update, **{REPLAY_GENERATION_KEY: first_tag})
+        await mux.session_update("adapter-session", update, **{REPLAY_GENERATION_KEY: first_tag})
+        await mux.session_update("adapter-session", update, **{REPLAY_GENERATION_KEY: second_tag})
+        await mux.session_update(
+            "adapter-session",
+            AgentMessageChunk(content=text_block("LIVE"), session_update="agent_message_chunk"),
+        )
+        live_client.flush()
+
+    asyncio.run(scenario())
+    assert live_client.answer == "LIVE"
+    assert tracker._generations == {}
+
+
+def test_failed_restore_replay_tag_does_not_reach_retry_turn(
+    state_root: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    class RawConnection:
+        def __init__(self) -> None:
+            self.observers: list[object] = []
+
+        def add_observer(self, observer: object) -> None:
+            self.observers.append(observer)
+
+        async def _process_message(self, message: object) -> None:
+            del message
+
+        async def receive(self, message: dict) -> None:
+            event = SimpleNamespace(direction=SimpleNamespace(value="incoming"), message=message)
+            for observer in self.observers:
+                assert callable(observer)
+                observer(event)
+            await self._process_message(message)
+
+    raw = RawConnection()
+    mux = daemon._MultiplexClient()
+    mux.on_connect(SimpleNamespace(_conn=raw))
+    session_id = new_session("retry")
+    restore_transcript = Transcript(state_root / "restore-failed.ndjson")
+    retry_transcript = Transcript(sessions.transcript_path(session_id))
+    restore_client = AcpcClient(restore_transcript, PermissionLevel.READ)
+    retry_client = AcpcClient(retry_transcript, PermissionLevel.READ)
+    frame = {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": "adapter-session",
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "failed-stale"},
+            },
+        },
+    }
+
+    async def scenario() -> None:
+        mux.bind("adapter-session", restore_client)
+        with pytest.raises(RuntimeError, match="restore failed"):
+            async with restore_client.replaying("adapter-session", raw):
+                await raw.receive(frame)
+                raise RuntimeError("restore failed")
+        mux.release("adapter-session")
+
+        mux.bind("adapter-session", retry_client)
+        tag = frame["params"]["_meta"][REPLAY_GENERATION_KEY]
+        stale = AgentMessageChunk(
+            content=text_block("failed-stale"), session_update="agent_message_chunk"
+        )
+        await mux.session_update("adapter-session", stale, **{REPLAY_GENERATION_KEY: tag})
+        await mux.session_update(
+            "adapter-session",
+            AgentMessageChunk(
+                content=text_block("retry-answer"), session_update="agent_message_chunk"
+            ),
+        )
+        retry_client.flush()
+
+    with caplog.at_level("WARNING", logger="acpc.client"):
+        asyncio.run(scenario())
+
+    assert retry_client.answer == "retry-answer"
+    assert [event["text"] for event in retry_transcript.read().events] == ["retry-answer"]
+    assert restore_transcript.read().events == []
+    assert "unknown generation" not in caplog.text
+    assert "replay suppression:" not in caplog.text
+
+
+def test_replay_binding_is_exclusive_while_generation_is_open(state_root: Path) -> None:
+    class RawConnection:
+        def __init__(self) -> None:
+            self.observers: list[object] = []
+
+        def add_observer(self, observer: object) -> None:
+            self.observers.append(observer)
+
+        async def _process_message(self, message: object) -> None:
+            del message
+
+    raw = RawConnection()
+    mux = daemon._MultiplexClient()
+    mux.on_connect(SimpleNamespace(_conn=raw))
+    adapter_session_id = "adapter-session"
+    restore_client = AcpcClient(Transcript(state_root / "restore.ndjson"), PermissionLevel.READ)
+    replacement_client = AcpcClient(
+        Transcript(state_root / "replacement.ndjson"), PermissionLevel.READ
+    )
+
+    async def scenario() -> None:
+        mux.bind(adapter_session_id, restore_client)
+        async with restore_client.replaying(adapter_session_id, raw):
+            mux.release(adapter_session_id)
+            with pytest.raises(daemon.DaemonError, match="cannot bind"):
+                mux.bind(adapter_session_id, replacement_client)
+
+    asyncio.run(scenario())
+
+
+def test_replay_binding_rejects_a_different_client_while_generation_is_open(
+    state_root: Path,
+) -> None:
+    class RawConnection:
+        def __init__(self) -> None:
+            self.observers: list[object] = []
+
+        def add_observer(self, observer: object) -> None:
+            self.observers.append(observer)
+
+        async def _process_message(self, message: object) -> None:
+            del message
+
+    raw = RawConnection()
+    mux = daemon._MultiplexClient()
+    mux.on_connect(SimpleNamespace(_conn=raw))
+    adapter_session_id = "adapter-session"
+    first_client = AcpcClient(Transcript(state_root / "first.ndjson"), PermissionLevel.READ)
+    second_client = AcpcClient(Transcript(state_root / "second.ndjson"), PermissionLevel.READ)
+
+    async def scenario() -> None:
+        mux.bind(adapter_session_id, first_client)
+        async with first_client.replaying(adapter_session_id, raw):
+            with pytest.raises(daemon.DaemonError, match="second acpc session"):
+                mux.bind(adapter_session_id, second_client)
+
+    asyncio.run(scenario())
+
+
+def test_replay_generation_scope_does_not_block_another_daemon_session(
+    state_root: Path,
+) -> None:
+    class RawConnection:
+        def __init__(self) -> None:
+            self.observers: list[object] = []
+
+        def add_observer(self, observer: object) -> None:
+            self.observers.append(observer)
+
+        async def _process_message(self, message: object) -> None:
+            del message
+
+    raw = RawConnection()
+    mux = daemon._MultiplexClient()
+    mux.on_connect(SimpleNamespace(_conn=raw))
+    restore_client = AcpcClient(Transcript(state_root / "restore.ndjson"), PermissionLevel.READ)
+    live_client = AcpcClient(Transcript(state_root / "live.ndjson"), PermissionLevel.READ)
+
+    async def scenario() -> None:
+        mux.bind("adapter-x", restore_client)
+        async with restore_client.replaying("adapter-x", raw):
+            mux.bind("adapter-y", live_client)
+            await mux.session_update(
+                "adapter-y",
+                AgentMessageChunk(
+                    content=text_block("session y"), session_update="agent_message_chunk"
+                ),
+            )
+            live_client.flush()
+
+    asyncio.run(scenario())
+    assert live_client.answer == "session y"
 
 
 def test_claimed_turn_is_finalized_if_daemon_task_registration_fails(

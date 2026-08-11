@@ -1,14 +1,18 @@
 """Behavioral tests for the transcript-backed ACP client."""
 
 import asyncio
+import gc
 import sys
-from collections.abc import Mapping
+import weakref
+from collections.abc import AsyncIterator, Mapping
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from acp import PROTOCOL_VERSION, RequestError, text_block
+from acp.client import ClientSideConnection
 from acp.schema import (
     AgentMessageChunk,
     AgentThoughtChunk,
@@ -27,7 +31,12 @@ from acp.schema import (
     UserMessageChunk,
 )
 
-from acpc.client import AcpcClient
+from acpc.client import (
+    MAX_RETAINED_CLOSED_REPLAY_GENERATIONS,
+    REPLAY_GENERATION_KEY,
+    AcpcClient,
+    ReplayTracker,
+)
 from acpc.permissions import PermissionLevel
 from acpc.registry import ModeSpec
 from acpc.runner import verify_replayed_prompts
@@ -76,6 +85,65 @@ def _spawn(client: AcpcClient, tmp_path: Path):
         },
         cwd=str(tmp_path),
     )
+
+
+class _ObserverOnlyRawConnection:
+    """Raw test double that exposes ordered frames but cannot tag callbacks."""
+
+    def __init__(self) -> None:
+        self.observers: list[Any] = []
+
+    def add_observer(self, observer: Any) -> None:
+        self.observers.append(observer)
+
+    def emit(self, message: Mapping[str, Any]) -> None:
+        event = SimpleNamespace(direction=SimpleNamespace(value="incoming"), message=dict(message))
+        for observer in self.observers:
+            observer(event)
+
+    def emit_outgoing(self, message: Mapping[str, Any]) -> None:
+        event = SimpleNamespace(direction=SimpleNamespace(value="outgoing"), message=dict(message))
+        for observer in self.observers:
+            observer(event)
+
+
+class _TaggingRawConnection(_ObserverOnlyRawConnection):
+    """Raw test double with the receive-to-dispatch seam available."""
+
+    async def _process_message(self, message: object) -> None:
+        del message
+
+    async def receive(self, message: Mapping[str, Any]) -> None:
+        self.emit(message)
+        await self._process_message(message)
+
+
+@asynccontextmanager
+async def _real_dispatch_connection(client: Any) -> AsyncIterator[Any]:
+    """Give an in-process ACP client a real Connection dispatcher."""
+    accepted: asyncio.Future[tuple[asyncio.StreamReader, asyncio.StreamWriter]] = (
+        asyncio.get_running_loop().create_future()
+    )
+
+    async def accept(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        if not accepted.done():
+            accepted.set_result((reader, writer))
+        else:
+            writer.close()
+
+    server = await asyncio.start_server(accept, "127.0.0.1", 0)
+    address = server.sockets[0].getsockname()
+    client_reader, client_writer = await asyncio.open_connection(address[0], address[1])
+    _server_reader, server_writer = await accepted
+    connection = ClientSideConnection(client, client_writer, client_reader, listening=False)
+    try:
+        yield connection
+    finally:
+        await connection.close()
+        server_writer.close()
+        await server_writer.wait_closed()
+        server.close()
+        await server.wait_closed()
 
 
 async def _drain_updates(predicate: Any) -> None:
@@ -208,25 +276,12 @@ def test_replay_is_silent_and_collects_user_messages_without_flushing_pending_pr
     assert transcript.read().events[1]["text"] == "before"
 
 
-def test_replay_collection_uses_ordered_frames_before_delayed_callbacks(tmp_path: Path) -> None:
+def test_replay_collection_uses_ordered_frames_before_delayed_callbacks(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     """A restore response must not outrun a delayed session/update callback."""
     client, transcript = _make_client(tmp_path, PermissionLevel.READ)
-
-    class RawConnection:
-        def __init__(self) -> None:
-            self.observers: list[Any] = []
-
-        def add_observer(self, observer: Any) -> None:
-            self.observers.append(observer)
-
-        def emit(self, message: Mapping[str, Any]) -> None:
-            event = SimpleNamespace(
-                direction=SimpleNamespace(value="incoming"), message=dict(message)
-            )
-            for observer in self.observers:
-                observer(event)
-
-    raw = RawConnection()
+    raw = _TaggingRawConnection()
     client.on_connect(SimpleNamespace(_conn=raw))
     frame = {
         "jsonrpc": "2.0",
@@ -241,32 +296,701 @@ def test_replay_collection_uses_ordered_frames_before_delayed_callbacks(tmp_path
         },
     }
 
-    async def restore_response() -> None:
-        """Model restore sending replay frames before its response arrives."""
-        raw.emit(frame)
-        await asyncio.sleep(0)
+    async def scenario() -> tuple[list[str], str]:
+        callback_started = asyncio.Event()
+        release_callback = asyncio.Event()
+        generation: dict[str, Any] = {}
 
-    async def scenario() -> list[str]:
+        async def delayed_callback() -> None:
+            callback_started.set()
+            await release_callback.wait()
+            await client.session_update(
+                "adapter-session",
+                UserMessageChunk(
+                    session_update="user_message_chunk",
+                    content=text_block("stored prompt"),
+                    message_id="replay-1",
+                ),
+                **{REPLAY_GENERATION_KEY: generation["value"]},
+            )
+
         async with client.replaying("adapter-session") as sink:
-            await restore_response()
-
-            async def delayed_callback() -> None:
-                await asyncio.sleep(0.05)
-                await client.session_update(
-                    "adapter-session",
-                    UserMessageChunk(
-                        session_update="user_message_chunk",
-                        content=text_block("stored prompt"),
-                        message_id="replay-1",
-                    ),
-                )
-
+            await raw.receive(frame)
+            generation["value"] = frame["params"]["_meta"][REPLAY_GENERATION_KEY]
             callback = asyncio.create_task(delayed_callback())
+            await callback_started.wait()
+        release_callback.set()
         await callback
-        return sink.user_messages
+        return sink.user_messages, caplog.text
 
-    assert asyncio.run(scenario()) == ["stored prompt"]
+    messages, logs = asyncio.run(scenario())
+    assert messages == ["stored prompt"]
+    assert "replay suppression:" not in logs
     assert transcript.read().events == []
+
+
+def test_tagged_replay_after_disconnect_is_suppressed_by_real_dispatcher(
+    tmp_path: Path,
+) -> None:
+    """A queued ACP notification still carries suppression after transport death."""
+    _base_client, transcript = _make_client(tmp_path, PermissionLevel.READ)
+
+    class CallbackClient(AcpcClient):
+        def __init__(self) -> None:
+            super().__init__(transcript, PermissionLevel.READ)
+            self.callback_seen = asyncio.Event()
+
+        async def session_update(self, session_id: str, update: Any, **kwargs: Any) -> None:
+            self.callback_seen.set()
+            await super().session_update(session_id, update, **kwargs)
+
+    client = CallbackClient()
+    frame = {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": "adapter-session",
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "QUEUED_STALE"},
+            },
+        },
+    }
+
+    async def scenario() -> None:
+        async with _real_dispatch_connection(client) as connection:
+            raw = connection._conn
+            async with client.replaying("adapter-session", raw):
+                await raw._process_message(frame)
+                raw._disconnect()
+            await _drain_updates(client.callback_seen.is_set)
+            assert client.callback_seen.is_set()
+
+    asyncio.run(scenario())
+    assert client.answer == ""
+    assert transcript.read().events == []
+
+
+@pytest.mark.parametrize(
+    "raw_update",
+    [
+        {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "same"},
+            "messageId": None,
+        },
+        {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "same", "annotations": None},
+            "messageId": "same-id",
+        },
+    ],
+    ids=["explicit-message-id-null", "content-annotation-null-vs-unset"],
+)
+def test_tagged_replay_historical_frame_variations_keep_identical_live_chunk(
+    raw_update: Mapping[str, Any], tmp_path: Path
+) -> None:
+    """Frame identity, not serialized content, keeps replay out of the answer."""
+    client, transcript = _make_client(tmp_path, PermissionLevel.READ)
+    raw = _TaggingRawConnection()
+    client.on_connect(SimpleNamespace(_conn=raw))
+    frame = {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": "adapter-session",
+            "update": dict(raw_update),
+        },
+    }
+
+    async def scenario() -> None:
+        async with client.replaying("adapter-session", raw):
+            await raw.receive(frame)
+            generation = frame["params"]["_meta"]["acpc_replay_generation"]
+        replay_update = AgentMessageChunk(
+            content=text_block("same"),
+            message_id=raw_update.get("messageId"),
+            session_update="agent_message_chunk",
+        )
+        await client.session_update(
+            "adapter-session", replay_update, **{REPLAY_GENERATION_KEY: generation}
+        )
+        await client.session_update("adapter-session", replay_update)
+        client.flush()
+
+    asyncio.run(scenario())
+
+    assert client.answer == "same"
+    assert [event["text"] for event in transcript.read().events] == ["same"]
+
+
+def test_tagless_replay_reports_unavailable_phase_attribution(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    client, _transcript = _make_client(tmp_path, PermissionLevel.READ)
+    raw = _ObserverOnlyRawConnection()
+    client.on_connect(SimpleNamespace(_conn=raw))
+    frame = {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": "adapter-session",
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "orphaned"},
+            },
+        },
+    }
+
+    async def scenario() -> None:
+        async with client.replaying("adapter-session", raw):
+            raw.emit(frame)
+
+    with caplog.at_level("WARNING", logger="acpc.client"):
+        asyncio.run(scenario())
+
+    assert "replay suppression unavailable" in caplog.text
+
+
+def test_failed_restore_opens_a_fresh_generation(tmp_path: Path) -> None:
+    client, _transcript = _make_client(tmp_path, PermissionLevel.READ)
+    raw = _TaggingRawConnection()
+    client.on_connect(SimpleNamespace(_conn=raw))
+    tracker = ReplayTracker.for_connection(raw)
+    assert tracker is not None
+
+    async def scenario() -> tuple[int, int]:
+        first: int | None = None
+        with pytest.raises(RuntimeError, match="restore failed"):
+            async with client.replaying("adapter-session", raw):
+                first = tracker.active_generation_id("adapter-session")
+                assert first == 1
+                raise RuntimeError("restore failed")
+        async with client.replaying("adapter-session", raw):
+            second = tracker.active_generation_id("adapter-session")
+            assert second == 2
+        assert first is not None
+        assert second is not None
+        return first, second
+
+    assert asyncio.run(scenario()) == (1, 2)
+    assert tracker.active_generation_id("adapter-session") is None
+
+
+def test_cancelled_restore_suppresses_stale_frame_in_the_next_attempt(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    client, _transcript = _make_client(tmp_path, PermissionLevel.READ)
+    raw = _TaggingRawConnection()
+    client.on_connect(SimpleNamespace(_conn=raw))
+    tracker = ReplayTracker.for_connection(raw)
+    assert tracker is not None
+    stale_frame = {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": "adapter-session",
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "stale"},
+            },
+        },
+    }
+
+    async def scenario() -> None:
+        old_tag: dict[str, Any] | None = None
+        with pytest.raises(asyncio.CancelledError):
+            async with client.replaying("adapter-session", raw):
+                await raw.receive(stale_frame)
+                old_tag = stale_frame["params"]["_meta"][REPLAY_GENERATION_KEY]
+                raise asyncio.CancelledError
+        async with client.replaying("adapter-session", raw):
+            assert tracker.active_generation_id("adapter-session") == 2
+        assert old_tag is not None
+        await client.session_update(
+            "adapter-session",
+            AgentMessageChunk(content=text_block("stale"), session_update="agent_message_chunk"),
+            **{REPLAY_GENERATION_KEY: old_tag},
+        )
+        await client.session_update(
+            "adapter-session",
+            AgentMessageChunk(content=text_block("live"), session_update="agent_message_chunk"),
+        )
+        client.flush()
+
+    with caplog.at_level("WARNING", logger="acpc.client"):
+        asyncio.run(scenario())
+
+    assert client.answer == "live"
+    assert [event["text"] for event in _transcript.read().events] == ["live"]
+    assert "unknown generation" not in caplog.text
+    assert "replay suppression:" not in caplog.text
+
+
+def test_connection_drop_keeps_open_generation_for_queued_callbacks(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    client, _transcript = _make_client(tmp_path, PermissionLevel.READ)
+
+    class DroppingRawConnection(_TaggingRawConnection):
+        def _disconnect(self) -> None:
+            return
+
+    raw = DroppingRawConnection()
+    client.on_connect(SimpleNamespace(_conn=raw))
+    tracker = ReplayTracker.for_connection(raw)
+    assert tracker is not None
+    frame = {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": "adapter-session",
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "stale"},
+            },
+        },
+    }
+
+    async def scenario() -> tuple[dict[str, Any], str]:
+        async with client.replaying("adapter-session", raw):
+            await raw.receive(frame)
+            old_tag = frame["params"]["_meta"][REPLAY_GENERATION_KEY]
+            raw._disconnect()
+            assert tracker.active_generation_id("adapter-session") == 1
+            assert tracker._generations
+        update = AgentMessageChunk(content=text_block("live"), session_update="agent_message_chunk")
+        await client.session_update("adapter-session", update, **{REPLAY_GENERATION_KEY: old_tag})
+        return old_tag, caplog.text
+
+    with caplog.at_level("WARNING", logger="acpc.client"):
+        old_tag, logs = asyncio.run(scenario())
+
+    assert old_tag["generation"] == 1
+    assert "was still open when the connection dropped" not in logs
+    assert "unknown generation" not in logs
+    assert client.answer == ""
+    assert _transcript.read().events == []
+
+
+def test_nonempty_closed_generations_release_when_tagged_callbacks_are_seen(tmp_path: Path) -> None:
+    client, _transcript = _make_client(tmp_path, PermissionLevel.READ)
+    raw = _TaggingRawConnection()
+    client.on_connect(SimpleNamespace(_conn=raw))
+    tracker = ReplayTracker.for_connection(raw)
+    assert tracker is not None
+
+    async def scenario(test_client: AcpcClient, test_raw: _TaggingRawConnection) -> None:
+        for index in range(10_000):
+            frame = {
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": "adapter-session",
+                    "update": {
+                        "sessionUpdate": "user_message_chunk",
+                        "content": {"type": "text", "text": "stored"},
+                        "messageId": f"replay-{index}",
+                    },
+                },
+            }
+            async with test_client.replaying("adapter-session", test_raw):
+                await test_raw.receive(frame)
+                tag = frame["params"]["_meta"][REPLAY_GENERATION_KEY]
+            await test_client.session_update(
+                "adapter-session",
+                UserMessageChunk(
+                    content=text_block("stored"),
+                    message_id=f"replay-{index}",
+                    session_update="user_message_chunk",
+                ),
+                **{REPLAY_GENERATION_KEY: tag},
+            )
+
+    asyncio.run(scenario(client, raw))
+    assert tracker._generations == {}
+
+    raw_ref = weakref.ref(raw)
+    del client, raw
+    gc.collect()
+    assert raw_ref() is None
+    assert tracker._generations == {}
+
+
+def test_close_invalidates_only_after_the_wrapped_close_awaits(tmp_path: Path) -> None:
+    client, _transcript = _make_client(tmp_path, PermissionLevel.READ)
+
+    class ClosingRawConnection(_TaggingRawConnection):
+        def __init__(self) -> None:
+            super().__init__()
+            self.generations_during_close: int | None = None
+
+        async def close(self) -> None:
+            tracker = ReplayTracker.for_connection(self)
+            assert tracker is not None
+            self.generations_during_close = len(tracker._generations)
+
+    raw = ClosingRawConnection()
+    client.on_connect(SimpleNamespace(_conn=raw))
+    tracker = ReplayTracker.for_connection(raw)
+    assert tracker is not None
+    frame = {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": "adapter-session",
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "unaccounted"},
+            },
+        },
+    }
+
+    async def scenario() -> None:
+        async with client.replaying("adapter-session", raw):
+            await raw.receive(frame)
+        assert tracker._generations
+        await raw.close()
+
+    asyncio.run(scenario())
+    assert raw.generations_during_close == 1
+    assert tracker._generations == {}
+
+
+def test_cancelled_close_waiter_retries_shared_shutdown_before_invalidation(tmp_path: Path) -> None:
+    """A cancelled waiter cannot turn ACP's early _closed flag into proof of shutdown."""
+    _base_client, transcript = _make_client(tmp_path, PermissionLevel.READ)
+
+    class DelayedClient(AcpcClient):
+        def __init__(self) -> None:
+            super().__init__(transcript, PermissionLevel.READ)
+            self.callback_started = asyncio.Event()
+            self.callback_finished = asyncio.Event()
+            self.release_callback = asyncio.Event()
+
+        async def session_update(self, session_id: str, update: Any, **kwargs: Any) -> None:
+            if kwargs.get(REPLAY_GENERATION_KEY) is not None:
+                self.callback_started.set()
+                await self.release_callback.wait()
+            await super().session_update(session_id, update, **kwargs)
+            self.callback_finished.set()
+
+    client = DelayedClient()
+    frame = {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": "adapter-session",
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "STALE_AFTER_RETRY"},
+            },
+        },
+    }
+
+    async def scenario() -> None:
+        async with _real_dispatch_connection(client) as connection:
+            raw = connection._conn
+            tracker = ReplayTracker.for_connection(raw)
+            assert tracker is not None
+            async with client.replaying("adapter-session", raw):
+                await raw._process_message(frame)
+            await client.callback_started.wait()
+
+            stop_started = asyncio.Event()
+            release_stop = asyncio.Event()
+            original_stop = raw._dispatcher.stop
+
+            async def delayed_stop() -> None:
+                stop_started.set()
+                await release_stop.wait()
+                await original_stop()
+
+            raw._dispatcher.stop = delayed_stop
+            first = asyncio.create_task(connection.close())
+            await stop_started.wait()
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+
+            assert tracker._generations
+            second = asyncio.create_task(connection.close())
+            for _ in range(10):
+                await asyncio.sleep(0)
+            assert not second.done()
+
+            client.release_callback.set()
+            await client.callback_finished.wait()
+            release_stop.set()
+            await second
+            assert tracker._generations == {}
+
+    asyncio.run(scenario())
+    assert client.answer == ""
+    assert transcript.read().events == []
+
+
+def test_concurrent_close_calls_share_one_underlying_shutdown(tmp_path: Path) -> None:
+    client, _transcript = _make_client(tmp_path, PermissionLevel.READ)
+
+    class ClosingRawConnection(_TaggingRawConnection):
+        def __init__(self) -> None:
+            super().__init__()
+            self.close_calls = 0
+            self.close_started = asyncio.Event()
+            self.release_close = asyncio.Event()
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            self.close_started.set()
+            await self.release_close.wait()
+
+    raw = ClosingRawConnection()
+    client.on_connect(SimpleNamespace(_conn=raw))
+    tracker = ReplayTracker.for_connection(raw)
+    assert tracker is not None
+    frame = {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": "adapter-session",
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "stale"},
+            },
+        },
+    }
+
+    async def scenario() -> None:
+        async with client.replaying("adapter-session", raw):
+            await raw.receive(frame)
+        first = asyncio.create_task(raw.close())
+        await raw.close_started.wait()
+        second = asyncio.create_task(raw.close())
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert not second.done()
+        assert raw.close_calls == 1
+        raw.release_close.set()
+        await asyncio.gather(first, second)
+
+    asyncio.run(scenario())
+    assert raw.close_calls == 1
+    assert tracker._generations == {}
+
+
+def test_failing_close_retains_replay_records(tmp_path: Path) -> None:
+    client, _transcript = _make_client(tmp_path, PermissionLevel.READ)
+
+    class FailingRawConnection(_TaggingRawConnection):
+        def __init__(self) -> None:
+            super().__init__()
+            self.close_calls = 0
+
+        async def close(self) -> None:
+            self.close_calls += 1
+            raise RuntimeError("shutdown failed")
+
+    raw = FailingRawConnection()
+    client.on_connect(SimpleNamespace(_conn=raw))
+    tracker = ReplayTracker.for_connection(raw)
+    assert tracker is not None
+    frame = {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": "adapter-session",
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "retained"},
+            },
+        },
+    }
+
+    async def scenario() -> None:
+        async with client.replaying("adapter-session", raw):
+            await raw.receive(frame)
+        with pytest.raises(RuntimeError, match="shutdown failed"):
+            await raw.close()
+        assert tracker._generations
+        with pytest.raises(RuntimeError, match="shutdown failed"):
+            await raw.close()
+        assert tracker._generations
+
+    asyncio.run(scenario())
+    assert raw.close_calls == 1
+
+
+def test_a_close_failing_after_its_waiter_left_reports_itself(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A shielded shutdown that fails with nobody waiting must not fail silently."""
+    client, _transcript = _make_client(tmp_path, PermissionLevel.READ)
+
+    class LateFailingRawConnection(_TaggingRawConnection):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered: asyncio.Event | None = None
+            self.release: asyncio.Event | None = None
+
+        async def close(self) -> None:
+            assert self.entered is not None and self.release is not None
+            self.entered.set()
+            await self.release.wait()
+            raise RuntimeError("late shutdown failed")
+
+    raw = LateFailingRawConnection()
+    client.on_connect(SimpleNamespace(_conn=raw))
+    tracker = ReplayTracker.for_connection(raw)
+    assert tracker is not None
+    frame = {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": "adapter-session",
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "retained"},
+            },
+        },
+    }
+
+    unstructured: list[Any] = []
+
+    async def scenario() -> None:
+        # asyncio reports the orphaned shielded future through the loop handler.
+        # Capture it: it is the whole point of the fix that acpc says so itself
+        # rather than leaving that report as the only trace, and letting it reach
+        # the default handler would put an ERROR into every serial suite run.
+        asyncio.get_running_loop().set_exception_handler(
+            lambda _loop, context: unstructured.append(context)
+        )
+        raw.entered = asyncio.Event()
+        raw.release = asyncio.Event()
+        async with client.replaying("adapter-session", raw):
+            await raw.receive(frame)
+
+        waiter = asyncio.ensure_future(raw.close())
+        await raw.entered.wait()
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+
+        # The shared shutdown outlives its only waiter, then fails.
+        shared = tracker._close_task
+        assert shared is not None
+        raw.release.set()
+        with pytest.raises(RuntimeError, match="late shutdown failed"):
+            await shared
+        assert tracker._generations
+
+    with caplog.at_level("WARNING", logger="acpc.client"):
+        asyncio.run(scenario())
+
+    assert any("closing the connection failed" in record.getMessage() for record in caplog.records)
+
+
+def test_session_close_does_not_purge_an_unaccounted_replay_generation(tmp_path: Path) -> None:
+    client, transcript = _make_client(tmp_path, PermissionLevel.READ)
+    raw = _TaggingRawConnection()
+    client.on_connect(SimpleNamespace(_conn=raw))
+    tracker = ReplayTracker.for_connection(raw)
+    assert tracker is not None
+    replay_frame = {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": "adapter-session",
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "stale"},
+            },
+        },
+    }
+    close_frame = {
+        "jsonrpc": "2.0",
+        "method": "session/close",
+        "params": {"sessionId": "adapter-session"},
+    }
+
+    async def scenario() -> None:
+        async with client.replaying("adapter-session", raw):
+            await raw.receive(replay_frame)
+            tag = replay_frame["params"]["_meta"][REPLAY_GENERATION_KEY]
+            await raw.receive(close_frame)
+        await client.session_update(
+            "adapter-session",
+            AgentMessageChunk(content=text_block("stale"), session_update="agent_message_chunk"),
+            **{REPLAY_GENERATION_KEY: tag},
+        )
+
+    asyncio.run(scenario())
+    assert client.answer == ""
+    assert transcript.read().events == []
+    assert tracker._generations == {}
+
+
+def test_closed_generation_cap_evicts_oldest_unaccounted_frame_with_diagnostic(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    assert MAX_RETAINED_CLOSED_REPLAY_GENERATIONS == 64
+    client, _transcript = _make_client(tmp_path, PermissionLevel.READ)
+    raw = _TaggingRawConnection()
+    client.on_connect(SimpleNamespace(_conn=raw))
+    tracker = ReplayTracker.for_connection(raw)
+    assert tracker is not None
+
+    async def scenario() -> None:
+        for index in range(MAX_RETAINED_CLOSED_REPLAY_GENERATIONS + 1):
+            frame = {
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": "adapter-session",
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": f"stale-{index}"},
+                    },
+                },
+            }
+            async with client.replaying("adapter-session", raw):
+                await raw.receive(frame)
+
+    with caplog.at_level("WARNING", logger="acpc.client"):
+        asyncio.run(scenario())
+
+    assert len(tracker._generations) == MAX_RETAINED_CLOSED_REPLAY_GENERATIONS
+    assert 1 not in tracker._generations
+    assert "evicted generation 1" in caplog.text
+
+    caplog.clear()
+    healthy_client, _healthy_transcript = _make_client(tmp_path / "healthy", PermissionLevel.READ)
+    healthy_raw = _TaggingRawConnection()
+    healthy_client.on_connect(SimpleNamespace(_conn=healthy_raw))
+    healthy_frame = {
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": "adapter-session",
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "healthy"},
+            },
+        },
+    }
+
+    async def healthy() -> None:
+        async with healthy_client.replaying("adapter-session", healthy_raw):
+            await healthy_raw.receive(healthy_frame)
+            tag = healthy_frame["params"]["_meta"][REPLAY_GENERATION_KEY]
+        await healthy_client.session_update(
+            "adapter-session",
+            AgentMessageChunk(content=text_block("healthy"), session_update="agent_message_chunk"),
+            **{REPLAY_GENERATION_KEY: tag},
+        )
+
+    asyncio.run(healthy())
+    assert "evicted" not in caplog.text
 
 
 def test_simultaneous_replays_scope_frames_to_their_adapter_sessions(tmp_path: Path) -> None:

@@ -37,7 +37,12 @@ from typing import Any
 from acp import PROTOCOL_VERSION, text_block
 
 from acpc import __version__, config, ipc, paths, runner, sessions, transcript, vocab
-from acpc.client import AcpcClient
+from acpc.client import (
+    REPLAY_GENERATION_KEY,
+    VALIDATED_SESSION_ID_KEY,
+    AcpcClient,
+    ReplayTracker,
+)
 from acpc.permissions import PermissionLevel
 from acpc.registry import AgentRegistry, ModeSpec
 from acpc.spawn import spawn_adapter
@@ -74,30 +79,67 @@ class _MultiplexClient:
     """Route one adapter connection's callbacks to per-session clients.
 
     A warm adapter serves several acpc sessions at once, but every ACP callback
-    carries the session it belongs to, so the demultiplex is exact. Anything
-    arriving for a session this daemon does not know is dropped rather than
-    misfiled onto another session's transcript.
+    carries the session it belongs to, so the demultiplex is exact. ACP's
+    router can overlay peer ``_meta`` on that argument, so updates use the
+    validated top-level session captured before routing.
+    Anything arriving for a session this daemon does not know is dropped
+    rather than misfiled onto another session's transcript.
     """
 
     def __init__(self) -> None:
         self._clients: dict[str, AcpcClient] = {}
+        self._replay_tracker: ReplayTracker | None = None
 
     def bind(self, adapter_session_id: str, client: AcpcClient) -> None:
+        generation_id = (
+            self._replay_tracker.active_generation_id(adapter_session_id)
+            if self._replay_tracker is not None
+            else None
+        )
+        current = self._clients.get(adapter_session_id)
+        if generation_id is not None and current is not None and current is not client:
+            raise DaemonError(
+                f"adapter session {adapter_session_id} cannot bind a second acpc session "
+                f"while replay generation {generation_id} is open"
+            )
+        if generation_id is not None and current is None:
+            raise DaemonError(
+                f"adapter session {adapter_session_id} cannot bind while replay generation "
+                f"{generation_id} is open"
+            )
         self._clients[adapter_session_id] = client
 
     def release(self, adapter_session_id: str) -> None:
         self._clients.pop(adapter_session_id, None)
 
     def on_connect(self, conn: Any) -> None:
-        del conn
+        self._replay_tracker = ReplayTracker.for_connection(getattr(conn, "_conn", None))
 
     def _for(self, session_id: str) -> AcpcClient | None:
         return self._clients.get(session_id)
 
     async def session_update(self, session_id: str, update: Any, **kwargs: Any) -> None:
-        client = self._for(session_id)
+        validated_session_id = kwargs.pop(VALIDATED_SESSION_ID_KEY, None)
+        routed_session_id = (
+            validated_session_id if isinstance(validated_session_id, str) else session_id
+        )
+        generation_id = kwargs.get(REPLAY_GENERATION_KEY)
+        if generation_id is not None and self._replay_tracker is not None:
+            tagged_session_id = self._replay_tracker.session_for_tag(generation_id)
+            if tagged_session_id is not None:
+                # ACP merges peer _meta over validated handler arguments. The
+                # tracker captured the real top-level sessionId before that
+                # merge, so a replay tag remains a safe fallback for delayed
+                # callbacks that were handed to this method directly.
+                routed_session_id = tagged_session_id
+            status = self._replay_tracker.consume_tag(generation_id)
+            if status in {"active", "closed"}:
+                return
+            kwargs = dict(kwargs)
+            kwargs.pop(REPLAY_GENERATION_KEY, None)
+        client = self._for(routed_session_id)
         if client is not None:
-            await client.session_update(session_id, update, **kwargs)
+            await client.session_update(routed_session_id, update, **kwargs)
 
     async def request_permission(
         self, session_id: str, tool_call: Any, options: list[Any], **kwargs: Any
