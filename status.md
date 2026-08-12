@@ -2,6 +2,40 @@
 
 ## Now
 
+**0.6 is complete on `main` at `d05ae38`, and unreleased.** Sixteen commits since `v0.5.0`, eleven of them the
+chain's slices and five docs-only: `663bc71`/`cdae7be` the help and `[modes]` corrections, `856193b` `escalates` as a
+third measured mode fact, `00fc49c` silent replay consumption, `6266f3d` a failed session says why,
+`c3b7cb0` finished-bucket ordering, `dee19b2` verified cold resume, `8222b70` replay routed by
+validated session identity, `2caf219` an honest delivery record, `fbce7ee` `probe --discover`, and
+`d05ae38` Stage B. Nothing is tagged and **the installed `acpc` is still 0.5.0**, so no behaviour on
+this machine has changed yet; reinstalling is a deliberate act and Damian's call, not the chain's.
+
+**Two things were descoped, both with the work preserved rather than abandoned.** `probe`'s four-probe
+measurement engine moved to 0.7 after review 9, under a stop rule armed before review 8 rather than
+argued about while tired — it is complete on branch `probe-engine-r13` (`30f3080`) with its frontier in
+the commit message, and 0.7 inherits a precise next step (effect epochs, or invalidation when the
+expected effect disappears). S5b went with it, because `--write`, adapter provenance and the
+version-mismatch warning were all specified against a measured table 0.6 no longer produces; the two
+independent halves can be re-proposed on their own. The durability cluster (backlog 13) and the
+`failed`-versus-`orphaned` precedence rule (backlog 22) were routed out on the same principle: both are
+pre-existing, both need a SPEC sentence rather than a patch, and neither belongs inside a slice
+mid-fix-loop.
+
+**0.7 inherits a named queue rather than a vague one:** the probe engine and its frontier (21), session
+store durability under I/O failure and concurrent liveness (13), state precedence when a daemon dies
+(22), a callee's reach into the live state root (8, 9), `daemon list --json` surface consistency (23), a
+provider payment failure reported as exit 0 (24), the pre-route cancel under lock contention (26),
+`python -m acpc.cli` succeeding silently at nothing (27), and the no-op handler re-install left in place
+deliberately (28). **A new measurement axis joins it by Damian's ruling: network access as a mode fact**
+— what a mode permits on the network, recorded alongside the filesystem facts, folded into the engine
+rework and into the `requires`/loud-divergence design in backlog 16 rather than bolted on afterwards.
+
+**The chain's own lesson, since 0.6 spent more review rounds than any release before it.** Nine reviews
+on one slice ended in a descope; the rule that ended it was written after review 7 and fired on review
+9 exactly as designed. The cheaper version of that lesson is to arm the criterion early, while another
+round still looks affordable, because that is precisely when judgement about paying for it is worth the
+least.
+
 **Stage B is implemented on the daemon path.** A deferred continuation is registered in the daemon's in-memory turn table before reservation, adapter startup or restore; `status` overlays that table's `preparing` phase without writing a preparation marker. The normal turn claim is made on disk so a killed daemon is read as `orphaned`, while failed verification rolls back from an in-memory snapshot — and the reservation covers only that synchronous claim, so one session's slow restore no longer stalls the daemon's event loop. `stop` and Ctrl-C cancel preparation into a `cancelled` turn with a no-prompt placeholder, releasing the reservation and adapter binding; `steer` follows with its instruction plainly and says that nothing was interrupted. A cancelled restore exits `AcpcClient.replaying` through the existing `ReplayTracker.close` path: the generation is closed but retains any unaccounted tagged frames until their late callbacks are accounted, preserving the retention-over-forgetting asymmetry.
 
 **The narrow third review caught the routing window being handed Ctrl-C's semantics wholesale.** Making SIGINT correct there installed a handler before the route was known, and that handler had to guess what SIGTERM meant: it guessed `terminated`, so a SIGTERM during routing exited 130 instead of 143, and one landing in the single event-loop iteration between routing completing and the handlers being corrected cancelled a turn the daemon had already accepted rather than detaching from it. Both faces were reproduced, the second by widening the gap deliberately rather than by racing it. The fix makes the guess unavailable: the handler records which signal arrived and nothing more, and detach-versus-terminate is resolved at the two points where the route is actually known. A classification that cannot be computed early cannot be computed wrong.
@@ -254,6 +288,11 @@ Release: bump `0.4.0` → `0.4.1` (the pending `uv.lock` version line rides here
 - SPEC examples say "Claude Code (Anthropic)" where adapters render "Claude Code" — pre-existing cosmetic gap, flagged during the wave-5 SPEC alignment check.
 
 ## Decisions
+
+- 2026-08-12 (0.6): **Stage B promises a settled state, not the same state.** The bullet first promised that a `continue` following a cancelled restore "starts from the same state the cancelled one did". Round 1 proved that undeliverable: ACP defines no cancellation for `session/load` or `session/resume`, so the restore completes adapter-side after the cancel and mutates the session, and the only mechanism that reliably prevents it is closing the ACP connection — which destroys the warm adapter and every other session on it. The promise now covers what acpc actually controls, what a turn is allowed to run against, and the limit it does not control is stated in the same bullet rather than omitted. Keeping the old wording would have made the SPEC assert something the tool does not do; nobody later reads the weaker promise as a quiet retreat if the retreat is written down.
+- 2026-08-12 (0.6): **`probe`'s measurement engine descopes to 0.7 under a rule armed in advance.** Any further instance of the derive-a-fact-from-the-wrong-operation class ended the slice, and review 9 returned one: causal membership is append-only while the marker predicate beneath it is not, so a verdict could change with nothing but a frame's arrival order. Two architectural attempts is the budget. `probe --discover` ships alone, and a bare `probe` is a usage error rather than a silent answer to the cheaper question.
+- 2026-08-12 (0.6): **A signal handler records which signal arrived; what it means is resolved where the route is known.** The routing window had been given Ctrl-C's semantics wholesale, so SIGTERM there exited 130 and one arriving as the route resolved killed a daemon-owned turn instead of detaching. The fix is structural rather than careful: the handler is no longer given the route, so it can no longer guess it.
+- 2026-08-12 (0.7 scope, Damian): **network access becomes a measured mode fact.** What a mode permits on the network is recorded alongside the filesystem facts, and the probe engine's rework accounts for it from the start rather than gaining it later — the same vocabulary change backlog 16 already needs for `requires` and loud divergence.
 
 - 2026-08-08: **Permissions and modes collapse into one scale, and acpc always sets the mode.** Leaving `session/set_mode` unsent hands the policy to the vendor's config: measured, `acpc run claude --permissions all` produced a callee that could do nothing, because the vendor home pins `defaultMode: "dontAsk"`. The highest policy acpc offers was inert and said so nowhere.
 - 2026-08-08: **A mode is described by two facts, not one.** Sol's review killed the single-scalar version and the probe agrees: `acceptEdits` auto-allows edits *and* shell writes while still delegating the destructive call, and claude's `default` runs commands its own classifier deems read-only without emitting a request. `grants` bounds what happens unasked; `delegates` says whether anything arrives. Only `grants` is a bound acpc can state, so `edit` promises what a callee may change, never that no shell ran.
