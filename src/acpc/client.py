@@ -589,6 +589,7 @@ class AcpcClient:
         meta = self._prompt_meta(prompt_result)
         if not meta:
             return
+        previous_tokens, previous_cost = self._tokens, self._cost
         tokens = meta.get("totalTokens")
         if tokens is None:
             usage = meta.get("usage")
@@ -605,7 +606,6 @@ class AcpcClient:
                     cost = float(ticks) / 10_000_000_000
                 else:
                     cost = usage.get("costUsd") or usage.get("cost_usd")
-        previous_tokens, previous_cost = self._tokens, self._cost
         if isinstance(cost, (int, float)):
             amount = float(cost)
             self._cost = amount if self._cost is None else max(self._cost, amount)
