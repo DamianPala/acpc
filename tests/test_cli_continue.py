@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -821,6 +822,9 @@ def test_continue_migrates_legacy_mode_and_target_metadata(cli: CliRunner) -> No
     assert migrated.resolution["adapter"] == {
         "home_env": "MOCK_HOME",
         "effort_config_id": None,
+        "model_via": "config_option",
+        "effort_via": "config_option",
+        "effort_cli_flag": None,
         "modes": {
             "default": {"grants": "read", "delegates": True},
             "plan": {"grants": "read", "delegates": True},
@@ -833,6 +837,103 @@ def test_continue_migrates_legacy_mode_and_target_metadata(cli: CliRunner) -> No
     expected_target = runner.call_target(runner.resolution_from_session(migrated))
     assert migrated.target == expected_target
     assert migrated.target != old_target
+
+
+def test_continue_permissions_preserves_wire_vias(
+    cli: CliRunner, state_root: Path
+) -> None:
+    """continue --permissions must not strip model_via / effort_via from meta.
+
+    Grok relies on these session fields; dropping them reverts apply_call_options
+    to set_config_option and collapses CLI-effort spawn_identity. The mock agent
+    does not implement session/set_model, so this path uses effort_via=cli only
+    for the live turn and asserts model_via via the pure rewrite helper.
+    """
+    (state_root / "agents" / "mock.toml").write_text(
+        f"""
+name = "Mock Agent"
+command = "{sys.executable} {MOCK_AGENT_SCRIPT}"
+install_command = "true"
+home = "~/.mock"
+home_env = "MOCK_HOME"
+efforts = ["low", "medium", "high", "xhigh"]
+model_via = "config_option"
+effort_via = "cli"
+effort_cli_flag = "--effort"
+
+[modes]
+default = {{ grants = "read", delegates = true }}
+plan = {{ grants = "read", delegates = true }}
+yolo = {{ grants = "all", delegates = false }}
+acceptEdits = {{ grants = "edit", delegates = true }}
+
+[presets]
+fast = {{ model = "mock-haiku-4-5", effort = "high" }}
+standard = {{ model = "mock-sonnet-5", effort = "high" }}
+max = {{ model = "mock-opus-5", effort = "xhigh" }}
+""",
+        encoding="utf-8",
+    )
+    first = invoke(
+        cli,
+        "run",
+        "mock",
+        "turn one",
+        "--effort",
+        "low",
+        "--quiet",
+        "--json",
+    )
+    assert first.exit_code == vocab.EXIT_OK, first.stderr
+    session_id = json.loads(first.stdout)["session_id"]
+    started = sessions.load(session_id)
+    assert started.resolution["adapter"]["effort_via"] == "cli"
+    assert started.resolution["adapter"]["effort_cli_flag"] == "--effort"
+    assert started.resolution["adapter"]["model_via"] == "config_option"
+
+    result = invoke(
+        cli,
+        "continue",
+        session_id,
+        "turn two",
+        "--permissions",
+        "edit",
+        "--quiet",
+    )
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    continued = sessions.load(session_id)
+    adapter = continued.resolution["adapter"]
+    assert adapter["model_via"] == "config_option"
+    assert adapter["effort_via"] == "cli"
+    assert adapter["effort_cli_flag"] == "--effort"
+    assert continued.resolution["resolved"]["permissions"]["value"] == "edit"
+    assert continued.resolution["resolved"]["effort"]["value"] == "low"
+
+    rebuilt = runner.resolution_from_session(continued)
+    assert rebuilt.entry.effort_via == "cli"
+    assert rebuilt.entry.effort_cli_flag == "--effort"
+    assert "--effort" in rebuilt.command
+    assert rebuilt.command.count("--effort") == 1
+    assert continued.target == runner.call_target(rebuilt)
+    high = replace(rebuilt, effort="high", provenance=dict(rebuilt.provenance))
+    assert runner.call_target(high) != runner.call_target(rebuilt)
+
+    # Pure rewrite path: set_model vias must also survive (mock cannot live-call them).
+    started.resolution["adapter"]["model_via"] = "set_model"
+    selection = runner.resolution_from_session(started)
+    selection = replace(
+        selection,
+        entry=replace(selection.entry, model_via="set_model"),
+    )
+    rewritten = cli_module._updated_session_resolution(
+        started,
+        selection,
+        policy="edit",
+        policy_changed=True,
+    )
+    assert rewritten["adapter"]["model_via"] == "set_model"
+    assert rewritten["adapter"]["effort_via"] == "cli"
+    assert rewritten["adapter"]["effort_cli_flag"] == "--effort"
 
 
 def test_continue_preserves_meta_written_after_initial_load(
