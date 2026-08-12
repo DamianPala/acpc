@@ -575,7 +575,42 @@ class AcpcClient:
         self._advertised["modes"] = [
             mode.model_dump(mode="json", by_alias=True, exclude_none=True) for mode in modes
         ]
-        self._advertised["models"] = self._models_from_options(session.config_options or [])
+        models = self._models_from_options(session.config_options or [])
+        if not models:
+            models = self._models_from_session_meta(session)
+        self._advertised["models"] = models
+
+    def record_prompt_usage(self, prompt_result: Any) -> None:
+        """Record tokens/cost from a prompt response when usage_update is absent.
+
+        Some agents (Grok Build) put totals on PromptResponse ``_meta`` instead
+        of streaming ACP ``usage_update`` notifications.
+        """
+        meta = self._prompt_meta(prompt_result)
+        if not meta:
+            return
+        tokens = meta.get("totalTokens")
+        if tokens is None:
+            usage = meta.get("usage")
+            if isinstance(usage, Mapping):
+                tokens = usage.get("totalTokens") or usage.get("total_tokens")
+        if isinstance(tokens, (int, float)) and tokens > 0:
+            self._tokens = max(self._tokens, int(tokens))
+        cost = meta.get("costUsd")
+        if cost is None:
+            usage = meta.get("usage")
+            if isinstance(usage, Mapping):
+                ticks = usage.get("costUsdTicks")
+                if isinstance(ticks, (int, float)):
+                    cost = float(ticks) / 10_000_000_000
+                else:
+                    cost = usage.get("costUsd") or usage.get("cost_usd")
+        previous_tokens, previous_cost = self._tokens, self._cost
+        if isinstance(cost, (int, float)):
+            amount = float(cost)
+            self._cost = amount if self._cost is None else max(self._cost, amount)
+        if self._tokens != previous_tokens or self._cost != previous_cost:
+            self.transcript.append("usage", tokens=self._tokens, cost=self._cost)
 
     @asynccontextmanager
     async def replaying(
@@ -1093,3 +1128,41 @@ class AcpcClient:
                         if isinstance(nested_value, str):
                             models.append(nested_value)
         return models
+
+    @staticmethod
+    def _models_from_session_meta(session: NewSessionResponse) -> list[str]:
+        """Read model ids from vendor session ``_meta`` (e.g. x.ai/sessionConfig)."""
+        meta = AcpcClient._prompt_meta(session)
+        config = meta.get("x.ai/sessionConfig")
+        if not isinstance(config, Mapping):
+            return []
+        options = config.get("options")
+        if not isinstance(options, list):
+            return []
+        models: list[str] = []
+        for option in options:
+            if not isinstance(option, Mapping):
+                continue
+            if option.get("category") != "model":
+                continue
+            model_id = option.get("id")
+            if isinstance(model_id, str) and model_id:
+                models.append(model_id)
+        return models
+
+    @staticmethod
+    def _prompt_meta(value: Any) -> dict[str, Any]:
+        if value is None:
+            return {}
+        if hasattr(value, "model_dump"):
+            dumped = value.model_dump(by_alias=True, exclude_none=True)
+            if isinstance(dumped, Mapping):
+                meta = dumped.get("_meta")
+                return dict(meta) if isinstance(meta, Mapping) else {}
+        meta = getattr(value, "field_meta", None)
+        if isinstance(meta, Mapping):
+            return dict(meta)
+        meta = getattr(value, "_meta", None)
+        if isinstance(meta, Mapping):
+            return dict(meta)
+        return {}

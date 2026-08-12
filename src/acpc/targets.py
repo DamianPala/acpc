@@ -30,6 +30,7 @@ def target_for_call(
     declared_env: Mapping[str, str] | None = None,
     passthrough_values: Mapping[str, str] | None = None,
     permissions: str | None | object = _UNSET,
+    spawn_identity: Mapping[str, str] | None = None,
 ) -> str:
     """Build a readable, path-safe, stable daemon target for one resolved call.
 
@@ -39,15 +40,18 @@ def target_for_call(
     `env_passthrough` name present in the caller's environment to the value
     read at call time. Secret values shape the digest only — the returned
     target never contains them. The resolved permissions join the key because
-    the adapter environment is fixed at spawn. A completely bare entry may
-    omit permissions for the readable-entry optimization; every other call
-    must provide a canonical policy.
+    the adapter environment is fixed at spawn. `spawn_identity` captures
+    process-level spawn flags that cannot change without a new process (e.g.
+    CLI effort on adapters that set effort only at argv time). A completely
+    bare entry may omit permissions for the readable-entry optimization;
+    every other call must provide a canonical policy.
     """
     safe_entry = quote(entry, safe="-._~")
     declared_env = dict(declared_env or {})
     passthrough_values = dict(passthrough_values or {})
+    spawn_identity = dict(spawn_identity or {})
     if permissions is _UNSET:
-        if home is None and not declared_env and not passthrough_values:
+        if home is None and not declared_env and not passthrough_values and not spawn_identity:
             return safe_entry
         raise ValueError("permissions is required when target inputs need a digest")
     if not isinstance(permissions, str) or permissions not in _PERMISSION_VALUES:
@@ -59,6 +63,7 @@ def target_for_call(
         "env": dict(sorted(declared_env.items())),
         "passthrough": dict(sorted(passthrough_values.items())),
         "permissions": permissions,
+        "spawn": dict(sorted(spawn_identity.items())),
     }
     digest_input = json.dumps(
         digest_payload,

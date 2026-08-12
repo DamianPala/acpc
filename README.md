@@ -1,6 +1,6 @@
 # acpc
 
-Dispatch coding agents (codex, claude) over the Agent Client Protocol, from the command line.
+Dispatch coding agents (codex, claude, grok, …) over the Agent Client Protocol, from the command line.
 
 acpc is built for a specific primary user: **another agent calling it through a shell tool**. Everything follows from that — blocking calls that print the answer once, plain text with no spinners or ANSI, state on disk that can be grepped, and exit codes that mean something. A human at a terminal is the secondary audience and still gets an honest tool.
 
@@ -140,7 +140,7 @@ acpc documents itself: the root `--help` is a complete cheat sheet, and every co
 Add only the routing knowledge an agent cannot infer from the tool, e.g. in your global `AGENTS.md`:
 
 ```markdown
-## acpc — dispatch external coding agents (codex, claude, agy)
+## acpc — dispatch external coding agents (codex, claude, grok, agy)
 - Models available in your harness's own subagent tool → use that tool.
   acpc is for external agents only.
 - First contact: `acpc --help` (complete cheat sheet).

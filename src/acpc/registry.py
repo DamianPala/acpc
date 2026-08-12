@@ -26,6 +26,8 @@ _TIERS: Final = frozenset({"fast", "standard", "max"})
 _NON_INHERITABLE_FIELDS: Final = frozenset({"description"})
 _MODE_KEYS: Final = frozenset({"grants", "delegates", "escalates"})
 _MODE_GRANTS: Final = frozenset(PERMISSION_VALUES[:-1])
+_MODEL_VIA_VALUES: Final = frozenset({"config_option", "set_model"})
+_EFFORT_VIA_VALUES: Final = frozenset({"config_option", "cli"})
 _ENTRY_KEYS: Final = frozenset(
     {
         "name",
@@ -36,6 +38,9 @@ _ENTRY_KEYS: Final = frozenset(
         "home_env",
         "efforts",
         "effort_config_id",
+        "effort_via",
+        "effort_cli_flag",
+        "model_via",
         "env_passthrough",
         "extends",
         "description",
@@ -58,6 +63,9 @@ _FIELD_NAMES: Final = (
     "home_env",
     "efforts",
     "effort_config_id",
+    "effort_via",
+    "effort_cli_flag",
+    "model_via",
     "env_passthrough",
     "description",
     "model",
@@ -68,6 +76,7 @@ _FIELD_NAMES: Final = (
     "modes",
     "presets",
 )
+_DEFAULT_EFFORT_CLI_FLAG = "--reasoning-effort"
 
 
 class RegistryError(ValueError):
@@ -131,7 +140,16 @@ class CallResolution:
 
     @property
     def command(self) -> tuple[str, ...]:
-        return self.entry.command_args
+        """Return spawn argv, injecting CLI effort when the entry asks for it."""
+        args = list(self.entry.command_args)
+        if self.entry.effort_via == "cli" and self.effort is not None:
+            flag = self.entry.effort_cli_flag or _DEFAULT_EFFORT_CLI_FLAG
+            # Prefer flags before a trailing transport subcommand (stdio/serve/…).
+            if args and args[-1] in {"stdio", "serve", "headless", "leader"}:
+                args = [*args[:-1], flag, self.effort, args[-1]]
+            else:
+                args.extend([flag, self.effort])
+        return tuple(args)
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,6 +168,11 @@ class ResolvedEntry:
     # The session config option id that carries effort — a vendor fact like
     # home_env (codex speaks `reasoning_effort`, claude speaks `effort`).
     effort_config_id: str | None
+    # How acpc applies model/effort when the adapter's wire differs from the
+    # ACP config-option default (e.g. Grok: session/set_model + CLI effort).
+    model_via: str
+    effort_via: str
+    effort_cli_flag: str | None
     env_passthrough: tuple[str, ...]
     description: str | None
     model: str | None
@@ -430,6 +453,18 @@ def _parse_entry(
         value = _expect_string(path, "effort", raw["effort"])
         if value not in EFFORT_VALUES:
             raise RegistryError(f"{path}: key 'effort' has unsupported level '{value}'")
+    if "model_via" in raw:
+        value = _expect_string(path, "model_via", raw["model_via"])
+        if value not in _MODEL_VIA_VALUES:
+            supported = ", ".join(sorted(_MODEL_VIA_VALUES))
+            raise RegistryError(f"{path}: key 'model_via' must be one of: {supported}")
+    if "effort_via" in raw:
+        value = _expect_string(path, "effort_via", raw["effort_via"])
+        if value not in _EFFORT_VIA_VALUES:
+            supported = ", ".join(sorted(_EFFORT_VIA_VALUES))
+            raise RegistryError(f"{path}: key 'effort_via' must be one of: {supported}")
+    if "effort_cli_flag" in raw:
+        _expect_string(path, "effort_cli_flag", raw["effort_cli_flag"])
     permission_alias: str | None = None
     if "permissions" in raw:
         permission = _expect_string(path, "permissions", raw["permissions"])
@@ -579,6 +614,8 @@ def _to_resolved(
         "env",
         "modes",
         "presets",
+        "model_via",
+        "effort_via",
     }
     for field_name in _FIELD_NAMES:
         if field_name not in provenance:
@@ -595,6 +632,9 @@ def _to_resolved(
         home_env=string_or_none("home_env"),
         efforts=strings("efforts"),
         effort_config_id=string_or_none("effort_config_id"),
+        model_via=string_or_none("model_via") or "config_option",
+        effort_via=string_or_none("effort_via") or "config_option",
+        effort_cli_flag=string_or_none("effort_cli_flag"),
         env_passthrough=strings("env_passthrough"),
         description=string_or_none("description"),
         model=string_or_none("model"),
