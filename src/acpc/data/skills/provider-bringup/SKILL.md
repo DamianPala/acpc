@@ -35,7 +35,7 @@ it and change every field that names a model or sizes its context, leaving the
 provider switch (`home`, base URL, key mechanism) untouched. Run **rungs 1, 2
 and 5**, nothing else: the plumbing is proven, the model is not.
 
-**On a miss**, climb all six rungs. `references/openrouter.md`, in this skill's
+**On a miss**, climb all seven rungs. `references/openrouter.md`, in this skill's
 directory, carries both pairs anonymized plus what differs between the two
 harnesses; `acpc skills <name>` prints that directory on stderr.
 
@@ -132,6 +132,33 @@ stat -c '%y' ~/.claude/settings.json     # unchanged since the baseline
 ```
 
 Never `daemon stop` to fix something here: other sessions may be running.
+
+### 7. Check the advertised modes against the entry
+
+```bash
+acpc probe <name> --discover
+```
+
+Zero turns, zero cost: it opens a session, reads the mode catalogue the adapter
+advertises and releases it. The report is a two-sided diff against the entry's
+resolved `[modes]` — modes the adapter advertises that the entry does not list,
+and entry modes the adapter no longer advertises. It reports and never edits;
+applying anything it shows is your own explicit change to the entry.
+
+What it catches on a bringup: a wrong `extends` (the entry inherited another
+adapter's mode table), a typo'd mode name, and a harness build that renamed or
+dropped a mode since the parent's table was written. What it cannot tell you is
+what a mode *permits* — `grants` and `delegates` are measurements, and the
+measuring probe is not in this release. A clean diff means the names line up,
+not that the ceilings are right; a mode you add from this report still needs its
+facts filled in by hand, stated as what they are: copied or assumed, not
+measured.
+
+Modes are adapter-level, so on the rungs-1-2-5 path (new model, proven
+plumbing) this rung moves nothing. Run it when the harness or its version is
+new — and it is worth re-running after a harness upgrade for the same reason
+the command exists at all: a `[modes]` table records an observation, and
+observations age.
 
 ## The entry
 
