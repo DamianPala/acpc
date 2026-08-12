@@ -160,38 +160,35 @@ acpc probe "$NAME" --discover   # report only; empty catalogue stays empty
 
 ### 5. Model and effort — prove the wire before presets
 
-acpc applies call options with:
+Default path: `session/set_config_option` for model and effort
+(`effort_config_id`, default `reasoning_effort`), after `session/set_mode`.
 
-- `session/set_mode` for the selected mode,
-- `session/set_config_option` with `config_id=model` and
-  `config_id=<effort_config_id>` (default `reasoning_effort`).
+When that fails (Method not found / unknown option), use entry overrides:
 
-**Before** `[presets]` or pinning `model` / `effort` on the entry:
+| Field | Values | Effect |
+|---|---|---|
+| `model_via` | `config_option` (default), `set_model` | ACP `session/set_model` + `modelId` |
+| `effort_via` | `config_option` (default), `cli` | inject flag into spawn argv |
+| `effort_cli_flag` | e.g. `--reasoning-effort` | used when `effort_via = "cli"` |
 
-1. Run one turn with **no** model/effort in the entry (adapter default).
-2. If you need a pin, try dry-run + run with `--model` / `--effort`, or
-   `acpc agents --check` after adding a preset.
-3. If the adapter returns **Method not found** / unknown config option, stop
-   pinning. Models may live only in vendor `_meta`, CLI flags on `command`, or
-   home config — acpc's standard config-option path does not reach them yet.
-   Leave presets empty; document the gap in the entry comments.
-4. Effort (or "thinking") levels sometimes appear in a product UI as a "mode"
-   category — that is **not** a permission mode. Keep them out of `[modes]`.
-   Put accepted effort values in `efforts = […]` only after a successful set of
-   that option.
-5. Set `effort_config_id` only when the adapter's option id is not the default.
+**Before** `[presets]`:
+
+1. One turn with no model/effort pin (adapter default).
+2. Try `--model` / `--effort` or a preset; on wire failure, set `model_via` /
+   `effort_via` after verifying the alternate path, or leave presets empty.
+3. Effort / "thinking" labels are not permission modes — keep them out of
+   `[modes]`. List accepted levels in `efforts = […]`.
+4. `effort_config_id` only on the config-option path when non-default.
 
 ```toml
-# Only after set_config_option accepts these values on this binary:
+# When set_config_option is missing but set_model + CLI effort work:
+# model_via = "set_model"
+# effort_via = "cli"
+# effort_cli_flag = "--reasoning-effort"
 # efforts = ["low", "medium", "high"]
-# effort_config_id = "effort"
-#
 # [presets]
 # standard = { model = "…", effort = "high" }
 ```
-
-A stale preset that fails loud is better than a silent wrong model — but a
-preset that always hits Method not found is noise; omit it.
 
 ### 6. Dry-run, then a trivial turn
 
@@ -229,12 +226,13 @@ acpc agents --check "$NAME"   # live apply of resolved options; zero turns
 | `env_passthrough` | Caller env **names** forwarded at call time. |
 | `[env]` | Literal non-secret values. |
 | `[modes]` | Mode ids + assumed/measured permission facts. Required for run. |
-| `[presets]` | Only after model/effort config options work on this binary. |
-| `efforts` / `effort_config_id` | Only after those options work; non-default effort id if needed. |
+| `[presets]` | After model/effort apply path works (`*_via` or config options). |
+| `efforts` / `effort_config_id` | Allowed efforts; config option id if non-default. |
+| `model_via` / `effort_via` / `effort_cli_flag` | Wire workarounds when config options are missing. |
 | `description` | Roster purpose. |
 
 Shape references (not values to copy): package `data/agents/claude.toml`,
-`data/agents/codex.toml`.
+`data/agents/codex.toml`, `data/agents/grok.toml`.
 
 ## Traps
 
@@ -257,11 +255,11 @@ Shape references (not values to copy): package `data/agents/claude.toml`,
 | `run` / `--dry-run` refuse; message about modes/policy | Empty or unusable `[modes]`, not a missing model. Rung 4. |
 | `probe --discover` → 0 advertised | Catalogue missing on the wire — not proof the binary has no permission modes. Path B. |
 | Mode name from another adapter "should work" | Mode ids are vendor-local. |
-| `the adapter rejected model|effort '…'` with Method not found, Unknown config option, or similar | No working ACP config-option path for that pin on this binary. Drop pin/preset; default model/effort only until product or acpc grows a path. |
+| `the adapter rejected model|effort '…'` with Method not found, Unknown config option, or similar | Config-option path missing — set `model_via` / `effort_via` after proving the alternate wire, or drop pins. |
 | `missing → acpc install …` | argv[0] not on PATH; install binary or set `install_command`. |
 | Auth fails only under acpc | Passthrough or `home`/`home_env` wrong; re-run bare with the same env (rung 2). |
 | Daemon shares traffic with another entry | Same target key (agent + home + declared env + policy). Own `home`. |
-| `0 tok` / odd cost in the summary | Usage mapping may not match this agent; not a failed turn if exit 0 and answer present. |
+| `0 tok` / odd cost in the summary | Prefer ACP `usage_update`; acpc also reads PromptResponse `_meta` totals. Still not a failed turn if exit 0 and answer present. |
 
 ## When you are done
 

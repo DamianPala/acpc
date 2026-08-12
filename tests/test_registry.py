@@ -552,3 +552,46 @@ def test_a_presetless_adapter_has_no_default_model(tmp_path: Path) -> None:
     assert call.model is None
     assert call.effort is None
     assert call.provenance["model"].kind == "unset"
+
+
+def test_shipped_grok_uses_set_model_and_cli_effort(tmp_path: Path) -> None:
+    registry = AgentRegistry(tmp_path / "agents")
+    grok = registry.resolve("grok")
+    assert grok.command_args == ("grok", "agent", "--always-approve", "stdio")
+    assert grok.model_via == "set_model"
+    assert grok.effort_via == "cli"
+    assert grok.effort_cli_flag == "--reasoning-effort"
+    assert "default" in grok.modes
+    assert grok.presets["standard"].model == "grok-4.6"
+    call = grok.resolve_call(model="fast", permissions="read")
+    assert call.model == "grok-4.5"
+    assert call.effort == "low"
+    assert call.command == (
+        "grok",
+        "agent",
+        "--always-approve",
+        "--reasoning-effort",
+        "low",
+        "stdio",
+    )
+
+
+def test_effort_via_cli_injects_flag_before_transport(tmp_path: Path) -> None:
+    agents = tmp_path / "agents"
+    write_entry(
+        agents,
+        "tool",
+        """
+name = "Tool"
+command = "tool agent stdio"
+efforts = ["low", "high"]
+effort_via = "cli"
+effort_cli_flag = "--effort"
+model_via = "set_model"
+[modes]
+default = { grants = "read", delegates = true }
+""",
+    )
+    entry = AgentRegistry(agents).resolve("tool")
+    call = entry.resolve_call(effort="high", permissions="read")
+    assert call.command == ("tool", "agent", "--effort", "high", "stdio")

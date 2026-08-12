@@ -228,9 +228,21 @@ class ProbeReport:
         entry_missing = [item for item in payload["diff"] if item["status"] == "entry-missing"]
         if entry_missing:
             lines.append("")
-            lines.append("Entry modes absent from adapter catalogue")
+            if not self.advertised_modes and self.entry.modes:
+                lines.append(
+                    "Entry modes absent from adapter catalogue "
+                    "(empty discovery — table is operator-declared; do not strip it)"
+                )
+            else:
+                lines.append("Entry modes absent from adapter catalogue")
             for item in entry_missing:
                 lines.append(f"  - {item['mode']}")
+        if not self.advertised_modes and self.entry.modes:
+            lines.append("")
+            lines.append(
+                "note: adapter advertised no ACP modes; entry [modes] is Path B "
+                "(docs/assumed). A one-sided diff is expected."
+            )
         return "\n".join(lines) + "\n"
 
 

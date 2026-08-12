@@ -502,10 +502,14 @@ def _state_for_stop_reason(stop_reason: str | None) -> str:
 
 
 def adapter_command(resolution: CallResolution) -> tuple[str, tuple[str, ...]]:
-    """Split the entry's command, and refuse early when it is not installed."""
+    """Split the call's spawn argv, and refuse early when it is not installed.
+
+    Uses ``CallResolution.command`` so effort_via=cli can inject flags for this
+    call without rewriting the entry's base command string.
+    """
     entry = resolution.entry
     try:
-        args = entry.command_args
+        args = resolution.command
     except RegistryError as error:
         raise RunnerError(str(error)) from None
     if shutil.which(args[0]) is None:
@@ -527,12 +531,20 @@ def call_target(resolution: CallResolution) -> str:
         name: value
         for name, value in environment.environment_overrides({}, resolution.env_passthrough).items()
     }
+    spawn_identity: dict[str, str] = {}
+    if resolution.entry.effort_via == "cli" and resolution.effort is not None:
+        # Effort is process-level on the CLI path — distinct efforts need
+        # distinct daemons (they cannot be changed after spawn).
+        spawn_identity["effort"] = resolution.effort
+        flag = resolution.entry.effort_cli_flag or "--reasoning-effort"
+        spawn_identity["effort_cli_flag"] = flag
     return targets.target_for_call(
         resolution.entry.entry,
         home=resolution.home,
         declared_env=declared,
         passthrough_values=passthrough,
         permissions=resolution.permissions,
+        spawn_identity=spawn_identity or None,
     )
 
 
@@ -673,7 +685,12 @@ async def _drive_turn(
                 ) from None
             try:
                 stop_reason = await _await_prompt(
-                    conn, adapter_session_id, prompt_task, request, cancel
+                    conn,
+                    adapter_session_id,
+                    prompt_task,
+                    request,
+                    cancel,
+                    usage_client=client,
                 )
             except Exception as caught:  # noqa: BLE001
                 # The adapter failed the turn itself. Whatever prose it streamed
@@ -806,15 +823,22 @@ async def apply_call_options(conn: Any, adapter_session_id: str, request: TurnRe
         f"mode {resolution.mode!r}",
     )
     if resolution.model is not None:
-        await _configure(
-            conn.set_config_option(
-                config_id="model",
-                session_id=adapter_session_id,
-                value=resolution.model,
-            ),
-            f"model {resolution.model!r}",
-        )
-    if resolution.effort is not None:
+        if resolution.entry.model_via == "set_model":
+            await _configure(
+                _set_session_model(conn, adapter_session_id, resolution.model),
+                f"model {resolution.model!r} (session/set_model)",
+            )
+        else:
+            await _configure(
+                conn.set_config_option(
+                    config_id="model",
+                    session_id=adapter_session_id,
+                    value=resolution.model,
+                ),
+                f"model {resolution.model!r}",
+            )
+    # effort_via=cli is applied on the spawn argv (CallResolution.command).
+    if resolution.effort is not None and resolution.entry.effort_via != "cli":
         effort_config_id = resolution.entry.effort_config_id or _DEFAULT_EFFORT_CONFIG_ID
         await _configure(
             conn.set_config_option(
@@ -828,6 +852,28 @@ async def apply_call_options(conn: Any, adapter_session_id: str, request: TurnRe
                 "drop --effort, or drop effort from the preset in the entry TOML"
             ),
         )
+
+
+async def _set_session_model(conn: Any, session_id: str, model_id: str) -> Any:
+    """Set the session model via ACP ``session/set_model`` (not config options).
+
+    Some agents (Grok Build) advertise models on session/new but reject
+    ``session/set_config_option``. The typed SDK may omit a set_model helper;
+    fall back to the raw JSON-RPC connection.
+    """
+    set_model = getattr(conn, "set_model", None)
+    if callable(set_model):
+        return await set_model(session_id=session_id, model_id=model_id)
+    raw = getattr(conn, "_conn", None)
+    if raw is None or not hasattr(raw, "send_request"):
+        raise AdapterRejection(
+            "the adapter requested model_via=set_model but the connection "
+            "has no session/set_model path"
+        )
+    return await raw.send_request(
+        "session/set_model",
+        {"sessionId": session_id, "modelId": model_id},
+    )
 
 
 class AdapterRejection(RuntimeError):
@@ -861,6 +907,8 @@ async def _await_prompt(
     prompt_task: "asyncio.Task[Any]",
     request: TurnRequest,
     cancel: _CancelSignal,
+    *,
+    usage_client: Any | None = None,
 ) -> str | None:
     """Wait for the turn, honoring `--timeout` and any signal-driven cancel.
 
@@ -876,7 +924,7 @@ async def _await_prompt(
             return_when=asyncio.FIRST_COMPLETED,
         )
         if prompt_task in done:
-            return _stop_reason_of(prompt_task)
+            return _stop_reason_of(prompt_task, usage_client=usage_client)
 
         # Either the timeout expired or a signal asked us to wind down.
         if not cancel.requested.is_set():
@@ -887,7 +935,7 @@ async def _await_prompt(
         with contextlib.suppress(TimeoutError, asyncio.CancelledError, Exception):
             await asyncio.wait_for(asyncio.shield(prompt_task), timeout=CANCEL_ACK_TIMEOUT)
         if prompt_task.done():
-            return _stop_reason_of(prompt_task)
+            return _stop_reason_of(prompt_task, usage_client=usage_client)
         prompt_task.cancel()
         return "cancelled"
     finally:
@@ -896,14 +944,23 @@ async def _await_prompt(
             await waiter
 
 
-def _stop_reason_of(prompt_task: "asyncio.Task[Any]") -> str | None:
+def _stop_reason_of(
+    prompt_task: "asyncio.Task[Any]",
+    *,
+    usage_client: Any | None = None,
+) -> str | None:
     """Read a finished prompt task's stop reason, preserving adapter errors."""
     error = prompt_task.exception() if not prompt_task.cancelled() else None
     if prompt_task.cancelled():
         return "cancelled"
     if error is not None:
         raise error
-    return getattr(prompt_task.result(), "stop_reason", None)
+    result = prompt_task.result()
+    if usage_client is not None:
+        record = getattr(usage_client, "record_prompt_usage", None)
+        if callable(record):
+            record(result)
+    return getattr(result, "stop_reason", None)
 
 
 def _install_signal_handlers(
@@ -1512,10 +1569,14 @@ def resolution_payload(resolution: CallResolution, *, cwd: str | None) -> dict[s
         resolved["mode"]["grants"] = resolution.mode_spec.grants
         resolved["mode"]["delegates"] = resolution.mode_spec.delegates
         resolved["mode"]["escalates"] = resolution.mode_spec.escalates
+    try:
+        spawn_command = " ".join(resolution.command)
+    except RegistryError:
+        spawn_command = entry.command
     return {
         "entry": entry.entry,
         "base_adapter": entry.base_adapter,
-        "command": entry.command,
+        "command": spawn_command,
         "cwd": cwd,
         "env": dict(resolution.declared_env),
         "env_passthrough": list(resolution.env_passthrough),
@@ -1552,13 +1613,21 @@ def session_resolution(
     cwd: str | None,
     permissions_source: str | None = None,
 ) -> dict[str, Any]:
-    """The persisted session shape, distinct from the printed dry-run view."""
+    """The persisted session shape, distinct from the printed dry-run view.
+
+    Stores the entry's **base** command (not CLI-injected spawn argv) so
+    effort_via=cli can re-inject on continue without doubling flags.
+    """
     payload = resolution_payload(resolution, cwd=cwd)
+    payload["command"] = resolution.entry.command
     if permissions_source is not None:
         payload["permissions_source"] = permissions_source
     adapter: dict[str, Any] = {
         "home_env": resolution.entry.home_env,
         "effort_config_id": resolution.entry.effort_config_id,
+        "model_via": resolution.entry.model_via,
+        "effort_via": resolution.entry.effort_via,
+        "effort_cli_flag": resolution.entry.effort_cli_flag,
         "modes": mode_catalog_payload(resolution.entry.modes),
     }
     if resolution.mode is not None and resolution.mode_spec is not None:
@@ -1613,6 +1682,15 @@ def resolution_from_session(meta: sessions.SessionMeta) -> CallResolution:
     effort_config_id = adapter.get("effort_config_id")
     if effort_config_id is not None and not isinstance(effort_config_id, str):
         raise RunnerError(f"session {meta.session_id} has invalid stored effort config id")
+    model_via = adapter.get("model_via") or "config_option"
+    if model_via not in {"config_option", "set_model"}:
+        raise RunnerError(f"session {meta.session_id} has invalid stored model_via")
+    effort_via = adapter.get("effort_via") or "config_option"
+    if effort_via not in {"config_option", "cli"}:
+        raise RunnerError(f"session {meta.session_id} has invalid stored effort_via")
+    effort_cli_flag = adapter.get("effort_cli_flag")
+    if effort_cli_flag is not None and not isinstance(effort_cli_flag, str):
+        raise RunnerError(f"session {meta.session_id} has invalid stored effort_cli_flag")
     env_passthrough = stored_strings("env_passthrough", payload)
 
     stored_mode = adapter.get("mode", _stored_value(payload, "mode"))
@@ -1647,6 +1725,9 @@ def resolution_from_session(meta: sessions.SessionMeta) -> CallResolution:
         home_env=home_env,
         efforts=(),
         effort_config_id=effort_config_id,
+        model_via=model_via,
+        effort_via=effort_via,
+        effort_cli_flag=effort_cli_flag,
         env_passthrough=env_passthrough,
         description=None,
         model=None,

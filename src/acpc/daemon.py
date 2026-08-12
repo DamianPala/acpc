@@ -1151,7 +1151,12 @@ class Daemon:
                 ) from None
             try:
                 stop_reason = await runner._await_prompt(
-                    conn, adapter_session_id, prompt_task, request, cancel
+                    conn,
+                    adapter_session_id,
+                    prompt_task,
+                    request,
+                    cancel,
+                    usage_client=client,
                 )
             except Exception as caught:  # noqa: BLE001
                 # Same bargain as the direct path: keep the streamed prose as the
