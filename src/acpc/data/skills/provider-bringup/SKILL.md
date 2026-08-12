@@ -124,6 +124,22 @@ acpc run <name> "x" --dry-run   # what this call resolves to, incl. env
 acpc run <name> "Reply with exactly: OK" --timeout 180
 ```
 
+A variant inherits its parent's `[modes]` and the above just works. **A new
+adapter (`command`, no `extends`) starts with no `[modes]` at all, and both
+the dry-run and the run refuse it**: mode selection over an empty table has
+nothing to select. The mode names are not yours to guess — get them from
+discovery, which opens a session without selecting a mode and therefore works
+on the modes-less entry:
+
+```bash
+acpc probe <name> --discover
+```
+
+Write the advertised ids into `[modes]` with their facts marked for what they
+are — assumed, not measured — or bridge the very first run with
+`--permissions all --mode <id>`, the one policy allowed to run a mode the
+table has not recorded. Then come back through the dry-run.
+
 ### 6. Prove the isolation
 
 ```bash
@@ -159,6 +175,10 @@ plumbing) this rung moves nothing. Run it when the harness or its version is
 new — and it is worth re-running after a harness upgrade for the same reason
 the command exists at all: a `[modes]` table records an observation, and
 observations age.
+
+On a new adapter this is a second visit: rung 5 used discovery to learn the
+names before the first run could select a mode; this one checks the finished
+entry against the same catalogue.
 
 ## The entry
 
