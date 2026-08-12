@@ -9,7 +9,6 @@ boundaries, so mocking them out would test nothing.
 import asyncio
 import contextlib
 import json
-import os
 import sys
 import time
 from collections.abc import AsyncIterator
@@ -228,6 +227,26 @@ def test_a_turn_that_cannot_be_built_is_refused_in_a_reply_not_a_dropped_connect
     assert "grants all" in reply["error"]
 
 
+def test_daemon_acceptance_has_a_running_disk_claim_before_the_turn_task_runs(
+    state_root: Path,
+) -> None:
+    session_id = new_session("accepted turn")
+    instance = daemon.Daemon(target())
+
+    async def scenario() -> None:
+        reply = await instance._start(
+            {"session_id": session_id, "payload": dispatch_payload("accepted turn")}
+        )
+        assert reply["ok"] is True
+        claimed = sessions.read_meta(session_id)
+        assert claimed.state == "running"
+        assert claimed.pid is not None
+        await instance._shut_down_sessions("test cleanup")
+        await instance.host.close()
+
+    asyncio.run(scenario())
+
+
 # --- routing ----------------------------------------------------------------
 
 
@@ -240,6 +259,27 @@ def test_a_turn_runs_on_the_daemon_and_finishes_the_session(
 
     assert outcome.state == "done"
     assert outcome.route_note is None
+    assert sessions.read_meta(session_id).state == "done"
+
+
+def test_cancel_before_daemon_acceptance_is_the_no_such_turn_case(
+    state_root: Path, live_daemon: None
+) -> None:
+    session_id = new_session("already finished")
+    run_turn(session_id, "already finished")
+
+    async def cancel_finished() -> dict[str, Any]:
+        connection = await daemon_client.connect(target())
+        assert connection is not None
+        try:
+            return await connection.cancel(session_id)
+        finally:
+            await connection.close()
+
+    reply = asyncio.run(cancel_finished())
+
+    assert reply["ok"] is False
+    assert "not running here" in reply["error"]
     assert sessions.read_meta(session_id).state == "done"
 
 
@@ -602,7 +642,7 @@ def test_replay_generation_scope_does_not_block_another_daemon_session(
     assert live_client.answer == "session y"
 
 
-def test_claimed_turn_is_finalized_if_daemon_task_registration_fails(
+def test_a_turn_is_not_started_if_daemon_task_registration_fails(
     state_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     session_id = new_session("turn one")
@@ -617,24 +657,9 @@ def test_claimed_turn_is_finalized_if_daemon_task_registration_fails(
     )
     instance = daemon.Daemon(target())
 
-    async def prepare(_session_id: str, incoming: runner.TurnRequest) -> runner.TurnRequest:
-        rotated = sessions.rotate_turn(
-            session_id,
-            prompt=incoming.prompt,
-            resume_status="verified",
-            pid=os.getpid(),
-        )
-        return replace(
-            incoming,
-            defer_rotation=False,
-            resume_prepared=True,
-            turn_token=rotated.turns,
-        )
-
     def fail_task_registration(*args: object, **kwargs: object) -> None:
         raise OSError("injected task registration failure")
 
-    monkeypatch.setattr(instance, "_prepare_turn", prepare)
     monkeypatch.setattr(daemon.asyncio, "create_task", fail_task_registration)
 
     reply = asyncio.run(
@@ -648,8 +673,8 @@ def test_claimed_turn_is_finalized_if_daemon_task_registration_fails(
 
     assert reply["ok"] is False
     failed = sessions.read_meta(session_id)
-    assert failed.state == "failed"
-    assert failed.turns == 2
+    assert failed.state == "done"
+    assert failed.turns == 1
 
 
 def test_a_refused_switch_leaves_the_daemon_warm_for_continue(
@@ -727,13 +752,13 @@ def test_daemon_carries_incomplete_delivery_into_a_cold_resume(
         target=runner.call_target(resolution),
     ).session_id
 
-    async def run_daemon_turns() -> tuple[runner.TurnOutcome, str, runner.TurnOutcome]:
+    async def run_daemon_turns() -> tuple[runner.TurnOutcome, str, dict[str, Any]]:
         instance = daemon.Daemon(target())
         try:
             first = await instance._run_turn(
                 session_id,
                 runner.TurnRequest(resolution=resolution, prompt="daemon marker outage"),
-                runner._CancelSignal(),
+                daemon._Turn(session_id=session_id, task=None, cancel=runner._CancelSignal()),
             )
             first_meta = sessions.read_meta(session_id)
             await instance.host.close()
@@ -741,10 +766,16 @@ def test_daemon_carries_incomplete_delivery_into_a_cold_resume(
             request = runner.continue_request(
                 first_meta, "daemon cold follow-up", defer_rotation=True
             )
-            prepared = await instance._prepare_turn(session_id, request)
+            # The claim and rotation belong to acceptance, so the continuation
+            # goes through it rather than reproducing that sequence here.
+            accepted = await instance._start(
+                {"session_id": session_id, "payload": runner.daemon_payload(request)}
+            )
+            assert accepted["ok"] is True
+            await instance._await_preparation({"session_id": session_id})
             resume_status = sessions.read_meta(session_id).extra["resume"]
-            second = await instance._run_turn(session_id, prepared, runner._CancelSignal())
-            return first, resume_status, second
+            second = await instance._await({"session_id": session_id})
+            return first, resume_status, second["outcome"]
         finally:
             await instance.host.close()
 
@@ -754,7 +785,7 @@ def test_daemon_carries_incomplete_delivery_into_a_cold_resume(
     assert first.delivery_record_incomplete is True
     assert sessions.read_meta(session_id).extra[sessions.DELIVERY_RECORD_INCOMPLETE] is True
     assert resume_status == "unverified — delivery record incomplete"
-    assert second.state == "done"
+    assert second["state"] == "done"
 
 
 def test_daemon_keeps_a_pre_send_failure_record_complete_on_cold_resume(
@@ -784,7 +815,7 @@ def test_daemon_keeps_a_pre_send_failure_record_complete_on_cold_resume(
             return await instance._run_turn(
                 session_id,
                 runner.TurnRequest(resolution=resolution, prompt="daemon before-wire"),
-                runner._CancelSignal(),
+                daemon._Turn(session_id=session_id, task=None, cancel=runner._CancelSignal()),
             )
         finally:
             await instance.host.close()
@@ -803,10 +834,14 @@ def test_daemon_keeps_a_pre_send_failure_record_complete_on_cold_resume(
             request = runner.continue_request(
                 first_meta, "daemon later prompt", defer_rotation=True
             )
-            prepared = await instance._prepare_turn(session_id, request)
+            accepted = await instance._start(
+                {"session_id": session_id, "payload": runner.daemon_payload(request)}
+            )
+            assert accepted["ok"] is True
+            await instance._await_preparation({"session_id": session_id})
             resume_status = sessions.read_meta(session_id).extra["resume"]
-            outcome = await instance._run_turn(session_id, prepared, runner._CancelSignal())
-            assert outcome.state == "done"
+            outcome = await instance._await({"session_id": session_id})
+            assert outcome["outcome"]["state"] == "done"
             return resume_status
         finally:
             await instance.host.close()

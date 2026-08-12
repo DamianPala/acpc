@@ -1,7 +1,9 @@
 """Behavioral tests for the ``steer`` verb: cancel, then redirect."""
 
+import asyncio
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -9,7 +11,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from acpc import daemon_client, sessions, vocab
+from acpc import daemon_client, runner, sessions, vocab
 from acpc.cli import STEER_PREAMBLE, main
 
 MOCK_AGENT_SCRIPT = str(Path(__file__).with_name("mock_agent.py"))
@@ -247,3 +249,192 @@ def test_steer_interrupts_a_real_running_turn(cli: CliRunner, live_daemon: None)
     parked = sessions.turn_path(session_id, "answer", 1)
     assert "started" in parked.read_text(encoding="utf-8")
     assert sessions.prompt_path(session_id).read_text(encoding="utf-8").startswith(STEER_PREAMBLE)
+
+
+def test_steer_interleaved_with_an_in_flight_restore(
+    cli: CliRunner, live_daemon: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id = finished_mock_session(cli, "turn one")
+    resolution = runner.resolution_from_session(sessions.read_meta(session_id))
+
+    async def stop_target() -> None:
+        connection = await daemon_client.connect(runner.call_target(resolution))
+        assert connection is not None
+        try:
+            await connection.stop()
+        finally:
+            await connection.close()
+
+    asyncio.run(stop_target())
+    restore_release = Path(os.environ["ACPC_HOME"]) / "restore-release"
+    restore_ready = Path(os.environ["ACPC_HOME"]) / "restore-ready"
+    event_file = Path(os.environ["ACPC_HOME"]) / "adapter-events.ndjson"
+    monkeypatch.setenv("ACPC_MOCK_BLOCK_DURING_RESTORE", str(restore_release))
+    monkeypatch.setenv("ACPC_MOCK_BLOCK_DURING_RESTORE_READY", str(restore_ready))
+    monkeypatch.setenv("ACPC_MOCK_EVENT_FILE", str(event_file))
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "from acpc.cli import main; raise SystemExit(main())",
+            "continue",
+            session_id,
+            "restore must be cancelled",
+            "--quiet",
+        ],
+        env=os.environ.copy(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    steer_process: subprocess.Popen[str] | None = None
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not restore_ready.exists():
+            time.sleep(0.02)
+        if not restore_ready.exists():
+            process.kill()
+            process.wait(timeout=10)
+            pytest.fail("resume never reached the deterministic restore barrier")
+
+        steer_process = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "from acpc.cli import main; raise SystemExit(main())",
+                "steer",
+                session_id,
+                "echo:plain steering",
+            ],
+            env=os.environ.copy(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            meta = sessions.read_meta(session_id)
+            if meta.turns == 3 and meta.state == "running":
+                break
+            time.sleep(0.02)
+        else:
+            steer_process.kill()
+            steer_process.wait(timeout=10)
+            pytest.fail("steer did not claim its follow-up turn")
+
+        restore_release.touch()
+        steer_stdout, steer_stderr = steer_process.communicate(timeout=10)
+        process.wait(timeout=10)
+
+        assert steer_process.returncode == vocab.EXIT_OK, steer_stderr
+        assert "plain steering" in steer_stdout
+        assert "nothing was interrupted" in steer_stderr
+        assert STEER_PREAMBLE not in sessions.prompt_path(session_id).read_text(encoding="utf-8")
+        assert sessions.prompt_path(session_id).read_text(encoding="utf-8") == "echo:plain steering"
+
+        events = event_file.read_text(encoding="utf-8").splitlines()
+        first_end = next(
+            index for index, value in enumerate(events) if value.startswith("restore-end:")
+        )
+        second_start = next(
+            index
+            for index, value in enumerate(events[first_end + 1 :], first_end + 1)
+            if value.startswith("restore-start:")
+        )
+        prompt = next(
+            index
+            for index, value in enumerate(events[second_start + 1 :], second_start + 1)
+            if value.endswith(":echo:plain steering")
+        )
+        assert first_end < second_start < prompt
+        assert process.returncode != vocab.EXIT_OK
+    finally:
+        if steer_process is not None and steer_process.poll() is None:
+            steer_process.kill()
+            steer_process.wait(timeout=10)
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=10)
+
+
+def test_steer_before_outgoing_prompt_frame_is_a_plain_follow_up(
+    cli: CliRunner, live_daemon: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id = finished_mock_session(cli, "turn one")
+    resolution = runner.resolution_from_session(sessions.read_meta(session_id))
+
+    async def stop_target() -> None:
+        connection = await daemon_client.connect(runner.call_target(resolution))
+        assert connection is not None
+        try:
+            await connection.stop()
+        finally:
+            await connection.close()
+
+    asyncio.run(stop_target())
+    release = Path(os.environ["ACPC_HOME"]) / "prompt-options-release"
+    ready = Path(os.environ["ACPC_HOME"]) / "prompt-options-ready"
+    monkeypatch.setenv("ACPC_MOCK_BLOCK_BEFORE_PROMPT", str(release))
+    monkeypatch.setenv("ACPC_MOCK_BLOCK_BEFORE_PROMPT_READY", str(ready))
+    continue_process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "from acpc.cli import main; raise SystemExit(main())",
+            "continue",
+            session_id,
+            "turn to redirect",
+            "--quiet",
+        ],
+        env=os.environ.copy(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    steer_process: subprocess.Popen[str] | None = None
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not ready.exists():
+            time.sleep(0.02)
+        assert ready.exists()
+
+        steer_process = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "from acpc.cli import main; raise SystemExit(main())",
+                "steer",
+                session_id,
+                "echo:plain before frame",
+            ],
+            env=os.environ.copy(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            meta = sessions.read_meta(session_id)
+            if meta.turns == 3 and meta.state == "running":
+                break
+            time.sleep(0.02)
+        else:
+            pytest.fail("steer did not claim its plain follow-up")
+
+        release.touch()
+        steer_stdout, steer_stderr = steer_process.communicate(timeout=10)
+        continue_process.wait(timeout=10)
+        assert steer_process.returncode == vocab.EXIT_OK, steer_stderr
+        assert "plain before frame" in steer_stdout
+        assert "nothing was interrupted" in steer_stderr
+        assert STEER_PREAMBLE not in sessions.prompt_path(session_id).read_text(encoding="utf-8")
+        assert sessions.prompt_path(session_id).read_text(encoding="utf-8") == (
+            "echo:plain before frame"
+        )
+    finally:
+        if steer_process is not None and steer_process.poll() is None:
+            steer_process.kill()
+            steer_process.wait(timeout=10)
+        if continue_process.poll() is None:
+            continue_process.kill()
+            continue_process.wait(timeout=10)

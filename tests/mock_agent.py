@@ -244,6 +244,8 @@ class MockAgent(Agent):
         self._effort_calls: dict[str, int] = {}
         self._initialized = False
         self._late_calls: dict[str, tuple[str, Path, str]] = {}
+        self._last_restored_session: str | None = None
+        self._restore_settled = asyncio.Event()
 
     def on_connect(self, conn: Client) -> None:
         self._conn = conn
@@ -329,6 +331,9 @@ class MockAgent(Agent):
         client_info: Any = None,
         **kwargs: Any,
     ) -> InitializeResponse:
+        raw_delay = os.environ.get("ACPC_MOCK_INITIALIZE_DELAY")
+        if raw_delay:
+            await asyncio.sleep(float(raw_delay))
         self._initialized = True
         session_capabilities: SessionCapabilities | None = None
         if os.environ.get("ACPC_MOCK_ADVERTISE_LIST", "1") == "1":
@@ -395,6 +400,11 @@ class MockAgent(Agent):
         self._session_cwds[session_id] = Path(cwd)
         self._cancel_events[session_id] = asyncio.Event()
         self._persist_session(session_id)
+        late_ready = os.environ.get("ACPC_MOCK_LATE_RESTORE_FRAME_READY")
+        if late_ready and self._last_restored_session is not None:
+            await self._restore_settled.wait()
+            await self._send_usage(self._last_restored_session, used=9999)
+            Path(late_ready).touch()
         if not os.environ.get("MOCK_PROBE_BEHAVIOR"):
             asyncio.get_running_loop().create_task(self._send_commands_update(session_id))
         return NewSessionResponse(
@@ -442,6 +452,9 @@ class MockAgent(Agent):
         if not self._initialized:
             raise RuntimeError("initialize must run before session/load")
         self._record_session_method("load")
+        self._record_event(f"restore-start:{session_id}")
+        self._last_restored_session = session_id
+        self._restore_settled.clear()
         await self._resume_delay()
         # Vendor-faithful to codex-acp#343: session/load resets the session's
         # model and effort to the adapter's defaults. acpc survives only because
@@ -472,6 +485,8 @@ class MockAgent(Agent):
             await self._send_text(session_id, "history")
             if session_id == "load-slow":
                 await asyncio.sleep(0.2)
+        self._restore_settled.set()
+        self._record_event(f"restore-end:{session_id}")
         return LoadSessionResponse()
 
     async def set_session_mode(
@@ -534,6 +549,7 @@ class MockAgent(Agent):
             if hasattr(block, "text"):
                 prompt_text += block.text
 
+        self._record_event(f"prompt:{session_id}:{prompt_text}")
         history = list(self._sessions.get(session_id, []))
         self._sessions.setdefault(session_id, []).append(prompt_text)
         self._session_cwds.setdefault(session_id, Path.cwd())
@@ -973,6 +989,9 @@ class MockAgent(Agent):
         **kwargs: Any,
     ) -> ResumeSessionResponse:
         self._record_session_method("resume")
+        self._record_event(f"restore-start:{session_id}")
+        self._last_restored_session = session_id
+        self._restore_settled.clear()
         await self._resume_delay()
         if session_id not in self._sessions:
             stored = self._read_store().get(session_id, {})
@@ -981,6 +1000,8 @@ class MockAgent(Agent):
             self._cancel_events[session_id] = asyncio.Event()
         self._session_cwds[session_id] = Path(cwd)
         self._persist_session(session_id)
+        self._restore_settled.set()
+        self._record_event(f"restore-end:{session_id}")
         return ResumeSessionResponse()
 
     async def _send_replayed_user_messages(self, session_id: str, messages: list[str]) -> None:
@@ -1021,6 +1042,16 @@ class MockAgent(Agent):
             await self._conn.session_update(session_id=session_id, update=update)
 
     async def _resume_delay(self) -> None:
+        block_path = os.environ.get("ACPC_MOCK_BLOCK_DURING_RESTORE")
+        if block_path:
+            ready_path = os.environ.get("ACPC_MOCK_BLOCK_DURING_RESTORE_READY")
+            if ready_path:
+                Path(ready_path).touch()
+            deadline = time.monotonic() + HOLD_LIMIT_SECONDS
+            while not Path(block_path).exists():
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(f"timed out waiting for {block_path}")
+                await asyncio.sleep(HOLD_POLL_SECONDS)
         raw = os.environ.get("ACPC_MOCK_RESUME_DELAY")
         if raw:
             await asyncio.sleep(float(raw))
@@ -1033,6 +1064,13 @@ class MockAgent(Agent):
             # second one rather than have it overwrite the first.
             with Path(path).open("a", encoding="utf-8") as handle:
                 handle.write(f"{method}\n")
+
+    @staticmethod
+    def _record_event(event: str) -> None:
+        path = os.environ.get("ACPC_MOCK_EVENT_FILE")
+        if path:
+            with Path(path).open("a", encoding="utf-8") as handle:
+                handle.write(f"{event}\n")
 
     @staticmethod
     def _record_session_list_cursor(cursor: str | None) -> None:

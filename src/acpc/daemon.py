@@ -69,10 +69,22 @@ class _Turn:
     """One in-flight turn owned by this daemon."""
 
     session_id: str
-    task: "asyncio.Task[runner.TurnOutcome]"
+    task: "asyncio.Task[runner.TurnOutcome] | None"
     cancel: runner._CancelSignal
+    phase: str = "preparing"
+    claim_established: bool = False
+    backup: "_PreparationBackup | None" = None
+    preparation_cancelable: bool = False
+    preparation_done: "asyncio.Future[dict[str, Any]] | None" = None
     waiters: list["asyncio.Future[dict[str, Any]]"] = field(default_factory=list)
     result: dict[str, Any] | None = None
+
+
+@dataclass(slots=True)
+class _PreparationBackup:
+    """In-memory bytes needed to undo a failed deferred-turn claim."""
+
+    files: dict[Path, str]
 
 
 class _MultiplexClient:
@@ -203,6 +215,7 @@ class AdapterHost:
         # acpc session id -> the adapter session id it is bound to, for as long
         # as this adapter process lives. Presence here *is* "warm".
         self.adapter_sessions: dict[str, str] = {}
+        self._restore_tasks: dict[str, asyncio.Task[Any]] = {}
 
     @property
     def started(self) -> bool:
@@ -241,16 +254,24 @@ class AdapterHost:
     async def _start(self, resolution: Any) -> Any:
         command, args = runner.adapter_command(resolution)
         stack = contextlib.AsyncExitStack()
-        conn, process = await stack.enter_async_context(
-            spawn_adapter(
-                self.mux,
-                command,
-                *args,
-                env=resolution.adapter_environment,
-                drain_stderr=True,
+        try:
+            conn, process = await stack.enter_async_context(
+                spawn_adapter(
+                    self.mux,
+                    command,
+                    *args,
+                    env=resolution.adapter_environment,
+                    drain_stderr=True,
+                )
             )
-        )
-        initialize = await conn.initialize(protocol_version=PROTOCOL_VERSION)
+            initialize = await conn.initialize(protocol_version=PROTOCOL_VERSION)
+        except BaseException:
+            # A cancelled preparation can interrupt initialize after the
+            # adapter process and its transport have been entered, before the
+            # host has published its stack as the warm connection.
+            with contextlib.suppress(Exception):
+                await stack.aclose()
+            raise
         self._stack = stack
         self._conn = conn
         self._process = process
@@ -259,6 +280,13 @@ class AdapterHost:
         return conn
 
     async def close(self) -> None:
+        restore_tasks = tuple(self._restore_tasks.values())
+        self._restore_tasks.clear()
+        for task in restore_tasks:
+            task.cancel()
+        for task in restore_tasks:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
         if self._stack is not None:
             with contextlib.suppress(Exception):
                 await self._stack.aclose()
@@ -267,6 +295,40 @@ class AdapterHost:
         self._process = None
         self.agent_capabilities = None
         self.adapter_sessions.clear()
+
+    def start_restore(self, adapter_session_id: str, coroutine: Any) -> asyncio.Task[Any]:
+        """Track one uncancellable adapter restore until its response settles."""
+        previous = self._restore_tasks.get(adapter_session_id)
+        if previous is not None and not previous.done():
+            raise DaemonError(f"adapter session {adapter_session_id} is still restoring")
+        task = asyncio.create_task(coroutine, name=f"acpc.restore-flight.{adapter_session_id}")
+        self._restore_tasks[adapter_session_id] = task
+
+        def settled(completed: asyncio.Task[Any]) -> None:
+            if self._restore_tasks.get(adapter_session_id) is completed:
+                self._restore_tasks.pop(adapter_session_id, None)
+            if completed.cancelled():
+                return
+            with contextlib.suppress(BaseException):
+                completed.exception()
+
+        task.add_done_callback(settled)
+        return task
+
+    async def wait_for_restore(self, adapter_session_id: str) -> None:
+        """Wait for a cancelled restore before another one can use its session."""
+        task = self._restore_tasks.get(adapter_session_id)
+        if task is None:
+            return
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if not task.cancelled():
+                raise
+        except Exception:  # noqa: BLE001, S110
+            # The old restore's result belongs to the cancelled turn. A later
+            # continuation only needs its remote work to have settled.
+            pass
 
 
 def _endpoint_identity(path: Path | None) -> tuple[int, int] | None:
@@ -411,9 +473,12 @@ class Daemon:
         """
         for turn in list(self.turns.values()):
             turn.cancel.request("failed", stop_reason=reason)
-            turn.task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await turn.task
+            if turn.preparation_done is not None and not turn.preparation_done.done():
+                turn.preparation_done.set_result({"ok": False, "error": reason})
+            if turn.task is not None:
+                turn.task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await turn.task
             with contextlib.suppress(sessions.SessionError):
                 meta = sessions.read_meta(turn.session_id)
                 if meta.is_active:
@@ -462,6 +527,8 @@ class Daemon:
             return await self._start(frame)
         if operation == "await":
             return await self._await(frame)
+        if operation == "await_preparation":
+            return await self._await_preparation(frame)
         if operation == "cancel":
             return self._cancel(frame)
         if operation == "status":
@@ -500,6 +567,10 @@ class Daemon:
             "uptime": time.time() - self.started_at,
             "log": str(log_path_for_target(self.target)),
             "sessions": sorted(self.turns),
+            "preparing": sorted(
+                session_id for session_id, turn in self.turns.items() if turn.phase == "preparing"
+            ),
+            "restoring": sorted(self.host._restore_tasks),
             "max_concurrent": self.max_concurrent,
         }
 
@@ -509,6 +580,11 @@ class Daemon:
         if turn is None:
             return {"ok": False, "error": f"session {session_id} is not running here"}
         turn.cancel.request("cancelled")
+        if turn.phase == "preparing" and turn.preparation_cancelable and turn.task is not None:
+            # Preparation has no prompt task whose ACP cancellation can wind it
+            # down. Cancelling the daemon-owned preparation task runs its
+            # reservation, adapter binding and replay-generation finalizers.
+            turn.task.cancel()
         return {"ok": True}
 
     async def _start(self, frame: dict[str, Any]) -> dict[str, Any]:
@@ -529,48 +605,142 @@ class Daemon:
                 "preserve_session": bool((frame.get("payload") or {}).get("defer_rotation")),
             }
 
-        claimed_turn: int | None = None
+        queued = self._slots.locked()
+        cancel = runner._CancelSignal()
+        preparation = request.defer_rotation
+        turn = _Turn(
+            session_id=session_id,
+            task=None,
+            cancel=cancel,
+            preparation_cancelable=request.defer_rotation,
+            preparation_done=(
+                asyncio.get_running_loop().create_future() if request.defer_rotation else None
+            ),
+        )
+        self.turns[session_id] = turn
+        self._last_busy = time.monotonic()
+
         try:
-            async with contextlib.AsyncExitStack() as stack:
-                if request.defer_rotation:
-                    await stack.enter_async_context(sessions.session_reservation(session_id))
-                    request = await self._prepare_turn(session_id, request)
-                claimed_turn = request.turn_token
-                queued = self._slots.locked()
-                cancel = runner._CancelSignal()
-                turn_coro = self._run_turn(session_id, request, cancel)
-                try:
-                    task = asyncio.create_task(
-                        turn_coro,
-                        name=f"acpc.turn.{session_id}",
+            if request.defer_rotation:
+                async with sessions.session_reservation(session_id):
+                    turn.backup = self._snapshot_session(session_id)
+                    events = transcript.Transcript(sessions.transcript_path(session_id))
+                    request = runner._prepare_resumed_turn(
+                        session_id, request, events, pid=os.getpid()
                     )
-                except BaseException:
-                    turn_coro.close()
-                    raise
-                turn = _Turn(session_id=session_id, task=task, cancel=cancel)
-                self.turns[session_id] = turn
-                self._last_busy = time.monotonic()
-                return {"ok": True, "queued": queued, "max_concurrent": self.max_concurrent}
+            else:
+                sessions.mark_running(session_id, pid=os.getpid())
+                transcript.Transcript(sessions.transcript_path(session_id)).append(
+                    "state", **{"from": "starting", "to": "running"}
+                )
+            turn.claim_established = True
         except runner.ResumeRotationError as error:
-            if error.turn_token is not None:
-                runner._finalize_claimed_setup_failure(session_id, error.turn_token, error)
+            if error.turn_token is None:
+                self._rollback_preparation(session_id, turn)
+            self.turns.pop(session_id, None)
             return {
                 "ok": False,
                 "error": runner.describe_error(error),
-                "preserve_session": True,
+                "preserve_session": preparation,
             }
-        except asyncio.CancelledError as error:
-            if claimed_turn is not None:
-                runner._finalize_claimed_setup_failure(session_id, claimed_turn, error)
-            raise
         except BaseException as error:  # noqa: BLE001
-            if claimed_turn is not None:
-                runner._finalize_claimed_setup_failure(session_id, claimed_turn, error)
+            self._rollback_preparation(session_id, turn)
+            self.turns.pop(session_id, None)
             return {
                 "ok": False,
                 "error": runner.describe_error(error),
-                "preserve_session": True,
+                "preserve_session": preparation,
             }
+
+        turn_coro = self._run_accepted_turn(session_id, request, turn)
+        try:
+            task = asyncio.create_task(turn_coro, name=f"acpc.turn.{session_id}")
+        except BaseException as error:  # noqa: BLE001
+            turn_coro.close()
+            if turn.preparation_cancelable:
+                self._rollback_preparation(session_id, turn)
+            else:
+                runner._finalize(
+                    session_id,
+                    runner.TurnOutcome(state="failed", stop_reason="error", answer=""),
+                    error=error,
+                )
+            self.turns.pop(session_id, None)
+            return {
+                "ok": False,
+                "error": runner.describe_error(error),
+                "preserve_session": turn.preparation_cancelable,
+            }
+        turn.task = task
+        return {"ok": True, "queued": queued, "max_concurrent": self.max_concurrent}
+
+    async def _run_accepted_turn(
+        self, session_id: str, request: runner.TurnRequest, turn: _Turn
+    ) -> runner.TurnOutcome:
+        """Prepare and run a turn after its accepted disk claim."""
+        current_request = request
+        try:
+            if turn.preparation_cancelable:
+                current_request = await self._prepare_turn(session_id, request, turn)
+                if turn.preparation_done is not None and not turn.preparation_done.done():
+                    turn.preparation_done.set_result({"ok": True})
+                turn.backup = None
+            return await self._run_turn(session_id, current_request, turn)
+        except asyncio.CancelledError:
+            if (
+                turn.cancel.state == "cancelled"
+                and turn.phase == "preparing"
+                and turn.preparation_cancelable
+            ):
+                # No prompt task exists yet. The claimed turn is real, but its
+                # prompt did not cross ACP, so cancellation has no diagnosis and
+                # no partial answer to preserve.
+                try:
+                    expected_turn = sessions.read_meta(session_id).turns
+                except sessions.SessionError:
+                    expected_turn = current_request.turn_token
+                outcome = runner.TurnOutcome(
+                    state="cancelled",
+                    stop_reason=runner.PREPARATION_CANCELLED_REASON,
+                    answer=runner.preparation_cancelled_answer(session_id),
+                    turn_token=expected_turn,
+                )
+                if turn.preparation_done is not None and not turn.preparation_done.done():
+                    turn.preparation_done.set_result(
+                        {
+                            "ok": False,
+                            "cancelled": True,
+                            "error": runner.PREPARATION_CANCELLED_REASON,
+                        }
+                    )
+                runner._finalize(
+                    session_id,
+                    outcome,
+                    expected_turn=expected_turn,
+                )
+                self._finish(session_id, outcome)
+                return outcome
+            raise
+        except runner.ResumePreparationError as error:
+            self._rollback_preparation(session_id, turn)
+            if turn.preparation_done is not None and not turn.preparation_done.done():
+                turn.preparation_done.set_result(
+                    {"ok": False, "error": runner.describe_error(error)}
+                )
+            outcome = runner.TurnOutcome(state="failed", stop_reason="error", answer="")
+            self._finish(session_id, outcome, error=error)
+            return outcome
+        except BaseException as error:
+            if turn.preparation_cancelable and turn.phase == "preparing":
+                self._rollback_preparation(session_id, turn)
+                if turn.preparation_done is not None and not turn.preparation_done.done():
+                    turn.preparation_done.set_result(
+                        {"ok": False, "error": runner.describe_error(error)}
+                    )
+                outcome = runner.TurnOutcome(state="failed", stop_reason="error", answer="")
+                self._finish(session_id, outcome, error=error)
+                return outcome
+            raise
 
     async def _await(self, frame: dict[str, Any]) -> dict[str, Any]:
         session_id = frame.get("session_id", "")
@@ -582,6 +752,16 @@ class Daemon:
         waiter: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         turn.waiters.append(waiter)
         return {"ok": True, "outcome": await waiter}
+
+    async def _await_preparation(self, frame: dict[str, Any]) -> dict[str, Any]:
+        """Wait only for deferred resume preparation, not for the prompt."""
+        session_id = frame.get("session_id", "")
+        turn = self.turns.get(session_id)
+        if turn is None or turn.preparation_done is None:
+            return {"ok": True}
+        if turn.preparation_done.done():
+            return turn.preparation_done.result()
+        return await turn.preparation_done
 
     @staticmethod
     def _outcome_from_disk(session_id: str) -> dict[str, Any]:
@@ -705,55 +885,102 @@ class Daemon:
         )
 
     async def _prepare_turn(
-        self, session_id: str, request: runner.TurnRequest
+        self, session_id: str, request: runner.TurnRequest, turn: _Turn | None = None
     ) -> runner.TurnRequest:
-        """Verify and claim a continuation before it joins the prompt queue."""
+        """Claim, verify and prepare a continuation before its prompt."""
+        if turn is None:
+            turn = self.turns[session_id]
         events = transcript.Transcript(sessions.transcript_path(session_id))
-        conn = await self.host.ensure(request.resolution)
-        warm = self.host.adapter_sessions.get(session_id)
-        if warm is not None:
-            return runner._prepare_resumed_turn(session_id, request, events, pid=os.getpid())
-
         adapter_session_id = request.resume_adapter_session
         if adapter_session_id is None:
             raise runner.ResumePreparationError("continued turn has no adapter session id")
+        await self.host.wait_for_restore(adapter_session_id)
+        conn = await self.host.ensure(request.resolution)
+        warm = self.host.adapter_sessions.get(session_id)
+        if warm is not None:
+            return request
         client = AcpcClient(
             events,
             PermissionLevel(request.resolution.permissions or "read"),
             modes=request.resolution.entry.modes,
         )
         self.host.mux.bind(adapter_session_id, client)
+        abandon_event = asyncio.Event()
+        restore_task: asyncio.Task[Any] | None = None
         try:
             try:
-                resume_status = await runner.verify_adapter_resume(
-                    conn,
-                    client,
-                    self.host.agent_capabilities,
+                restore_task = self.host.start_restore(
                     adapter_session_id,
-                    request.cwd or os.getcwd(),
-                    session_id,
+                    runner.verify_adapter_resume(
+                        conn,
+                        client,
+                        self.host.agent_capabilities,
+                        adapter_session_id,
+                        request.cwd or os.getcwd(),
+                        session_id,
+                        abandon_event=abandon_event,
+                    ),
                 )
+                resume_status = await asyncio.shield(restore_task)
             except runner.ResumePreparationError:
                 raise
             except Exception as error:  # noqa: BLE001
                 raise runner.ResumePreparationError(str(error)) from None
-            return runner._prepare_resumed_turn(
-                session_id,
-                request,
-                events,
-                resume_status=resume_status,
-                pid=os.getpid(),
-            )
+            meta = sessions.read_meta(session_id)
+            extra = dict(meta.extra)
+            extra["resume"] = resume_status
+            with sessions.session_lock(session_id):
+                current = sessions.read_meta(session_id)
+                current.extra = extra
+                sessions.write_meta(current)
+            return request
+        except asyncio.CancelledError:
+            # ACP has no cancellation for session/load or session/resume. The
+            # local turn is cancelled now, while the tracked verification task
+            # closes its replay scope and waits for the remote restore response.
+            abandon_event.set()
+            raise
         finally:
             self.host.mux.release(adapter_session_id)
+
+    @staticmethod
+    def _snapshot_session(session_id: str) -> _PreparationBackup:
+        """Keep a failed verification able to restore the prior finished turn."""
+        files: dict[Path, str] = {}
+        directory = sessions.session_dir(session_id)
+        for path in directory.iterdir():
+            if path.name == sessions.LOCK_NAME or not path.is_file():
+                continue
+            files[path] = path.read_text(encoding="utf-8")
+        return _PreparationBackup(files)
+
+    @staticmethod
+    def _rollback_preparation(session_id: str, turn: _Turn) -> None:
+        """Undo a failed preparation claim while its daemon is still alive."""
+        backup = turn.backup
+        if backup is None:
+            return
+        directory = sessions.session_dir(session_id)
+        with sessions.session_lock(session_id):
+            for path in directory.iterdir():
+                if path.name == sessions.LOCK_NAME or not path.is_file():
+                    continue
+                if path not in backup.files:
+                    path.unlink()
+            for path, content in backup.files.items():
+                from acpc import paths
+
+                paths.atomic_write(path, content)
+        turn.backup = None
 
     async def _run_turn(
         self,
         session_id: str,
         request: runner.TurnRequest,
-        cancel: runner._CancelSignal,
+        turn: _Turn,
     ) -> runner.TurnOutcome:
         """Run one turn on the warm adapter and finalize it on disk."""
+        cancel = turn.cancel
         async with self._slots:
             events = transcript.Transcript(sessions.transcript_path(session_id))
             outcome = runner.TurnOutcome(state="failed", stop_reason="error", answer="")
@@ -763,10 +990,10 @@ class Daemon:
             # so without this mark a failure would quote a stranger's stderr.
             log_from = runner.adapter_log_offset(self.target)
             try:
-                if not request.defer_rotation and not request.resume_prepared:
+                if not turn.claim_established:
                     sessions.mark_running(session_id, pid=os.getpid())
                     events.append("state", **{"from": "starting", "to": "running"})
-                outcome = await self._drive(session_id, request, events, cancel)
+                outcome = await self._drive(session_id, request, events, turn)
             except runner.ResumePreparationError as caught:
                 # A deferred continuation has not rotated the session yet, so
                 # verification failure must leave its finished state untouched.
@@ -785,16 +1012,30 @@ class Daemon:
                     if ended_by_acpc
                     else caught
                 )
+                preparing_cancel = (
+                    isinstance(caught, asyncio.CancelledError)
+                    and turn.cancel.state == "cancelled"
+                    and turn.phase == "preparing"
+                    and turn.preparation_cancelable
+                )
+                if preparing_cancel:
+                    error = None
                 outcome = runner.TurnOutcome(
-                    state=cancel.state or "failed",
-                    stop_reason=cancel.stop_reason or "error",
-                    answer="",
+                    state=("cancelled" if preparing_cancel else turn.cancel.state or "failed"),
+                    stop_reason=(
+                        runner.PREPARATION_CANCELLED_REASON
+                        if preparing_cancel
+                        else turn.cancel.stop_reason or "error"
+                    ),
+                    answer=(
+                        runner.preparation_cancelled_answer(session_id) if preparing_cancel else ""
+                    ),
                     turn_token=request.turn_token,
                 )
                 runner._finalize(
                     session_id,
                     outcome,
-                    error=error,
+                    error=None if preparing_cancel else error,
                     adapter_log_from=log_from,
                     expected_turn=outcome.turn_token,
                 )
@@ -802,7 +1043,7 @@ class Daemon:
                 # rather than on the next turn's ensure().
                 with contextlib.suppress(Exception):
                     await self.host.reset_if_dead()
-                if isinstance(caught, asyncio.CancelledError):
+                if isinstance(caught, asyncio.CancelledError) and not preparing_cancel:
                     raise
             else:
                 runner._finalize(
@@ -825,9 +1066,10 @@ class Daemon:
         session_id: str,
         request: runner.TurnRequest,
         events: transcript.Transcript,
-        cancel: runner._CancelSignal,
+        turn: _Turn,
     ) -> runner.TurnOutcome:
         """Prompt the adapter, reusing this session's warm ACP session if it has one."""
+        cancel = turn.cancel
         conn = await self.host.ensure(request.resolution)
         level = PermissionLevel(request.resolution.permissions or "read")
         client = AcpcClient(
@@ -839,6 +1081,7 @@ class Daemon:
         )
 
         turn_error: BaseException | None = None
+        prompt_task: asyncio.Task[Any] | None = None
         warm = self.host.adapter_sessions.get(session_id)
         if warm is not None:
             # The adapter still holds this session, so its own history is
@@ -874,19 +1117,34 @@ class Daemon:
             adapter_session_id = session.session_id
             client.capture_advertised(session)
 
-        self.host.adapter_sessions[session_id] = adapter_session_id
         self.host.mux.bind(adapter_session_id, client)
         try:
             try:
                 await runner.apply_call_options(conn, adapter_session_id, request)
                 delivery = runner.register_prompt_delivery(
-                    conn, session_id, adapter_session_id, request.prompt
+                    conn,
+                    session_id,
+                    adapter_session_id,
+                    request.prompt,
+                    on_delivered=lambda: self._prompt_delivered(
+                        session_id, adapter_session_id, turn
+                    ),
                 )
+                if cancel.requested.is_set() and request.resume_prepared:
+                    return runner.TurnOutcome(
+                        state="cancelled",
+                        stop_reason=runner.PREPARATION_CANCELLED_REASON,
+                        answer=runner.preparation_cancelled_answer(session_id),
+                        adapter_session_id=adapter_session_id,
+                        turn_token=request.turn_token,
+                    )
                 prompt_task = asyncio.create_task(
                     conn.prompt(session_id=adapter_session_id, prompt=[text_block(request.prompt)])
                 )
             except BaseException as error:
                 if request.turn_token is None:
+                    raise
+                if isinstance(error, asyncio.CancelledError):
                     raise
                 raise runner.ResumeSetupError(
                     runner.describe_error(error), turn_token=request.turn_token
@@ -906,6 +1164,10 @@ class Daemon:
                 turn_error = caught if turn_error is None else turn_error
                 stop_reason = "error"
         finally:
+            if prompt_task is not None and not prompt_task.done():
+                prompt_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await prompt_task
             self.host.mux.release(adapter_session_id)
             client.flush()
 
@@ -928,6 +1190,11 @@ class Daemon:
             delivery_record_incomplete=delivery.delivery_record_incomplete,
             turn_token=request.turn_token,
         )
+
+    def _prompt_delivered(self, session_id: str, adapter_session_id: str, turn: _Turn) -> None:
+        """Enter the running phase only after the outgoing prompt was observed."""
+        turn.phase = "running"
+        self.host.adapter_sessions[session_id] = adapter_session_id
 
     def _finish(
         self, session_id: str, outcome: runner.TurnOutcome, *, error: BaseException | None = None

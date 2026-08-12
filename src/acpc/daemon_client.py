@@ -54,6 +54,10 @@ class DaemonConnection(Protocol):
         """Block until the turn finishes and return its outcome."""
         ...
 
+    async def await_preparation(self, session_id: str) -> dict[str, Any]:
+        """Block until a deferred continuation has claimed its next turn."""
+        ...
+
     async def cancel(self, session_id: str) -> dict[str, Any]:
         """Ask the daemon to cancel a session's in-flight turn."""
         ...
@@ -95,6 +99,9 @@ class _SocketDaemon:
 
     async def await_turn(self, session_id: str) -> dict[str, Any]:
         return await self.call({"op": "await", "session_id": session_id})
+
+    async def await_preparation(self, session_id: str) -> dict[str, Any]:
+        return await self.call({"op": "await_preparation", "session_id": session_id})
 
     async def cancel(self, session_id: str) -> dict[str, Any]:
         return await self.call({"op": "cancel", "session_id": session_id})

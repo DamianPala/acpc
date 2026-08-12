@@ -32,6 +32,25 @@ NDJSON_STREAM_LIMIT = 10_485_760  # 10 MB; asyncio default (64 KB) too small for
 _EXIT_TIMEOUT = 1.0
 
 
+async def _close_acp_connection(conn: ClientSideConnection) -> None:
+    """Stop ACP reception before its dispatcher queue is closed.
+
+    ACP 0.13 closes the notification queue in ``Connection.close`` before it
+    cancels the receive loop. A frame arriving in that interval is then
+    published to the closed queue and logs a spurious receive-loop failure.
+    The receive task is an implementation seam of the pinned ACP transport;
+    cancelling it first preserves the adapter connection's normal teardown.
+    """
+    raw_connection = getattr(conn, "_conn", None)
+    receive_task = getattr(raw_connection, "_recv_task", None)
+    if isinstance(receive_task, asyncio.Task) and not receive_task.done():
+        receive_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await receive_task
+    with contextlib.suppress(Exception):
+        await conn.close()
+
+
 async def _forward_stderr(stream: asyncio.StreamReader) -> None:
     """Forward adapter stderr to acpc's stderr while the adapter is running."""
     try:
@@ -118,8 +137,7 @@ async def spawn_adapter(
         yield conn, process
     finally:
         # 1. Close ACP connection (protocol-level shutdown)
-        with contextlib.suppress(Exception):
-            await conn.close()
+        await _close_acp_connection(conn)
 
         # 2. Graceful: close stdin to signal adapter
         if process.stdin is not None:

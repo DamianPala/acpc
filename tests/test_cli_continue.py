@@ -16,7 +16,7 @@ import pytest
 from click.testing import CliRunner
 
 from acpc import cli as cli_module
-from acpc import daemon_client, runner, sessions, transcript, vocab
+from acpc import daemon_client, ipc, proc, runner, sessions, transcript, vocab
 from acpc.cli import main
 
 MOCK_AGENT_SCRIPT = str(Path(__file__).with_name("mock_agent.py"))
@@ -88,6 +88,134 @@ def continue_subprocess(
     )
 
 
+def stop_session_daemon(session_id: str) -> None:
+    resolution = runner.resolution_from_session(sessions.read_meta(session_id))
+
+    async def stop_target() -> None:
+        connection = await daemon_client.connect(runner.call_target(resolution))
+        assert connection is not None
+        try:
+            await connection.stop()
+        finally:
+            await connection.close()
+
+    asyncio.run(stop_target())
+
+
+def wait_for_daemon_stop(resolution: Any, timeout: float = 10.0) -> None:
+    target = runner.call_target(resolution)
+
+    async def poll() -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            connection = await daemon_client.connect(target)
+            if connection is None:
+                return
+            await connection.close()
+            await asyncio.sleep(0.02)
+        pytest.fail(f"daemon for {target} did not stop")
+
+    asyncio.run(poll())
+
+
+def wait_for_preparing(cli: CliRunner, session_id: str, timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        result = invoke(cli, "status", session_id, "--json")
+        if result.exit_code == vocab.EXIT_OK and json.loads(result.stdout)["state"] == "preparing":
+            return
+        time.sleep(0.05)
+    pytest.fail(f"session {session_id} never became preparing")
+
+
+def wait_for_path(path: Path, timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return
+        time.sleep(0.02)
+    pytest.fail(f"file barrier was not reached: {path}")
+
+
+def wait_for_process_dead(pid: int, process_start_time: str | None, timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proc.process_liveness(pid, process_start_time) == "dead":
+            return
+        time.sleep(0.02)
+    pytest.fail(f"process {pid} did not become dead")
+
+
+def wait_for_process_exit(process: subprocess.Popen[str], timeout: float = 10.0) -> int:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        returncode = process.poll()
+        if returncode is not None:
+            return returncode
+        time.sleep(0.02)
+    pytest.fail("process did not exit")
+
+
+def watch_for_file_open(path: Path) -> int:
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.inotify_init1.argtypes = [ctypes.c_int]
+    libc.inotify_init1.restype = ctypes.c_int
+    libc.inotify_add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+    libc.inotify_add_watch.restype = ctypes.c_int
+    fd = libc.inotify_init1(os.O_NONBLOCK)
+    if fd < 0:
+        raise OSError(ctypes.get_errno(), "inotify_init1 failed")
+    watch = libc.inotify_add_watch(fd, os.fsencode(path.parent), 0x20)
+    if watch < 0:
+        os.close(fd)
+        raise OSError(ctypes.get_errno(), f"inotify_add_watch failed for {path.parent}")
+    return fd
+
+
+def wait_for_file_open(watch_fd: int, path: Path, timeout: float = 10.0) -> None:
+    import select
+    import struct
+
+    poller = select.poll()
+    poller.register(watch_fd, select.POLLIN)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
+        if not poller.poll(remaining_ms):
+            break
+        raw = os.read(watch_fd, 4096)
+        offset = 0
+        while offset + 16 <= len(raw):
+            _watch, mask, _cookie, name_length = struct.unpack_from("iIII", raw, offset)
+            name_start = offset + 16
+            name = raw[name_start : name_start + name_length].split(b"\0", 1)[0]
+            if mask & 0x20 and name == path.name.encode():
+                return
+            offset = name_start + name_length
+    pytest.fail(f"no open event for {path}")
+
+
+def wait_for_daemon_restore_settled(session_id: str, timeout: float = 10.0) -> None:
+    resolution = runner.resolution_from_session(sessions.read_meta(session_id))
+
+    async def wait() -> None:
+        connection = await daemon_client.connect(runner.call_target(resolution))
+        assert connection is not None
+        deadline = time.monotonic() + timeout
+        try:
+            while time.monotonic() < deadline:
+                if not (await connection.status()).get("restoring"):
+                    return
+                await asyncio.sleep(0.02)
+        finally:
+            await connection.close()
+        pytest.fail("daemon restore flight did not settle")
+
+    asyncio.run(wait())
+
+
 def run_cli_until_early_line(*args: str) -> tuple[int, str, str, str, bool]:
     process = subprocess.Popen(
         [sys.executable, "-c", "from acpc.cli import main; main()", *args],
@@ -152,6 +280,470 @@ def test_continue_accepts_a_suffixed_timeout(cli: CliRunner) -> None:
 
     assert result.exit_code == vocab.EXIT_OK
     assert "waited 2s" in result.stdout
+
+
+def test_status_exposes_daemon_resume_preparation(cli: CliRunner, live_daemon: None) -> None:
+    session_id = start_session(cli, "turn one")
+    stop_session_daemon(session_id)
+    cli_env = os.environ.copy()
+    cli_env["ACPC_MOCK_RESUME_DELAY"] = "1"
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "from acpc.cli import main; raise SystemExit(main())",
+            "continue",
+            session_id,
+            "turn two",
+            "--quiet",
+        ],
+        env=cli_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        wait_for_preparing(cli, session_id)
+        assert process.poll() is None
+    finally:
+        process.wait(timeout=10)
+
+    assert process.returncode == vocab.EXIT_OK
+    assert sessions.load(session_id).state == "done"
+
+
+def test_stop_during_daemon_preparation_is_cancelled_and_resumable(
+    cli: CliRunner,
+    live_daemon: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session_id = start_session(cli, "turn one")
+    stop_session_daemon(session_id)
+    release = Path(os.environ["ACPC_HOME"]) / "release-before-prompt"
+    ready = Path(os.environ["ACPC_HOME"]) / "before-prompt-ready"
+    monkeypatch.setenv("ACPC_MOCK_BLOCK_BEFORE_PROMPT", str(release))
+    monkeypatch.setenv("ACPC_MOCK_BLOCK_BEFORE_PROMPT_READY", str(ready))
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "from acpc.cli import main; raise SystemExit(main())",
+            "continue",
+            session_id,
+            "turn two",
+            "--quiet",
+        ],
+        env=os.environ.copy(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        wait_for_path(ready)
+        wait_for_preparing(cli, session_id)
+
+        stopped = invoke(cli, "stop", session_id, "--json")
+
+        assert stopped.exit_code == vocab.EXIT_OK, stopped.stderr
+        assert json.loads(stopped.stdout)["state"] == "cancelled"
+        answer = sessions.answer_path(session_id).read_text(encoding="utf-8")
+        assert answer == runner.preparation_cancelled_answer(session_id)
+        release.touch()
+        process.wait(timeout=10)
+        assert process.returncode != vocab.EXIT_OK
+
+        resumed = invoke(cli, "continue", session_id, "echo:after preparation cancel", "--quiet")
+        assert resumed.exit_code == vocab.EXIT_OK, resumed.stderr
+        assert "after preparation cancel" in resumed.stdout
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=10)
+
+
+def test_ctrl_c_during_daemon_restore_cancels_without_a_diagnosis(
+    cli: CliRunner, live_daemon: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id = start_session(cli, "turn one")
+    stop_session_daemon(session_id)
+    monkeypatch.setenv("ACPC_MOCK_RESUME_DELAY", "5")
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "from acpc.cli import main; raise SystemExit(main())",
+            "continue",
+            session_id,
+            "turn two",
+            "--quiet",
+        ],
+        env=os.environ.copy(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    wait_for_preparing(cli, session_id)
+    process.send_signal(signal.SIGINT)
+    process.wait(timeout=10)
+
+    assert process.returncode == vocab.EXIT_CANCELLED
+    assert sessions.load(session_id).state == "cancelled"
+    assert "no prompt was sent" in sessions.answer_path(session_id).read_text(encoding="utf-8")
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux inotify semantics")
+def test_ctrl_c_during_daemon_routing_cancels_a_new_turn_without_overwriting_history(
+    cli: CliRunner, live_daemon: None
+) -> None:
+    import fcntl
+
+    session_id = start_session(cli, "turn one")
+    previous_answer = sessions.answer_path(session_id).read_text(encoding="utf-8")
+    stop_session_daemon(session_id)
+    resolution = runner.resolution_from_session(sessions.read_meta(session_id))
+    wait_for_daemon_stop(resolution)
+    start_lock = ipc.lock_path_for_target(runner.call_target(resolution))
+    holder = start_lock.open("a+b")
+    fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    watch_fd = watch_for_file_open(start_lock)
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "from acpc.cli import main; raise SystemExit(main())",
+            "continue",
+            session_id,
+            "turn two",
+        ],
+        env=os.environ.copy(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        wait_for_file_open(watch_fd, start_lock)
+        process.send_signal(signal.SIGINT)
+        returncode = wait_for_process_exit(process)
+        stdout, stderr = process.communicate(timeout=10)
+        assert returncode == vocab.EXIT_CANCELLED, (stdout, stderr)
+        final = sessions.read_meta(session_id)
+        assert final.state == "cancelled"
+        assert final.turns == 2
+        assert final.stop_reason == runner.PREPARATION_CANCELLED_REASON
+        assert sessions.answer_path(session_id).read_text(encoding="utf-8") == (
+            runner.preparation_cancelled_answer(session_id)
+        )
+        assert sessions.turn_path(session_id, "answer", 1).read_text(encoding="utf-8") == (
+            previous_answer
+        )
+    finally:
+        os.close(watch_fd)
+        fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+        holder.close()
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=10)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux inotify semantics")
+def test_sigterm_during_daemon_routing_cancels_a_new_turn_and_exits_143(
+    cli: CliRunner, live_daemon: None
+) -> None:
+    import fcntl
+
+    session_id = start_session(cli, "turn one")
+    previous_answer = sessions.answer_path(session_id).read_text(encoding="utf-8")
+    stop_session_daemon(session_id)
+    resolution = runner.resolution_from_session(sessions.read_meta(session_id))
+    wait_for_daemon_stop(resolution)
+    start_lock = ipc.lock_path_for_target(runner.call_target(resolution))
+    holder = start_lock.open("a+b")
+    fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    watch_fd = watch_for_file_open(start_lock)
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "from acpc.cli import main; raise SystemExit(main())",
+            "continue",
+            session_id,
+            "turn two",
+        ],
+        env=os.environ.copy(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        wait_for_file_open(watch_fd, start_lock)
+        process.send_signal(signal.SIGTERM)
+        returncode = wait_for_process_exit(process)
+        stdout, stderr = process.communicate(timeout=10)
+        assert returncode == vocab.EXIT_SIGTERM, (stdout, stderr)
+        final = sessions.read_meta(session_id)
+        assert final.state == "cancelled"
+        assert final.turns == 2
+        assert final.stop_reason == runner.PREPARATION_CANCELLED_REASON
+        assert sessions.answer_path(session_id).read_text(encoding="utf-8") == (
+            runner.preparation_cancelled_answer(session_id)
+        )
+        assert sessions.turn_path(session_id, "answer", 1).read_text(encoding="utf-8") == (
+            previous_answer
+        )
+    finally:
+        os.close(watch_fd)
+        fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+        holder.close()
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=10)
+
+
+def test_cancelled_restore_drops_late_frame_after_mux_release(
+    cli: CliRunner, live_daemon: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    restore_release = Path(os.environ["ACPC_HOME"]) / "restore-release"
+    restore_ready = Path(os.environ["ACPC_HOME"]) / "restore-ready"
+    late_ready = Path(os.environ["ACPC_HOME"]) / "late-frame-ready"
+    monkeypatch.setenv("ACPC_MOCK_BLOCK_DURING_RESTORE", str(restore_release))
+    monkeypatch.setenv("ACPC_MOCK_BLOCK_DURING_RESTORE_READY", str(restore_ready))
+    monkeypatch.setenv("ACPC_MOCK_LATE_RESTORE_FRAME_READY", str(late_ready))
+
+    session_id = start_session(cli, "turn one")
+    stop_session_daemon(session_id)
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "from acpc.cli import main; raise SystemExit(main())",
+            "continue",
+            session_id,
+            "turn two",
+            "--quiet",
+        ],
+        env=os.environ.copy(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        wait_for_path(restore_ready)
+        stopped = invoke(cli, "stop", session_id, "--json")
+        assert stopped.exit_code == vocab.EXIT_OK, stopped.stderr
+        assert json.loads(stopped.stdout)["state"] == "cancelled"
+        assert sessions.answer_path(session_id).read_text(encoding="utf-8") == (
+            runner.preparation_cancelled_answer(session_id)
+        )
+        restore_release.touch()
+        process.wait(timeout=10)
+        assert process.returncode != vocab.EXIT_OK
+        wait_for_daemon_restore_settled(session_id)
+
+        new_session = invoke(cli, "run", "mock", "echo:unrelated", "--quiet", "--json")
+        assert new_session.exit_code == vocab.EXIT_OK, new_session.stderr
+        wait_for_path(late_ready)
+        assert "9999" not in sessions.transcript_path(session_id).read_text(encoding="utf-8")
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=10)
+
+
+def test_continue_waits_for_cancelled_restore_to_settle_before_preparing(
+    cli: CliRunner, live_daemon: None, state_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    restore_release = state_root / "restore-release"
+    restore_ready = state_root / "restore-ready"
+    event_file = state_root / "adapter-events.ndjson"
+    session_id = start_session(cli, "turn one")
+    monkeypatch.setenv("ACPC_MOCK_BLOCK_DURING_RESTORE", str(restore_release))
+    monkeypatch.setenv("ACPC_MOCK_BLOCK_DURING_RESTORE_READY", str(restore_ready))
+    monkeypatch.setenv("ACPC_MOCK_EVENT_FILE", str(event_file))
+
+    stop_session_daemon(session_id)
+    first = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "from acpc.cli import main; raise SystemExit(main())",
+            "continue",
+            session_id,
+            "first restore",
+            "--quiet",
+        ],
+        env=os.environ.copy(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    second: subprocess.Popen[str] | None = None
+    try:
+        wait_for_path(restore_ready)
+        stopped = invoke(cli, "stop", session_id, "--json")
+        assert stopped.exit_code == vocab.EXIT_OK, stopped.stderr
+        first.wait(timeout=10)
+        assert first.returncode != vocab.EXIT_OK
+
+        second = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "from acpc.cli import main; raise SystemExit(main())",
+                "continue",
+                session_id,
+                "echo:after cancel",
+                "--quiet",
+            ],
+            env=os.environ.copy(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            meta = sessions.read_meta(session_id)
+            if meta.turns == 3 and meta.state == "running":
+                break
+            time.sleep(0.02)
+        else:
+            pytest.fail("second continue did not claim its turn")
+        assert "prompt:" not in event_file.read_text(encoding="utf-8")
+
+        restore_release.touch()
+        stdout, stderr = second.communicate(timeout=10)
+        assert second.returncode == vocab.EXIT_OK, stderr
+        assert "after cancel" in stdout
+
+        events = event_file.read_text(encoding="utf-8").splitlines()
+        first_end = next(
+            index for index, value in enumerate(events) if value.startswith("restore-end:")
+        )
+        second_start = next(
+            index
+            for index, value in enumerate(events[first_end + 1 :], first_end + 1)
+            if value.startswith("restore-start:")
+        )
+        prompt = next(
+            index
+            for index, value in enumerate(events[second_start + 1 :], second_start + 1)
+            if value.endswith(":echo:after cancel")
+        )
+        assert first_end < second_start < prompt
+
+        adapter_session_id = sessions.read_meta(session_id).adapter_session_id
+        assert adapter_session_id is not None
+        store = json.loads((state_root / "mock-sessions.json").read_text(encoding="utf-8"))
+        assert "reloaded" in store[adapter_session_id]["history"]
+    finally:
+        if second is not None and second.poll() is None:
+            second.kill()
+            second.wait(timeout=10)
+        if first.poll() is None:
+            first.kill()
+            first.wait(timeout=10)
+
+
+def test_daemon_death_during_resume_is_orphaned_without_a_preparation_marker(
+    cli: CliRunner, live_daemon: None, state_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id = start_session(cli, "turn one")
+    stop_session_daemon(session_id)
+    restore_release = state_root / "restore-release"
+    restore_ready = state_root / "restore-ready"
+    monkeypatch.setenv("ACPC_MOCK_BLOCK_DURING_RESTORE", str(restore_release))
+    monkeypatch.setenv("ACPC_MOCK_BLOCK_DURING_RESTORE_READY", str(restore_ready))
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "from acpc.cli import main; raise SystemExit(main())",
+            "continue",
+            session_id,
+            "turn two",
+            "--quiet",
+        ],
+        env=os.environ.copy(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        wait_for_path(restore_ready)
+        wait_for_preparing(cli, session_id)
+        resolution = runner.resolution_from_session(sessions.read_meta(session_id))
+
+        async def daemon_pid() -> int:
+            connection = await daemon_client.connect(runner.call_target(resolution))
+            assert connection is not None
+            try:
+                return int((await connection.status())["pid"])
+            finally:
+                await connection.close()
+
+        pid = asyncio.run(daemon_pid())
+        daemon_meta = sessions.read_meta(session_id)
+        assert daemon_meta.pid == pid
+        assert daemon_meta.state == "running"
+
+        # Remove the client that is awaiting the preparation before killing
+        # the daemon; otherwise it can race orphan detection to finalize the
+        # session as failed after its connection breaks.
+        process.kill()
+        process.wait(timeout=10)
+        assert sessions.read_meta(session_id).state == "running"
+
+        os.kill(pid, signal.SIGKILL)
+        wait_for_process_dead(pid, daemon_meta.process_start_time)
+        assert sessions.load(session_id).state == "orphaned"
+        assert "preparing" not in sessions.read_meta(session_id).to_dict()
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=10)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file-lock semantics")
+def test_daemon_reservation_contention_does_not_block_unrelated_sessions(
+    cli: CliRunner, live_daemon: None
+) -> None:
+    import fcntl
+
+    session_id = start_session(cli, "turn one")
+    lock_path = sessions.session_dir(session_id) / sessions.LOCK_NAME
+    holder = lock_path.open("r+b")
+    fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    blocked: subprocess.Popen[str] | None = None
+    try:
+        blocked = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "from acpc.cli import main; raise SystemExit(main())",
+                "continue",
+                session_id,
+                "turn two",
+                "--quiet",
+            ],
+            env=os.environ.copy(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        assert wait_for_process_exit(blocked) == vocab.EXIT_AGENT_ERROR
+        _blocked_stdout, blocked_stderr = blocked.communicate(timeout=10)
+        assert "wait for the current turn" in blocked_stderr
+        assert sessions.read_meta(session_id).state == "done"
+
+        result = invoke(cli, "run", "mock", "echo:unrelated", "--quiet", "--json")
+        assert result.exit_code == vocab.EXIT_OK, result.stderr
+        assert "unrelated" in result.stdout
+    finally:
+        fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+        holder.close()
+        if blocked is not None and blocked.poll() is None:
+            blocked.kill()
+        if blocked is not None:
+            blocked.wait(timeout=10)
 
 
 def test_blocking_continue_emits_the_early_line_before_a_slow_turn_finishes(

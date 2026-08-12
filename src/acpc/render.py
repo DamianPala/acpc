@@ -440,12 +440,17 @@ def format_log_footer(
     return "-- " + " | ".join(parts)
 
 
+def _status_active(meta: sessions.SessionMeta) -> bool:
+    """Include the daemon's ephemeral preparation view in active status."""
+    return meta.is_active or meta.state == "preparing"
+
+
 def _status_selection(
     sessions_in: Sequence[sessions.SessionMeta], *, all_sessions: bool
 ) -> list[sessions.SessionMeta]:
     if all_sessions:
         return list(sessions_in)
-    active = [meta for meta in sessions_in if meta.is_active]
+    active = [meta for meta in sessions_in if _status_active(meta)]
     # SPEC `status`: the 5 most recent *finished*. The incoming order is by
     # start time, under which a long run that finished last is cut while a
     # shorter one started after it survives — so this bucket re-sorts by
@@ -489,7 +494,7 @@ def _status_timing(meta: sessions.SessionMeta, *, clock: Clock | None) -> tuple[
 
 
 def _idle_seconds(meta: sessions.SessionMeta, *, now: float) -> float | None:
-    if not meta.is_active:
+    if not _status_active(meta):
         return None
     last_event = transcript.last_event_time(sessions.transcript_path(meta.session_id))
     if last_event is None:
@@ -502,7 +507,7 @@ def daemon_idle_seconds(
 ) -> float | None:
     """Return the target's idle age, or ``None`` when it is not defined."""
     target_sessions = [meta for meta in sessions_in if meta.target == target]
-    if any(meta.is_active for meta in target_sessions):
+    if any(_status_active(meta) for meta in target_sessions):
         return None
     last_finished = max(
         (meta.finished_at for meta in target_sessions if meta.finished_at is not None),
@@ -526,7 +531,7 @@ def render_status_list(
         header=("id", "entry", "model", "state", "runtime", "idle", "name", "prompt"),
         separator="  ",
     )
-    running_count = sum(meta.is_active for meta in sessions_in)
+    running_count = sum(_status_active(meta) for meta in sessions_in)
     finished_count = len([meta for meta in sessions_in if meta.is_finished])
     if all_sessions:
         footer = f"-- {running_count} running · {len(sessions_in)} sessions"

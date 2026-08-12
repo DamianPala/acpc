@@ -1573,15 +1573,18 @@ def stop_command(selector: str, json_mode: bool) -> None:
     """Stop a running session; it stays resumable with ``acpc continue``.
 
     Cancels the turn in flight (ACP ``session/cancel``) and waits up to 10s for the
-    ack; past that the connection is torn down anyway. Transcript, meta and the
-    partial answer stay on disk for post-mortem. Stopping an already-finished
-    session is a successful no-op that reports the state it found; an unknown id is
-    a usage error.
+    ack; past that the connection is torn down anyway. During a daemon-owned
+    continuation preparation it cancels the preparation and writes a no-prompt
+    placeholder. Transcript, meta and the partial answer stay on disk for
+    post-mortem. Stopping an already-finished session is a successful no-op that
+    reports the state it found; an unknown id is a usage error.
 
     Example: ``acpc stop q7x2``
     """
     meta = _load_view_session(selector)
-    if meta.is_active:
+    if not meta.is_active:
+        meta = _status_view_meta(meta)
+    if meta.is_active or meta.state == "preparing":
         meta = _cancel_session(meta)
 
     payload = {
@@ -1674,6 +1677,31 @@ def _load_view_session(selector: str) -> sessions.SessionMeta:
         raise UsageProblem(str(error)) from None
 
 
+async def _collect_preparing_sessions(targets: Sequence[str]) -> set[str]:
+    """Read the daemon's in-memory preparation register without starting it."""
+    preparing: set[str] = set()
+    for target in set(targets):
+        daemon = await daemon_client.connect(target)
+        if daemon is None:
+            continue
+        try:
+            reply = await daemon.status()
+        finally:
+            await daemon.close()
+        values = reply.get("preparing", [])
+        if isinstance(values, list):
+            preparing.update(value for value in values if isinstance(value, str))
+    return preparing
+
+
+def _status_view_meta(meta: sessions.SessionMeta) -> sessions.SessionMeta:
+    """Overlay the daemon-only ``preparing`` phase for status rendering."""
+    if meta.target is None:
+        return meta
+    preparing = asyncio.run(_collect_preparing_sessions([meta.target]))
+    return replace(meta, state="preparing") if meta.session_id in preparing else meta
+
+
 _LOG_DEFAULT_TAIL = 20
 # SPEC `log --follow`: a bounded replay for orientation, the `tail -f` prior.
 _FOLLOW_DEFAULT_TAIL = 10
@@ -1760,7 +1788,9 @@ def status_command(selector: str | None, all_sessions: bool, json_mode: bool) ->
     With no id and no ``--all``: every running session plus the 5 most recent
     finished ones. With an id: that session's vitals. State is verified against the
     process behind it, so a ``running`` session whose process is gone reads
-    ``orphaned`` rather than a stale ``running``.
+    ``orphaned`` rather than a stale ``running``. A daemon-owned continuation in
+    its pre-prompt window is shown as ``preparing`` from the daemon's in-memory
+    register.
 
     Example: ``acpc status <session-id> --json``
     """
@@ -1769,6 +1799,7 @@ def status_command(selector: str | None, all_sessions: bool, json_mode: bool) ->
 
     if selector is not None:
         meta = _load_view_session(selector)
+        meta = _status_view_meta(meta)
         if json_mode:
             _write_stdout(json.dumps(render.status_detail_json(meta), ensure_ascii=False) + "\n")
         else:
@@ -1776,6 +1807,11 @@ def status_command(selector: str | None, all_sessions: bool, json_mode: bool) ->
         return
 
     metas = sessions.list_sessions()
+    targets = [meta.target for meta in metas if meta.target is not None]
+    preparing = asyncio.run(_collect_preparing_sessions(targets)) if targets else set()
+    metas = [
+        replace(meta, state="preparing") if meta.session_id in preparing else meta for meta in metas
+    ]
     if json_mode:
         _write_stdout(
             json.dumps(
@@ -2666,29 +2702,40 @@ def steer_command(
     """Interrupt the running turn and redirect the session in one verb.
 
     Cancels the turn in flight (ACP session/cancel), waits for the ack, then
-    starts the next turn with the instruction under a fixed preamble. The
-    interrupted turn's partial answer is kept as that turn's answer file. A
-    finished session is a usage error: there is no turn to interrupt, and the
-    follow-up verb for it is ``acpc continue``.
+    starts the next turn with the instruction under a fixed preamble. If a
+    daemon-owned ``continue`` is still preparing, no prompt has happened: acpc
+    cancels that preparation, reports that nothing was interrupted, and sends
+    the instruction plainly. The interrupted turn's partial answer is kept as
+    that turn's answer file. A finished session is a usage error: there is no
+    turn to interrupt, and the follow-up verb for it is ``acpc continue``.
 
     Example: ``acpc steer x7k2 "Stop editing; diagnose only"``
     """
     instruction = _read_prompt(instruction_text, prompt_file)
     meta = _load_view_session(selector)
     if not meta.is_active:
+        meta = _status_view_meta(meta)
+    if not meta.is_active and meta.state != "preparing":
         raise UsageProblem(
             f"session {meta.session_id} is {meta.state} — there is no turn to interrupt; "
             f"the follow-up verb for a finished session is: acpc continue {meta.session_id}"
         )
 
     meta = _cancel_session(meta)
-    interrupted = meta.state == "cancelled"
+    interrupted = (
+        meta.state == "cancelled" and meta.stop_reason != runner.PREPARATION_CANCELLED_REASON
+    )
     if not interrupted and not quiet:
         # SPEC `steer`: nothing was interrupted, so the preamble would lie.
-        _echo_metadata(
-            "-- the turn finished on its own before the cancel landed; "
-            "continuing as a plain follow-up"
-        )
+        if meta.stop_reason == runner.PREPARATION_CANCELLED_REASON:
+            _echo_metadata(
+                "-- nothing was interrupted during preparation; continuing as a plain follow-up"
+            )
+        else:
+            _echo_metadata(
+                "-- the turn finished on its own before the cancel landed; "
+                "continuing as a plain follow-up"
+            )
 
     _dispatch_follow_up(
         meta,

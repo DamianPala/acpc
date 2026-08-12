@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -17,7 +18,7 @@ import pytest
 from acp import RequestError, text_block
 from acp.schema import UserMessageChunk
 
-from acpc import cache, runner, sessions, vocab
+from acpc import cache, daemon_client, runner, sessions, vocab
 from acpc.client import AcpcClient
 from acpc.permissions import PermissionLevel
 from acpc.registry import AgentRegistry
@@ -662,6 +663,39 @@ def test_sigterm_on_the_direct_path_cancels_too_but_exits_143() -> None:
 
     assert outcome.exit_code == vocab.EXIT_SIGTERM
     assert sessions.read_meta(session_id).state == "cancelled"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal semantics")
+def test_sigterm_after_daemon_route_resolution_detaches_before_the_turn_finishes(
+    live_daemon: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_ensure_daemon = daemon_client.ensure_daemon
+
+    async def ensure_and_signal(target: str):
+        daemon = await real_ensure_daemon(target)
+        asyncio.get_running_loop().call_soon(os.kill, os.getpid(), signal.SIGTERM)
+        return daemon
+
+    monkeypatch.setattr(daemon_client, "ensure_daemon", ensure_and_signal)
+    resolution = resolve()
+    assert resolution.mode is not None
+    resolution = replace(resolution, mode_spec=resolution.entry.modes[resolution.mode])
+    meta = sessions.create_session(
+        entry=resolution.entry.entry,
+        base_adapter=resolution.entry.base_adapter,
+        prompt="slow:30 sigterm route boundary probe",
+        resolution=runner.resolution_payload(resolution, cwd=None),
+        target=runner.call_target(resolution),
+    )
+    request = runner.TurnRequest(
+        resolution=resolution, prompt="slow:30 sigterm route boundary probe"
+    )
+    session_id = meta.session_id
+    outcome = runner.execute_turn(session_id, request)
+
+    assert outcome.state == "detached"
+    assert outcome.exit_code == vocab.EXIT_SIGTERM
+    assert sessions.read_meta(session_id).state == "running"
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal semantics")

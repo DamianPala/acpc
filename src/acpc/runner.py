@@ -267,6 +267,8 @@ async def verify_adapter_resume(
     adapter_session_id: str,
     cwd: str,
     session_id: str,
+    *,
+    abandon_event: asyncio.Event | None = None,
 ) -> str:
     """Restore and independently run the adapter identity and replay checks."""
     try:
@@ -287,8 +289,43 @@ async def verify_adapter_resume(
             )
         except ResumeVerificationError as error:
             list_error = error
+    if abandon_event is not None and abandon_event.is_set():
+        return _resume_status(list_checked=list_checked, replay_checked=False)
+
+    restore_started = False
+    restore_to_settle: asyncio.Task[None] | None = None
     async with client.replaying(adapter_session_id, conn) as sink:
-        await _restore_adapter_session(conn, capabilities, adapter_session_id, cwd)
+        restore_task = asyncio.create_task(
+            _restore_adapter_session(conn, capabilities, adapter_session_id, cwd),
+            name=f"acpc.restore.{adapter_session_id}",
+        )
+        restore_started = True
+        if abandon_event is None:
+            await restore_task
+        else:
+            abandoned = asyncio.create_task(
+                abandon_event.wait(), name=f"acpc.restore-abandon.{adapter_session_id}"
+            )
+            try:
+                done, _pending = await asyncio.wait(
+                    {restore_task, abandoned}, return_when=asyncio.FIRST_COMPLETED
+                )
+                if restore_task not in done:
+                    # Leave the replay scope before waiting for the adapter's
+                    # uncancellable restore request to settle. Late frames are
+                    # then retained by ReplayTracker and cannot reach a later
+                    # live binding.
+                    restore_to_settle = restore_task
+                else:
+                    await restore_task
+            finally:
+                abandoned.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await abandoned
+    if restore_to_settle is not None:
+        await restore_to_settle
+    if not restore_started:
+        return _resume_status(list_checked=list_checked, replay_checked=False)
     replay_checked = sink.replay_available and bool(expected_prompts) and bool(sink.user_messages)
     if replay_checked:
         verify_replayed_prompts(adapter_session_id, expected_prompts, sink.user_messages)
@@ -307,10 +344,17 @@ _PROMPT_MARKER_ATTEMPTS = 3
 class PromptDelivery:
     """Track a sent prompt until its durable delivery marker is persisted."""
 
-    def __init__(self, session_id: str, adapter_session_id: str, prompt: str) -> None:
+    def __init__(
+        self,
+        session_id: str,
+        adapter_session_id: str,
+        prompt: str,
+        on_delivered: Callable[[], None] | None = None,
+    ) -> None:
         self.session_id = session_id
         self.adapter_session_id = adapter_session_id
         self.prompt = prompt
+        self._on_delivered = on_delivered
         self.available = False
         self.seen = False
         self.persisted = False
@@ -329,7 +373,10 @@ class PromptDelivery:
             or params.get("sessionId") != self.adapter_session_id
         ):
             return
+        first_observation = not self.seen
         self.seen = True
+        if first_observation and self._on_delivered is not None:
+            self._on_delivered()
         try:
             sessions.mark_prompt_delivered(self.session_id, self.prompt)
         except (OSError, sessions.SessionError) as error:
@@ -362,10 +409,15 @@ class PromptDelivery:
 
 
 def register_prompt_delivery(
-    conn: Any, session_id: str, adapter_session_id: str, prompt: str
+    conn: Any,
+    session_id: str,
+    adapter_session_id: str,
+    prompt: str,
+    *,
+    on_delivered: Callable[[], None] | None = None,
 ) -> PromptDelivery:
     """Record a prompt after ACP has accepted its outgoing wire frame."""
-    delivery = PromptDelivery(session_id, adapter_session_id, prompt)
+    delivery = PromptDelivery(session_id, adapter_session_id, prompt, on_delivered)
     raw_connection = getattr(conn, "_conn", None)
     add_observer = getattr(raw_connection, "add_observer", None)
     if not callable(add_observer):
@@ -485,11 +537,13 @@ def call_target(resolution: CallResolution) -> str:
 
 
 class _CancelSignal:
-    """Records why a turn is being wound down, and what that means on exit."""
+    """Record a turn stop, resolving signal meaning once routing is known."""
 
     def __init__(self) -> None:
         self.state: str | None = None
         self.stop_reason: str | None = None
+        self.received_signal: int | None = None
+        self._daemon_routed: bool | None = None
         self.requested = asyncio.Event()
         self.cancellation_dispatched = asyncio.Event()
 
@@ -499,9 +553,38 @@ class _CancelSignal:
             self.stop_reason = stop_reason
         self.requested.set()
 
+    def request_signal(self, signal_number: int) -> None:
+        """Latch a signal without guessing what SIGTERM means yet."""
+        if self.received_signal is None:
+            self.received_signal = signal_number
+            if self.state is None and self._daemon_routed is not None:
+                self.state = self._signal_state()
+        self.requested.set()
+
+    def resolve_route(self, *, daemon_routed: bool) -> None:
+        """Apply the route-specific meaning to the first received signal."""
+        self._daemon_routed = daemon_routed
+        if self.state is None:
+            self.state = self._signal_state()
+
+    def _signal_state(self) -> str | None:
+        if self.received_signal == signal.SIGINT:
+            return "cancelled"
+        if self.received_signal == signal.SIGTERM and self._daemon_routed is not None:
+            return "detached" if self._daemon_routed else "terminated"
+        return None
+
     def end_turn(self) -> None:
         """End a turn through the same cancellation path as external stops."""
         self.request("failed", stop_reason="permission_denied")
+
+
+PREPARATION_CANCELLED_REASON = "cancelled during preparation"
+
+
+def preparation_cancelled_answer(session_id: str) -> str:
+    """Explain a cancellation for which no prompt crossed the ACP boundary."""
+    return f"Session {session_id} was cancelled during preparation; no prompt was sent.\n"
 
 
 async def _drive_turn(
@@ -826,8 +909,6 @@ def _stop_reason_of(prompt_task: "asyncio.Task[Any]") -> str | None:
 def _install_signal_handlers(
     loop: asyncio.AbstractEventLoop,
     cancel: _CancelSignal,
-    *,
-    daemon_routed: bool,
 ) -> None:
     """Route SIGINT/SIGTERM into the turn's cancel path.
 
@@ -837,12 +918,9 @@ def _install_signal_handlers(
     if sys.platform == "win32":
         return
     with contextlib.suppress(NotImplementedError, RuntimeError):
-        loop.add_signal_handler(signal.SIGINT, lambda: cancel.request("cancelled"))
+        loop.add_signal_handler(signal.SIGINT, lambda: cancel.request_signal(signal.SIGINT))
     with contextlib.suppress(NotImplementedError, RuntimeError):
-        loop.add_signal_handler(
-            signal.SIGTERM,
-            lambda: cancel.request("detached" if daemon_routed else "terminated"),
-        )
+        loop.add_signal_handler(signal.SIGTERM, lambda: cancel.request_signal(signal.SIGTERM))
 
 
 def daemon_payload(request: TurnRequest) -> dict[str, Any]:
@@ -899,9 +977,28 @@ async def _route(request: TurnRequest) -> tuple[Any | None, str | None]:
 
 
 async def _execute(session_id: str, request: TurnRequest) -> TurnOutcome:
-    daemon, route_note = await _route(request)
     cancel = _CancelSignal()
-    _install_signal_handlers(asyncio.get_running_loop(), cancel, daemon_routed=daemon is not None)
+    loop = asyncio.get_running_loop()
+    _install_signal_handlers(loop, cancel)
+
+    routing = asyncio.create_task(_route(request), name="acpc.route")
+    signalled = asyncio.create_task(cancel.requested.wait(), name="acpc.route-cancel")
+    try:
+        done, _pending = await asyncio.wait(
+            {routing, signalled}, return_when=asyncio.FIRST_COMPLETED
+        )
+        if routing not in done:
+            routing.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await routing
+            return await _cancel_before_route_acceptance(session_id, request, cancel)
+        daemon, route_note = routing.result()
+        cancel.resolve_route(daemon_routed=daemon is not None)
+        _install_signal_handlers(loop, cancel)
+    finally:
+        signalled.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await signalled
 
     if daemon is not None:
         target = call_target(request.resolution)
@@ -915,6 +1012,34 @@ async def _execute(session_id: str, request: TurnRequest) -> TurnOutcome:
             raise ResumePreparationError(str(error)) from None
 
     return await _execute_direct(session_id, request, cancel, route_note=route_note)
+
+
+async def _cancel_before_route_acceptance(
+    session_id: str, request: TurnRequest, cancel: _CancelSignal
+) -> TurnOutcome:
+    """Record a pre-route cancellation without overwriting an earlier turn."""
+    cancel.resolve_route(daemon_routed=False)
+    if request.defer_rotation:
+        try:
+            async with sessions.session_reservation(session_id):
+                events = transcript.Transcript(sessions.transcript_path(session_id))
+                request = _prepare_resumed_turn(
+                    session_id,
+                    request,
+                    events,
+                    pid=_host_pid(),
+                )
+        except (ResumeRotationError, sessions.SessionError) as error:
+            raise ResumePreparationError(str(error)) from None
+
+    outcome = TurnOutcome(
+        state=cancel.state or "cancelled",
+        stop_reason=PREPARATION_CANCELLED_REASON,
+        answer=preparation_cancelled_answer(session_id),
+        turn_token=request.turn_token,
+    )
+    _finalize(session_id, outcome, expected_turn=request.turn_token)
+    return outcome
 
 
 async def _execute_direct(
@@ -1033,6 +1158,10 @@ async def dispatch_background(session_id: str, request: TurnRequest) -> str | No
         started = await routed.start_turn(session_id, daemon_payload(request))
         if not started.get("ok"):
             return str(started.get("error", "the daemon refused the turn"))
+        if request.defer_rotation:
+            prepared = await routed.await_preparation(session_id)
+            if not prepared.get("ok"):
+                return str(prepared.get("error", "the daemon refused the turn"))
     finally:
         with contextlib.suppress(Exception):
             await routed.close()
