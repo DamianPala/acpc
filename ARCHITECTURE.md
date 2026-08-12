@@ -23,6 +23,7 @@ cli.py                          argument parsing, verbs, help, exit codes, TTY d
   ├── render.py                 log/status views, footers, --max-output truncation
   ├── skills.py                 bundled skill discovery, frontmatter, and body loading
   ├── output.py                 output contract: stdout modes, stderr summary, --json
+  ├── probe.py                  direct ACP mode discovery and registry diff
   ├── cache.py                  advertised models/modes/commands cache under cache/<agent>/
   └── config.py                 config.toml (retention, daemon_ttl, daemon_max_concurrent)
 
@@ -50,6 +51,7 @@ vocab.py (frozen)               efforts, permission values, session states, exit
 | `daemon_client.py` | Client side of the daemon protocol: ensure-running (spawn+connect race-safe via lock), request/response framing over `ipc`, orphan-never rules | *`daemon`*, *Session states* |
 | `render.py` | Condensed event lines, `--prose` view, footers (stderr, `--` prefix, `|`/`·` separators), `--max-output` truncation (UTF-8 boundary, marker line, event-granular for `log`), status line/detail views with idle age | *`log`*, *`status`*, *Output contract* |
 | `output.py` | stdout discipline (answer / confirmation / JSON envelope / id+dir), stderr summary line, `--json` shapes, `-o` atomic write | *Output contract* |
+| `probe.py` | Direct adapter mode discovery: one ACP connection, one session opened and released, the advertised catalogue and a two-sided diff against the entry's `[modes]`; never writes registry entries. Measuring what a mode permits is 0.7 work and lives on `probe-engine-r13` | *`probe`* |
 | `cache.py` | `cache/<agent>/` advertised data (models/modes/commands), refresh on every run, cache-age footers, `commands.md` full-text render | *`agents`* (advertised data) |
 
 ## How the layers talk
@@ -59,6 +61,8 @@ vocab.py (frozen)               efforts, permission values, session states, exit
 **`continue` cold-resume path:** an ephemeral per-session reservation is acquired before restore I/O and held across verification, rotation, and daemon task registration (or direct-turn setup). A competing continuation loses with the normal session-busy error. Failed verification releases only that reservation, so the finished session remains unchanged. `runner` then restores the adapter session and independently checks the listed session and replayed user prompts when those capabilities exist. `sessions.rotate_turn` claims the next turn, writes its prompt, records the resume status, and marks the session running under the session lock. The claim's turn number guards finalization, while setup failures before ownership finalize that token; the ACP outgoing boundary records only prompts that were actually delivered, and a failed or unavailable delivery record permanently marks the session incomplete so a later resume cannot claim verification from an empty or partial record. Queued `--bg` requests return after this preparation, without waiting for the prompt slot.
 
 **Daemon fallback:** if the daemon can't start, `runner` spawns the adapter as a direct child via `spawn.spawn_adapter` — same `client`, same transcript; the stderr summary says so and SIGTERM then cancels instead of detaching.
+
+**`probe` path:** `cli` resolves the registry entry → `probe` spawns one direct ACP adapter connection, opens a session, reads the advertised mode catalogue, and closes the session when the adapter advertises `session/close` → the catalogue is diffed against the entry's recorded `[modes]` from both sides. Zero turns, no daemon, no registry write. Its client answers every callback `method_not_found`: with no turn running, a callback would mean the adapter did something discovery never asked for.
 
 **State reads (`status`/`log`/`wait`/every gate):** read `meta.json`, and for `running` sessions verify liveness via `proc` (pid + start-time token); a dead process ⇒ persist `orphaned` (atomic, under the session lock). No command trusts a stored `running`.
 

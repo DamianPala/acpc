@@ -34,6 +34,7 @@ from acpc import (
     transcript,
     vocab,
 )
+from acpc import probe as probe_engine
 from acpc.permissions import ModeSelectionError, PermissionLevel, select_mode
 from acpc.registry import (
     AgentRegistry,
@@ -149,7 +150,7 @@ Maintenance and setup:
 
 Common commands:
   run, continue, steer, wait, status, log, agents, skills, daemon,
-  stop, rm, prune, install
+  probe, stop, rm, prune, install
   Use `acpc <command> --help` for the command's full reference.
 
 Flag → ACP
@@ -1275,6 +1276,51 @@ def _agents_check(registry: AgentRegistry, name: str | None, *, json_mode: bool)
                 _write_stdout(f"{result['agent']} failed: {result['error']}\n")
     if any(not result["ok"] for result in results):
         raise SystemExit(vocab.EXIT_AGENT_ERROR)
+
+
+@main.command(name="probe")
+@click.argument("entry")
+@click.option(
+    "--discover",
+    is_flag=True,
+    help="Read the advertised modes; opens and releases a session and sends zero turns.",
+)
+@click.option("--json", "json_mode", is_flag=True, help="Emit the report as JSON.")
+@click.help_option("-h", "--help")
+def probe_command(entry: str, discover: bool, json_mode: bool) -> None:
+    """Read an adapter's advertised modes, without editing its registry entry.
+
+    ``--discover`` opens a session, reads the advertised mode catalogue and releases it,
+    sending zero turns.  Output is the catalogue and a diff against the entry's current
+    ``[modes]`` table, stated from both sides.  Applying any of it is a separate, explicit act.
+
+    Measuring what a mode actually permits is not in this release, so ``--discover`` is
+    required.  On Windows probe refuses to run: its commands are POSIX shell commands and
+    would measure the shell rather than the sandbox.
+
+    Example: ``acpc probe claude --discover``
+    """
+    if not discover:
+        raise UsageProblem(
+            "probe needs --discover: reading the advertised mode catalogue is what this "
+            "release measures. Measuring what a mode actually permits is not in it"
+        )
+    try:
+        report = probe_engine.run(entry)
+    except RegistryError as error:
+        if json_mode:
+            _emit_json({"error": str(error)})
+            raise SystemExit(vocab.EXIT_USAGE) from None
+        raise UsageProblem(str(error)) from None
+    except probe_engine.ProbeError as error:
+        if json_mode:
+            _emit_json({"error": str(error)})
+            raise SystemExit(vocab.EXIT_AGENT_ERROR) from None
+        raise AgentProblem(str(error)) from None
+    if json_mode:
+        _emit_json(report.payload())
+    else:
+        _write_stdout(report.text())
 
 
 @agents_group.command(name="init")

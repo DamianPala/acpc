@@ -25,6 +25,7 @@ stop <id>
 rm <id> | prune [--older-than D] [--dry-run]   # session cleanup (auto-prune per config retention)
 agents [name] [--models|--commands|--check]   # adapters + variants; with name: resolved definition (cached)
 agents init <name> --extends <agent>  # scaffold a variant
+probe <entry> --discover [--json]     # the adapter's advertised modes, diffed against the entry
 skills [name] [--json]                # bundled skills; with name: skill body and directory
 install <agent>                       # one-step fix for "not installed"
 daemon status|stop [target] [--force]   # plumbing escape hatch — never needed in the happy path
@@ -243,6 +244,45 @@ Going with 2; `test_auth` needs its own fixture either way.
 - **The transcript records what the adapter reports**, which is not always everything the callee attempted. A vendor that blocks an action inside its own process need emit nothing over ACP: codex's sandbox denials arrive as neither tool call, error nor permission event — measured on codex-acp 1.1.9, where the client received 3 tool calls for a session whose own rollout recorded 8. So `log` is the record of the session as ACP reported it, and an audit that has to be exhaustive cannot end there.
 - **`--follow` ends exactly three ways**, and the exit code says which: the session finished (**0**, finished footer — following a stopped stream ends, the `logs -f` convention, so a session already finished at the call returns its replay at once); `--timeout` expired (**124**, still-running footer plus the `--wait-new` timeout note — the session is untouched and keeps running); `--max-output` ran out before either (**4**, the truncation marker on stdout and, on stderr, `-- stopped: --max-output <N> exhausted — resume with: acpc log <id> --follow --since <cursor>`). The third code exists because a cut stream is not a completed follow: with 0 or 124 alone a caller cannot tell "the run is still going" from "I stopped reading it". Every ending prints the footer, whose cursor covers exactly what stdout carried, so `--since <cursor>` resumes without a gap or a repeat.
 - **`--follow` is for one case**: supervising a run you intend to steer or stop mid-flight. It is not a live view — a foreground tool call returns its output when it exits, so what a caller gets is a bounded digest of what happened while it blocked. Checking in on a run is a plain `log` snapshot; waiting for a result is `wait`. Follow costs a blocked call and puts every event it collects into the caller's context, which is the expensive way to ask a question the other two answer for free.
+
+### `probe`
+
+```
+probe <entry> --discover [--json]
+```
+
+| Option | Purpose |
+|--------|---------|
+| `--discover` | Read the advertised mode catalogue. Zero turns |
+| `--json` | Emit the report as JSON |
+
+Report the modes an adapter advertises, and how they differ from the entry's recorded `[modes]`
+table, without editing anything.
+
+- **`probe` re-reads the adapter, because a `[modes]` table goes stale.** A `[modes]` entry records
+what an adapter was observed to allow, and observation ages: vendors change defaults, ship new modes,
+and rename old ones between releases. Nothing in the entry notices when that happens, so a table that
+was accurate when it was written keeps being trusted after it stops being true. `probe` asks the
+adapter directly.
+- **`--discover` costs nothing.** It opens a session, reads the advertised mode catalogue and
+releases it, running zero turns: enough to see a mode the adapter advertises that the entry does not
+list, and an entry mode the adapter no longer advertises, each shown with the description the adapter
+gives.
+- **`probe` reports; it does not edit the registry.** Output is the advertised catalogue and a diff
+against the entry's current table, stated from both sides — what the adapter advertises that the
+entry lacks, and what the entry records that the adapter no longer advertises. Applying any of it is
+a separate, explicit act.
+- **Measuring what a mode actually permits is not in this release.** What an adapter *advertises* and
+what it *allows* are different questions, and the second can only be answered by evidence read off
+disk after a real turn. `probe` invoked without `--discover` says so and is a usage error naming the
+flag, exit 2 — not an empty report, and not a silent success. A discovery report handed to a caller
+who expected a measurement would be the exact failure this command exists to prevent: an answer to a
+question nobody asked, presented as though it settled the one they did.
+
+```
+acpc probe claude --discover
+acpc probe codex --discover --json
+```
 
 ### `prune`
 
@@ -582,7 +622,7 @@ Entry TOMLs are trusted at the level of shell config: an adapter definition name
 - **Client death ≠ session death.** SIGINT (a human's Ctrl-C) cancels the session (`session/cancel`, state `cancelled`). SIGTERM (a harness killing the tool call on its own timeout — the *normal* case for an agent caller) detaches: the session keeps running under the daemon, and on the way out the client prints exactly `-- detached, still RUNNING: <id> — answer: acpc wait <id> · cancel: acpc stop <id>` to stderr, so the caller that killed the tool still learns both the id and its options. When the adapter ran as a direct child because the daemon couldn't start (see `daemon`), detach is impossible — SIGTERM cancels there too.
 - **`--json` means "this command's output as JSON"**, uniformly. Three shapes:
   - **Answer-printing commands** (`run`, `continue`, `wait`): a result envelope — `state`, `session_id`, `stop_reason`, `paths`, `cost`, `answer`. Two flags reshape it: `--bg` leaves only what exists at dispatch time (`session_id`, `state`, `paths`); `-o` names the output file and omits `answer`.
-  - **Everything else** (`status`, `agents`, `daemon status`, `stop`, `rm`, `prune`, `install`, `--dry-run`): the same data the text view shows, as JSON.
+  - **Everything else** (`status`, `agents`, `daemon status`, `stop`, `rm`, `prune`, `install`, `probe`, `--dry-run`): the same data the text view shows, as JSON.
   - **The one exception**: `log --json` emits raw transcript events (see `log`), not an envelope.
 - **End-of-run summary, one line, on stderr, prefixed `--`**: duration, tokens/cost, exit status, session ID, session dir, and the follow-up command as `continue: acpc continue <id>` — every finished state is resumable, and the caller reading this line is the one deciding whether to send another turn, so the id travels next to the verb that consumes it. Harnesses merge stderr into the same blob as the answer — the fixed prefix keeps it mechanically separable. The prefix only separates at a line boundary, and answers need not end with a newline, so when stdout's last line is unterminated the stderr metadata that follows leads with a newline of its own — on stderr, never appended to stdout, which stays byte-identical to `answer.md`. When permission denials occurred the summary adds a segment naming the count, the categories and the lowest policy that would have admitted them: `denied: 3 edit (pass --permissions edit)`. Reported whether the policy was defaulted or passed explicitly — an explicit policy set too low is the same mistake as an absent one, and the caller that passes flags is the one reading output mechanically; when it was defaulted the segment says so (`default read policy`), since that caller chose nothing. A refused mode switch is reported the same way, naming the mode. The tally is per turn and appears in `--json` as `denied`. `--quiet` suppresses it. A `--bg` dispatch prints none — nothing has finished; the finished `log` footer carries the same data. `log` footers follow the same rule — stderr, `--` prefix — the general principle being: when stdout carries agent content, acpc's own metadata goes to stderr; when stdout is acpc's own view (`status`, `agents`), the footer is part of the view and stays there.
 - **Early session line, on blocking `run`/`continue`**: at dispatch — before the turn has produced anything — one stderr line, `-- session <id> | dir <path>`. Its segments are identical in form to the end-of-run summary's own `session <id>` and `dir <path>` segments; harnesses merge both streams into one blob, so one spelling has to serve whether it is read at the start or at the end. It is what makes a blocking call self-sufficient: the id is in the captured output from the first moment, so `log` and `stop` work mid-run and a call the harness kills on its own timeout leaves a session the caller can still find rather than an orphan. The client prints it before the turn starts, so it is the same on the daemon path and on the direct-child fallback. `--bg` does not print it — stdout already carries the id and the dir — and `--quiet` suppresses it exactly as it suppresses the summary. stdout is untouched and stays byte-identical to `answer.md`.

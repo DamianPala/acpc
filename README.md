@@ -44,11 +44,14 @@ stop <id>
 rm <id> | prune [--older-than D] [--dry-run]
 agents [name] [--models|--commands|--check]   # adapters + variants; resolved definitions
 agents init <name> --extends <agent>          # scaffold a variant
+probe <entry> --discover [--json]             # read the adapter's advertised modes; report only
 install <agent>
 daemon status|stop [target] [--force]   # plumbing escape hatch — never needed in the happy path
 ```
 
 `acpc --help` is a self-contained cheat sheet; `acpc <cmd> --help` is that command's full reference. `<id>` accepts a session id or a `--name` alias; `last` works on a TTY only.
+
+`acpc probe <entry> --discover` opens a session, reads the modes the adapter advertises, releases it, and prints that catalogue alongside a two-sided diff against the entry's recorded `[modes]`: modes the adapter advertises that the entry does not list, and entry modes the adapter no longer advertises. It costs zero turns and never edits the registry — applying anything it reports is a separate, explicit act. Measuring what a mode actually *permits* is not in this release, so `--discover` is required and a bare `probe` says so rather than answering a question you did not ask. Probe refuses to run on Windows because its commands are POSIX shell commands and would measure the shell rather than the sandbox.
 
 `steer <id> "…"` interrupts the turn in flight and redirects the session in one call — `stop` plus `continue` without the race in the middle. The instruction reaches the callee under a fixed preamble naming the interruption, and the interrupted turn's partial answer is kept as that turn's answer file.
 

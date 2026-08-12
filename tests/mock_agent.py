@@ -128,9 +128,16 @@ EFFORTS = ("low", "medium", "high", "xhigh")
 DEFAULT_EFFORT = "medium"
 MODES = ("default", "acceptEdits", "plan", "yolo")
 RESTRICTED_MODE = "yolo"
+MODE_DESCRIPTIONS = {
+    "default": "Mock default mode",
+    "acceptEdits": "Mock editing mode",
+    "plan": "Mock planning mode",
+    "yolo": "Mock unrestricted mode",
+}
 
 _HUGE_TARGET_BYTES = 220 * 1024
 _STRADDLE_OFFSET = 1998  # byte offset a 4-byte emoji starts at, see _huge_answer
+
 
 # (tool title, ACP kind, target) for the perm scenario — one request per
 # policy-relevant kind, including both switch_mode flavors.
@@ -236,6 +243,7 @@ class MockAgent(Agent):
         self._mode_calls: dict[str, int] = {}
         self._effort_calls: dict[str, int] = {}
         self._initialized = False
+        self._late_calls: dict[str, tuple[str, Path, str]] = {}
 
     def on_connect(self, conn: Client) -> None:
         self._conn = conn
@@ -366,7 +374,10 @@ class MockAgent(Agent):
     def _mode_state(self, session_id: str) -> SessionModeState:
         return SessionModeState(
             current_mode_id=self._modes.get(session_id, "default"),
-            available_modes=[SessionMode(id=mode, name=mode) for mode in MODES],
+            available_modes=[
+                SessionMode(id=mode, name=mode, description=MODE_DESCRIPTIONS[mode])
+                for mode in MODES
+            ],
         )
 
     async def new_session(
@@ -384,7 +395,8 @@ class MockAgent(Agent):
         self._session_cwds[session_id] = Path(cwd)
         self._cancel_events[session_id] = asyncio.Event()
         self._persist_session(session_id)
-        asyncio.get_running_loop().create_task(self._send_commands_update(session_id))
+        if not os.environ.get("MOCK_PROBE_BEHAVIOR"):
+            asyncio.get_running_loop().create_task(self._send_commands_update(session_id))
         return NewSessionResponse(
             session_id=session_id,
             modes=self._mode_state(session_id),
