@@ -901,7 +901,7 @@ class Daemon:
                 turn_error = caught
                 stop_reason = "error"
             try:
-                await delivery.ensure_persisted()
+                await delivery.ensure_persisted(prompt_completed=turn_error is None)
             except Exception as caught:  # noqa: BLE001
                 turn_error = caught if turn_error is None else turn_error
                 stop_reason = "error"
@@ -925,6 +925,7 @@ class Daemon:
             adapter_session_id=adapter_session_id,
             advertised=client.advertised,
             error=turn_error,
+            delivery_record_incomplete=delivery.delivery_record_incomplete,
             turn_token=request.turn_token,
         )
 

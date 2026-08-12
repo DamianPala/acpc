@@ -7,6 +7,7 @@ boundaries, so mocking them out would test nothing.
 """
 
 import asyncio
+import contextlib
 import json
 import os
 import sys
@@ -98,6 +99,21 @@ def next_turn(session_id: str, prompt: str) -> runner.TurnOutcome:
     sessions.write_prompt(session_id, prompt)
     resumed = sessions.read_meta(session_id).adapter_session_id
     return run_turn(session_id, prompt, resume_adapter_session=resumed)
+
+
+class _ClosedBeforePromptConnection:
+    """Proxy a real ACP connection that closes before its prompt is sent."""
+
+    def __init__(self, connection: Any) -> None:
+        self._connection = connection
+        self._conn = connection._conn
+
+    async def prompt(self, **kwargs: Any) -> Any:
+        await self._connection.close()
+        return await self._connection.prompt(**kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._connection, name)
 
 
 def dispatch_payload(prompt: str = "x") -> dict:
@@ -688,6 +704,114 @@ def test_the_daemon_writes_the_answer_the_client_never_saw(
     on_disk = sessions.answer_path(session_id).read_text(encoding="utf-8")
     assert "who writes the answer" in on_disk
     assert outcome.answer == on_disk
+
+
+def test_daemon_carries_incomplete_delivery_into_a_cold_resume(
+    state_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The daemon must persist the delivery fact it learned on its own path."""
+    original_mark = sessions.mark_prompt_delivered
+
+    def fail_first_marker(session_id: str, prompt: str) -> sessions.SessionMeta:
+        if prompt == "daemon marker outage":
+            raise OSError("the daemon cannot persist this marker")
+        return original_mark(session_id, prompt)
+
+    monkeypatch.setattr(sessions, "mark_prompt_delivered", fail_first_marker)
+    resolution = resolve()
+    session_id = sessions.create_session(
+        entry="mock",
+        base_adapter="mock",
+        prompt="daemon marker outage",
+        resolution=runner.session_resolution(resolution, cwd=None),
+        target=runner.call_target(resolution),
+    ).session_id
+
+    async def run_daemon_turns() -> tuple[runner.TurnOutcome, str, runner.TurnOutcome]:
+        instance = daemon.Daemon(target())
+        try:
+            first = await instance._run_turn(
+                session_id,
+                runner.TurnRequest(resolution=resolution, prompt="daemon marker outage"),
+                runner._CancelSignal(),
+            )
+            first_meta = sessions.read_meta(session_id)
+            await instance.host.close()
+
+            request = runner.continue_request(
+                first_meta, "daemon cold follow-up", defer_rotation=True
+            )
+            prepared = await instance._prepare_turn(session_id, request)
+            resume_status = sessions.read_meta(session_id).extra["resume"]
+            second = await instance._run_turn(session_id, prepared, runner._CancelSignal())
+            return first, resume_status, second
+        finally:
+            await instance.host.close()
+
+    first, resume_status, second = asyncio.run(run_daemon_turns())
+
+    assert first.state == "done"
+    assert first.delivery_record_incomplete is True
+    assert sessions.read_meta(session_id).extra[sessions.DELIVERY_RECORD_INCOMPLETE] is True
+    assert resume_status == "unverified — delivery record incomplete"
+    assert second.state == "done"
+
+
+def test_daemon_keeps_a_pre_send_failure_record_complete_on_cold_resume(
+    state_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed prompt that never crossed ACP must not poison later verification."""
+    original_spawn = daemon.spawn_adapter
+
+    @contextlib.asynccontextmanager
+    async def spawn_closed_before_prompt(*args: Any, **kwargs: Any) -> AsyncIterator[Any]:
+        async with original_spawn(*args, **kwargs) as (connection, process):
+            yield _ClosedBeforePromptConnection(connection), process
+
+    monkeypatch.setattr(daemon, "spawn_adapter", spawn_closed_before_prompt)
+    resolution = resolve()
+    session_id = sessions.create_session(
+        entry="mock",
+        base_adapter="mock",
+        prompt="daemon before-wire",
+        resolution=runner.session_resolution(resolution, cwd=None),
+        target=runner.call_target(resolution),
+    ).session_id
+
+    async def run_failed_turn() -> runner.TurnOutcome:
+        instance = daemon.Daemon(target())
+        try:
+            return await instance._run_turn(
+                session_id,
+                runner.TurnRequest(resolution=resolution, prompt="daemon before-wire"),
+                runner._CancelSignal(),
+            )
+        finally:
+            await instance.host.close()
+
+    first = asyncio.run(run_failed_turn())
+    first_meta = sessions.read_meta(session_id)
+    assert first.state == "failed"
+    assert first_meta.extra.get(sessions.DELIVERY_RECORD_INCOMPLETE) is not True
+    assert "delivered_prompts" not in first_meta.extra
+
+    monkeypatch.setattr(daemon, "spawn_adapter", original_spawn)
+
+    async def run_cold_resume() -> str:
+        instance = daemon.Daemon(target())
+        try:
+            request = runner.continue_request(
+                first_meta, "daemon later prompt", defer_rotation=True
+            )
+            prepared = await instance._prepare_turn(session_id, request)
+            resume_status = sessions.read_meta(session_id).extra["resume"]
+            outcome = await instance._run_turn(session_id, prepared, runner._CancelSignal())
+            assert outcome.state == "done"
+            return resume_status
+        finally:
+            await instance.host.close()
+
+    assert asyncio.run(run_cold_resume()) == "verified"
 
 
 def test_one_daemon_serves_several_sessions(state_root: Path, live_daemon: None) -> None:

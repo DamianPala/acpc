@@ -660,6 +660,105 @@ def test_cold_resume_reports_unverified_in_json_and_summary(
     assert "resume: unverified" in result.stderr
 
 
+def test_exhausted_marker_retries_keep_the_turn_and_report_incomplete_resume(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempts = 0
+
+    def always_fail(session_id: str, prompt: str) -> sessions.SessionMeta:
+        nonlocal attempts
+        attempts += 1
+        raise OSError(f"cannot persist marker for {session_id}: {prompt}")
+
+    monkeypatch.setattr(sessions, "mark_prompt_delivered", always_fail)
+    first = invoke(cli, "run", "mock", "first prompt", "--quiet", "--json")
+
+    assert first.exit_code == vocab.EXIT_OK
+    session_id = json.loads(first.stdout)["session_id"]
+    first_meta = sessions.load(session_id)
+    assert attempts == 4
+    assert first_meta.state == "done"
+    assert first_meta.extra[sessions.DELIVERY_RECORD_INCOMPLETE] is True
+    assert "first prompt" in sessions.answer_path(session_id).read_text(encoding="utf-8")
+
+    resumed = invoke(cli, "continue", session_id, "second prompt", "--json")
+
+    assert resumed.exit_code == vocab.EXIT_OK
+    expected = "unverified — delivery record incomplete"
+    assert json.loads(resumed.stdout)["resume"] == expected
+    assert f"resume: {expected}" in resumed.stderr
+    assert "second prompt" in sessions.answer_path(session_id).read_text(encoding="utf-8")
+
+
+def test_incomplete_marker_cannot_be_lost_when_its_separate_write_fails(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker_attempts = 0
+    separate_write_failed = False
+    original_write_meta = sessions.write_meta
+
+    def always_fail_marker(session_id: str, prompt: str) -> sessions.SessionMeta:
+        nonlocal marker_attempts
+        marker_attempts += 1
+        raise OSError(f"cannot persist marker for {session_id}: {prompt}")
+
+    def fail_only_the_old_separate_write(meta: sessions.SessionMeta) -> None:
+        nonlocal separate_write_failed
+        if (
+            not separate_write_failed
+            and meta.turns == 1
+            and meta.state == "running"
+            and meta.extra.get(sessions.DELIVERY_RECORD_INCOMPLETE) is True
+        ):
+            separate_write_failed = True
+            raise OSError("incompleteness write lost")
+        original_write_meta(meta)
+
+    monkeypatch.setattr(sessions, "mark_prompt_delivered", always_fail_marker)
+    monkeypatch.setattr(sessions, "write_meta", fail_only_the_old_separate_write)
+
+    first = invoke(cli, "run", "mock", "first prompt", "--quiet", "--json")
+
+    assert first.exit_code == vocab.EXIT_OK
+    assert marker_attempts == 4
+    session_id = json.loads(first.stdout)["session_id"]
+    first_meta = sessions.load(session_id)
+    assert first_meta.state == "done"
+    assert first_meta.extra[sessions.DELIVERY_RECORD_INCOMPLETE] is True
+    assert "first prompt" in sessions.answer_path(session_id).read_text(encoding="utf-8")
+
+    resumed = invoke(cli, "continue", session_id, "second prompt", "--json")
+
+    assert resumed.exit_code == vocab.EXIT_OK
+    expected = "unverified — delivery record incomplete"
+    assert json.loads(resumed.stdout)["resume"] == expected
+    assert f"resume: {expected}" in resumed.stderr
+
+
+def test_incomplete_delivery_record_remains_unverified_after_a_later_success(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = sessions.mark_prompt_delivered
+
+    def fail_first(session_id: str, prompt: str) -> sessions.SessionMeta:
+        if prompt == "first prompt":
+            raise OSError("first marker is unavailable")
+        return original(session_id, prompt)
+
+    monkeypatch.setattr(sessions, "mark_prompt_delivered", fail_first)
+    first = invoke(cli, "run", "mock", "first prompt", "--quiet", "--json")
+    session_id = json.loads(first.stdout)["session_id"]
+
+    second = invoke(cli, "continue", session_id, "second prompt", "--json")
+
+    assert second.exit_code == vocab.EXIT_OK
+    meta = sessions.load(session_id)
+    assert meta.extra[sessions.DELIVERY_RECORD_INCOMPLETE] is True
+    assert [record["turn"] for record in meta.extra["delivered_prompts"]] == [2]
+    assert json.loads(second.stdout)["resume"] == "unverified — delivery record incomplete"
+    assert "resume: unverified — delivery record incomplete" in second.stderr
+
+
 def test_list_without_replay_is_verified_on_the_direct_path(
     cli: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:

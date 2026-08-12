@@ -92,10 +92,6 @@ class ResumeSetupError(RunnerError):
         self.turn_token = turn_token
 
 
-class PromptDeliveryError(RunnerError):
-    """The ACP prompt crossed the wire but its durable delivery marker failed."""
-
-
 class TurnEndedByAcpc(RunnerError):
     """acpc itself ended a running turn — a daemon stop, not an adapter fault."""
 
@@ -192,8 +188,12 @@ def verify_replayed_prompts(
         replay_index = found_at + 1
 
 
-def _resume_status(*, list_checked: bool, replay_checked: bool) -> str:
+def _resume_status(
+    *, list_checked: bool, replay_checked: bool, delivery_record_incomplete: bool = False
+) -> str:
     """Render the persisted resume confidence for summaries and JSON."""
+    if delivery_record_incomplete:
+        return "unverified — delivery record incomplete"
     if list_checked or replay_checked:
         return "verified"
     unavailable = []
@@ -269,6 +269,14 @@ async def verify_adapter_resume(
     session_id: str,
 ) -> str:
     """Restore and independently run the adapter identity and replay checks."""
+    try:
+        meta = sessions.read_meta(session_id)
+    except sessions.SessionNotFound:
+        # The focused verifier tests can provide their stored prompt list
+        # without constructing a session directory.
+        delivery_record_incomplete = False
+    else:
+        delivery_record_incomplete = meta.extra.get(sessions.DELIVERY_RECORD_INCOMPLETE) is True
     expected_prompts = _stored_prompt_items(session_id)
     list_checked = False
     list_error: ResumeVerificationError | None = None
@@ -281,12 +289,16 @@ async def verify_adapter_resume(
             list_error = error
     async with client.replaying(adapter_session_id, conn) as sink:
         await _restore_adapter_session(conn, capabilities, adapter_session_id, cwd)
-    replay_checked = sink.replay_available and bool(sink.user_messages)
+    replay_checked = sink.replay_available and bool(expected_prompts) and bool(sink.user_messages)
     if replay_checked:
         verify_replayed_prompts(adapter_session_id, expected_prompts, sink.user_messages)
     if list_error is not None:
         raise list_error
-    return _resume_status(list_checked=list_checked, replay_checked=replay_checked)
+    return _resume_status(
+        list_checked=list_checked,
+        replay_checked=replay_checked,
+        delivery_record_incomplete=delivery_record_incomplete,
+    )
 
 
 _PROMPT_MARKER_ATTEMPTS = 3
@@ -302,6 +314,7 @@ class PromptDelivery:
         self.available = False
         self.seen = False
         self.persisted = False
+        self.delivery_record_incomplete = False
         self.error: Exception | None = None
 
     def observe(self, event: Any) -> None:
@@ -324,25 +337,28 @@ class PromptDelivery:
         else:
             self.persisted = True
 
-    async def ensure_persisted(self) -> None:
+    async def ensure_persisted(self, *, prompt_completed: bool) -> None:
         """Retry marker persistence before the turn can be finalized."""
-        if not self.available or not self.seen or self.persisted:
+        if self.persisted:
             return
-        last_error = self.error
+        if not self.available:
+            if prompt_completed:
+                self.delivery_record_incomplete = True
+            return
+        if not self.seen:
+            if prompt_completed:
+                self.delivery_record_incomplete = True
+            return
         for _attempt in range(_PROMPT_MARKER_ATTEMPTS):
             try:
                 sessions.mark_prompt_delivered(self.session_id, self.prompt)
             except (OSError, sessions.SessionError) as error:
-                last_error = error
+                self.error = error
                 continue
             self.persisted = True
             self.error = None
             return
-        detail = str(last_error) if last_error is not None else "unknown persistence error"
-        raise PromptDeliveryError(
-            f"could not persist delivered-prompt marker for session {self.session_id} "
-            f"after {_PROMPT_MARKER_ATTEMPTS} retries: {detail}"
-        ) from last_error
+        self.delivery_record_incomplete = True
 
 
 def register_prompt_delivery(
@@ -392,6 +408,8 @@ class TurnOutcome:
     # The adapter's own failure, when the turn died in `session/prompt`. Carried
     # on the outcome rather than raised so the prose streamed before it survives.
     error: BaseException | None = None
+    # The finalizer persists this under the same lock as the answer and state.
+    delivery_record_incomplete: bool = False
     # Set when the daemon owns the session and has already written it out;
     # finalizing again here would overwrite the daemon's own result.
     finalized_elsewhere: bool = False
@@ -581,7 +599,7 @@ async def _drive_turn(
                 turn_error = caught
                 stop_reason = "error"
             try:
-                await delivery.ensure_persisted()
+                await delivery.ensure_persisted(prompt_completed=turn_error is None)
             except Exception as caught:  # noqa: BLE001
                 turn_error = caught if turn_error is None else turn_error
                 stop_reason = "error"
@@ -602,6 +620,7 @@ async def _drive_turn(
         adapter_session_id=adapter_session_id,
         advertised=client.advertised,
         error=turn_error,
+        delivery_record_incomplete=delivery.delivery_record_incomplete,
         turn_token=request.turn_token,
     )
 
@@ -1144,6 +1163,7 @@ def _finalize(
             denied=outcome.denied,
             denial_details=outcome.denial_details,
             error_event=error_event,
+            delivery_record_incomplete=outcome.delivery_record_incomplete,
             adapter_session_id=(
                 outcome.adapter_session_id
                 if outcome.adapter_session_id is not None

@@ -1,14 +1,17 @@
 """Behavioral tests for one turn end to end on the direct path."""
 
 import asyncio
+import contextlib
 import json
 import os
 import signal
 import sys
 import threading
 import time
+from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from acp import RequestError, text_block
@@ -184,6 +187,43 @@ class _NoObserverResumeConnection:
         )
 
 
+class _RawObserver:
+    def __init__(self) -> None:
+        self._observers: list[Any] = []
+
+    def add_observer(self, observer: Any) -> None:
+        self._observers.append(observer)
+
+    def emit_user_message(self, session_id: str, text: str) -> None:
+        event = SimpleNamespace(
+            direction=SimpleNamespace(value="incoming"),
+            message={
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "user_message_chunk",
+                        "content": {"type": "text", "text": text},
+                        "messageId": "replay-1",
+                    },
+                },
+            },
+        )
+        for observer in self._observers:
+            observer(event)
+
+
+class _ReplayResumeConnection(_NoObserverResumeConnection):
+    def __init__(self, client: AcpcClient, *, list_available: bool) -> None:
+        super().__init__(client, list_available=list_available)
+        self._raw = _RawObserver()
+        self._conn = self._raw
+
+    async def load_session(self, session_id: str, **kwargs: object) -> None:
+        await super().load_session(session_id, **kwargs)
+        self._raw.emit_user_message(session_id, "stored prompt")
+
+
 def _resume_test_client(tmp_path: Path) -> AcpcClient:
     return AcpcClient(Transcript(tmp_path / "transcript.ndjson"), PermissionLevel.READ)
 
@@ -244,6 +284,27 @@ def test_no_observer_replay_does_not_block_independent_listing_verification(
     assert status == "verified"
 
 
+def test_empty_prompt_comparison_is_not_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(runner, "_stored_prompt_items", lambda _session_id: [])
+    client = _resume_test_client(tmp_path)
+    connection = _ReplayResumeConnection(client, list_available=False)
+
+    status = asyncio.run(
+        runner.verify_adapter_resume(
+            connection,
+            client,
+            _resume_test_capabilities(list_available=False),
+            "adapter-session",
+            "/tmp",
+            "session-id",
+        )
+    )
+
+    assert status == "unverified — session/list unavailable; conversation replay unavailable"
+
+
 def test_failed_state_is_observable_only_after_its_explanation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -291,23 +352,141 @@ def test_prompt_marker_is_retried_before_a_successful_finalization(
     assert attempts >= 2
     delivered = sessions.read_meta(session_id).extra["delivered_prompts"]
     assert [record["turn"] for record in delivered] == [1]
+    assert sessions.DELIVERY_RECORD_INCOMPLETE not in sessions.read_meta(session_id).extra
 
 
-def test_prompt_marker_failure_fails_the_turn_without_claiming_delivery(
+def test_prompt_marker_failure_keeps_the_answer_and_marks_the_record_incomplete(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    attempts = 0
+
     def always_fail(session_id: str, prompt: str) -> sessions.SessionMeta:
+        nonlocal attempts
+        attempts += 1
         raise OSError(f"cannot persist marker for {session_id}: {prompt}")
 
     monkeypatch.setattr(sessions, "mark_prompt_delivered", always_fail)
     session_id, outcome = start_turn("marker must not disappear")
 
-    assert outcome.state == "failed"
+    assert attempts == 4  # the observer attempt plus the three existing retries
+    assert outcome.state == "done"
+    assert "marker must not disappear" in outcome.answer
     meta = sessions.read_meta(session_id)
-    assert meta.state == "failed"
-    assert "delivered_prompts" not in meta.extra
+    assert meta.state == "done"
+    assert meta.extra[sessions.DELIVERY_RECORD_INCOMPLETE] is True
+    assert sessions.answer_path(session_id).read_text(encoding="utf-8") == outcome.answer
     errors = [event for event in transcript_events(session_id) if event.get("type") == "error"]
-    assert "could not persist delivered-prompt marker" in errors[-1]["message"]
+    assert not errors
+
+
+class _NoFrameObserverConnection:
+    """Proxy a real ACP connection while hiding its raw-frame observer hook."""
+
+    def __init__(self, connection: Any) -> None:
+        self._connection = connection
+        self._conn = object()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._connection, name)
+
+
+class _ClosedBeforePromptConnection:
+    """Proxy a real ACP connection that closes before its prompt preflight."""
+
+    def __init__(self, connection: Any) -> None:
+        self._connection = connection
+        self._conn = connection._conn
+
+    async def prompt(self, **kwargs: Any) -> Any:
+        await self._connection.close()
+        return await self._connection.prompt(**kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._connection, name)
+
+
+def test_unobservable_delivery_finishes_and_stays_unverified_on_cold_resume(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_spawn = runner.spawn_adapter
+
+    @contextlib.asynccontextmanager
+    async def spawn_without_observer(*args: Any, **kwargs: Any) -> AsyncIterator[tuple[Any, Any]]:
+        async with original_spawn(*args, **kwargs) as (connection, process):
+            yield _NoFrameObserverConnection(connection), process
+
+    monkeypatch.setattr(runner, "spawn_adapter", spawn_without_observer)
+    resolution = resolve()
+    created = sessions.create_session(
+        entry=resolution.entry.entry,
+        base_adapter=resolution.entry.base_adapter,
+        prompt="the unobservable prompt",
+        resolution=runner.session_resolution(resolution, cwd=None),
+        target=runner.call_target(resolution),
+    )
+    session_id = created.session_id
+    first = runner.execute_turn(
+        session_id,
+        runner.TurnRequest(resolution=resolution, prompt="the unobservable prompt"),
+    )
+
+    assert first.state == "done"
+    assert "the unobservable prompt" in sessions.answer_path(session_id).read_text(encoding="utf-8")
+    meta = sessions.load(session_id)
+    assert meta.extra[sessions.DELIVERY_RECORD_INCOMPLETE] is True
+    assert "delivered_prompts" not in meta.extra
+
+    request = runner.continue_request(meta, "the cold follow-up", defer_rotation=True)
+    second = runner.execute_turn(session_id, request)
+
+    assert second.state == "done"
+    resumed = sessions.load(session_id)
+    assert resumed.extra["resume"] == "unverified — delivery record incomplete"
+    assert "the cold follow-up" in sessions.answer_path(session_id).read_text(encoding="utf-8")
+
+
+def test_pre_send_prompt_failure_with_observer_keeps_record_complete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_spawn = runner.spawn_adapter
+
+    @contextlib.asynccontextmanager
+    async def spawn_closed_before_prompt(
+        *args: Any, **kwargs: Any
+    ) -> AsyncIterator[tuple[Any, Any]]:
+        async with original_spawn(*args, **kwargs) as (connection, process):
+            yield _ClosedBeforePromptConnection(connection), process
+
+    monkeypatch.setattr(runner, "spawn_adapter", spawn_closed_before_prompt)
+    resolution = resolve()
+    created = sessions.create_session(
+        entry=resolution.entry.entry,
+        base_adapter=resolution.entry.base_adapter,
+        prompt="never sent",
+        resolution=runner.session_resolution(resolution, cwd=None),
+        target=runner.call_target(resolution),
+    )
+    session_id = created.session_id
+    first = runner.execute_turn(
+        session_id,
+        runner.TurnRequest(resolution=resolution, prompt="never sent"),
+    )
+
+    assert first.state == "failed"
+    first_meta = sessions.load(session_id)
+    assert first_meta.extra.get(sessions.DELIVERY_RECORD_INCOMPLETE) is not True
+    assert "delivered_prompts" not in first_meta.extra
+
+    monkeypatch.setattr(runner, "spawn_adapter", original_spawn)
+    second = runner.execute_turn(
+        session_id,
+        runner.continue_request(first_meta, "later prompt", defer_rotation=True),
+    )
+
+    assert second.state == "done"
+    resumed = sessions.load(session_id)
+    assert resumed.extra["resume"] == "verified"
+    assert "later prompt" in sessions.answer_path(session_id).read_text(encoding="utf-8")
 
 
 def test_a_turn_records_its_start_and_end_as_state_events() -> None:

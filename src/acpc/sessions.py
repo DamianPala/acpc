@@ -152,6 +152,7 @@ class SessionMeta:
 
 
 _META_FIELDS: tuple[str, ...] = tuple(f.name for f in fields(SessionMeta) if f.name != "extra")
+DELIVERY_RECORD_INCOMPLETE = "delivery_record_incomplete"
 
 
 # --------------------------------------------------------------------------
@@ -677,6 +678,7 @@ def finalize_turn(
     expected_turn: int | None = None,
     clock: Clock | None = None,
     error_event: Mapping[str, Any] | None = None,
+    delivery_record_incomplete: bool = False,
     **changes: Any,
 ) -> SessionMeta | None:
     """Publish a turn answer and terminal state as one token-checked claim.
@@ -708,6 +710,8 @@ def finalize_turn(
             events.append("error", **dict(error_event))
         events.append("state", **{"from": meta.state, "to": to_state})
         meta.state = to_state
+        if delivery_record_incomplete:
+            meta.extra[DELIVERY_RECORD_INCOMPLETE] = True
         for key, value in changes.items():
             setattr(meta, key, value)
         now = resolved_clock()
