@@ -393,20 +393,10 @@ def _updated_session_resolution(
     resolved["permissions"] = permission_payload
     if policy_changed:
         payload.pop("permissions_source", None)
-    adapter = payload.get("adapter")
-    if not isinstance(adapter, dict):
-        adapter = {}
-    adapter = {
-        key: adapter[key] for key in ("home_env", "effort_config_id", "modes") if key in adapter
-    }
-    adapter["modes"] = runner.mode_catalog_payload(resolution.entry.modes)
-    if resolution.mode is not None and resolution.mode_spec is not None:
-        adapter.update(
-            mode=resolution.mode,
-            grants=resolution.mode_spec.grants,
-            delegates=resolution.mode_spec.delegates,
-        )
-    payload["adapter"] = adapter
+    # Rebuild adapter from the live selection so wire vias (model_via /
+    # effort_via / effort_cli_flag) survive continue --permissions. A hard
+    # allowlist used to drop those fields and force config_option defaults.
+    payload["adapter"] = runner.session_resolution(resolution, cwd=None)["adapter"]
     return payload
 
 

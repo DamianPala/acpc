@@ -234,3 +234,5 @@ def test_wheel_contains_bundled_skill_files(tmp_path: Path) -> None:
         names = set(archive.namelist())
     assert "acpc/data/skills/provider-bringup/SKILL.md" in names
     assert "acpc/data/skills/provider-bringup/references/openrouter.md" in names
+    assert "acpc/data/skills/adapter-bringup/SKILL.md" in names
+    assert "acpc/data/agents/grok.toml" in names
