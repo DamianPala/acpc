@@ -2,6 +2,21 @@
 
 ## Now
 
+**0.6 is released and installed (2026-08-12, same day, later).** Version bumped to 0.6.0
+(`e6bfe8a`), tagged `v0.6.0` — the tag now sits on `524a42b` after two post-release skill
+amendments rode in under it — and `uv tool install --force` moved the live tool off 0.5.0, so
+the paragraph below describing the installed tool as 0.5.0 is historical. The provider-bringup
+skill gained a rung 7 (`probe --discover` diffs the advertised catalogue against the entry,
+`d719bfe`) and an ordering fix (`524a42b`): a brand-new adapter has no `[modes]`, mode selection
+over an empty table refuses the first run, so on that path discovery runs inside rung 5 as the
+*source* of the mode names and rung 7 becomes the second visit. First field test: a grok
+bringup, planned same day. Cleanup executed after diff-verification: all ten worktrees removed
+(the five dirty ones held only pre-landing intermediate states), ten merged branches deleted,
+26 dispatch roots trashed with the registry symlinks unlinked first; `probe-engine-r13` and
+`docs/plans/0.6/` (the chain record) deliberately kept. Origin push: Damian's own act, pending;
+when it lands, the "local-only, never push" ground rule in CLAUDE.md needs rewording (push is
+the user's act; release/PyPI stay off-limits to agents).
+
 **0.6 is complete on `main` at `d05ae38`, and unreleased.** Sixteen commits since `v0.5.0`, eleven of them the
 chain's slices and five docs-only: `663bc71`/`cdae7be` the help and `[modes]` corrections, `856193b` `escalates` as a
 third measured mode fact, `00fc49c` silent replay consumption, `6266f3d` a failed session says why,
