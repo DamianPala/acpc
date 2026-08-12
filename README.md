@@ -45,11 +45,29 @@ rm <id> | prune [--older-than D] [--dry-run]
 agents [name] [--models|--commands|--check]   # adapters + variants; resolved definitions
 agents init <name> --extends <agent>          # scaffold a variant
 probe <entry> --discover [--json]             # read the adapter's advertised modes; report only
+skills [name] [--json]                        # bundled how-to skills; with name: body + dir on stderr
 install <agent>
 daemon status|stop [target] [--force]   # plumbing escape hatch — never needed in the happy path
 ```
 
 `acpc --help` is a self-contained cheat sheet; `acpc <cmd> --help` is that command's full reference. `<id>` accepts a session id or a `--name` alias; `last` works on a TTY only.
+
+## Bundled skills
+
+Recipes that would go stale in `AGENTS.md` live as package skills. List them
+with `acpc skills`; print one body with `acpc skills <name>` (the skill
+directory path is on stderr — that is how you find `references/`).
+
+| Skill | For | Source |
+|-------|-----|--------|
+| `adapter-bringup` | New base adapter for any ACP agent (`command`, no `extends`): binary, entry TOML, modes via discovery or product docs | [`src/acpc/data/skills/adapter-bringup/SKILL.md`](src/acpc/data/skills/adapter-bringup/SKILL.md) |
+| `provider-bringup` | Existing harness + new provider/model (OpenRouter, gateway, local endpoint); variants that fail on the selected model | [`src/acpc/data/skills/provider-bringup/SKILL.md`](src/acpc/data/skills/provider-bringup/SKILL.md) |
+
+```bash
+acpc skills
+acpc skills adapter-bringup
+acpc skills provider-bringup
+```
 
 `acpc probe <entry> --discover` opens a session, reads the modes the adapter advertises, releases it, and prints that catalogue alongside a two-sided diff against the entry's recorded `[modes]`: modes the adapter advertises that the entry does not list, and entry modes the adapter no longer advertises. It costs zero turns and never edits the registry — applying anything it reports is a separate, explicit act. Measuring what a mode actually *permits* is not in this release, so `--discover` is required and a bare `probe` says so rather than answering a question you did not ask. Probe refuses to run on Windows because its commands are POSIX shell commands and would measure the shell rather than the sandbox.
 
