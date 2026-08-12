@@ -77,3 +77,12 @@ def test_long_entry_names_stay_under_the_byte_cap() -> None:
     assert len(target.encode("utf-8")) <= 180
     assert target.startswith("x")
     assert "~" in target
+
+
+def test_spawn_identity_is_part_of_the_digest() -> None:
+    a = target_for_call("grok", permissions="execute", spawn_identity={"effort": "low"})
+    b = target_for_call("grok", permissions="execute", spawn_identity={"effort": "high"})
+    c = target_for_call("grok", permissions="execute")
+    assert a != b
+    assert a != c
+    assert target_for_call("grok", permissions="execute", spawn_identity={"effort": "low"}) == a
