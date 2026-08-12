@@ -1,11 +1,10 @@
 ---
 name: provider-bringup
 description: >-
-  Bring up a new harness + provider combination for acpc (a vendor CLI pointed
-  at OpenRouter, a gateway or a local endpoint) and write its agent entry. Also
-  for putting a new model on a provider that already works, where the plumbing
-  carries over but the model's own capabilities do not. Use as well when a
-  variant fails with "There's an issue with the selected model".
+  Existing shipped harness + new provider/model for acpc (variant with extends:
+  OpenRouter, gateway, local endpoint). Also for a new model on plumbing that
+  already works, or when a variant fails with "There's an issue with the
+  selected model". Not for a new base command entry — that is adapter-bringup.
 ---
 
 # Bringing up a provider
@@ -14,6 +13,8 @@ A harness (Claude Code, codex, gemini) talks to a provider over the provider's
 API. acpc only builds the environment the harness runs in. Every failure is in
 exactly one of those two places, and the whole method is proving which one
 before changing anything.
+
+New base adapter (`command`, no `extends`)? Stop — use `adapter-bringup`.
 
 Vendor errors lie about which one it is. Climb the ladder instead of reading
 them, except for the recognized strings in *Known lies*, which name their own
@@ -116,7 +117,9 @@ forwarding proxy worth writing.
 
 ### 5. Write the entry, dry-run before you run it
 
-Entry format and its traps are in *The entry* below.
+Entry format and its traps are in *The entry* below. This skill assumes a
+variant (`extends`); a base adapter with `command` and no `extends` is
+`adapter-bringup` (empty `[modes]`, discovery, first mode table).
 
 ```bash
 acpc agents <name>              # what the entry resolves to, with provenance
@@ -124,21 +127,8 @@ acpc run <name> "x" --dry-run   # what this call resolves to, incl. env
 acpc run <name> "Reply with exactly: OK" --timeout 180
 ```
 
-A variant inherits its parent's `[modes]` and the above just works. **A new
-adapter (`command`, no `extends`) starts with no `[modes]` at all, and both
-the dry-run and the run refuse it**: mode selection over an empty table has
-nothing to select. The mode names are not yours to guess — get them from
-discovery, which opens a session without selecting a mode and therefore works
-on the modes-less entry:
-
-```bash
-acpc probe <name> --discover
-```
-
-Write the advertised ids into `[modes]` with their facts marked for what they
-are — assumed, not measured — or bridge the very first run with
-`--permissions all --mode <id>`, the one policy allowed to run a mode the
-table has not recorded. Then come back through the dry-run.
+A variant inherits its parent's `[modes]` and the above just works once the
+provider env is right.
 
 ### 6. Prove the isolation
 
@@ -170,15 +160,16 @@ not that the ceilings are right; a mode you add from this report still needs its
 facts filled in by hand, stated as what they are: copied or assumed, not
 measured.
 
+If discovery is **empty by design** (parent is Path B in `adapter-bringup`: no
+ACP modes on the wire, table filled from docs), "entry modes absent from
+catalogue" is expected — do **not** strip `[modes]` to clear the diff.
+
 Modes are adapter-level, so on the rungs-1-2-5 path (new model, proven
 plumbing) this rung moves nothing. Run it when the harness or its version is
 new — and it is worth re-running after a harness upgrade for the same reason
 the command exists at all: a `[modes]` table records an observation, and
-observations age.
-
-On a new adapter this is a second visit: rung 5 used discovery to learn the
-names before the first run could select a mode; this one checks the finished
-entry against the same catalogue.
+observations age. Building the first `[modes]` table for a new base adapter is
+`adapter-bringup`, not this rung.
 
 ## The entry
 

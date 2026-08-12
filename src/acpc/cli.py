@@ -146,6 +146,7 @@ Maintenance and setup:
   rm <id>           delete a finished session's on-disk state
   prune             delete finished sessions older than retention (--older-than D)
   install <agent>   install the agent's adapter
+  skills            list bundled how-to skills; skills <name> prints the body
   Killing acpc does not stop the session — acpc stop does.
 
 Common commands:
