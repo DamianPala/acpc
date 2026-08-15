@@ -72,7 +72,8 @@ $CMD --help 2>&1 | head -80
 ```
 
 Record a one-line installer as `install_command` only if it is as trusted as the
-entry itself.
+entry itself. Otherwise set `install_docs` to the vendor's install page so
+missing-binary errors do not promise `acpc install`.
 
 ### 2. ACP works without acpc
 
@@ -95,7 +96,8 @@ name = "Display name"
 author = "Vendor"
 description = "One line: what this adapter is for."
 command = "myagent acp"                   # shlex-split; args allowed
-# install_command = "…"
+# install_command = "…"                   # only a trusted one-liner
+# install_docs = "https://vendor.example/install"
 home = "~/.myagent"
 home_env = "MYAGENT_HOME"                 # omit only if the vendor has no home var
 env_passthrough = [
@@ -152,7 +154,7 @@ Rules that do not move:
   then fill the table and drop the bridge.
 - Hyphenated mode ids may be bare TOML keys (`read-only = { … }`) or quoted;
   quote if the id is not a bare key (spaces, etc.).
-- Do not put `efforts` / free keys under `[modes]` — only mode → table values.
+- Do not put free keys under `[modes]` — only mode → table values.
 
 ```bash
 acpc probe "$NAME" --discover   # report only; empty catalogue stays empty
@@ -177,7 +179,9 @@ When that fails (Method not found / unknown option), use entry overrides:
 2. Try `--model` / `--effort` or a preset; on wire failure, set `model_via` /
    `effort_via` after verifying the alternate path, or leave presets empty.
 3. Effort / "thinking" labels are not permission modes — keep them out of
-   `[modes]`. List accepted levels in `efforts = […]`.
+   `[modes]`. Per-model allowlists go in `[effort_by_model]`; omit the table
+   (or leave it empty) to use the global scale. An empty row means that model
+   has no effort setting. Quote dotted model ids (`"grok-4.5"`).
 4. `effort_config_id` only on the config-option path when non-default.
 
 ```toml
@@ -185,7 +189,9 @@ When that fails (Method not found / unknown option), use entry overrides:
 # model_via = "set_model"
 # effort_via = "cli"
 # effort_cli_flag = "--reasoning-effort"
-# efforts = ["low", "medium", "high"]
+# [effort_by_model]
+# "vendor-model-a" = ["low", "medium", "high"]
+# "vendor-model-b" = ["low", "medium", "high", "xhigh"]
 # [presets]
 # standard = { model = "…", effort = "high" }
 ```
@@ -222,12 +228,13 @@ acpc agents --check "$NAME"   # live apply of resolved options; zero turns
 |---|---|
 | `command` | Process acpc spawns (ACP on stdio). Required. |
 | `install_command` | Trusted shell line for `acpc install <name>`. Optional. |
+| `install_docs` | Vendor install URL when there is no trusted installer. Optional. |
 | `home` / `home_env` | Vendor config+credentials dir; env var that points at it. |
 | `env_passthrough` | Caller env **names** forwarded at call time. |
 | `[env]` | Literal non-secret values. |
 | `[modes]` | Mode ids + assumed/measured permission facts. Required for run. |
 | `[presets]` | After model/effort apply path works (`*_via` or config options). |
-| `efforts` / `effort_config_id` | Allowed efforts; config option id if non-default. |
+| `[effort_by_model]` / `effort_config_id` | Optional per-model allowlists (empty/omitted = global scale); config option id if non-default. |
 | `model_via` / `effort_via` / `effort_cli_flag` | Wire workarounds when config options are missing. |
 | `description` | Roster purpose. |
 
@@ -256,7 +263,8 @@ Shape references (not values to copy): package `data/agents/claude.toml`,
 | `probe --discover` → 0 advertised | Catalogue missing on the wire — not proof the binary has no permission modes. Path B. |
 | Mode name from another adapter "should work" | Mode ids are vendor-local. |
 | `the adapter rejected model|effort '…'` with Method not found, Unknown config option, or similar | Config-option path missing — set `model_via` / `effort_via` after proving the alternate wire, or drop pins. |
-| `missing → acpc install …` | argv[0] not on PATH; install binary or set `install_command`. |
+| `missing → acpc install …` | argv[0] not on PATH and the entry has `install_command`. |
+| `missing → https://…` | argv[0] not on PATH; entry has `install_docs`, no `install_command`. Install the vendor CLI. |
 | Auth fails only under acpc | Passthrough or `home`/`home_env` wrong; re-run bare with the same env (rung 2). |
 | Daemon shares traffic with another entry | Same target key (agent + home + declared env + policy). Own `home`. |
 | `0 tok` / odd cost in the summary | Prefer ACP `usage_update`; acpc also reads PromptResponse `_meta` totals. Still not a failed turn if exit 0 and answer present. |

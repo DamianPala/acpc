@@ -24,7 +24,6 @@ command = "{sys.executable} {MOCK_AGENT_SCRIPT}"
 install_command = "true"
 home = "~/.mock"
 home_env = "MOCK_HOME"
-efforts = ["low", "medium", "high", "xhigh"]
 
 [modes]
 default = {{ grants = "read", delegates = true }}
@@ -172,6 +171,24 @@ def test_a_missing_adapter_binary_exits_1_and_names_the_install(cli: CliRunner) 
 
     assert result.exit_code == vocab.EXIT_AGENT_ERROR
     assert "acpc install phantom" in result.stderr
+
+
+def test_a_missing_adapter_without_install_command_names_vendor_docs(
+    cli: CliRunner, state_root: Path
+) -> None:
+    (state_root / "agents" / "vendorish.toml").write_text(
+        'command = "definitely-not-installed-vendorish-xyz"\n'
+        'install_docs = "https://example.test/cli"\n'
+        "\n[modes]\ndefault = { grants = \"read\", delegates = true }\n",
+        encoding="utf-8",
+    )
+
+    result = invoke(cli, "run", "vendorish", "hello")
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    assert "https://example.test/cli" in result.stderr
+    assert "already registered" in result.stderr
+    assert "acpc install vendorish" not in result.stderr
 
 
 def test_a_missing_adapter_binary_creates_no_session(cli: CliRunner, state_root: Path) -> None:
@@ -863,3 +880,61 @@ def test_the_reserved_name_last_is_refused(cli: CliRunner) -> None:
     result = invoke(cli, "run", "mock", "echo:nope", "--name", "last", "--quiet")
 
     assert result.exit_code == vocab.EXIT_USAGE
+
+
+def test_unlisted_model_warns_on_dry_run(cli: CliRunner) -> None:
+    result = invoke(
+        cli,
+        "run",
+        "grok",
+        "probe",
+        "--model",
+        "grok-4.7",
+        "--effort",
+        "xhigh",
+        "--dry-run",
+    )
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert "grok-4.7 has no [effort_by_model] row" in result.stderr
+    assert "using adapter efforts low, medium, high, xhigh" in result.stderr
+
+
+def test_unlisted_model_warns_on_run(cli: CliRunner, state_root: Path) -> None:
+    (state_root / "agents" / "mock.toml").write_text(
+        MOCK_ENTRY + '\n[effort_by_model]\n"mock-sonnet-5" = ["low", "medium", "high"]\n',
+        encoding="utf-8",
+    )
+
+    result = invoke(
+        cli,
+        "run",
+        "mock",
+        "echo:hi",
+        "--model",
+        "mock-opus-5",
+        "--effort",
+        "high",
+        "--quiet",
+    )
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert "mock-opus-5 has no [effort_by_model] row" in result.stderr
+    assert "using adapter efforts low, medium, high" in result.stderr
+
+
+def test_listed_model_does_not_warn_on_dry_run(cli: CliRunner) -> None:
+    result = invoke(
+        cli,
+        "run",
+        "grok",
+        "probe",
+        "--model",
+        "grok-4.6",
+        "--effort",
+        "high",
+        "--dry-run",
+    )
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert "has no [effort_by_model] row" not in result.stderr

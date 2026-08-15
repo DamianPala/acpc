@@ -140,7 +140,7 @@ trash-put "$ACPC_HOME"
 
 | # | Do | Expect |
 |---|---|---|
-| F1 | Run an entry whose adapter binary is not installed | An actionable error naming the install command |
+| F1 | Run an entry whose adapter binary is not installed | An actionable error naming `acpc install` when the entry has `install_command`, otherwise the vendor docs / binary |
 | F2 | `--model` the vendor rejects | The vendor's own refusal plus the adapter log path, not a generic failure |
 | F3 | SIGKILL the adapter mid-turn, by PID from `acpc daemon status` | State `failed`; the cause is agent-visible — what acpc observed, the adapter's last stderr, and one next step |
 | F4 | An `ACPC_HOME` spelling containing `..`, then run | The daemon is reachable with no stall, and no 15s hang followed by a direct-child fallback |

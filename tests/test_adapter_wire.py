@@ -55,7 +55,6 @@ command = "base agent stdio"
 model_via = "set_model"
 effort_via = "cli"
 effort_cli_flag = "--effort"
-efforts = ["low", "high"]
 [modes]
 default = { grants = "read", delegates = true }
 """,
@@ -116,7 +115,6 @@ def test_call_target_separates_cli_effort_processes(tmp_path: Path) -> None:
         """
 name = "Tool"
 command = "tool agent stdio"
-efforts = ["low", "high"]
 effort_via = "cli"
 effort_cli_flag = "--effort"
 [modes]
@@ -137,7 +135,6 @@ def test_call_target_ignores_effort_when_via_config_option(tmp_path: Path) -> No
         """
 name = "Tool"
 command = "tool"
-efforts = ["low", "high"]
 [modes]
 default = { grants = "read", delegates = true }
 """,
@@ -164,7 +161,6 @@ command = "tool agent stdio"
 model_via = "set_model"
 effort_via = "cli"
 effort_cli_flag = "--effort"
-efforts = ["low", "high"]
 [modes]
 default = { grants = "read", delegates = true }
 """,
@@ -271,7 +267,6 @@ command = "tool agent stdio"
 model_via = "set_model"
 effort_via = "cli"
 effort_cli_flag = "--effort"
-efforts = ["low", "high"]
 [modes]
 default = { grants = "read", delegates = true }
 """,
@@ -295,7 +290,6 @@ def test_apply_call_options_uses_config_option_by_default(tmp_path: Path) -> Non
         """
 name = "Tool"
 command = "tool"
-efforts = ["low", "high"]
 effort_config_id = "effort"
 [modes]
 default = { grants = "read", delegates = true }

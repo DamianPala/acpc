@@ -34,9 +34,10 @@ _ENTRY_KEYS: Final = frozenset(
         "author",
         "command",
         "install_command",
+        "install_docs",
         "home",
         "home_env",
-        "efforts",
+        "effort_by_model",
         "effort_config_id",
         "effort_via",
         "effort_cli_flag",
@@ -59,9 +60,10 @@ _FIELD_NAMES: Final = (
     "author",
     "command",
     "install_command",
+    "install_docs",
     "home",
     "home_env",
-    "efforts",
+    "effort_by_model",
     "effort_config_id",
     "effort_via",
     "effort_cli_flag",
@@ -162,9 +164,11 @@ class ResolvedEntry:
     author: str | None
     command: str
     install_command: str | None
+    # Vendor docs when there is no trusted `install_command` (e.g. Grok Build).
+    install_docs: str | None
     home: str | None
     home_env: str | None
-    efforts: tuple[str, ...]
+    effort_by_model: Mapping[str, tuple[str, ...]]
     # The session config option id that carries effort — a vendor fact like
     # home_env (codex speaks `reasoning_effort`, claude speaks `effort`).
     effort_config_id: str | None
@@ -223,6 +227,34 @@ class ResolvedEntry:
     @property
     def install_status(self) -> str:
         return "installed" if self.installed else "missing"
+
+    def install_next_step(self) -> str:
+        """Actionable next step when the adapter binary is not on PATH."""
+        if self.install_command:
+            return f"run 'acpc install {self.base_adapter}'"
+        if self.install_docs:
+            return (
+                "adapter is already registered; install the vendor CLI from "
+                f"{self.install_docs}"
+            )
+        return f"install '{self.command_head}' from the vendor"
+
+    def missing_binary_error(self) -> str:
+        """One-line refusal when argv[0] is not installed."""
+        return (
+            f"{self.entry}: '{self.command_head}' is not installed — "
+            f"{self.install_next_step()}"
+        )
+
+    def roster_install_status(self) -> str:
+        """Roster status cell, including a next-step hint when missing."""
+        if self.installed:
+            return "installed"
+        if self.install_command:
+            return f"missing → acpc install {self.entry}"
+        if self.install_docs:
+            return f"missing → {self.install_docs}"
+        return "missing"
 
     @property
     def source(self) -> Path:
@@ -302,7 +334,7 @@ class ResolvedEntry:
             sources["model"] = FieldSource("unset")
 
         if resolved_effort is not None:
-            self._validate_effort(resolved_effort)
+            self._validate_effort(resolved_effort, resolved_model)
 
         resolved_mode = self.mode if mode is None else mode
         if resolved_mode is not None:
@@ -346,16 +378,30 @@ class ResolvedEntry:
             provenance=sources,
         )
 
-    def _validate_effort(self, value: str) -> None:
+    def derived_effort_union(self) -> tuple[str, ...]:
+        """Unique values from non-empty ``[effort_by_model]`` rows, in vocab order."""
+        seen: set[str] = set()
+        for levels in self.effort_by_model.values():
+            seen.update(levels)
+        return tuple(value for value in EFFORT_VALUES if value in seen)
+
+    def effective_efforts(self, model: str | None) -> tuple[str, ...]:
+        """Allowlist that applies to ``model`` (empty means no effort setting)."""
+        if model is not None and model in self.effort_by_model:
+            return self.effort_by_model[model]
+        return self.derived_effort_union() or EFFORT_VALUES
+
+    def _validate_effort(self, value: str, model: str | None) -> None:
         if value not in EFFORT_VALUES:
-            supported = ", ".join(self.efforts) if self.efforts else ", ".join(EFFORT_VALUES)
+            supported = ", ".join(EFFORT_VALUES)
             raise RegistryError(
                 f"{self.entry}: unsupported effort '{value}'; supported levels: {supported}"
             )
-        # An empty list means the adapter has no verified advertisement yet,
-        # rather than that it supports no efforts at all.
-        if self.efforts and value not in self.efforts:
-            supported = ", ".join(self.efforts)
+        if model is not None and model in self.effort_by_model and not self.effort_by_model[model]:
+            raise RegistryError(f"{self.entry}: {model} has no effort setting")
+        allowed = self.effective_efforts(model)
+        if value not in allowed:
+            supported = ", ".join(allowed)
             raise RegistryError(
                 f"{self.entry}: effort '{value}' is not supported; supported levels: {supported}"
             )
@@ -440,6 +486,7 @@ def _parse_entry(
         "author",
         "command",
         "install_command",
+        "install_docs",
         "home",
         "home_env",
         "extends",
@@ -474,9 +521,18 @@ def _parse_entry(
             raise RegistryError(f"{path}: key 'permissions' must be one of: {supported}")
         if permission in PERMISSION_ALIASES:
             permission_alias = permission
-    for key in ("efforts", "env_passthrough"):
-        if key in raw:
-            _expect_string_list(path, key, raw[key])
+    if "env_passthrough" in raw:
+        _expect_string_list(path, "env_passthrough", raw["env_passthrough"])
+    if "effort_by_model" in raw:
+        table = raw["effort_by_model"]
+        if not isinstance(table, dict):
+            raise RegistryError(f"{path}: table '[effort_by_model]' must contain model ids")
+        for model_id, levels in table.items():
+            if not isinstance(model_id, str) or not model_id:
+                raise RegistryError(f"{path}: [effort_by_model] keys must be non-empty model ids")
+            # Vendor rows may list advertised extras (claude's "default") that
+            # are not on the CLI scale; resolve-time still requires EFFORT_VALUES.
+            _expect_string_list(path, f"effort_by_model.{model_id}", levels)
     if "env" in raw and (
         not isinstance(raw["env"], dict)
         or any(
@@ -555,6 +611,24 @@ def _shipped_files() -> Iterator[tuple[str, Path]]:
             yield resource.name[:-5], _resource_path(resource)
 
 
+def _effort_by_model_from_data(data: Mapping[str, Any], source: Path) -> dict[str, tuple[str, ...]]:
+    raw_map = data.get("effort_by_model", {})
+    if not isinstance(raw_map, dict):
+        raise RegistryError(f"{source}: [effort_by_model] must be a table")
+    result: dict[str, tuple[str, ...]] = {}
+    for model_id, levels in raw_map.items():
+        if not isinstance(model_id, str) or not model_id:
+            raise RegistryError(f"{source}: [effort_by_model] keys must be non-empty model ids")
+        if not isinstance(levels, (list, tuple)) or any(
+            not isinstance(item, str) or not item for item in levels
+        ):
+            raise RegistryError(
+                f"{source}: [effort_by_model.{model_id}] must be an array of non-empty strings"
+            )
+        result[model_id] = tuple(levels)
+    return result
+
+
 def _to_resolved(
     name: str, parsed: _ParsedEntry, extends: str | None, base_adapter: str
 ) -> ResolvedEntry:
@@ -609,7 +683,7 @@ def _to_resolved(
     env = dict(raw_env) if isinstance(raw_env, dict) else {}
     provenance = dict(parsed.provenance)
     default_fields = {
-        "efforts",
+        "effort_by_model",
         "env_passthrough",
         "env",
         "modes",
@@ -628,9 +702,10 @@ def _to_resolved(
         author=string_or_none("author"),
         command=command,
         install_command=string_or_none("install_command"),
+        install_docs=string_or_none("install_docs"),
         home=string_or_none("home"),
         home_env=string_or_none("home_env"),
-        efforts=strings("efforts"),
+        effort_by_model=_effort_by_model_from_data(data, parsed.source),
         effort_config_id=string_or_none("effort_config_id"),
         model_via=string_or_none("model_via") or "config_option",
         effort_via=string_or_none("effort_via") or "config_option",
@@ -729,7 +804,8 @@ class AgentRegistry:
             parent_data = {
                 key: getattr(parent, key)
                 for key in _FIELD_NAMES
-                if key not in {"modes", "presets", "env"} and key not in _NON_INHERITABLE_FIELDS
+                if key not in {"modes", "presets", "env", "effort_by_model"}
+                and key not in _NON_INHERITABLE_FIELDS
             }
             # Rebuild nested values from the parent's public representation;
             # provenance is kept separately and then overlaid with the child.
@@ -746,6 +822,9 @@ class AgentRegistry:
                 for mode, spec in parent.modes.items()
             }
             parent_data["env"] = dict(parent.env)
+            parent_data["effort_by_model"] = {
+                model_id: list(levels) for model_id, levels in parent.effort_by_model.items()
+            }
             parent_provenance = {
                 field: source
                 for field, source in parent.provenance.items()
@@ -779,9 +858,12 @@ class AgentRegistry:
         )
 
     def install_command(self, name: str) -> str:
-        command = self.resolve(name).install_command
+        entry = self.resolve(name)
+        command = entry.install_command
         if not command:
-            raise RegistryError(f"agent '{name}' does not define an install_command")
+            raise RegistryError(
+                f"agent '{name}' has no install_command — {entry.install_next_step()}"
+            )
         return command
 
     def execute_install(

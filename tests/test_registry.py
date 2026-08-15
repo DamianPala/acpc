@@ -65,7 +65,7 @@ def test_variant_inherits_and_reports_nearest_field_provenance(tmp_path: Path) -
     write_entry(
         agents,
         "base",
-        'name = "Base"\ncommand = "python -m base"\nhome = "~/.base"\nefforts = ["low", "high"]\n',
+        'name = "Base"\ncommand = "python -m base"\nhome = "~/.base"\n',
     )
     write_entry(
         agents,
@@ -287,20 +287,22 @@ def test_a_variant_inherits_the_parent_adapter_contract_lists(tmp_path: Path) ->
         agents,
         "base",
         'name = "Base"\ncommand = "python -m base"\n'
-        'efforts = ["low", "high"]\n'
         'effort_config_id = "effort"\n'
-        'env_passthrough = ["BASE_KEY"]\n',
+        'env_passthrough = ["BASE_KEY"]\n'
+        "[effort_by_model]\n"
+        'some-model = ["low", "high"]\n',
     )
     write_entry(agents, "worker", 'extends = "base"\nmodel = "base-model"\n')
 
     registry = AgentRegistry(agents)
     worker = registry.resolve("worker")
 
-    assert worker.efforts == ("low", "high")
+    assert worker.effort_by_model == {"some-model": ("low", "high")}
+    assert worker.effective_efforts("some-model") == ("low", "high")
     assert worker.effort_config_id == "effort"
     assert worker.env_passthrough == ("BASE_KEY",)
     with pytest.raises(RegistryError, match="low, high"):
-        registry.resolve_call("worker", effort="medium")
+        registry.resolve_call("worker", model="some-model", effort="medium")
 
 
 def test_user_override_new_adapter_and_variant_are_distinct_cases(tmp_path: Path) -> None:
@@ -462,10 +464,14 @@ def test_call_resolution_exports_ask_as_a_read_ceiling(tmp_path: Path) -> None:
 
 def test_effort_validation_lists_supported_levels(tmp_path: Path) -> None:
     agents = tmp_path / "agents"
-    write_entry(agents, "limited", 'command = "python"\nefforts = ["low", "medium"]\n')
+    write_entry(
+        agents,
+        "limited",
+        'command = "python"\n[effort_by_model]\nsome-model = ["low", "medium"]\n',
+    )
 
     with pytest.raises(RegistryError, match=r"supported levels: low, medium"):
-        AgentRegistry(agents).resolve_call("limited", effort="xhigh")
+        AgentRegistry(agents).resolve_call("limited", model="some-model", effort="xhigh")
 
     entry = AgentRegistry(agents).resolve("limited")
     assert entry.provenance["permissions"].kind == "unset"
@@ -496,6 +502,36 @@ def test_install_status_checks_command_head_and_install_helper_is_injectable(
     assert registry.install_command("local") == "python -m installer"
     assert result == "result"
     assert calls == [(["python", "-m", "installer"],)]
+
+
+def test_missing_binary_without_install_command_names_vendor_docs(tmp_path: Path) -> None:
+    agents = tmp_path / "agents"
+    write_entry(
+        agents,
+        "vendorish",
+        'command = "definitely-not-installed-vendorish-xyz"\n'
+        'install_docs = "https://example.test/cli"\n',
+    )
+    registry = AgentRegistry(agents)
+    entry = registry.resolve("vendorish")
+
+    assert entry.roster_install_status() == "missing → https://example.test/cli"
+    assert "acpc install" not in entry.missing_binary_error()
+    assert "https://example.test/cli" in entry.missing_binary_error()
+    assert "already registered" in entry.missing_binary_error()
+    with pytest.raises(RegistryError, match="https://example.test/cli") as caught:
+        registry.install_command("vendorish")
+    assert "acpc install vendorish" not in str(caught.value)
+
+
+def test_missing_binary_without_installer_or_docs_names_the_binary(tmp_path: Path) -> None:
+    agents = tmp_path / "agents"
+    write_entry(agents, "bare", 'command = "definitely-not-installed-bare-xyz"\n')
+    entry = AgentRegistry(agents).resolve("bare")
+
+    assert entry.roster_install_status() == "missing"
+    assert "acpc install" not in entry.missing_binary_error()
+    assert "definitely-not-installed-bare-xyz" in entry.missing_binary_error()
 
 
 def test_malformed_entry_is_a_clean_registry_error(tmp_path: Path) -> None:
@@ -558,6 +594,10 @@ def test_shipped_grok_uses_set_model_and_cli_effort(tmp_path: Path) -> None:
     registry = AgentRegistry(tmp_path / "agents")
     grok = registry.resolve("grok")
     assert grok.command_args == ("grok", "agent", "--always-approve", "stdio")
+    assert grok.install_command is None
+    assert grok.install_docs == "https://docs.x.ai/build/overview"
+    assert "acpc install" not in grok.install_next_step()
+    assert grok.install_docs in grok.install_next_step()
     assert grok.model_via == "set_model"
     assert grok.effort_via == "cli"
     assert grok.effort_cli_flag == "--reasoning-effort"
@@ -584,7 +624,6 @@ def test_effort_via_cli_injects_flag_before_transport(tmp_path: Path) -> None:
         """
 name = "Tool"
 command = "tool agent stdio"
-efforts = ["low", "high"]
 effort_via = "cli"
 effort_cli_flag = "--effort"
 model_via = "set_model"
@@ -595,3 +634,135 @@ default = { grants = "read", delegates = true }
     entry = AgentRegistry(agents).resolve("tool")
     call = entry.resolve_call(effort="high", permissions="read")
     assert call.command == ("tool", "agent", "--effort", "high", "stdio")
+
+
+def test_shipped_grok_4_5_rejects_xhigh_and_accepts_high(tmp_path: Path) -> None:
+    registry = AgentRegistry(tmp_path / "agents")
+
+    with pytest.raises(RegistryError) as error:
+        registry.resolve_call("grok", model="grok-4.5", effort="xhigh")
+    message = str(error.value)
+    assert "supported levels: low, medium, high" in message
+    assert "supported levels: low, medium, high, xhigh" not in message
+
+    call = registry.resolve_call("grok", model="grok-4.5", effort="high")
+    assert call.model == "grok-4.5"
+    assert call.effort == "high"
+
+
+def test_shipped_grok_4_6_accepts_xhigh(tmp_path: Path) -> None:
+    call = AgentRegistry(tmp_path / "agents").resolve_call("grok", model="grok-4.6", effort="xhigh")
+    assert call.model == "grok-4.6"
+    assert call.effort == "xhigh"
+
+
+def test_unlisted_model_uses_derived_union(tmp_path: Path) -> None:
+    registry = AgentRegistry(tmp_path / "agents")
+    allowed = registry.resolve_call("grok", model="grok-4.7", effort="xhigh")
+    assert allowed.effort == "xhigh"
+    assert allowed.model == "grok-4.7"
+
+    with pytest.raises(RegistryError, match="supported levels: low, medium, high, xhigh"):
+        registry.resolve_call("grok", model="grok-4.7", effort="ultra")
+
+
+def test_empty_effort_row_rejects_any_effort(tmp_path: Path) -> None:
+    agents = tmp_path / "agents"
+    write_entry(
+        agents,
+        "limited",
+        'command = "python"\n[effort_by_model]\nhaiku = []\nsonnet = ["low", "high"]\n',
+    )
+
+    with pytest.raises(RegistryError, match="haiku has no effort setting"):
+        AgentRegistry(agents).resolve_call("limited", model="haiku", effort="high")
+    call = AgentRegistry(agents).resolve_call("limited", model="sonnet", effort="high")
+    assert call.effort == "high"
+
+
+def test_empty_union_falls_back_to_global_vocab(tmp_path: Path) -> None:
+    agents = tmp_path / "agents"
+    write_entry(
+        agents,
+        "onlyempty",
+        'command = "python"\n[effort_by_model]\nhaiku = []\n',
+    )
+    registry = AgentRegistry(agents)
+
+    call = registry.resolve_call("onlyempty", model="other", effort="ultra")
+    assert call.effort == "ultra"
+    with pytest.raises(RegistryError, match="haiku has no effort setting"):
+        registry.resolve_call("onlyempty", model="haiku", effort="low")
+
+
+def test_user_effort_by_model_overlay_merges_rows(tmp_path: Path) -> None:
+    agents = tmp_path / "agents"
+    write_entry(agents, "grok", '[effort_by_model]\nextra = ["low"]\n')
+
+    grok = AgentRegistry(agents).resolve("grok")
+
+    assert grok.effort_by_model["grok-4.5"] == ("low", "medium", "high")
+    assert grok.effort_by_model["extra"] == ("low",)
+    assert grok.provenance["effort_by_model.extra"].path == agents / "grok.toml"
+    assert grok.provenance["effort_by_model.grok-4.5"].kind == "adapter-default"
+
+
+def test_efforts_key_is_unknown(tmp_path: Path) -> None:
+    agents = tmp_path / "agents"
+    write_entry(agents, "legacy", 'command = "python"\nefforts = ["low"]\n')
+
+    with pytest.raises(RegistryError, match="unknown key"):
+        AgentRegistry(agents)
+
+
+def test_variant_inherits_grok_effort_by_model(tmp_path: Path) -> None:
+    agents = tmp_path / "agents"
+    write_entry(agents, "worker", 'extends = "grok"\n')
+
+    registry = AgentRegistry(agents)
+    worker = registry.resolve("worker")
+    grok = registry.resolve("grok")
+
+    assert worker.effort_by_model == grok.effort_by_model
+    assert worker.effective_efforts("grok-4.5") == ("low", "medium", "high")
+    assert worker.effective_efforts("grok-4.6") == ("low", "medium", "high", "xhigh")
+
+
+def test_shipped_claude_haiku_rejects_effort_and_sonnet_accepts_high(
+    tmp_path: Path,
+) -> None:
+    registry = AgentRegistry(tmp_path / "agents")
+
+    with pytest.raises(RegistryError, match="claude-haiku-4-5 has no effort setting"):
+        registry.resolve_call("claude", model="claude-haiku-4-5", effort="high")
+    call = registry.resolve_call("claude", model="claude-sonnet-5", effort="high")
+    assert call.effort == "high"
+
+
+def test_shipped_codex_empty_map_accepts_global_vocab(tmp_path: Path) -> None:
+    registry = AgentRegistry(tmp_path / "agents")
+    assert registry.resolve("codex").effort_by_model == {}
+    assert registry.resolve_call("codex", effort="low").effort == "low"
+    assert registry.resolve_call("codex", effort="xhigh").effort == "xhigh"
+    assert registry.resolve_call("codex", effort="ultra").effort == "ultra"
+
+
+def test_unknown_effort_lists_global_vocab(tmp_path: Path) -> None:
+    with pytest.raises(RegistryError, match="supported levels: none, minimal, low"):
+        AgentRegistry(tmp_path / "agents").resolve_call("codex", effort="turbo")
+
+
+def test_preset_effort_rejected_when_model_row_disallows_it(tmp_path: Path) -> None:
+    agents = tmp_path / "agents"
+    write_entry(
+        agents,
+        "local",
+        'command = "python"\n'
+        "[effort_by_model]\n"
+        'small = ["low"]\n'
+        "[presets]\n"
+        'fast = { model = "small", effort = "high" }\n',
+    )
+
+    with pytest.raises(RegistryError, match="supported levels: low"):
+        AgentRegistry(agents).resolve_call("local", model="fast")

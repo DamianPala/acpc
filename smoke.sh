@@ -251,7 +251,6 @@ command = "${PYTHON_BIN} ${SCRIPT_DIR}/tests/mock_agent.py"
 install_command = "true"
 home = "~/.mock"
 home_env = "MOCK_HOME"
-efforts = ["low", "medium", "high", "xhigh"]
 
 [modes]
 default = { grants = "read", delegates = true }

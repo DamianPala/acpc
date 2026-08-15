@@ -317,6 +317,26 @@ def _warn_permission_alias(alias: str | None) -> None:
     _normalize_permission(alias)
 
 
+def _warn_unlisted_effort_model(resolution: CallResolution) -> None:
+    """Warn when the resolved model has no ``[effort_by_model]`` row."""
+    model = resolution.model
+    entry = resolution.entry
+    if model is None or not entry.effort_by_model or model in entry.effort_by_model:
+        return
+    union = entry.derived_effort_union()
+    if union:
+        click.echo(
+            f"-- effort: {model} has no [effort_by_model] row; "
+            f"using adapter efforts {', '.join(union)}",
+            err=True,
+        )
+        return
+    click.echo(
+        f"-- effort: {model} has no [effort_by_model] row; using the global effort scale",
+        err=True,
+    )
+
+
 def _stored_permission_policy(meta: sessions.SessionMeta) -> str:
     """Read and normalize the permission policy from a validated session."""
     resolved = meta.resolution.get("resolved")
@@ -348,7 +368,9 @@ def _continue_selection(
         stored_mode = _stored_mode_item(meta)
         source = stored_mode.get("source") if stored_mode is not None else None
         explicit_mode = stored.mode if stored.mode is not None and source != "selected" else None
-        resolution = entry.resolve_call(
+        # Live [effort_by_model] must not reject a stored model/effort pair.
+        # Mode/permissions re-read the current table; effort stays as persisted.
+        resolution = replace(entry, effort_by_model={}).resolve_call(
             model=stored.model,
             effort=stored.effort,
             mode=explicit_mode,
@@ -665,9 +687,7 @@ _ROSTER_DESCRIPTION_LIMIT = 80
 
 
 def _agent_row(entry: ResolvedEntry) -> tuple[str, ...]:
-    status = entry.install_status
-    if status == "missing":
-        status = f"missing → acpc install {entry.entry}"
+    status = entry.roster_install_status()
     description = (
         render.snippet(entry.description, limit=_ROSTER_DESCRIPTION_LIMIT)
         if entry.description is not None
@@ -796,10 +816,7 @@ def _ensure_cache(entry: ResolvedEntry) -> cache.CachedAdvertised:
     if record is not None:
         return record
     if not entry.installed:
-        raise cache.ProbeError(
-            f"{entry.entry}: '{entry.command_head}' is not installed — "
-            f"run 'acpc install {entry.base_adapter}'"
-        )
+        raise cache.ProbeError(entry.missing_binary_error())
     advertised = asyncio.run(cache.probe_advertised(entry.resolve_call()))
     refreshed = cache.read_advertised(entry.base_adapter)
     return refreshed or cache.CachedAdvertised(advertised=advertised, cached_at=time.time())
@@ -1101,6 +1118,7 @@ def _run_agents_view(
                     _write_stdout(text)
             else:
                 entry = registry.resolve(name)
+                _warn_unlisted_effort_model(registry.resolve_call(name))
                 record = _ensure_cache(entry)
                 text, payload = _render_models(entry, record)
                 if json_mode:
@@ -1252,7 +1270,9 @@ def _agents_check(registry: AgentRegistry, name: str | None, *, json_mode: bool)
     results: list[dict[str, Any]] = []
     for entry in entries:
         try:
-            advertised = asyncio.run(cache.probe_advertised(registry.resolve_call(entry.entry)))
+            resolution = registry.resolve_call(entry.entry)
+            _warn_unlisted_effort_model(resolution)
+            advertised = asyncio.run(cache.probe_advertised(resolution))
             result = {"agent": entry.entry, "ok": True, "models": len(advertised["models"])}
         except cache.ProbeError as error:
             result = {"agent": entry.entry, "ok": False, "error": str(error)}
@@ -1357,7 +1377,7 @@ def agents_init_command(
         registry = AgentRegistry()
         registry.resolve(parent)
         if effort is not None:
-            registry.resolve_call(parent, effort=effort)
+            registry.resolve_call(parent, model=model, effort=effort)
     except RegistryError as error:
         if json_mode:
             _emit_json({"error": str(error)})
@@ -2249,6 +2269,7 @@ def run_command(
         )
         if permissions is None:
             _warn_permission_alias(registry.permission_alias(agent))
+        _warn_unlisted_effort_model(resolution)
     except RegistryError as error:
         raise UsageProblem(str(error)) from None
 
