@@ -173,10 +173,7 @@ async def probe_advertised(resolution: CallResolution) -> dict[str, Any]:
     except Exception as error:  # noqa: BLE001
         raise ProbeError(str(error)) from None
     if not command or shutil.which(command[0]) is None:
-        raise ProbeError(
-            f"{resolution.entry.entry}: '{command[0] if command else ''}' is not installed — "
-            f"run 'acpc install {resolution.entry.base_adapter}'"
-        )
+        raise ProbeError(resolution.entry.missing_binary_error())
 
     with tempfile.TemporaryDirectory(prefix="acpc-probe-") as temporary:
         transcript = Transcript(Path(temporary) / "transcript.ndjson")

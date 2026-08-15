@@ -22,7 +22,7 @@ env_passthrough = [
 # denied by the sandbox. Treat `edit` as the measured floor, not a guarantee:
 # read-only is the mode with the least predictable ceiling, not the safe one.
 # Verified live 2026-08-06: codex-acp rejects minimal/ultra ("Invalid params").
-efforts = ["low", "medium", "high", "xhigh"]
+# Not measured per model — empty map, global vocab.
 
 # `escalates = true` on read-only records exactly that: the in-vendor reviewer can
 # raise the effective ceiling with nothing reaching acpc, so `grants` there is a

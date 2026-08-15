@@ -4,6 +4,9 @@ description = "Grok Build ACP agent (stdio)."
 # Multi-word: TUI is bare `grok`; ACP is `grok agent … stdio`.
 # --always-approve matches Grok automation docs (skip interactive tool prompts).
 command = "grok agent --always-approve stdio"
+# Binary is the vendor `grok` CLI, not a separate ACP package. No
+# install_command: curl|bash is not a trusted one-liner for `acpc install`.
+install_docs = "https://docs.x.ai/build/overview"
 home = "~/.grok"
 home_env = "GROK_HOME"
 env_passthrough = [
@@ -18,7 +21,11 @@ env_passthrough = [
 model_via = "set_model"
 effort_via = "cli"
 effort_cli_flag = "--reasoning-effort"
-efforts = ["low", "medium", "high", "xhigh"]
+
+# xhigh is grok-4.6 only (measured).
+[effort_by_model]
+"grok-4.5" = ["low", "medium", "high"]
+"grok-4.6" = ["low", "medium", "high", "xhigh"]
 
 # probe --discover advertises 0 modes (no ACP modes on session/new). Ids from
 # product docs (permissions); grants/delegates ASSUMED, not measured on disk.

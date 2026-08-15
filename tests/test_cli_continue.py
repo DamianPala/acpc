@@ -29,7 +29,6 @@ command = "{sys.executable} {MOCK_AGENT_SCRIPT}"
 install_command = "true"
 home = "~/.mock"
 home_env = "MOCK_HOME"
-efforts = ["low", "medium", "high", "xhigh"]
 
 [modes]
 default = {{ grants = "read", delegates = true }}
@@ -839,6 +838,63 @@ def test_continue_migrates_legacy_mode_and_target_metadata(cli: CliRunner) -> No
     assert migrated.target != old_target
 
 
+def test_continue_permissions_keeps_stored_effort_after_table_tightens(
+    cli: CliRunner, state_root: Path
+) -> None:
+    """continue --permissions must not re-validate stored effort against the live table."""
+    (state_root / "agents" / "mock.toml").write_text(
+        MOCK_ENTRY + '\n[effort_by_model]\n"mock-sonnet-5" = ["low", "medium", "high"]\n',
+        encoding="utf-8",
+    )
+    first = invoke(
+        cli,
+        "run",
+        "mock",
+        "turn one",
+        "--model",
+        "mock-sonnet-5",
+        "--effort",
+        "high",
+        "--quiet",
+        "--json",
+    )
+    assert first.exit_code == vocab.EXIT_OK, first.stderr
+    session_id = json.loads(first.stdout)["session_id"]
+    assert sessions.load(session_id).resolution["resolved"]["effort"]["value"] == "high"
+
+    (state_root / "agents" / "mock.toml").write_text(
+        MOCK_ENTRY + '\n[effort_by_model]\n"mock-sonnet-5" = ["low"]\n',
+        encoding="utf-8",
+    )
+    refused = invoke(
+        cli,
+        "run",
+        "mock",
+        "fresh",
+        "--model",
+        "mock-sonnet-5",
+        "--effort",
+        "high",
+        "--dry-run",
+    )
+    assert refused.exit_code == vocab.EXIT_USAGE
+    assert "supported levels: low" in refused.stderr
+
+    result = invoke(
+        cli,
+        "continue",
+        session_id,
+        "turn two",
+        "--permissions",
+        "edit",
+        "--quiet",
+    )
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    continued = sessions.load(session_id)
+    assert continued.resolution["resolved"]["effort"]["value"] == "high"
+    assert continued.resolution["resolved"]["permissions"]["value"] == "edit"
+
+
 def test_continue_permissions_preserves_wire_vias(
     cli: CliRunner, state_root: Path
 ) -> None:
@@ -856,7 +912,6 @@ command = "{sys.executable} {MOCK_AGENT_SCRIPT}"
 install_command = "true"
 home = "~/.mock"
 home_env = "MOCK_HOME"
-efforts = ["low", "medium", "high", "xhigh"]
 model_via = "config_option"
 effort_via = "cli"
 effort_cli_flag = "--effort"

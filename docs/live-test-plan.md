@@ -75,7 +75,7 @@ stdout is the answer, stderr is acpc metadata prefixed `--`; redirect them separ
 
 | # | Do | Expect |
 |---|---|---|
-| A1 | `acpc agents` | Every adapter with install status; variants indented showing only their delta; `missing → acpc install <name>` for absent adapters |
+| A1 | `acpc agents` | Every adapter with install status; variants indented showing only their delta; `missing → acpc install <name>` only for absent adapters that define `install_command` (else `install_docs` URL or bare `missing`) |
 | A2 | `acpc agents lt` | Field-by-field resolution with provenance (`(entry)`, `(adapter default)`, …); ends with a pointer to the parent's catalogs, no cache footer |
 | A3 | `acpc run lt "x" --dry-run` | The call's full resolution incl. declared env and cwd, each value sourced; no adapter contacted, no session dir created |
 | A4 | `acpc --help`, then `acpc log --help` | Cheat sheet ≤100 lines with grouped examples + flag→ACP table; per-command page is the full reference; `acpc stop --help` prints the root page (no stubs) |
@@ -134,7 +134,7 @@ D2 shipped broken in 0.2 and was caught by review, not tests. Measure it.
 
 | # | Do | Expect |
 |---|---|---|
-| F1 | Run an agent whose adapter binary is absent from PATH | Exit 1, one actionable line naming `acpc install <agent>` |
+| F1 | Run an agent whose adapter binary is absent from PATH | Exit 1, one actionable line: `acpc install <agent>` when the entry has `install_command`, otherwise the vendor docs / binary |
 | F2 | `--model definitely-not-a-model` | The vendor's refusal surfaced, not a generic failure |
 | F3 | Kill the *adapter* mid-turn by PID from `acpc daemon status` | Loss reported; session `orphaned` or `failed`, never stale `running`; `answer.md` exists (placeholder if nothing was written) |
 | F4 | `ACPC_HOME` containing `..`, then run | Daemon reachable — no stall-then-fallback (0.2: two spellings of one dir derived two socket paths) |
@@ -145,11 +145,11 @@ D2 shipped broken in 0.2 and was caught by review, not tests. Measure it.
 
 ## V. Vendor facts (tier 2 — real codex only)
 
-Verifies the shipped codex TOML against vendor reality, one trivial prompt per check. Last verified 2026-08-06: modes `read-only`/`agent`/`agent-full-access`, `bypass_modes = ["agent-full-access"]`, `efforts = ["low","medium","high","xhigh"]` (minimal and ultra rejected with `Invalid params`).
+Verifies the shipped codex TOML against vendor reality, one trivial prompt per check. Last verified 2026-08-06: modes `read-only`/`agent`/`agent-full-access`, `bypass_modes = ["agent-full-access"]`, no `[effort_by_model]` (empty map, global vocab: low/medium/high/xhigh work; vendor still rejects minimal/ultra with `Invalid params`).
 
 | # | Do | Expect / record |
 |---|---|---|
-| V1 | `acpc agents codex` after one real run | Advertised modes, models, commands as the vendor announces them; compare `bypass_modes` and `efforts` in the shipped TOML against reality; fix the TOML in the same change |
+| V1 | `acpc agents codex` after one real run | Advertised modes, models, commands as the vendor announces them; compare `bypass_modes` and `[effort_by_model]` in the shipped TOML against reality; fix the TOML in the same change |
 | V2 | `acpc agents codex --models` | Preset table resolves to model IDs the vendor actually accepts (`--model fast` must not 404) |
 | V3 | `acpc continue` on a codex session after `daemon stop` | Does real codex support `loadSession` and restore context on the cold path; record either way |
 | V4 | `acpc agents codex --check` | Launch+auth verdict, exit 0; a failure → exit 1. The unnamed `--check` live-probes every installed adapter — do not run it while claude is excluded from live testing |

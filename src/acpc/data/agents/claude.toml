@@ -28,7 +28,11 @@ env_passthrough = [
 # "Unknown config option: effort"; sonnet and opus keep it. The `fast` preset
 # therefore pins the model only, and haiku runs at its own built-in level.
 effort_config_id = "effort"
-efforts = ["default", "low", "medium", "high", "xhigh", "max"]
+
+[effort_by_model]
+claude-haiku-4-5 = []
+claude-sonnet-5 = ["default", "low", "medium", "high", "xhigh", "max"]
+claude-opus-5 = ["default", "low", "medium", "high", "xhigh", "max"]
 
 # Measured by probe spike 2026-08-10 against claude-agent-acp 0.64.0 /
 # Claude Code 2.1.226 (docs/plans/0.6/spike-probe/REPORT.md). Two corrections

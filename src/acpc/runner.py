@@ -513,9 +513,7 @@ def adapter_command(resolution: CallResolution) -> tuple[str, tuple[str, ...]]:
     except RegistryError as error:
         raise RunnerError(str(error)) from None
     if shutil.which(args[0]) is None:
-        raise RunnerError(
-            f"{entry.entry}: '{args[0]}' is not installed — run 'acpc install {entry.base_adapter}'"
-        )
+        raise RunnerError(entry.missing_binary_error())
     return args[0], args[1:]
 
 
@@ -1721,9 +1719,10 @@ def resolution_from_session(meta: sessions.SessionMeta) -> CallResolution:
         author=None,
         command=command,
         install_command=None,
+        install_docs=None,
         home=None,
         home_env=home_env,
-        efforts=(),
+        effort_by_model={},
         effort_config_id=effort_config_id,
         model_via=model_via,
         effort_via=effort_via,

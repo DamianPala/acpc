@@ -20,7 +20,6 @@ command = "{sys.executable} {MOCK_AGENT_SCRIPT}"
 install_command = "true"
 home = "~/.mock"
 home_env = "MOCK_HOME"
-efforts = ["low", "medium", "high", "xhigh"]
 
 [presets]
 fast = {{ model = "mock-haiku-4-5", effort = "high" }}
@@ -195,6 +194,22 @@ def test_agents_list_shows_missing_install_hint(cli: CliRunner) -> None:
 
     assert result.exit_code == vocab.EXIT_OK
     assert "missing → acpc install phantom" in result.stdout
+
+
+def test_agents_list_shows_vendor_docs_when_entry_has_no_install_command(
+    cli: CliRunner, state_root: Path
+) -> None:
+    (state_root / "agents" / "vendorish.toml").write_text(
+        'command = "definitely-not-installed-vendorish-xyz"\n'
+        'install_docs = "https://example.test/cli"\n',
+        encoding="utf-8",
+    )
+
+    result = invoke(cli, "agents")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert "missing → https://example.test/cli" in result.stdout
+    assert "acpc install vendorish" not in result.stdout
 
 
 def test_agents_list_has_no_cache_footer(cli: CliRunner) -> None:
@@ -549,6 +564,61 @@ def test_check_applies_the_resolved_options_so_a_bad_config_fails_it(
     assert "Unknown config option: bogus_effort_id" in result.stdout
 
 
+def test_agents_init_validates_effort_against_the_requested_model(
+    cli: CliRunner, state_root: Path
+) -> None:
+    rejected = invoke(
+        cli,
+        "agents",
+        "init",
+        "too-high",
+        "--extends",
+        "grok",
+        "--model",
+        "grok-4.5",
+        "--effort",
+        "xhigh",
+    )
+    assert rejected.exit_code == vocab.EXIT_USAGE
+    assert "supported levels: low, medium, high" in rejected.stderr
+    assert not (state_root / "agents" / "too-high.toml").exists()
+
+    accepted = invoke(
+        cli,
+        "agents",
+        "init",
+        "ok-high",
+        "--extends",
+        "grok",
+        "--model",
+        "grok-4.5",
+        "--effort",
+        "high",
+    )
+    assert accepted.exit_code == vocab.EXIT_OK
+    created = (state_root / "agents" / "ok-high.toml").read_text(encoding="utf-8")
+    assert 'model = "grok-4.5"' in created
+    assert 'effort = "high"' in created
+
+
+def test_agents_init_without_model_uses_parent_default_effort_row(
+    cli: CliRunner, state_root: Path
+) -> None:
+    result = invoke(
+        cli,
+        "agents",
+        "init",
+        "def-xhigh",
+        "--extends",
+        "grok",
+        "--effort",
+        "xhigh",
+    )
+    assert result.exit_code == vocab.EXIT_OK
+    created = (state_root / "agents" / "def-xhigh.toml").read_text(encoding="utf-8")
+    assert 'effort = "xhigh"' in created
+
+
 def test_agents_init_writes_the_requested_variant_fields(cli: CliRunner, state_root: Path) -> None:
     result = invoke(
         cli,
@@ -584,6 +654,15 @@ def test_install_returns_one_for_a_failed_definition_command(cli: CliRunner) -> 
     assert "install phantom failed" in result.stderr
 
 
+def test_install_without_install_command_names_vendor_docs(cli: CliRunner) -> None:
+    result = invoke(cli, "install", "grok")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert "https://docs.x.ai/build/overview" in result.stderr
+    assert "already registered" in result.stderr
+    assert "run 'acpc install grok'" not in result.stderr
+
+
 def test_install_unknown_agent_returns_usage_exit_two(cli: CliRunner) -> None:
     result = invoke(cli, "install", "unknown-agent-xyz")
 
@@ -606,3 +685,46 @@ def test_install_json_is_one_object(cli: CliRunner) -> None:
 
     assert result.exit_code == vocab.EXIT_OK
     assert json.loads(result.stdout) == {"agent": "mock", "ok": True, "returncode": 0}
+
+
+def test_agents_models_warns_when_resolved_model_has_no_row(
+    cli: CliRunner, state_root: Path
+) -> None:
+    (state_root / "agents" / "mock.toml").write_text(
+        MOCK_ENTRY + '\n[effort_by_model]\nother = ["low", "high"]\n',
+        encoding="utf-8",
+    )
+
+    result = invoke(cli, "agents", "mock", "--models")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert "mock-sonnet-5 has no [effort_by_model] row" in result.stderr
+    assert "using adapter efforts low, high" in result.stderr
+
+
+def test_agents_check_warns_when_resolved_model_has_no_row(
+    cli: CliRunner, state_root: Path
+) -> None:
+    (state_root / "agents" / "mock.toml").write_text(
+        MOCK_ENTRY + '\n[effort_by_model]\nother = ["low", "high"]\n',
+        encoding="utf-8",
+    )
+
+    result = invoke(cli, "agents", "mock", "--check")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert "mock-sonnet-5 has no [effort_by_model] row" in result.stderr
+
+
+def test_agents_models_does_not_warn_when_resolved_model_has_a_row(
+    cli: CliRunner, state_root: Path
+) -> None:
+    (state_root / "agents" / "mock.toml").write_text(
+        MOCK_ENTRY + '\n[effort_by_model]\n"mock-sonnet-5" = ["low", "high"]\n',
+        encoding="utf-8",
+    )
+
+    result = invoke(cli, "agents", "mock", "--models")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert "has no [effort_by_model] row" not in result.stderr
