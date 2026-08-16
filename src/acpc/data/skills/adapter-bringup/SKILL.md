@@ -5,8 +5,8 @@ description: >-
   its own command (no extends). Use when adding a vendor agent that is not
   already shipped (or a local ACP binary), writing ~/.acpc/agents/<name>.toml
   with command/home/modes, or when run/dry-run refuse because the modes table is
-  empty. Not for pointing an existing adapter at a new provider or model — that
-  is provider-bringup.
+  empty. Not for pointing an existing adapter at a new provider (provider-bringup)
+  or retargeting presets when the vendor catalogue moved (refresh-adapter-models).
 ---
 
 # Bringing up an adapter
@@ -17,8 +17,9 @@ This skill is for a **new base entry**: `command` set, no `extends` — shipping
 product, local binary, or wrapper, same ladder.
 
 If the agent is already shipped as a base (claude, codex, …) and you only need
-another provider, home, or model, stop — use `provider-bringup`. That path
-inherits `[modes]` and the command; this one does not.
+another provider or home, stop — use `provider-bringup`. Same adapter, vendor
+catalogue moved? `refresh-adapter-models` (overlay only). This path does not
+inherit `[modes]`.
 
 Every failure is in one place: the binary is not ACP, auth/env/home is wrong, or
 the entry's modes/presets/env lie about what this process accepts. Climb the
@@ -33,7 +34,7 @@ keyed by **filename**:
 |---|---|
 | `<name>.toml` with `extends = "…"` | variant — wrong skill; use `provider-bringup` |
 | `<name>.toml` with `command`, no `extends` | **this** skill: new base adapter |
-| same name as a shipped adapter | field overrides on that adapter (e.g. `[presets]`) |
+| same name as a shipped adapter | field overrides; catalogue refresh is `refresh-adapter-models` |
 
 Read a shipped TOML only as a **field catalogue** (`acpc agents claude`), never
 as a modes or presets table to copy.

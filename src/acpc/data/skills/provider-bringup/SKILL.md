@@ -4,7 +4,8 @@ description: >-
   Existing shipped harness + new provider/model for acpc (variant with extends:
   OpenRouter, gateway, local endpoint). Also for a new model on plumbing that
   already works, or when a variant fails with "There's an issue with the
-  selected model". Not for a new base command entry — that is adapter-bringup.
+  selected model". Not a new base command (adapter-bringup). Not a new id on
+  the same shipped adapter's own catalogue — that is refresh-adapter-models.
 ---
 
 # Bringing up a provider
@@ -15,6 +16,8 @@ exactly one of those two places, and the whole method is proving which one
 before changing anything.
 
 New base adapter (`command`, no `extends`)? Stop — use `adapter-bringup`.
+Vendor advertised a new id on the same shipped adapter (grok-4.7 on grok)?
+Stop — use `refresh-adapter-models`.
 
 Vendor errors lie about which one it is. Climb the ladder instead of reading
 them, except for the recognized strings in *Known lies*, which name their own
@@ -182,6 +185,9 @@ effort = "high"
 home = "~/.claude-openrouter"
 env_passthrough = ["OPENROUTER_API_KEY"]
 
+[effort_by_model]
+"deepseek/deepseek-v4-flash" = ["low", "medium", "high"]
+
 [env]
 ANTHROPIC_BASE_URL = "https://openrouter.ai/api"
 ANTHROPIC_DEFAULT_HAIKU_MODEL = "deepseek/deepseek-v4-flash"
@@ -199,6 +205,12 @@ Five traps, all silent:
   (`ANTHROPIC_MODEL`) is then only needed for running the harness bare at rung
   3. Verified 2026-08-07.
 - **Pin `effort`** for the same reason: unpinned it moves when the preset moves.
+  The value must pass the inherited `[effort_by_model]` row for this model.
+  A new provider id is almost never in the parent's table — acpc warns and
+  allows the parent's union. Overlay one quoted row (as above) to name what
+  this model accepts, or to silence the warning. An empty row means no
+  effort setting: omit `effort` too. Do not write `efforts = […]` (unknown
+  key). Table semantics live in `adapter-bringup`.
 - **`[env]` merges with the parent, `env_passthrough` replaces it.** Your
   passthrough list must be complete on its own.
 - **The key never goes in `[env]`**, that is the entry on disk. Pass it through

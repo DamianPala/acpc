@@ -62,11 +62,13 @@ directory path is on stderr — that is how you find `references/`).
 |-------|-----|--------|
 | `adapter-bringup` | New base adapter for any ACP agent (`command`, no `extends`): binary, entry TOML, modes via discovery or product docs | [`src/acpc/data/skills/adapter-bringup/SKILL.md`](src/acpc/data/skills/adapter-bringup/SKILL.md) |
 | `provider-bringup` | Existing harness + new provider/model (OpenRouter, gateway, local endpoint); variants that fail on the selected model | [`src/acpc/data/skills/provider-bringup/SKILL.md`](src/acpc/data/skills/provider-bringup/SKILL.md) |
+| `refresh-adapter-models` | Vendor shipped new model ids: upgrade the adapter binary first, then overlay `$ACPC_HOME/agents/<name>.toml` presets and `[effort_by_model]` | [`src/acpc/data/skills/refresh-adapter-models/SKILL.md`](src/acpc/data/skills/refresh-adapter-models/SKILL.md) |
 
 ```bash
 acpc skills
 acpc skills adapter-bringup
 acpc skills provider-bringup
+acpc skills refresh-adapter-models
 ```
 
 `acpc probe <entry> --discover` opens a session, reads the modes the adapter advertises, releases it, and prints that catalogue alongside a two-sided diff against the entry's recorded `[modes]`: modes the adapter advertises that the entry does not list, and entry modes the adapter no longer advertises. It costs zero turns and never edits the registry — applying anything it reports is a separate, explicit act. Measuring what a mode actually *permits* is not in this release, so `--discover` is required and a bare `probe` says so rather than answering a question you did not ask. Probe refuses to run on Windows because its commands are POSIX shell commands and would measure the shell rather than the sandbox.
@@ -131,7 +133,7 @@ MODEL_PROVIDER = "openrouter"
 
 The `home` field is the provider switch: OpenAI vs OpenRouter vs a local endpoint is just a different vendor home. Resolution stays fully inspectable — `acpc agents builder` shows what the entry resolves to with per-field provenance, `run --dry-run` shows one concrete call.
 
-`--model fast|standard|max` resolves through the adapter's preset table (overridable per adapter in `agents/`). The adapter's environment is **constructed, not inherited**: a base system set, capability variables (ssh agent, proxies, CA bundles), and the entry's declared env — the rest of your ambient environment never reaches the adapter.
+`--model fast|standard|max` resolves through the adapter's preset table (overridable per adapter in `agents/`). When the vendor advertises new model ids, upgrade that adapter's binary first, then `acpc skills refresh-adapter-models` — it writes only the operator overlay, after a confirm. The adapter's environment is **constructed, not inherited**: a base system set, capability variables (ssh agent, proxies, CA bundles), and the entry's declared env — the rest of your ambient environment never reaches the adapter.
 
 ## Teaching agents about acpc
 
