@@ -3,7 +3,7 @@
 ## Ground rules
 
 - `SPEC.md` (repo root) = normative contract. Behavior change land in spec first, same change as code. Code/docs/spec conflict → spec win.
-- **Local-only.** Never push origin, never release, never touch PyPI. Origin frozen on purpose.
+- **Pushing is the user's act.** Origin lives at github.com/DamianPala/acpc and changes land through PRs, but every push, PR merge and tag push happens only on Damian's explicit go in the moment — never on an agent's own judgement. Releases and PyPI stay off-limits to agents entirely.
 - **Installed `acpc` = working tool** — non-editable snapshot on purpose: acpc dispatch agents that edit this repo, editable install would change tool under them mid-task. Develop with `uv run acpc ...`; after change land on main, reinstall deliberate with `uv tool install --force "git+file:///home/haz/ai/lab/projects/acpc@main"` — never `-e`.
 - All tests + dev runs use isolated state root (temp dir via env override). Never touch `~/.acpc`.
 

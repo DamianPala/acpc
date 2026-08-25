@@ -2,6 +2,41 @@
 
 ## Now
 
+**0.7 is released and installed (2026-08-25): the grok adapter bringup.** This is the first release
+to travel through origin instead of past it: Damian built the branch with another agent, pushed it to
+github.com/DamianPala/acpc, and it landed as PR #1 — reviewed here by a four-seam Opus fleet plus a
+delta reviewer with adversarial mutation testing, which returned DO-NOT-SHIP once (a failed turn's
+default `TurnOutcome` wiped a session's accumulated cost) before SHIP. Seven fix commits rode on top
+of the original seven; the PR merged `--rebase`, `main` is at `be63a70` plus the bump, tagged
+`v0.7.0`, and `uv tool install --force` moved the live tool to 0.7.0. **The planned 0.7 queue
+(backlog 21–28 plus the network-access mode-fact axis) moved wholesale to 0.8** — see
+`docs/plans/0.8/backlog.md`, which also inherits the delta review's non-blocking findings F4–F7
+(declared-env vs live daemon env in the target key, `shutil.which` on warm reuse, a SPEC sentence for
+direct/daemon via divergence, `daemon_target` coverage at `_execute`/`--bg`).
+
+What 0.7 ships: a grok entry whose wire facts are all measured — grok rejects
+`session/set_config_option`, so `model_via = "set_model"` sends a raw `session/set_model` below the
+SDK's typed surface and `effort_via = "cli"` injects `--reasoning-effort` into spawn argv, making
+effort part of spawn identity and the daemon target key. `[effort_by_model]` replaces the flat
+`efforts` list (per-model allowlists, derived-union fallback for unlisted models) — a breaking config
+change, accepted deliberately since Damian is the only user. The grok `[modes]` table is honest about
+what was measured: zero `request_permission` ever reaches acpc, writes and shell succeed under
+`--permissions read`, so nothing delegates, every mode grants `execute` or `all`, and acpc refuses
+grok below `--permissions execute` — the codex-shape refusal, not a false promise. `--no-leader` is
+pinned in the command against leader-mode surprises. Usage accounting learned grok's per-turn
+`_meta` reporting: cost sums across turns, tokens are the latest replayed-context figure, streamed
+cumulative usage keeps a `max()` guard, and a turn reporting no usage leaves stored totals untouched
+(`None`-sentinel through `TurnOutcome` and `finalize_turn`). The daemon refuses a warm adapter whose
+argv no longer matches the required spawn (`SpawnArgvMismatch`), the mock agent speaks
+`session/set_model` through a raw router route so the boundary is tested for real, and two bundled
+skills arrived from the branch: `adapter-bringup` and `refresh-adapter-models`. Gates at merge: 871
+tests twice, ruff + format + pyright clean, smoke 581/581, six review mutations red.
+
+The ground rule changed with the workflow: CLAUDE.md's "local-only, never push" became **pushing is
+the user's act** — origin and PRs are how changes land now, but every push and merge waits for
+Damian's explicit go, and releases/PyPI stay agent-forbidden. (A hook enforces the no-direct-push-to-
+main half mechanically.)
+
 **0.6 is released and installed (2026-08-12, same day, later).** Version bumped to 0.6.0
 (`e6bfe8a`), tagged `v0.6.0` — the tag now sits on `524a42b` after two post-release skill
 amendments rode in under it — and `uv tool install --force` moved the live tool off 0.5.0, so
