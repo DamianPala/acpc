@@ -145,7 +145,7 @@ D2 shipped broken in 0.2 and was caught by review, not tests. Measure it.
 
 ## V. Vendor facts (tier 2 — real codex only)
 
-Verifies the shipped codex TOML against vendor reality, one trivial prompt per check. Last verified 2026-08-06: modes `read-only`/`agent`/`agent-full-access`, `bypass_modes = ["agent-full-access"]`, no `[effort_by_model]` (empty map, global vocab: low/medium/high/xhigh work; vendor still rejects minimal/ultra with `Invalid params`).
+Verifies the shipped codex TOML against vendor reality, one trivial prompt per check. Last verified 2026-08-06: modes `read-only`/`agent`/`agent-full-access`, `bypass_modes = ["agent-full-access"]`, preset `[effort_by_model]` rows allow low/medium/high/xhigh and unlisted models use the derived union; vendor still rejects minimal/ultra with `Invalid params`.
 
 | # | Do | Expect / record |
 |---|---|---|

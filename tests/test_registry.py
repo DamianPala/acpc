@@ -760,12 +760,26 @@ def test_shipped_claude_haiku_rejects_effort_and_sonnet_accepts_high(
     assert call.effort == "high"
 
 
-def test_shipped_codex_empty_map_accepts_global_vocab(tmp_path: Path) -> None:
+def test_shipped_codex_preset_rows_reject_unsupported_efforts(tmp_path: Path) -> None:
     registry = AgentRegistry(tmp_path / "agents")
-    assert registry.resolve("codex").effort_by_model == {}
+    expected = ("low", "medium", "high", "xhigh")
+    codex = registry.resolve("codex")
+    assert codex.effort_by_model == {
+        "gpt-5.6-luna": expected,
+        "gpt-5.6-terra": expected,
+        "gpt-5.6-sol": expected,
+    }
     assert registry.resolve_call("codex", effort="low").effort == "low"
     assert registry.resolve_call("codex", effort="xhigh").effort == "xhigh"
-    assert registry.resolve_call("codex", effort="ultra").effort == "ultra"
+    for model in codex.preset_models:
+        for effort in ("none", "minimal", "ultra"):
+            with pytest.raises(RegistryError, match="supported levels: low, medium, high, xhigh"):
+                registry.resolve_call("codex", model=model, effort=effort)
+
+    # Models without a row retain the derived-union fallback and its warning.
+    assert (
+        registry.resolve_call("codex", model="gpt-5.6-unlisted", effort="xhigh").effort == "xhigh"
+    )
 
 
 def test_unknown_effort_lists_global_vocab(tmp_path: Path) -> None:

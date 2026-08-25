@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
 
 import pytest
 
@@ -227,6 +226,39 @@ default = { grants = "read", delegates = true }
     assert rebuilt.entry.effort_cli_flag is None
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("model_via", "magic"), ("effort_via", 7), ("effort_cli_flag", 7)],
+)
+def test_continue_rejects_invalid_stored_wire_fields(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    agents = tmp_path / "state" / "agents"
+    write_entry(
+        agents,
+        "tool",
+        """
+name = "Tool"
+command = "tool"
+[modes]
+default = { grants = "read", delegates = true }
+""",
+    )
+    resolution = AgentRegistry(agents).resolve_call("tool", permissions="read")
+    payload = runner.session_resolution(resolution, cwd=None)
+    payload["adapter"][field] = value
+    meta = sessions.create_session(
+        entry=resolution.entry.entry,
+        base_adapter=resolution.entry.base_adapter,
+        prompt="corrupt stored wire field",
+        resolution=payload,
+        target="tool~corrupt",
+    )
+
+    with pytest.raises(runner.RunnerError, match=f"invalid stored {field}"):
+        runner.resolution_from_session(meta)
+
+
 # --- apply_call_options branching ------------------------------------------
 
 
@@ -234,8 +266,6 @@ class _FakeConn:
     def __init__(self) -> None:
         self.modes: list[str] = []
         self.config: list[tuple[str, str]] = []
-        self.models: list[str] = []
-        self._conn = self
 
     async def set_session_mode(self, *, session_id: str, mode_id: str) -> None:
         del session_id
@@ -244,42 +274,6 @@ class _FakeConn:
     async def set_config_option(self, *, config_id: str, session_id: str, value: str) -> None:
         del session_id
         self.config.append((config_id, value))
-
-    async def set_model(self, *, session_id: str, model_id: str) -> None:
-        del session_id
-        self.models.append(model_id)
-
-    async def send_request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
-        if method == "session/set_model":
-            self.models.append(params["modelId"])
-            return {}
-        raise AssertionError(f"unexpected method {method}")
-
-
-def test_apply_call_options_uses_set_model_and_skips_cli_effort(tmp_path: Path) -> None:
-    agents = tmp_path / "state" / "agents"
-    write_entry(
-        agents,
-        "tool",
-        """
-name = "Tool"
-command = "tool agent stdio"
-model_via = "set_model"
-effort_via = "cli"
-effort_cli_flag = "--effort"
-[modes]
-default = { grants = "read", delegates = true }
-""",
-    )
-    resolution = AgentRegistry(agents).resolve_call(
-        "tool", model="m1", effort="low", mode="default", permissions="read"
-    )
-    request = runner.TurnRequest(resolution=resolution, prompt="x")
-    conn = _FakeConn()
-    asyncio.run(runner.apply_call_options(conn, "sid", request))
-    assert conn.modes == ["default"]
-    assert conn.models == ["m1"]
-    assert conn.config == []  # effort not via config option
 
 
 def test_apply_call_options_uses_config_option_by_default(tmp_path: Path) -> None:
@@ -303,23 +297,11 @@ default = { grants = "read", delegates = true }
     asyncio.run(runner.apply_call_options(conn, "sid", request))
     assert ("model", "m1") in conn.config
     assert ("effort", "high") in conn.config
-    assert conn.models == []  # config_option path never calls set_model
 
 
-def test_set_session_model_falls_back_to_raw_send_request() -> None:
-    class RawOnly:
-        def __init__(self) -> None:
-            self.calls: list[tuple[str, dict[str, Any]]] = []
-            self._conn = self
-
-        async def send_request(self, method: str, params: dict[str, Any]) -> dict[str, str]:
-            self.calls.append((method, params))
-            return {"ok": "yes"}
-
-    raw = RawOnly()
-    result = asyncio.run(runner._set_session_model(raw, "sid", "grok-4.5"))
-    assert result == {"ok": "yes"}
-    assert raw.calls == [("session/set_model", {"sessionId": "sid", "modelId": "grok-4.5"})]
+def test_set_session_model_rejects_a_connection_without_a_raw_path() -> None:
+    with pytest.raises(runner.AdapterRejection, match="no session/set_model path"):
+        asyncio.run(runner._set_session_model(object(), "sid", "grok-4.5"))
 
 
 # --- usage from prompt meta ------------------------------------------------

@@ -73,6 +73,10 @@ def invoke(cli: CliRunner, *args: str, stdin: str | None = None):
     return cli.invoke(main, list(args), input=stdin, catch_exceptions=False)
 
 
+def wire_events(path: Path) -> list[dict]:
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
 def run_cli_until_early_line(*args: str) -> tuple[int, str, str, str, bool]:
     process = subprocess.Popen(
         [sys.executable, "-c", "from acpc.cli import main; main()", *args],
@@ -135,6 +139,53 @@ def test_prompt_file_reads_the_prompt_from_disk(cli: CliRunner, tmp_path: Path) 
 
     assert result.exit_code == vocab.EXIT_OK
     assert "hello from the file" in result.stdout
+
+
+def test_run_uses_raw_session_set_model_for_set_model_entries(
+    cli: CliRunner, state_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wire_file = state_root / "wire.jsonl"
+    monkeypatch.setenv("ACPC_MOCK_WIRE_FILE", str(wire_file))
+    (state_root / "agents" / "mock.toml").write_text(
+        MOCK_ENTRY.replace("\n[modes]", '\nmodel_via = "set_model"\n\n[modes]'),
+        encoding="utf-8",
+    )
+
+    result = invoke(cli, "run", "mock", "settings", "--model", "mock-opus-5", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    assert "mock-opus-5/" in result.stdout
+    events = wire_events(wire_file)
+    set_model = [event for event in events if event["method"] == "session/set_model"]
+    assert len(set_model) == 1
+    assert set_model[0]["params"]["modelId"] == "mock-opus-5"
+    assert not any(
+        event["method"] == "session/set_config_option"
+        and event["params"].get("configId") == "model"
+        for event in events
+    )
+
+
+def test_run_uses_model_config_option_for_config_option_entries(
+    cli: CliRunner, state_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wire_file = state_root / "wire.jsonl"
+    monkeypatch.setenv("ACPC_MOCK_WIRE_FILE", str(wire_file))
+
+    result = invoke(cli, "run", "mock", "settings", "--model", "mock-opus-5", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    assert "mock-opus-5/" in result.stdout
+    events = wire_events(wire_file)
+    model_options = [
+        event
+        for event in events
+        if event["method"] == "session/set_config_option"
+        and event["params"].get("configId") == "model"
+    ]
+    assert len(model_options) == 1
+    assert model_options[0]["params"]["value"] == "mock-opus-5"
+    assert not any(event["method"] == "session/set_model" for event in events)
 
 
 def test_no_prompt_source_is_a_usage_error(cli: CliRunner) -> None:

@@ -22,7 +22,8 @@ env_passthrough = [
 # denied by the sandbox. Treat `edit` as the measured floor, not a guarantee:
 # read-only is the mode with the least predictable ceiling, not the safe one.
 # Verified live 2026-08-06: codex-acp rejects minimal/ultra ("Invalid params").
-# Not measured per model — empty map, global vocab.
+# Preset models are guarded to the vendor's supported effort levels; unlisted
+# models use the derived union as a fallback.
 
 # `escalates = true` on read-only records exactly that: the in-vendor reviewer can
 # raise the effective ceiling with nothing reaching acpc, so `grants` there is a
@@ -36,3 +37,8 @@ agent-full-access = { grants = "all", delegates = false }
 fast = { model = "gpt-5.6-luna", effort = "high" }
 standard = { model = "gpt-5.6-terra", effort = "xhigh" }
 max = { model = "gpt-5.6-sol", effort = "xhigh" }
+
+[effort_by_model]
+"gpt-5.6-luna" = ["low", "medium", "high", "xhigh"]
+"gpt-5.6-terra" = ["low", "medium", "high", "xhigh"]
+"gpt-5.6-sol" = ["low", "medium", "high", "xhigh"]
