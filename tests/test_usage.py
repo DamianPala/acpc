@@ -49,7 +49,7 @@ def invoke(cli: CliRunner, *args: str):
 
 
 @pytest.mark.parametrize("use_daemon", [False, True], ids=["direct", "daemon"])
-def test_prompt_meta_usage_accumulates_across_run_and_continue(
+def test_prompt_meta_usage_uses_latest_tokens_and_accumulates_cost(
     cli: CliRunner,
     use_daemon: bool,
     live_daemon: None,
@@ -73,25 +73,25 @@ def test_prompt_meta_usage_accumulates_across_run_and_continue(
         cli,
         "continue",
         session_id,
-        "meta:240:2000000000:second turn",
+        "meta:80:2000000000:second turn",
         "--json",
     )
     assert second.exit_code == 0, second.stderr
     second_payload = json.loads(second.stdout)
     assert second_payload["cost"] == pytest.approx(0.3)
-    assert "240 tok" in second.stderr
+    assert "80 tok" in second.stderr
     assert "cost $0.30" in second.stderr
 
     final = sessions.read_meta(session_id)
-    assert final.tokens == 240
+    assert final.tokens == 80
     assert final.cost == pytest.approx(0.3)
     status = json.loads(invoke(cli, "status", session_id, "--json").stdout)
-    assert status["tokens"] == 240
+    assert status["tokens"] == 80
     assert status["cost"] == pytest.approx(0.3)
     meta = json.loads(
         (state_root / "sessions" / session_id / "meta.json").read_text(encoding="utf-8")
     )
-    assert meta["tokens"] == 240
+    assert meta["tokens"] == 80
     assert meta["cost"] == pytest.approx(0.3)
 
     events = [
@@ -104,7 +104,7 @@ def test_prompt_meta_usage_accumulates_across_run_and_continue(
     usage = [event for event in events if event.get("type") == "usage"]
     assert [(event["tokens"], event["cost"]) for event in usage] == [
         (120, pytest.approx(0.1)),
-        (240, pytest.approx(0.3)),
+        (80, pytest.approx(0.3)),
     ]
 
 
@@ -118,6 +118,27 @@ def test_streamed_usage_wins_over_prompt_meta(cli: CliRunner) -> None:
     assert final.cost == pytest.approx(0.3)
     assert payload["cost"] == pytest.approx(0.3)
     assert "cost $0.30" in result.stderr
+
+
+def test_streamed_usage_uses_latest_tokens_and_keeps_prior_cost(cli: CliRunner) -> None:
+    first = invoke(cli, "run", "mock", "both:700:3000000000:first stream", "--json")
+    assert first.exit_code == 0, first.stderr
+    session_id = json.loads(first.stdout)["session_id"]
+
+    second = invoke(
+        cli,
+        "continue",
+        session_id,
+        "both:500:1000000000:second stream",
+        "--json",
+    )
+    assert second.exit_code == 0, second.stderr
+
+    payload = json.loads(second.stdout)
+    final = sessions.read_meta(session_id)
+    assert final.tokens == 500
+    assert final.cost == pytest.approx(0.3)
+    assert payload["cost"] == pytest.approx(0.3)
 
 
 def test_prompt_meta_usage_flushes_pending_prose_before_usage(cli: CliRunner) -> None:

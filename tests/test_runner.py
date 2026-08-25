@@ -504,6 +504,7 @@ def test_a_turn_records_its_start_and_end_as_state_events() -> None:
 def test_token_usage_reaches_the_session_metadata() -> None:
     session_id, outcome = start_turn("report some usage")
 
+    assert outcome.tokens is not None
     assert outcome.tokens > 0
     assert sessions.read_meta(session_id).tokens == outcome.tokens
 

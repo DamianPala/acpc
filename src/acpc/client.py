@@ -551,7 +551,7 @@ class AcpcClient:
 
     @property
     def tokens(self) -> int:
-        """Return the cumulative token count reported by the adapter."""
+        """Return the latest token figure reported by the adapter."""
         return self._tokens
 
     @property
@@ -601,6 +601,10 @@ class AcpcClient:
         if not meta:
             return
         previous_tokens, previous_cost = self._tokens, self._cost
+        # Measured 2026-08-25 with Grok CLI 1.0.4: numTurns=1 on both turns;
+        # totalTokens was 35570 then 35854, while costUsdTicks was 241394560
+        # then 39157120 (turn 2 had cachedReadTokens=35456). Both are per-turn:
+        # tokens are the latest replayed-context total, while charges are summed.
         tokens = meta.get("totalTokens")
         if tokens is None:
             usage = meta.get("usage")
@@ -1089,7 +1093,7 @@ class AcpcClient:
 
     def _record_usage(self, update: UsageUpdate) -> None:
         self._usage_update_seen = True
-        self._tokens = max(self._tokens, update.used)
+        self._tokens = update.used
         if update.cost is not None:
             amount = update.cost.amount
             self._cost = amount if self._cost is None else max(self._cost, amount)

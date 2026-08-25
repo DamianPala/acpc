@@ -713,6 +713,8 @@ def finalize_turn(
         if delivery_record_incomplete:
             meta.extra[DELIVERY_RECORD_INCOMPLETE] = True
         for key, value in changes.items():
+            if key in {"tokens", "cost"} and value is None:
+                continue
             setattr(meta, key, value)
         now = resolved_clock()
         if to_state == "running" and meta.started_at is None:
