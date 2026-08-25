@@ -179,7 +179,7 @@ def test_a_missing_adapter_without_install_command_names_vendor_docs(
     (state_root / "agents" / "vendorish.toml").write_text(
         'command = "definitely-not-installed-vendorish-xyz"\n'
         'install_docs = "https://example.test/cli"\n'
-        "\n[modes]\ndefault = { grants = \"read\", delegates = true }\n",
+        '\n[modes]\ndefault = { grants = "read", delegates = true }\n',
         encoding="utf-8",
     )
 
@@ -882,6 +882,15 @@ def test_the_reserved_name_last_is_refused(cli: CliRunner) -> None:
     assert result.exit_code == vocab.EXIT_USAGE
 
 
+def test_grok_refuses_policies_below_execute(cli: CliRunner) -> None:
+    """The shipped table records that nothing delegates, so the default
+    non-TTY policy (read) must refuse instead of claiming a ceiling."""
+    result = invoke(cli, "run", "grok", "probe", "--dry-run")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert "no mode on grok grants at most permissions read" in result.stderr
+
+
 def test_unlisted_model_warns_on_dry_run(cli: CliRunner) -> None:
     result = invoke(
         cli,
@@ -892,6 +901,8 @@ def test_unlisted_model_warns_on_dry_run(cli: CliRunner) -> None:
         "grok-4.7",
         "--effort",
         "xhigh",
+        "--permissions",
+        "execute",
         "--dry-run",
     )
 
@@ -933,6 +944,8 @@ def test_listed_model_does_not_warn_on_dry_run(cli: CliRunner) -> None:
         "grok-4.6",
         "--effort",
         "high",
+        "--permissions",
+        "execute",
         "--dry-run",
     )
 

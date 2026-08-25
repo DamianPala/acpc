@@ -2,8 +2,14 @@ name = "Grok Build"
 author = "xAI"
 description = "Grok Build ACP agent (stdio)."
 # Multi-word: TUI is bare `grok`; ACP is `grok agent … stdio`.
-# --always-approve matches Grok automation docs (skip interactive tool prompts).
-command = "grok agent --always-approve stdio"
+# --no-leader: without it `grok agent` may attach to a shared leader process
+# ([cli] use_leader in the operator's config.toml), and a leader ignores this
+# spawn's --reasoning-effort — silently defeating effort_via = "cli" and the
+# per-effort daemon target key.
+# No --always-approve: it is bypassPermissions under its product name (vendor
+# docs), sticky beneath mode switches, and changes nothing measured — grok
+# auto-approves over ACP stdio either way. See [modes].
+command = "grok agent --no-leader stdio"
 # Binary is the vendor `grok` CLI, not a separate ACP package. No
 # install_command: curl|bash is not a trusted one-liner for `acpc install`.
 install_docs = "https://docs.x.ai/build/overview"
@@ -15,32 +21,39 @@ env_passthrough = [
     "GROK_CODE_XAI_API_KEY",
 ]
 
-# Grok does not implement session/set_config_option (Method not found).
-# Model: ACP session/set_model (verified 2026-08-12). Effort: CLI flag at spawn
-# (--reasoning-effort); set_model's reasoningEffort field is ignored on the wire.
+# Grok does not implement session/set_config_option (Method not found,
+# re-verified 2026-08-25 against CLI 1.0.4). Model: ACP session/set_model.
+# Effort: CLI flag at spawn (--reasoning-effort); set_model's reasoningEffort
+# field is ignored on the wire.
 model_via = "set_model"
 effort_via = "cli"
 effort_cli_flag = "--reasoning-effort"
 
-# xhigh is grok-4.6 only (measured).
+# xhigh is grok-4.6 only (measured; models_cache re-checked 2026-08-25, 1.0.5).
 [effort_by_model]
 "grok-4.5" = ["low", "medium", "high"]
 "grok-4.6" = ["low", "medium", "high", "xhigh"]
 
-# probe --discover advertises 0 modes (no ACP modes on session/new). Ids from
-# product docs (permissions); grants/delegates ASSUMED, not measured on disk.
-# set_session_mode accepts these ids; ceiling measurement is still open.
+# Measured 2026-08-25, `grok agent stdio` (CLI 1.0.4/1.0.5): zero
+# request_permission ever reached the client, with and without
+# --always-approve — grok auto-approves in-vendor, so nothing delegates and
+# every grant below is a measured floor, never a bound. Under `default` a cwd
+# file write AND a shell command both ran unasked. Mode ids accepted by
+# set_session_mode; probe --discover advertises 0 modes (Path B). Docs floors
+# (acceptEdits "file edits", dontAsk "read-only handling") were non-predictive
+# for `default`, so those rows inherit its measured floor and stay assumed.
+# Consequence: no mode grants at most read, so `--permissions none/read/edit`
+# refuse — grok runs at `execute` and above only.
 [modes]
-default = { grants = "read", delegates = true }
-acceptEdits = { grants = "edit", delegates = true }
-plan = { grants = "edit", delegates = true }
+default = { grants = "execute", delegates = false, escalates = true }
+acceptEdits = { grants = "execute", delegates = false, escalates = true }
+plan = { grants = "execute", delegates = false, escalates = true }
 auto = { grants = "all", delegates = false, escalates = true }
-dontAsk = { grants = "none", delegates = false }
+dontAsk = { grants = "execute", delegates = false, escalates = true }
 bypassPermissions = { grants = "all", delegates = false }
-"always-approve" = { grants = "all", delegates = false }
 
 [presets]
-# Live catalogue 2026-08-12: grok-4.6 (default), grok-4.5.
+# Live catalogue 2026-08-25: grok-4.6 (default), grok-4.5.
 fast = { model = "grok-4.5", effort = "low" }
 standard = { model = "grok-4.6", effort = "high" }
 max = { model = "grok-4.6", effort = "xhigh" }

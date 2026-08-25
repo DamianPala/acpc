@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from acpc.permissions import ModeSelectionError, select_mode
 from acpc.registry import AgentRegistry, RegistryError
 
 
@@ -593,7 +594,7 @@ def test_a_presetless_adapter_has_no_default_model(tmp_path: Path) -> None:
 def test_shipped_grok_uses_set_model_and_cli_effort(tmp_path: Path) -> None:
     registry = AgentRegistry(tmp_path / "agents")
     grok = registry.resolve("grok")
-    assert grok.command_args == ("grok", "agent", "--always-approve", "stdio")
+    assert grok.command_args == ("grok", "agent", "--no-leader", "stdio")
     assert grok.install_command is None
     assert grok.install_docs == "https://docs.x.ai/build/overview"
     assert "acpc install" not in grok.install_next_step()
@@ -603,17 +604,37 @@ def test_shipped_grok_uses_set_model_and_cli_effort(tmp_path: Path) -> None:
     assert grok.effort_cli_flag == "--reasoning-effort"
     assert "default" in grok.modes
     assert grok.presets["standard"].model == "grok-4.6"
-    call = grok.resolve_call(model="fast", permissions="read")
+    call = grok.resolve_call(model="fast", permissions="execute")
     assert call.model == "grok-4.5"
     assert call.effort == "low"
     assert call.command == (
         "grok",
         "agent",
-        "--always-approve",
+        "--no-leader",
         "--reasoning-effort",
         "low",
         "stdio",
     )
+
+
+def test_shipped_grok_modes_are_honest_about_delegation(tmp_path: Path) -> None:
+    """No grok mode delegates over ACP stdio (measured 2026-08-25), so low
+    policies must refuse instead of pretending a ceiling exists."""
+    registry = AgentRegistry(tmp_path / "agents")
+    grok = registry.resolve("grok")
+
+    assert all(not spec.delegates for spec in grok.modes.values())
+    assert "always-approve" not in grok.modes
+    assert grok.modes["default"].grants == "execute"
+    assert grok.modes["default"].escalates is True
+    assert grok.modes["bypassPermissions"].grants == "all"
+
+    for policy in ("none", "read", "edit"):
+        with pytest.raises(ModeSelectionError, match="no mode grants at most"):
+            select_mode(grok.modes, policy)
+
+    assert select_mode(grok.modes, "execute")[0] == "default"
+    assert select_mode(grok.modes, "all")[0] == "auto"
 
 
 def test_effort_via_cli_injects_flag_before_transport(tmp_path: Path) -> None:
