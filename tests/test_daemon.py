@@ -261,6 +261,74 @@ def test_a_turn_runs_on_the_daemon_and_finishes_the_session(
     assert sessions.read_meta(session_id).state == "done"
 
 
+def test_warm_daemon_rejects_a_changed_spawn_argv(
+    state_root: Path, live_daemon: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entry = MOCK_ENTRY.replace(
+        'home_env = "MOCK_HOME"',
+        'home_env = "MOCK_HOME"\neffort_via = "cli"\neffort_cli_flag = "--mock-effort"',
+    )
+    (state_root / "agents" / "mock.toml").write_text(entry, encoding="utf-8")
+    resolution = resolve()
+    meta = sessions.create_session(
+        entry="mock",
+        base_adapter="mock",
+        prompt="first",
+        resolution=runner.session_resolution(resolution, cwd=None),
+        target=runner.call_target(resolution),
+    )
+    event_file = state_root / "adapter-events.ndjson"
+    monkeypatch.setenv("ACPC_MOCK_EVENT_FILE", str(event_file))
+    run_turn(meta.session_id, "first")
+    first = sessions.read_meta(meta.session_id)
+    assert first.target is not None
+    old_target = first.target
+
+    changed = entry.replace(
+        'effort_cli_flag = "--mock-effort"',
+        'effort_cli_flag = "--different-effort"',
+    )
+    (state_root / "agents" / "mock.toml").write_text(changed, encoding="utf-8")
+    sessions.rotate_turn(
+        meta.session_id,
+        target_from_meta=lambda _meta: old_target,
+        prompt="second",
+    )
+    current = sessions.read_meta(meta.session_id)
+    request = runner.continue_request(current, "second")
+
+    async def drive() -> dict[str, Any]:
+        connection = await daemon_client.connect(old_target)
+        assert connection is not None
+        try:
+            started = await connection.start_turn(meta.session_id, runner.daemon_payload(request))
+            assert started["ok"] is True
+            return (await connection.await_turn(meta.session_id))["outcome"]
+        finally:
+            await connection.close()
+
+    outcome = asyncio.run(drive())
+    assert outcome["state"] == "failed"
+    assert sessions.read_meta(meta.session_id).state == "failed"
+    answer = sessions.answer_path(meta.session_id).read_text(encoding="utf-8")
+    assert "argv mismatch" in answer
+    assert "--mock-effort high" in answer
+    assert "--different-effort high" in answer
+    assert f"acpc daemon stop {old_target}" in answer
+    errors = [
+        event["message"]
+        for event in Transcript(sessions.transcript_path(meta.session_id)).read().events
+        if event["type"] == "error"
+    ]
+    assert errors and "argv mismatch" in errors[-1]
+    prompt_events = [
+        line
+        for line in event_file.read_text(encoding="utf-8").splitlines()
+        if line.startswith("prompt:")
+    ]
+    assert len(prompt_events) == 1
+
+
 def test_cancel_before_daemon_acceptance_is_the_no_such_turn_case(
     state_root: Path, live_daemon: None
 ) -> None:

@@ -1125,6 +1125,17 @@ class MockAgent(Agent):
 
 
 async def main() -> None:
+    for index, argument in enumerate(sys.argv[1:-1], start=1):
+        if argument in {"--effort", "--reasoning-effort", "--mock-effort"}:
+            effort = sys.argv[index + 1]
+            if effort not in EFFORTS:
+                supported = ", ".join(EFFORTS)
+                print(
+                    f"unsupported effort: {effort} (supported: {supported})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                raise SystemExit(2)
     await run_agent(
         MockAgent(), use_unstable_protocol=os.environ.get("ACPC_MOCK_ADVERTISE_RESUME") == "1"
     )

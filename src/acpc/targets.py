@@ -63,8 +63,9 @@ def target_for_call(
         "env": dict(sorted(declared_env.items())),
         "passthrough": dict(sorted(passthrough_values.items())),
         "permissions": permissions,
-        "spawn": dict(sorted(spawn_identity.items())),
     }
+    if spawn_identity:
+        digest_payload["spawn"] = dict(sorted(spawn_identity.items()))
     digest_input = json.dumps(
         digest_payload,
         ensure_ascii=False,

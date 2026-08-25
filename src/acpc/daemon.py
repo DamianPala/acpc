@@ -28,6 +28,7 @@ import asyncio
 import contextlib
 import functools
 import os
+import shlex
 import sys
 import time
 from dataclasses import dataclass, field, replace
@@ -57,6 +58,10 @@ OP = "op"
 
 class DaemonError(Exception):
     """The daemon could not serve a request; the message is one line."""
+
+
+class SpawnArgvMismatch(DaemonError):
+    """The live entry now requires a different adapter process argv."""
 
 
 def log_path_for_target(target: str) -> Path:
@@ -232,10 +237,12 @@ class AdapterHost:
         loser's process would be orphaned with a session already bound to it.
         """
         if self._conn is not None and not self._adapter_died():
+            self._check_command(resolution)
             return self._conn
         async with self._starting:
             if self._conn is not None:
                 if not self._adapter_died():
+                    self._check_command(resolution)
                     return self._conn
                 # The adapter process died under this daemon. Drop the dead
                 # connection so the target heals with a fresh adapter instead
@@ -244,6 +251,21 @@ class AdapterHost:
                 # the dead process, so their next turn honestly resumes cold.
                 await self.close()
             return await self._start(resolution)
+
+    def _check_command(self, resolution: Any) -> None:
+        """Refuse a turn whose live entry requires a different spawn argv."""
+        running = self._command
+        if running is None:
+            return
+        required = runner.adapter_command(resolution)
+        if running == required:
+            return
+        running_argv = shlex.join((running[0], *running[1]))
+        required_argv = shlex.join((required[0], *required[1]))
+        raise SpawnArgvMismatch(
+            f"daemon adapter argv mismatch: running {running_argv}; "
+            f"required {required_argv}; run 'acpc daemon stop {self.target}' and retry"
+        )
 
     async def reset_if_dead(self) -> None:
         """Drop the connection to an adapter whose process is gone."""
@@ -293,6 +315,7 @@ class AdapterHost:
         self._stack = None
         self._conn = None
         self._process = None
+        self._command = None
         self.agent_capabilities = None
         self.adapter_sessions.clear()
 
@@ -686,6 +709,27 @@ class Daemon:
                     turn.preparation_done.set_result({"ok": True})
                 turn.backup = None
             return await self._run_turn(session_id, current_request, turn)
+        except SpawnArgvMismatch as error:
+            if turn.preparation_cancelable and turn.phase == "preparing":
+                turn.backup = None
+                if turn.preparation_done is not None and not turn.preparation_done.done():
+                    turn.preparation_done.set_result({"ok": False, "error": str(error)})
+                expected_turn = sessions.read_meta(session_id).turns
+                outcome = runner.TurnOutcome(
+                    state="failed",
+                    stop_reason="error",
+                    answer="",
+                    turn_token=expected_turn,
+                )
+                runner._finalize(
+                    session_id,
+                    outcome,
+                    error=error,
+                    expected_turn=expected_turn,
+                )
+                self._finish(session_id, outcome, error=error)
+                return outcome
+            raise
         except asyncio.CancelledError:
             if (
                 turn.cancel.state == "cancelled"

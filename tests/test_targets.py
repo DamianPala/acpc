@@ -86,3 +86,26 @@ def test_spawn_identity_is_part_of_the_digest() -> None:
     assert a != b
     assert a != c
     assert target_for_call("grok", permissions="execute", spawn_identity={"effort": "low"}) == a
+
+
+def test_empty_spawn_identity_keeps_the_06_digest() -> None:
+    target = target_for_call(
+        "codex",
+        home="/srv/codex",
+        declared_env={"MODEL_PROVIDER": "openai"},
+        passthrough_values={"OPENROUTER_API_KEY": "secret"},
+        permissions="read",
+    )
+
+    assert target == "codex~99efc3ea373a12a6"
+
+
+def test_spawn_identity_includes_the_cli_effort_flag() -> None:
+    without_flag = target_for_call("grok", permissions="execute", spawn_identity={"effort": "high"})
+    with_flag = target_for_call(
+        "grok",
+        permissions="execute",
+        spawn_identity={"effort": "high", "effort_cli_flag": "--effort"},
+    )
+
+    assert without_flag != with_flag

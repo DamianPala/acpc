@@ -989,6 +989,51 @@ max = {{ model = "mock-opus-5", effort = "xhigh" }}
     assert rewritten["adapter"]["effort_cli_flag"] == "--effort"
 
 
+def test_continue_targets_use_live_effort_vias(cli: CliRunner, state_root: Path) -> None:
+    initial = MOCK_ENTRY.replace("[modes]", 'effort_via = "config_option"\n\n[modes]')
+    (state_root / "agents" / "mock.toml").write_text(initial, encoding="utf-8")
+    sessions_by_effort: dict[str, str] = {}
+    for effort in ("low", "high"):
+        result = invoke(
+            cli,
+            "run",
+            "mock",
+            f"turn {effort}",
+            "--effort",
+            effort,
+            "--quiet",
+            "--json",
+        )
+        assert result.exit_code == vocab.EXIT_OK, result.stderr
+        sessions_by_effort[effort] = json.loads(result.stdout)["session_id"]
+
+    live = initial.replace(
+        'effort_via = "config_option"',
+        'effort_via = "cli"\neffort_cli_flag = "--mock-effort"',
+    )
+    (state_root / "agents" / "mock.toml").write_text(live, encoding="utf-8")
+
+    targets: list[str] = []
+
+    async def unavailable(target: str) -> daemon_client.DaemonUnavailable:
+        targets.append(target)
+        return daemon_client.DaemonUnavailable("test direct-child fallback")
+
+    original = daemon_client.ensure_daemon
+    daemon_client.ensure_daemon = unavailable
+    try:
+        for effort in ("low", "high"):
+            result = invoke(cli, "continue", sessions_by_effort[effort], "next", "--quiet")
+            assert result.exit_code == vocab.EXIT_OK, result.stderr
+    finally:
+        daemon_client.ensure_daemon = original
+
+    assert len(targets) == 2
+    assert targets[0] != targets[1]
+    assert sessions.load(sessions_by_effort["low"]).target == targets[0]
+    assert sessions.load(sessions_by_effort["high"]).target == targets[1]
+
+
 def test_continue_preserves_meta_written_after_initial_load(
     cli: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
