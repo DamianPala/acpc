@@ -60,7 +60,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 from acp import (
@@ -75,6 +75,7 @@ from acp import (
 )
 from acp.helpers import start_edit_tool_call, start_tool_call, update_tool_call
 from acp.interfaces import Client
+from acp.router import Route
 from acp.schema import (
     AcpMcpServer,
     AgentCapabilities,
@@ -252,6 +253,29 @@ class MockAgent(Agent):
 
     def on_connect(self, conn: Client) -> None:
         self._conn = conn
+        raw_connection = cast(Any, conn)._conn
+        router = raw_connection._handler
+        router.add_route(
+            Route(
+                method="session/set_model",
+                func=self._set_session_model,
+                kind="request",
+            )
+        )
+
+    async def _set_session_model(self, params: Any) -> dict[str, Any]:
+        self._record_wire("session/set_model", params)
+        if not isinstance(params, dict):
+            raise RequestError.invalid_params({"details": "params must be an object"})
+        session_id = params.get("sessionId")
+        model_id = params.get("modelId")
+        if not isinstance(session_id, str) or not isinstance(model_id, str):
+            raise RequestError.invalid_params({"details": "sessionId and modelId must be strings"})
+        if model_id not in MODELS:
+            raise RequestError(400, f"unsupported model: {model_id}")
+        self._models[session_id] = model_id
+        self._model_calls[session_id] = self._model_calls.get(session_id, 0) + 1
+        return {}
 
     @staticmethod
     def _store_path() -> Path | None:
@@ -516,6 +540,10 @@ class MockAgent(Agent):
     async def set_config_option(
         self, config_id: str, session_id: str, value: str | bool, **kwargs: Any
     ) -> SetSessionConfigOptionResponse | None:
+        self._record_wire(
+            "session/set_config_option",
+            {"configId": config_id, "sessionId": session_id, "value": value},
+        )
         if config_id not in {"model", "reasoning_effort"}:
             # Vendor-faithful: claude-agent-acp 0.64.0 answers an unknown
             # config id with exactly this JSON-RPC shape.
@@ -1099,6 +1127,13 @@ class MockAgent(Agent):
             # second one rather than have it overwrite the first.
             with Path(path).open("a", encoding="utf-8") as handle:
                 handle.write(f"{method}\n")
+
+    @staticmethod
+    def _record_wire(method: str, params: Any) -> None:
+        path = os.environ.get("ACPC_MOCK_WIRE_FILE")
+        if path:
+            with Path(path).open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"method": method, "params": params}) + "\n")
 
     @staticmethod
     def _record_event(event: str) -> None:
