@@ -1072,12 +1072,15 @@ class Daemon:
         cancel = turn.cancel
         conn = await self.host.ensure(request.resolution)
         level = PermissionLevel(request.resolution.permissions or "read")
+        stored = sessions.read_meta(session_id)
         client = AcpcClient(
             events,
             level,
             modes=request.resolution.entry.modes,
             end_turn=cancel.end_turn,
             cancellation_dispatched=cancel.cancellation_dispatched,
+            previous_tokens=stored.tokens,
+            previous_cost=stored.cost,
         )
 
         turn_error: BaseException | None = None

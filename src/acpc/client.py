@@ -72,6 +72,11 @@ _CHUNK_MAX_CHARS = 4096
 # A broken cancellation watcher must not hold an ACP permission response forever.
 _CANCELLATION_DISPATCH_TIMEOUT = 1.0
 
+# Inferred from the vendor display: 241394560 ticks for a 35.5k-token Grok-4.5
+# turn implies about $0.024, consistent with its per-turn cost; 1e9 or 1e11
+# would instead put that turn at $0.24 or $0.0024.
+_COST_USD_TICKS_DIVISOR = 10_000_000_000
+
 
 @dataclass(slots=True)
 class _ToolCall:
@@ -510,6 +515,8 @@ class AcpcClient:
         cancellation_dispatched: asyncio.Event | None = None,
         permission_prompt: _PermissionPrompt | None = None,
         clock: _Clock | None = None,
+        previous_tokens: int = 0,
+        previous_cost: float | None = None,
     ) -> None:
         self.transcript = transcript
         self.permission_level = permission_level
@@ -522,8 +529,10 @@ class AcpcClient:
         self._answer_parts: list[str] = []
         self._answer_boundary_pending = False
         self._tool_calls: dict[str, _ToolCall] = {}
-        self._tokens = 0
-        self._cost: float | None = None
+        self._tokens = previous_tokens
+        self._cost = previous_cost
+        self._usage_update_seen = False
+        self._meta_usage_recorded = False
         self._denied: dict[str, int] = {}
         self._denial_details: dict[str, dict[str, Any]] = {}
         self._replay_sink: ReplaySink | None = None
@@ -586,6 +595,8 @@ class AcpcClient:
         Some agents (Grok Build) put totals on PromptResponse ``_meta`` instead
         of streaming ACP ``usage_update`` notifications.
         """
+        if self._usage_update_seen or self._meta_usage_recorded:
+            return
         meta = self._prompt_meta(prompt_result)
         if not meta:
             return
@@ -596,20 +607,22 @@ class AcpcClient:
             if isinstance(usage, Mapping):
                 tokens = usage.get("totalTokens") or usage.get("total_tokens")
         if isinstance(tokens, (int, float)) and tokens > 0:
-            self._tokens = max(self._tokens, int(tokens))
+            self._tokens = int(tokens)
         cost = meta.get("costUsd")
         if cost is None:
             usage = meta.get("usage")
             if isinstance(usage, Mapping):
                 ticks = usage.get("costUsdTicks")
                 if isinstance(ticks, (int, float)):
-                    cost = float(ticks) / 10_000_000_000
+                    cost = float(ticks) / _COST_USD_TICKS_DIVISOR
                 else:
                     cost = usage.get("costUsd") or usage.get("cost_usd")
         if isinstance(cost, (int, float)):
             amount = float(cost)
-            self._cost = amount if self._cost is None else max(self._cost, amount)
+            self._cost = amount if self._cost is None else self._cost + amount
+        self._meta_usage_recorded = True
         if self._tokens != previous_tokens or self._cost != previous_cost:
+            self.flush()
             self.transcript.append("usage", tokens=self._tokens, cost=self._cost)
 
     @asynccontextmanager
@@ -1075,6 +1088,7 @@ class AcpcClient:
         current.finished = True
 
     def _record_usage(self, update: UsageUpdate) -> None:
+        self._usage_update_seen = True
         self._tokens = max(self._tokens, update.used)
         if update.cost is not None:
             amount = update.cost.amount
