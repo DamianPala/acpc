@@ -39,6 +39,8 @@ Exact-prefix triggers (donor design, for precise timing control in tests):
 - ``crash-late:TEXT``stream TEXT, then fail the turn with a JSON-RPC error
 - ``stderr-crash:TEXT`` print TEXT to stderr, then fail the turn
 - ``auth-data:``     fail with an auth error marked in ``data``, not in the text
+- ``meta:TOKENS:TICKS:TEXT`` -> prose plus per-turn PromptResponse ``_meta`` usage
+- ``both:TOKENS:TICKS:TEXT`` -> streamed usage plus deliberately stale ``_meta``
 
 Anything else runs the default scenario: three tool events, a progress msg, a
 usage update, and a markdown answer quoting the prompt — history-aware, so a
@@ -84,6 +86,7 @@ from acp.schema import (
     AvailableCommand,
     AvailableCommandsUpdate,
     CloseSessionResponse,
+    Cost,
     DeniedOutcome,
     EmbeddedResourceContentBlock,
     ForkSessionResponse,
@@ -576,6 +579,33 @@ class MockAgent(Agent):
         self, session_id: str, prompt_text: str, cancel_event: asyncio.Event
     ) -> PromptResponse | None:
         """Handle the donor's exact-prefix triggers; None means no match."""
+        if prompt_text.startswith(("meta:", "both:")):
+            source, token_text, ticks_text, answer = prompt_text.split(":", 3)
+            tokens = int(token_text)
+            ticks = int(ticks_text)
+            await self._send_text(session_id, answer)
+            if source == "both":
+                await self._send_usage(
+                    session_id,
+                    used=tokens,
+                    cost=ticks / 10_000_000_000,
+                )
+                meta_tokens = tokens + 100
+                meta_ticks = ticks * 2
+            else:
+                meta_tokens = tokens
+                meta_ticks = ticks
+            return PromptResponse.model_validate(
+                {
+                    "stopReason": "end_turn",
+                    "_meta": {
+                        "numTurns": 1,
+                        "totalTokens": meta_tokens,
+                        "usage": {"costUsdTicks": meta_ticks},
+                    },
+                },
+            )
+
         if prompt_text.startswith("echo:"):
             await self._send_text(session_id, prompt_text.split(":", 1)[1])
             return PromptResponse(stop_reason="end_turn")
@@ -864,8 +894,13 @@ class MockAgent(Agent):
         chunk = update_agent_message(text_block(text))
         await self._conn.session_update(session_id=session_id, update=chunk)
 
-    async def _send_usage(self, session_id: str, used: int) -> None:
-        update = UsageUpdate(session_update="usage_update", used=used, size=200_000)
+    async def _send_usage(self, session_id: str, used: int, cost: float | None = None) -> None:
+        update = UsageUpdate(
+            session_update="usage_update",
+            used=used,
+            size=200_000,
+            cost=Cost(amount=cost, currency="USD") if cost is not None else None,
+        )
         try:
             await self._conn.session_update(session_id=session_id, update=update)
         except (ConnectionError, OSError, RuntimeError):
