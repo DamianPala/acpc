@@ -281,6 +281,7 @@ def test_warm_daemon_rejects_a_changed_spawn_argv(
     monkeypatch.setenv("ACPC_MOCK_EVENT_FILE", str(event_file))
     run_turn(meta.session_id, "first")
     first = sessions.read_meta(meta.session_id)
+    sessions.update_meta(meta.session_id, tokens=1234, cost=0.5)
     assert first.target is not None
     old_target = first.target
 
@@ -309,7 +310,10 @@ def test_warm_daemon_rejects_a_changed_spawn_argv(
 
     outcome = asyncio.run(drive())
     assert outcome["state"] == "failed"
-    assert sessions.read_meta(meta.session_id).state == "failed"
+    failed = sessions.read_meta(meta.session_id)
+    assert failed.state == "failed"
+    assert failed.tokens == 1234
+    assert failed.cost == pytest.approx(0.5)
     answer = sessions.answer_path(meta.session_id).read_text(encoding="utf-8")
     assert "argv mismatch" in answer
     assert "--mock-effort high" in answer

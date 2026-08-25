@@ -450,7 +450,7 @@ class TurnOutcome:
     state: str
     stop_reason: str | None
     answer: str
-    tokens: int = 0
+    tokens: int | None = None
     cost: float | None = None
     denied: dict[str, int] = field(default_factory=dict)
     denial_details: dict[str, dict[str, Any]] = field(default_factory=dict)
