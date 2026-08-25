@@ -22,11 +22,11 @@ import os
 import shutil
 import signal
 import sys
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from acp import PROTOCOL_VERSION, RequestError, text_block
 
@@ -861,7 +861,8 @@ async def _set_session_model(conn: Any, session_id: str, model_id: str) -> Any:
     """
     set_model = getattr(conn, "set_model", None)
     if callable(set_model):
-        return await set_model(session_id=session_id, model_id=model_id)
+        typed = cast("Callable[..., Awaitable[Any]]", set_model)
+        return await typed(session_id=session_id, model_id=model_id)
     raw = getattr(conn, "_conn", None)
     if raw is None or not hasattr(raw, "send_request"):
         raise AdapterRejection(

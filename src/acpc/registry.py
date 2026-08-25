@@ -233,18 +233,12 @@ class ResolvedEntry:
         if self.install_command:
             return f"run 'acpc install {self.base_adapter}'"
         if self.install_docs:
-            return (
-                "adapter is already registered; install the vendor CLI from "
-                f"{self.install_docs}"
-            )
+            return f"adapter is already registered; install the vendor CLI from {self.install_docs}"
         return f"install '{self.command_head}' from the vendor"
 
     def missing_binary_error(self) -> str:
         """One-line refusal when argv[0] is not installed."""
-        return (
-            f"{self.entry}: '{self.command_head}' is not installed — "
-            f"{self.install_next_step()}"
-        )
+        return f"{self.entry}: '{self.command_head}' is not installed — {self.install_next_step()}"
 
     def roster_install_status(self) -> str:
         """Roster status cell, including a next-step hint when missing."""

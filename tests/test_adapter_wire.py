@@ -274,7 +274,7 @@ default = { grants = "read", delegates = true }
     resolution = AgentRegistry(agents).resolve_call(
         "tool", model="m1", effort="low", mode="default", permissions="read"
     )
-    request = SimpleNamespace(resolution=resolution)
+    request = runner.TurnRequest(resolution=resolution, prompt="x")
     conn = _FakeConn()
     asyncio.run(runner.apply_call_options(conn, "sid", request))
     assert conn.modes == ["default"]
@@ -298,7 +298,7 @@ default = { grants = "read", delegates = true }
     resolution = AgentRegistry(agents).resolve_call(
         "tool", model="m1", effort="high", mode="default", permissions="read"
     )
-    request = SimpleNamespace(resolution=resolution)
+    request = runner.TurnRequest(resolution=resolution, prompt="x")
     conn = _FakeConn()
     asyncio.run(runner.apply_call_options(conn, "sid", request))
     assert ("model", "m1") in conn.config
@@ -319,9 +319,7 @@ def test_set_session_model_falls_back_to_raw_send_request() -> None:
     raw = RawOnly()
     result = asyncio.run(runner._set_session_model(raw, "sid", "grok-4.5"))
     assert result == {"ok": "yes"}
-    assert raw.calls == [
-        ("session/set_model", {"sessionId": "sid", "modelId": "grok-4.5"})
-    ]
+    assert raw.calls == [("session/set_model", {"sessionId": "sid", "modelId": "grok-4.5"})]
 
 
 # --- usage from prompt meta ------------------------------------------------
