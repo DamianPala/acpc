@@ -1440,8 +1440,8 @@ if begin_section S16-skills "bundled skill list, detail, metadata, and JSON"; th
     run_acpc skills --json
     assert_json_valid "skills list JSON is valid" "$LAST_OUT"
     assert_eq "skills list JSON is an object keyed by skills" "provider-bringup" \
-        "$(jq -r '.skills[0].name' <<<"$LAST_OUT")"
-    SKILL_DIR="$(jq -r '.skills[0].path' <<<"$LAST_OUT")"
+        "$(jq -r '.skills[] | select(.name == "provider-bringup") | .name' <<<"$LAST_OUT")"
+    SKILL_DIR="$(jq -r '.skills[] | select(.name == "provider-bringup") | .path' <<<"$LAST_OUT")"
     assert_file "skills list JSON path points at the skill directory" \
         "${SKILL_DIR}/SKILL.md"
 

@@ -895,9 +895,7 @@ def test_continue_permissions_keeps_stored_effort_after_table_tightens(
     assert continued.resolution["resolved"]["permissions"]["value"] == "edit"
 
 
-def test_continue_permissions_preserves_wire_vias(
-    cli: CliRunner, state_root: Path
-) -> None:
+def test_continue_permissions_preserves_wire_vias(cli: CliRunner, state_root: Path) -> None:
     """continue --permissions must not strip model_via / effort_via from meta.
 
     Grok relies on these session fields; dropping them reverts apply_call_options
