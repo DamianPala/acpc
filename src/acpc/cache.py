@@ -168,11 +168,13 @@ def first_sentence(description: str) -> str:
 
 async def probe_advertised(resolution: CallResolution) -> dict[str, Any]:
     """Launch an adapter, initialize it, and create a session for a live probe."""
+    from acpc import runner as runner_module
+
     try:
-        command = resolution.entry.command_args
+        command, args = runner_module.adapter_command(resolution)
     except Exception as error:  # noqa: BLE001
         raise ProbeError(str(error)) from None
-    if not command or shutil.which(command[0]) is None:
+    if not command or shutil.which(command) is None:
         raise ProbeError(resolution.entry.missing_binary_error())
 
     with tempfile.TemporaryDirectory(prefix="acpc-probe-") as temporary:
@@ -185,8 +187,8 @@ async def probe_advertised(resolution: CallResolution) -> dict[str, Any]:
         try:
             async with spawn_adapter(
                 client,
-                command[0],
-                *command[1:],
+                command,
+                *args,
                 env=resolution.adapter_environment,
                 drain_stderr=False,
             ) as (connection, _process):
@@ -197,8 +199,6 @@ async def probe_advertised(resolution: CallResolution) -> dict[str, Any]:
                 # the adapter rejects (wrong effort id, unknown model) must
                 # fail the check, not first surface on a paid run.  Imported
                 # lazily — runner imports this module at load time.
-                from acpc import runner as runner_module
-
                 if resolution.entry.modes and (
                     resolution.mode is None or resolution.mode_spec is None
                 ):

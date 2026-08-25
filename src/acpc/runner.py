@@ -42,7 +42,7 @@ from acpc import (
 )
 from acpc.client import AcpcClient
 from acpc.permissions import PermissionLevel
-from acpc.registry import CallResolution, ModeSpec, RegistryError, ResolvedEntry
+from acpc.registry import AgentRegistry, CallResolution, ModeSpec, RegistryError, ResolvedEntry
 from acpc.spawn import spawn_adapter
 
 # SPEC.md `stop`: graceful cancel with a bounded wait for the ack (10s) — if
@@ -546,6 +546,22 @@ def call_target(resolution: CallResolution) -> str:
     )
 
 
+def daemon_target(resolution: CallResolution) -> str:
+    """Compute a continue target with the live entry's apply-path identity."""
+    try:
+        live_entry = AgentRegistry().resolve(resolution.entry.entry)
+    except RegistryError:
+        # A deleted or temporarily invalid entry must not make continue fail
+        # before the daemon gets its existing, actionable rebuild error.
+        return call_target(resolution)
+    return call_target(replace(resolution, entry=live_entry))
+
+
+def daemon_target_from_session(meta: sessions.SessionMeta) -> str:
+    """Compute a continue target from stored values plus live entry vias."""
+    return daemon_target(resolution_from_session(meta))
+
+
 class _CancelSignal:
     """Record a turn stop, resolving signal meaning once routing is known."""
 
@@ -756,7 +772,7 @@ def _prepare_resumed_turn(
         rotated = sessions.rotate_turn(
             session_id,
             resolution_from_meta=resolution_from_meta,
-            target_from_meta=lambda meta: call_target(resolution_from_session(meta)),
+            target_from_meta=daemon_target_from_session,
             prompt=request.prompt,
             resume_status=resume_status,
             pid=pid if pid is not None else _host_pid(),
@@ -1029,7 +1045,7 @@ async def _route(request: TurnRequest) -> tuple[Any | None, str | None]:
     forced = routes_direct(request)
     if forced is not None:
         return None, f"direct child ({forced})"
-    routed = await daemon_client.ensure_daemon(call_target(request.resolution))
+    routed = await daemon_client.ensure_daemon(daemon_target(request.resolution))
     if isinstance(routed, daemon_client.DaemonUnavailable):
         return None, f"direct child ({routed.reason})"
     return routed, None
@@ -1060,7 +1076,7 @@ async def _execute(session_id: str, request: TurnRequest) -> TurnOutcome:
             await signalled
 
     if daemon is not None:
-        target = call_target(request.resolution)
+        target = daemon_target(request.resolution)
         return await _execute_via_daemon(session_id, request, daemon, cancel, target)
 
     if request.defer_rotation:
@@ -1210,7 +1226,7 @@ async def dispatch_background(session_id: str, request: TurnRequest) -> str | No
     forced = routes_direct(request)
     if forced is not None:
         return f"--bg needs the daemon, and {forced}"
-    routed = await daemon_client.ensure_daemon(call_target(request.resolution))
+    routed = await daemon_client.ensure_daemon(daemon_target(request.resolution))
     if isinstance(routed, daemon_client.DaemonUnavailable):
         return f"--bg needs the daemon: {routed.reason}"
     try:

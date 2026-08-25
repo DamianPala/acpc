@@ -564,6 +564,22 @@ def test_check_applies_the_resolved_options_so_a_bad_config_fails_it(
     assert "Unknown config option: bogus_effort_id" in result.stdout
 
 
+def test_check_spawns_the_resolved_cli_effort_argv(cli: CliRunner, state_root: Path) -> None:
+    (state_root / "agents" / "brokenargv.toml").write_text(
+        MOCK_ENTRY.replace(
+            "[presets]",
+            'effort = "max"\neffort_via = "cli"\neffort_cli_flag = "--mock-effort"\n\n[presets]',
+        ),
+        encoding="utf-8",
+    )
+
+    result = invoke(cli, "agents", "brokenargv", "--check")
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    assert "brokenargv failed" in result.stdout
+    assert "live probe failed" in result.stdout
+
+
 def test_agents_init_validates_effort_against_the_requested_model(
     cli: CliRunner, state_root: Path
 ) -> None:
