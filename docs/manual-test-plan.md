@@ -60,7 +60,7 @@ run measured `head` instead of acpc. Capture the code before piping.
 |---|---|---|
 | A1 | `acpc agents` | Every adapter with install status. On a fresh `ACPC_HOME` there are no variants yet, so no variant rows and no header — the header appears at B4, once a variant exists |
 | A2 | `acpc agents codex` | Resolved model, effort, permissions, home, each with provenance; a `modes` line naming every mode's `grants`, plus a ` · delegates` marker on any mode that delegates and a ` · escalates` marker on any that escalates. On codex none delegate, so that marker is absent everywhere, and only `read-only` carries `escalates` — both are the pass |
-| A3 | `acpc run codex "x" --dry-run` | Exit 2: the non-TTY default `read` fits no codex mode, and the error names the adapter's declared modes. This is the real first-contact experience, not a defect |
+| A3 | `acpc run codex "x" --dry-run` | Exit 2: the non-TTY default `read` fits no codex mode, and the error names the adapter's declared modes, the floor, and the `--permissions` flag that clears it. This is the real first-contact experience, not a defect |
 | A4 | `acpc run codex "x" --permissions edit --dry-run` | Full resolution, including the mode line naming why that mode was selected, whether it delegates, and whether it escalates (`read-only … · vendor-decided · escalates`) |
 | A5 | `acpc run codex "x" --permissions prompt --dry-run` | A one-time deprecation warning naming `ask`, then `ask` on non-TTY is a usage error listing the alternatives |
 | A6 | `acpc run codex "x" --help` and `acpc --help` | Defaults stated as rules where they depend on the caller; the usage line for `--permissions` does not offer `write`/`prompt` as first-class choices |
@@ -117,7 +117,7 @@ acpc and the boundary is entirely vendor-side. That is by design, not a defect.
 |---|---|---|
 | E1 | claude, `--permissions read`, prompt asks to create a file | The file is not created; the answer says so honestly |
 | E2 | `--json` on that run | `denied` as an array of self-describing records, each with category, count, `minimum_policy` and a `remedy` an orchestrator can retry on mechanically |
-| E3 | `--permissions none` on codex | Exit 2 naming the modes and their grants — no codex mode grants at most `none` |
+| E3 | `--permissions none` on codex | Exit 2 naming the modes and their grants, the floor, and the `--permissions` flag that clears it — no codex mode grants at most `none` |
 | E4 | `--permissions ask` on a **real TTY** (operator only) | A y/n question on `/dev/tty`; answering `y` lets the write through |
 | E5 | codex, `--permissions edit`, prompt that shells out to write a file | Record what happens. A write landing with zero permission events is the known vendor behavior (`read-only` escalates through an in-vendor reviewer); report the transcript, not a verdict |
 

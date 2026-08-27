@@ -41,6 +41,18 @@ standard = {{ model = "mock-sonnet-5", effort = "high" }}
 max = {{ model = "mock-opus-5", effort = "xhigh" }}
 """
 
+FLOOR_ENTRY = f"""
+name = "Floor Agent"
+command = "{sys.executable} {MOCK_AGENT_SCRIPT}"
+install_command = "true"
+home = "~/.floor"
+home_env = "FLOOR_HOME"
+
+[modes]
+bypass = {{ grants = "all", delegates = false }}
+default = {{ grants = "execute", delegates = false }}
+"""
+
 
 @pytest.fixture(autouse=True)
 def state_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
@@ -2193,6 +2205,23 @@ def test_continue_permissions_apply_and_persist_for_later_turns(
         "remedy": "pass --permissions all",
     }
     assert "denied:" in fourth.stderr
+
+
+def test_continue_permissions_refusal_names_the_permission_floor(
+    cli: CliRunner, state_root: Path
+) -> None:
+    (state_root / "agents" / "floor.toml").write_text(FLOOR_ENTRY, encoding="utf-8")
+    first = invoke(cli, "run", "floor", "turn one", "--permissions", "execute", "--quiet", "--json")
+    session_id = json.loads(first.stdout)["session_id"]
+
+    result = invoke(cli, "continue", session_id, "turn two", "--permissions", "read")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert result.stderr == (
+        "Error: no mode on floor grants at most permissions read — the lowest policy floor runs "
+        "under is execute; pass --permissions execute; declared modes: bypass (grants all), "
+        "default (grants execute)\n"
+    )
 
 
 def test_continuation_clamps_and_persists_an_inherited_ceiling(

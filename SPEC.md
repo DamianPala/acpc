@@ -419,7 +419,11 @@ overrides the policy. Two steps: discard every mode whose `grants` exceeds the p
 then among the rest prefer `delegates = true`, then the highest `grants`. A policy no mode
 satisfies is a usage error naming the adapter's modes, never a silent downgrade. A mode
 the adapter advertises but `[modes]` omits is refused unless the policy is `all`. `--mode`
-and an entry's `mode` override the second step, not the first.
+and an entry's `mode` override the second step, not the first. A policy that sits below every
+declared mode's grant is refused with the floor named and the flag that clears it — `the lowest
+policy grok runs under is execute; pass --permissions execute` — because the caller who hits this
+is one flag away from a working call, and a declared-modes dump alone makes them compute the floor
+by hand.
 
 **A runtime switch is a re-selection, not a permission.** acpc resolves a `switch_mode`
 target through `[modes]` under the same rules as dispatch: a target above the policy is

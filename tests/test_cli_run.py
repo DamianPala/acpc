@@ -36,6 +36,16 @@ standard = {{ model = "mock-sonnet-5", effort = "high" }}
 max = {{ model = "mock-opus-5", effort = "xhigh" }}
 """
 
+FLOOR_ENTRY = """
+name = "Grok Build Mock"
+command = "true"
+install_command = "true"
+
+[modes]
+bypass = { grants = "all", delegates = false }
+default = { grants = "execute", delegates = false }
+"""
+
 PHANTOM_ENTRY = """
 name = "Phantom Agent"
 command = "definitely-not-installed-phantom-xyz"
@@ -62,6 +72,11 @@ def cli() -> CliRunner:
     # stdout is not a tty under CliRunner, which is the non-interactive branch
     # of every TTY rule below.
     return CliRunner()
+
+
+@pytest.fixture
+def grok_floor_entry(state_root: Path) -> None:
+    (state_root / "agents" / "grok-floor.toml").write_text(FLOOR_ENTRY, encoding="utf-8")
 
 
 @pytest.fixture
@@ -933,13 +948,92 @@ def test_the_reserved_name_last_is_refused(cli: CliRunner) -> None:
     assert result.exit_code == vocab.EXIT_USAGE
 
 
-def test_grok_refuses_policies_below_execute(cli: CliRunner) -> None:
-    """The shipped table records that nothing delegates, so the default
+def test_an_execute_floor_refuses_policies_below_execute(
+    cli: CliRunner, grok_floor_entry: None
+) -> None:
+    """The mock table records that nothing delegates, so the default
     non-TTY policy (read) must refuse instead of claiming a ceiling."""
-    result = invoke(cli, "run", "grok", "probe", "--dry-run")
+    result = invoke(cli, "run", "grok-floor", "probe")
 
     assert result.exit_code == vocab.EXIT_USAGE
-    assert "no mode on grok grants at most permissions read" in result.stderr
+    assert result.stderr == (
+        "Error: no mode on grok-floor grants at most permissions read — "
+        "the lowest policy grok-floor runs under is execute; pass --permissions execute; "
+        "declared modes: bypass (grants all), default (grants execute)\n"
+    )
+
+
+def test_an_execute_floor_dry_run_refusal_names_the_permission_floor(
+    cli: CliRunner, grok_floor_entry: None
+) -> None:
+    result = invoke(cli, "run", "grok-floor", "probe", "--dry-run")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert result.stderr == (
+        "Error: no mode on grok-floor grants at most permissions read — "
+        "the lowest policy grok-floor runs under is execute; pass --permissions execute; "
+        "declared modes: bypass (grants all), default (grants execute)\n"
+    )
+
+
+def test_an_execute_floor_ask_refusal_names_the_permission_floor(
+    cli: CliRunner, grok_floor_entry: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli_module, "_stdout_is_tty", lambda: True)
+
+    result = invoke(cli, "run", "grok-floor", "probe", "--permissions", "ask")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert result.stderr == (
+        "Error: --permissions ask on grok-floor is not really asking anything: "
+        "no mode grants at most read, so no permission request can reach acpc — "
+        "the lowest policy grok-floor runs under is execute; pass --permissions execute; "
+        "declared modes: bypass (grants all), default (grants execute)\n"
+    )
+
+
+def test_real_grok_refusal_names_the_permission_floor(cli: CliRunner) -> None:
+    result = invoke(cli, "run", "grok", "probe")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert result.stderr == (
+        "Error: no mode on grok grants at most permissions read — the lowest policy grok runs "
+        "under is execute; pass --permissions execute; declared modes: default (grants execute), "
+        "acceptEdits (grants execute), plan (grants execute), auto (grants all), "
+        "dontAsk (grants execute), bypassPermissions (grants all)\n"
+    )
+
+
+def test_empty_modes_refusal_keeps_the_existing_message(cli: CliRunner, state_root: Path) -> None:
+    (state_root / "agents" / "empty.toml").write_text(
+        'name = "Empty Modes"\ncommand = "true"\n\n[modes]\n', encoding="utf-8"
+    )
+
+    result = invoke(cli, "run", "empty", "probe")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert (
+        result.stderr
+        == "Error: no mode on empty grants at most permissions read; declared modes: none\n"
+    )
+
+
+def test_an_edit_floor_refusal_names_the_permission_floor(cli: CliRunner, state_root: Path) -> None:
+    (state_root / "agents" / "edit-floor.toml").write_text(
+        'command = "true"\n\n[modes]\n'
+        'bypass = { grants = "all", delegates = false }\n'
+        'default = { grants = "edit", delegates = false }\n',
+        encoding="utf-8",
+    )
+
+    result = invoke(cli, "run", "edit-floor", "probe")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert result.stderr == (
+        "Error: no mode on edit-floor grants at most permissions read — the lowest policy "
+        "edit-floor runs under is edit; pass --permissions edit; declared modes: bypass "
+        "(grants all), default (grants edit)\n"
+    )
 
 
 def test_unlisted_model_warns_on_dry_run(cli: CliRunner) -> None:

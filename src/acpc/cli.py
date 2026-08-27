@@ -529,7 +529,14 @@ def _mode_selection_error(
         )
     else:
         reason = f"no mode on {entry.entry} grants at most permissions {error.policy}"
-    return UsageProblem(f"{reason}; declared modes: {modes}")
+    if not error.modes:
+        return UsageProblem(f"{reason}; declared modes: {modes}")
+    floor = min(
+        (PermissionLevel(spec.grants) for spec in error.modes.values()),
+        key=lambda level: level.rank,
+    ).value
+    reason = f"{reason} — the lowest policy {entry.entry} runs under is {floor}"
+    return UsageProblem(f"{reason}; pass --permissions {floor}; declared modes: {modes}")
 
 
 def _select_resolution(resolution: CallResolution) -> CallResolution:
