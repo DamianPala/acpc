@@ -3,12 +3,12 @@ revision = 3
 requires-python = ">=3.13"
 
 [options]
-exclude-newer = "2026-08-05T09:17:31.827295713Z"
+exclude-newer = "2026-08-20T09:13:17.455990776Z"
 exclude-newer-span = "P1W"
 
 [[package]]
 name = "acpc"
-version = "0.6.1"
+version = "0.7.1"
 source = { editable = "." }
 dependencies = [
     { name = "agent-client-protocol" },
