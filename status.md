@@ -2,6 +2,29 @@
 
 ## Now
 
+**0.7.1 is built, tagged and installed live (2026-08-27): failure ergonomics.** Born from the same
+day's real grok dispatch (session 8rin: a mid-turn xAI inference stall, killed correctly by the 600s
+idle timeout, diagnosed only by digging the transcript). Two slices, both built by `builder-sub`
+dispatches through acpc itself and reviewed by Opus subagents with adversarial mutation testing —
+both came back DO-NOT-SHIP once (slice 1: an OSC regex that could eat the very error text it
+existed to clean, plus `meta.failure` not actually one-line/ANSI-free/bounded, plus the
+observation-vs-message distinction untested on the daemon path; slice 2: floor fixtures that let a
+"first declared mode" mutation pass), then SHIP after fix turns. What ships: a failed turn's
+one-line observation persists in `meta.json` (normalized to 300 chars, cleared on rotation) and
+surfaces as a `failure` line with the `continue:` hint in `status <id>` and `--json`; adapter log
+tails are ANSI-stripped (newline-bounded OSC branch — unterminated introducers leak payload instead
+of eating the diagnosis); the no-mode-fits refusal names the floor and the flag
+(`pass --permissions execute`); SPEC blesses `continue` as the post-failure recovery path.
+Deliberately NOT done: no `permissions` default in bundled grok.toml and no silent mode fallback —
+the read default stays the security floor. Gates: 887 tests, ruff/pyright clean, smoke 581/581 on
+the combined state. Commits `19f3eed` + `bd15ae3`, bump `50fc982` (uv.lock synced there — it had
+been stale since 0.6.1), tag `v0.7.1`, installed tool at 0.7.1. **Not yet pushed** — main, branch
+and tag await Damian's push. Review deferrals landed in `docs/plans/0.8/backlog.md` (inherited-
+ceiling clamp vs the floor remedy, `error.modes`/`entry.modes` unification), which also got two
+corrections from verifying the 2026-08-27 observations: `answer.<n>.md` parking already existed
+(the "no archive" report was wrong), and the 0-tok failed turn is grok reporting nothing, not an
+accounting bug.
+
 **0.7 is released and installed (2026-08-25): the grok adapter bringup.** This is the first release
 to travel through origin instead of past it: Damian built the branch with another agent, pushed it to
 github.com/DamianPala/acpc, and it landed as PR #1 — reviewed here by a four-seam Opus fleet plus a
