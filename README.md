@@ -12,6 +12,8 @@ acpc is built for a specific primary user: **another agent calling it through a 
 
 `status` is a lightweight pulse: active sessions show `idle <age>` since their newest transcript event, while finished sessions show `·`. The JSON view exposes the same value as `idle_seconds` (`null` when unavailable or finished). Every row also names the model the session resolved to, because entry names hide it — two variants that both `extend` the same parent run the same model, and only the column says so.
 
+A failed run is not lost: `acpc status <id>` names the failure on its `failure` line, and `acpc continue <id>` resumes the session with its transcript context intact — the failed turn's partial answer is parked as `answer.<n>.md` in the session dir.
+
 ```bash
 # 90% of usage is this:
 acpc run codex "fix the failing test in tests/test_auth.py" --cwd ~/repo --permissions execute

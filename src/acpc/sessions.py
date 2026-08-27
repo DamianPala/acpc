@@ -110,6 +110,7 @@ class SessionMeta:
     turns: int = 1
     exit_code: int | None = None
     stop_reason: str | None = None
+    failure: str | None = None
     tokens: int = 0
     cost: float | None = None
     denied: dict[str, int] = field(default_factory=dict)
@@ -415,6 +416,7 @@ def meta_from_dict(data: Mapping[str, Any], *, path: Path) -> SessionMeta:
         turns=_coerce_int(known.get("turns"), "turns", path) or 1,
         exit_code=_coerce_int(known.get("exit_code"), "exit_code", path),
         stop_reason=_coerce_str(known.get("stop_reason"), "stop_reason", path),
+        failure=_coerce_str(known.get("failure"), "failure", path),
         tokens=_coerce_int(known.get("tokens"), "tokens", path) or 0,
         cost=_coerce_float(known.get("cost"), "cost", path),
         denied=_coerce_denied(known.get("denied"), "denied", path),
@@ -811,8 +813,10 @@ def rotate_turn(
         meta.finished_at = None
         meta.exit_code = None
         meta.stop_reason = None
+        meta.failure = None
         meta.denied = {}
         meta.denial_details = {}
+        meta.extra.pop("failure", None)
         meta.extra.pop("resume", None)
         if prompt is not None:
             paths.atomic_write(prompt_path(session_id), prompt)

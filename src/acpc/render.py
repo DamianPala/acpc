@@ -573,6 +573,8 @@ def render_status_detail(
         f"agent    {meta.entry} ({meta.base_adapter}) · model: {model} · name: {name}",
         f"dir      {directory} · answer: {Path(sessions.answer_path(meta.session_id)).name}",
     ]
+    if meta.failure is not None:
+        lines.append(f"failure  {meta.failure} · continue: acpc continue {meta.session_id}")
     return "\n".join(lines) + "\n"
 
 
@@ -624,5 +626,6 @@ def status_detail_json(
         "cost": meta.cost,
         "exit_code": meta.exit_code,
         "stop_reason": meta.stop_reason,
+        "failure": meta.failure,
         "paths": sessions.session_paths(meta.session_id),
     }

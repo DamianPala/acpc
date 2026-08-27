@@ -563,6 +563,13 @@ def test_a_switch_above_the_ceiling_ends_the_turn_with_exit_2() -> None:
     )
 
 
+def test_permission_denied_turn_does_not_record_a_failure() -> None:
+    session_id, outcome = start_turn("run the perm scenario", permissions="read")
+
+    assert outcome.stop_reason == "permission_denied"
+    assert sessions.read_meta(session_id).failure is None
+
+
 def test_timeout_cancels_the_turn_and_exits_124() -> None:
     session_id, outcome = start_turn("slow:30 timeout probe", timeout=1.0)
 
@@ -601,6 +608,32 @@ def test_a_late_adapter_failure_keeps_the_partial_answer() -> None:
     errors = [event for event in transcript_events(session_id) if event.get("type") == "error"]
     assert errors
     assert "upstream connection reset" in errors[-1]["message"]
+
+
+def test_persisted_failure_is_normalized_but_transcript_observation_is_lossless() -> None:
+    session_id, outcome = start_turn("failure-details:multiline styled details")
+
+    assert outcome.state == "failed"
+    meta = sessions.read_meta(session_id)
+    event = [event for event in transcript_events(session_id) if event.get("type") == "error"][-1]
+
+    assert meta.failure is not None
+    assert "\x1b" not in meta.failure
+    assert "\n" not in meta.failure
+    assert len(meta.failure) <= runner.MESSAGE_TAIL_CHARS
+    assert "\x1b[31m" in event["observation"]
+    assert "\n" in event["observation"]
+    assert "last line" in event["observation"]
+
+
+def test_unterminated_osc_does_not_hide_later_error_text(tmp_path: Path) -> None:
+    raw = b"\x1b]0;codex\nERROR: adapter died: connection refused\nprogress\x07 done"
+    log_file = tmp_path / "target.log"
+    log_file.write_bytes(raw)
+
+    tail = runner._read_adapter_log_tail(log_file, 0)
+
+    assert tail == "]0;codex\nERROR: adapter died: connection refused\nprogress done"
 
 
 def test_a_huge_adapter_log_does_not_flood_the_failure_message(tmp_path: Path) -> None:

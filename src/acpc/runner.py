@@ -19,6 +19,7 @@ resolved call and a finished session:
 import asyncio
 import contextlib
 import os
+import re
 import shutil
 import signal
 import sys
@@ -54,7 +55,11 @@ CANCEL_ACK_TIMEOUT = 10.0
 # diagnostics while keeping one unusually large stderr line bounded.
 ADAPTER_LOG_TAIL_BYTES = 8 * 1024
 
-# How much of that tail is spliced into the one-line failure message.
+# Adapter stderr is terminal-oriented, but transcript consumers are not.
+_ANSI_ESCAPE_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b\n]*(?:\x07|\x1b\\))")
+
+# Bounds both the tail spliced into the one-line failure message and the
+# persisted failure observation in meta.json.
 MESSAGE_TAIL_CHARS = 300
 
 # ACP stop reasons that mean the turn failed rather than completed.
@@ -1367,6 +1372,11 @@ def _finalize(
             denied=outcome.denied,
             denial_details=outcome.denial_details,
             error_event=error_event,
+            failure=(
+                _single_line(_strip_ansi(failure.observation))[:MESSAGE_TAIL_CHARS]
+                if failure is not None
+                else None
+            ),
             delivery_record_incomplete=outcome.delivery_record_incomplete,
             adapter_session_id=(
                 outcome.adapter_session_id
@@ -1530,8 +1540,13 @@ def _read_adapter_log_tail(path: Path | None, start: int) -> str | None:
         return None
     if not raw:
         return None
-    decoded = raw.decode("utf-8", errors="ignore").strip()
+    decoded = _strip_ansi(raw.decode("utf-8", errors="ignore")).strip()
     return decoded or None
+
+
+def _strip_ansi(text: str) -> str:
+    """Remove terminal control sequences without discarding surrounding text."""
+    return _ANSI_ESCAPE_RE.sub("", text).replace("\x1b", "").replace("\x07", "")
 
 
 def _single_line(text: str) -> str:

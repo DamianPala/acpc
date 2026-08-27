@@ -168,6 +168,64 @@ def test_status_reports_the_model_a_real_dispatch_resolved(cli: CliRunner) -> No
     assert "model: mock-sonnet-5" in text
 
 
+def test_status_detail_surfaces_current_failure_and_json(cli: CliRunner) -> None:
+    session_id = run_mock(
+        cli,
+        "crash-late:partial answer before the adapter failed",
+        expected_exit=vocab.EXIT_AGENT_ERROR,
+    )
+
+    meta = sessions.read_meta(session_id)
+    assert meta.failure is not None
+    stored = json.loads(sessions.meta_path(session_id).read_text(encoding="utf-8"))
+    assert stored["failure"] == meta.failure
+
+    text_result = invoke(cli, "status", session_id)
+    json_result = invoke(cli, "status", session_id, "--json")
+
+    assert f"failure  {meta.failure} · continue: acpc continue {session_id}" in text_result.stdout
+    assert json.loads(json_result.stdout)["failure"] == meta.failure
+
+
+def test_status_detail_omits_failure_for_successful_turn(cli: CliRunner) -> None:
+    session_id = run_mock(cli)
+
+    text_result = invoke(cli, "status", session_id)
+    json_result = invoke(cli, "status", session_id, "--json")
+
+    assert "failure  " not in text_result.stdout
+    assert json.loads(json_result.stdout)["failure"] is None
+
+
+def test_status_detail_reads_meta_without_the_failure_field(cli: CliRunner) -> None:
+    meta = finished_session()
+    stored = json.loads(sessions.meta_path(meta.session_id).read_text(encoding="utf-8"))
+    stored.pop("failure")
+    sessions.meta_path(meta.session_id).write_text(json.dumps(stored), encoding="utf-8")
+
+    text_result = invoke(cli, "status", meta.session_id)
+    json_result = invoke(cli, "status", meta.session_id, "--json")
+
+    assert "failure  " not in text_result.stdout
+    assert json.loads(json_result.stdout)["failure"] is None
+
+
+def test_continue_clears_the_previous_failure_from_status(cli: CliRunner) -> None:
+    session_id = run_mock(
+        cli,
+        "crash-late:partial answer before the adapter failed",
+        expected_exit=vocab.EXIT_AGENT_ERROR,
+    )
+
+    result = invoke(cli, "continue", session_id, "turn two succeeds", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert sessions.turn_path(session_id, "answer", 1).is_file()
+    assert sessions.read_meta(session_id).failure is None
+    assert "failure  " not in invoke(cli, "status", session_id).stdout
+    assert json.loads(invoke(cli, "status", session_id, "--json").stdout)["failure"] is None
+
+
 def test_status_json_without_an_id_returns_a_session_list(cli: CliRunner) -> None:
     """Status JSON without an id returns the list envelope."""
     meta = finished_session()

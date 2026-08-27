@@ -404,6 +404,14 @@ class TestTurnRotation:
         sessions.write_prompt(session_id, "now apply the same fix to v2")
         assert sessions.read_meta(session_id).prompt_snippet == "now apply the same fix to v2"
 
+    def test_rotation_clears_the_previous_failure(self) -> None:
+        session_id = finished_session()
+        sessions.update_meta(session_id, failure="the previous turn failed")
+
+        rotated = sessions.rotate_turn(session_id, clock=at(100.0))
+
+        assert rotated.failure is None
+
     def test_rotation_callbacks_see_the_locked_meta_snapshot(self) -> None:
         session_id = finished_session()
         current = sessions.read_meta(session_id)

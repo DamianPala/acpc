@@ -38,6 +38,7 @@ Exact-prefix triggers (donor design, for precise timing control in tests):
 - ``auth:``          fail the turn with a JSON-RPC authentication error
 - ``crash-late:TEXT``stream TEXT, then fail the turn with a JSON-RPC error
 - ``stderr-crash:TEXT`` print TEXT to stderr, then fail the turn
+- ``failure-details:`` fail with multiline, ANSI-styled error details
 - ``auth-data:``     fail with an auth error marked in ``data``, not in the text
 - ``meta:TOKENS:TICKS:TEXT`` -> prose plus per-turn PromptResponse ``_meta`` usage
 - ``both:TOKENS:TICKS:TEXT`` -> streamed usage plus deliberately stale ``_meta``
@@ -765,6 +766,10 @@ class MockAgent(Agent):
             # the two are separate channels with no ordering between them.
             await asyncio.sleep(0.3)
             raise RequestError(-32603, "Internal error", {"details": "died after complaining"})
+
+        if prompt_text.startswith("failure-details:"):
+            details = "first line\n\x1b[31m" + ("diagnostic detail " * 30) + "\x1b[0m\nlast line"
+            raise RequestError(-32603, "Internal error", {"details": details})
 
         if prompt_text.startswith("crash-late:"):
             await self._send_text(session_id, prompt_text.split(":", 1)[1])

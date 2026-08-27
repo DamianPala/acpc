@@ -1130,6 +1130,54 @@ def test_a_failure_quotes_its_own_turn_and_not_an_earlier_one(
     assert "words from an earlier session" not in event["message"]
 
 
+def test_daemon_failure_strips_ansi_from_transcript_but_not_raw_log(
+    state_root: Path, live_daemon: None
+) -> None:
+    styled = "\x1b[2mdim\x1b[0m plain \x1b]0;adapter title\x07tail\x1b"
+    prompt = f"stderr-crash:{styled}"
+    session_id = new_session(prompt)
+    problem = asyncio.run(
+        runner.dispatch_background(
+            session_id,
+            runner.TurnRequest(resolution=resolve(), prompt=prompt),
+        )
+    )
+    assert problem is None
+
+    assert _wait_for_finished(session_id).state == "failed"
+    event = [event for event in _events(session_id) if event.get("type") == "error"][-1]
+    assert "\x1b" not in event["message"]
+    assert "\x1b" not in event["adapter_log_tail"]
+    assert "dim plain tail" in event["adapter_log_tail"]
+
+    raw_log = daemon.log_path_for_target(target()).read_bytes()
+    assert b"\x1b[2m" in raw_log
+    assert b"\x1b]0;adapter title\x07" in raw_log
+    assert raw_log.endswith(b"\x1b") or b"\x1b\n" in raw_log
+
+
+def test_daemon_failure_persists_observation_without_the_message_tail(
+    state_root: Path, live_daemon: None
+) -> None:
+    prompt = "stderr-crash:words from the failing turn"
+    session_id = new_session(prompt)
+    problem = asyncio.run(
+        runner.dispatch_background(
+            session_id,
+            runner.TurnRequest(resolution=resolve(), prompt=prompt),
+        )
+    )
+    assert problem is None
+
+    meta = _wait_for_finished(session_id)
+    event = [event for event in _events(session_id) if event.get("type") == "error"][-1]
+
+    assert "adapter log tail:" in event["message"]
+    assert meta.failure is not None
+    assert meta.failure == event["observation"]
+    assert "adapter log tail:" not in meta.failure
+
+
 def test_an_auth_refusal_is_recognized_from_its_data_not_its_text(
     state_root: Path, live_daemon: None
 ) -> None:
