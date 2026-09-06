@@ -763,6 +763,11 @@ class AgentRegistry:
         return tuple(sorted(self._entries))
 
     @property
+    def shipped_names(self) -> frozenset[str]:
+        """Names acpc ships, as opposed to entries this machine wrote."""
+        return frozenset(self._shipped_names)
+
+    @property
     def adapters(self) -> tuple[ResolvedEntry, ...]:
         return tuple(entry for entry in self if entry.is_adapter)
 

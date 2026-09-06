@@ -9,7 +9,7 @@ import click
 import pytest
 from click.testing import CliRunner
 
-from acpc import cli, vocab
+from acpc import interaction, vocab
 from acpc.cli import main
 
 MOCK_AGENT_SCRIPT = str(Path(__file__).with_name("mock_agent.py"))
@@ -365,7 +365,7 @@ def test_short_version_matches_long_version(runner: CliRunner) -> None:
 def test_background_prompt_policy_is_rejected_on_a_tty(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(cli, "_stdout_is_tty", lambda: True)
+    monkeypatch.setattr(interaction, "stdout_is_tty", lambda: True)
 
     result = invoke(runner, "run", "mock", "hello", "--permissions", "prompt", "--bg")
 

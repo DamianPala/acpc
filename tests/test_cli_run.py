@@ -13,7 +13,7 @@ import pytest
 from click.testing import CliRunner
 
 from acpc import cli as cli_module
-from acpc import sessions, vocab
+from acpc import interaction, sessions, vocab
 from acpc.cli import main
 
 MOCK_AGENT_SCRIPT = str(Path(__file__).with_name("mock_agent.py"))
@@ -273,26 +273,26 @@ def test_a_missing_adapter_binary_creates_no_session(cli: CliRunner, state_root:
     assert not sessions_dir.exists() or not list(sessions_dir.iterdir())
 
 
-# --- --dry-run --------------------------------------------------------------
+# --- --resolve --------------------------------------------------------------
 
 
-def test_dry_run_shows_the_resolved_model_and_its_source(cli: CliRunner) -> None:
-    result = invoke(cli, "run", "mock", "probe", "--dry-run")
+def test_resolve_shows_the_resolved_model_and_its_source(cli: CliRunner) -> None:
+    result = invoke(cli, "run", "mock", "probe", "--resolve")
 
     assert result.exit_code == vocab.EXIT_OK
     assert "mock-sonnet-5" in result.stdout
     assert "adapter default" in result.stdout
 
 
-def test_dry_run_runs_nothing(cli: CliRunner, state_root: Path) -> None:
-    invoke(cli, "run", "mock", "probe", "--dry-run")
+def test_resolve_runs_nothing(cli: CliRunner, state_root: Path) -> None:
+    invoke(cli, "run", "mock", "probe", "--resolve")
 
     sessions_dir = state_root / "sessions"
     assert not sessions_dir.exists() or not list(sessions_dir.iterdir())
 
 
-def test_dry_run_json_is_machine_readable(cli: CliRunner) -> None:
-    result = invoke(cli, "run", "mock", "probe", "--dry-run", "--json")
+def test_resolve_json_is_machine_readable(cli: CliRunner) -> None:
+    result = invoke(cli, "run", "mock", "probe", "--resolve", "--json")
 
     payload = json.loads(result.stdout)
     assert payload["entry"] == "mock"
@@ -300,14 +300,14 @@ def test_dry_run_json_is_machine_readable(cli: CliRunner) -> None:
     assert "entry_definition" not in payload
 
 
-def test_dry_run_reports_mode_for_entry_flag_and_unset_sources(
+def test_resolve_reports_mode_for_entry_flag_and_unset_sources(
     cli: CliRunner, state_root: Path
 ) -> None:
     (state_root / "agents" / "pinned.toml").write_text(
         'extends = "mock"\nmode = "plan"\n', encoding="utf-8"
     )
 
-    entry = json.loads(invoke(cli, "run", "pinned", "probe", "--dry-run", "--json").stdout)
+    entry = json.loads(invoke(cli, "run", "pinned", "probe", "--resolve", "--json").stdout)
     flag = json.loads(
         invoke(
             cli,
@@ -316,11 +316,11 @@ def test_dry_run_reports_mode_for_entry_flag_and_unset_sources(
             "probe",
             "--mode",
             "plan",
-            "--dry-run",
+            "--resolve",
             "--json",
         ).stdout
     )
-    unset = json.loads(invoke(cli, "run", "mock", "probe", "--dry-run", "--json").stdout)
+    unset = json.loads(invoke(cli, "run", "mock", "probe", "--resolve", "--json").stdout)
 
     assert entry["resolved"]["mode"] == {
         "value": "plan",
@@ -345,8 +345,8 @@ def test_dry_run_reports_mode_for_entry_flag_and_unset_sources(
     }
 
 
-def test_dry_run_reports_the_permission_policy_it_would_use(cli: CliRunner) -> None:
-    result = invoke(cli, "run", "mock", "probe", "--dry-run", "--json")
+def test_resolve_reports_the_permission_policy_it_would_use(cli: CliRunner) -> None:
+    result = invoke(cli, "run", "mock", "probe", "--resolve", "--json")
 
     # Non-interactive stdout, no --permissions: SPEC's default is `read`.
     assert json.loads(result.stdout)["resolved"]["permissions"]["value"] == "read"
@@ -357,7 +357,7 @@ def test_inherited_ceiling_clamps_a_nested_all_policy_and_reports_it(
 ) -> None:
     monkeypatch.setenv("ACPC_CEILING", "edit")
 
-    result = invoke(cli, "run", "mock", "probe", "--permissions", "all", "--dry-run", "--json")
+    result = invoke(cli, "run", "mock", "probe", "--permissions", "all", "--resolve", "--json")
 
     permission = json.loads(result.stdout)["resolved"]["permissions"]
     assert permission["value"] == "edit"
@@ -374,7 +374,7 @@ def test_inherited_ceiling_keeps_a_lower_nested_policy(
 ) -> None:
     monkeypatch.setenv("ACPC_CEILING", "execute")
 
-    result = invoke(cli, "run", "mock", "probe", "--permissions", "read", "--dry-run", "--json")
+    result = invoke(cli, "run", "mock", "probe", "--permissions", "read", "--resolve", "--json")
 
     permission = json.loads(result.stdout)["resolved"]["permissions"]
     assert permission["value"] == "read"
@@ -403,7 +403,7 @@ def test_nested_ask_is_rejected_by_a_numeric_ceiling(
 ) -> None:
     monkeypatch.setenv("ACPC_CEILING", ceiling)
 
-    result = invoke(cli, "run", "mock", "probe", "--permissions", "ask", "--dry-run")
+    result = invoke(cli, "run", "mock", "probe", "--permissions", "ask", "--resolve")
 
     assert result.exit_code == vocab.EXIT_USAGE
     assert f"inherited ceiling {ceiling}" in result.stderr
@@ -414,9 +414,9 @@ def test_nested_ask_remains_ask_under_an_all_ceiling(
     cli: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("ACPC_CEILING", "all")
-    monkeypatch.setattr(cli_module, "_stdout_is_tty", lambda: True)
+    monkeypatch.setattr(interaction, "stdout_is_tty", lambda: True)
 
-    result = invoke(cli, "run", "mock", "probe", "--permissions", "ask", "--dry-run", "--json")
+    result = invoke(cli, "run", "mock", "probe", "--permissions", "ask", "--resolve", "--json")
 
     assert result.exit_code == vocab.EXIT_OK
     assert json.loads(result.stdout)["resolved"]["permissions"]["value"] == "ask"
@@ -427,7 +427,7 @@ def test_invalid_inherited_ceiling_is_a_usage_error(
 ) -> None:
     monkeypatch.setenv("ACPC_CEILING", "not-a-policy")
 
-    result = invoke(cli, "run", "mock", "probe", "--permissions", "all", "--dry-run")
+    result = invoke(cli, "run", "mock", "probe", "--permissions", "all", "--resolve")
 
     assert result.exit_code == vocab.EXIT_USAGE
     assert "ACPC_CEILING='not-a-policy' is invalid" in result.stderr
@@ -436,10 +436,10 @@ def test_invalid_inherited_ceiling_is_a_usage_error(
 def test_write_alias_matches_execute_and_warns_once_per_process(
     cli: CliRunner, fresh_permission_alias_warnings: None
 ) -> None:
-    first = invoke(cli, "run", "mock", "probe", "--permissions", "write", "--dry-run", "--json")
-    second = invoke(cli, "run", "mock", "probe", "--permissions", "write", "--dry-run", "--json")
+    first = invoke(cli, "run", "mock", "probe", "--permissions", "write", "--resolve", "--json")
+    second = invoke(cli, "run", "mock", "probe", "--permissions", "write", "--resolve", "--json")
     canonical = invoke(
-        cli, "run", "mock", "probe", "--permissions", "execute", "--dry-run", "--json"
+        cli, "run", "mock", "probe", "--permissions", "execute", "--resolve", "--json"
     )
 
     assert json.loads(first.stdout)["resolved"]["permissions"]["value"] == "execute"
@@ -449,7 +449,7 @@ def test_write_alias_matches_execute_and_warns_once_per_process(
 
 
 def test_a_raw_model_id_on_the_call_is_labelled_as_a_call_flag(cli: CliRunner) -> None:
-    result = invoke(cli, "run", "mock", "probe", "--model", "mock-opus-5", "--dry-run", "--json")
+    result = invoke(cli, "run", "mock", "probe", "--model", "mock-opus-5", "--resolve", "--json")
 
     resolved = json.loads(result.stdout)["resolved"]
     assert resolved["model"]["value"] == "mock-opus-5"
@@ -457,7 +457,7 @@ def test_a_raw_model_id_on_the_call_is_labelled_as_a_call_flag(cli: CliRunner) -
 
 
 def test_a_tier_name_resolves_through_the_entry_preset_that_defines_it(cli: CliRunner) -> None:
-    result = invoke(cli, "run", "mock", "probe", "--model", "max", "--dry-run", "--json")
+    result = invoke(cli, "run", "mock", "probe", "--model", "max", "--resolve", "--json")
 
     resolved = json.loads(result.stdout)["resolved"]
     assert resolved["model"]["value"] == "mock-opus-5"
@@ -480,9 +480,9 @@ def test_prompt_alias_resolves_to_ask_on_a_tty(
     fresh_permission_alias_warnings: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(cli_module, "_stdout_is_tty", lambda: True)
+    monkeypatch.setattr(interaction, "stdout_is_tty", lambda: True)
 
-    result = invoke(cli, "run", "mock", "probe", "--permissions", "prompt", "--dry-run", "--json")
+    result = invoke(cli, "run", "mock", "probe", "--permissions", "prompt", "--resolve", "--json")
 
     assert result.exit_code == vocab.EXIT_OK
     assert json.loads(result.stdout)["resolved"]["permissions"]["value"] == "ask"
@@ -823,7 +823,7 @@ def test_a_default_cwd_resolves_to_the_callers_absolute_directory(
     caller_dir.mkdir()
     monkeypatch.chdir(caller_dir)
 
-    result = invoke(cli, "run", "mock", "echo:x", "--dry-run", "--json")
+    result = invoke(cli, "run", "mock", "echo:x", "--resolve", "--json")
 
     payload = json.loads(result.stdout)
     assert payload["cwd"] == str(caller_dir.resolve())
@@ -933,7 +933,7 @@ def test_an_invalid_timeout_has_the_pinned_duration_error(cli: CliRunner) -> Non
 
 @pytest.mark.parametrize("value", ["-1", "-1m"])
 def test_negative_timeout_is_a_usage_error(cli: CliRunner, value: str) -> None:
-    result = invoke(cli, "run", "mock", "hello", "--timeout", value, "--dry-run")
+    result = invoke(cli, "run", "mock", "hello", "--timeout", value, "--resolve")
 
     assert result.exit_code == vocab.EXIT_USAGE
     assert "--timeout" in result.stderr
@@ -983,10 +983,10 @@ def test_an_execute_floor_refuses_policies_below_execute(
     assert envelope["hint"] == "Run: acpc run grok-floor --permissions execute"
 
 
-def test_an_execute_floor_dry_run_refusal_names_the_permission_floor(
+def test_an_execute_floor_resolve_refusal_names_the_permission_floor(
     cli: CliRunner, grok_floor_entry: None
 ) -> None:
-    result = invoke(cli, "run", "grok-floor", "probe", "--dry-run")
+    result = invoke(cli, "run", "grok-floor", "probe", "--resolve")
 
     assert result.exit_code == vocab.EXIT_USAGE
     assert error_envelope(result)["message"] == (
@@ -999,7 +999,7 @@ def test_an_execute_floor_dry_run_refusal_names_the_permission_floor(
 def test_an_execute_floor_ask_refusal_names_the_permission_floor(
     cli: CliRunner, grok_floor_entry: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(cli_module, "_stdout_is_tty", lambda: True)
+    monkeypatch.setattr(interaction, "stdout_is_tty", lambda: True)
 
     result = invoke(cli, "run", "grok-floor", "probe", "--permissions", "ask")
 
@@ -1057,7 +1057,7 @@ def test_an_edit_floor_refusal_names_the_permission_floor(cli: CliRunner, state_
     )
 
 
-def test_unlisted_model_warns_on_dry_run(cli: CliRunner) -> None:
+def test_unlisted_model_warns_on_resolve(cli: CliRunner) -> None:
     result = invoke(
         cli,
         "run",
@@ -1069,7 +1069,7 @@ def test_unlisted_model_warns_on_dry_run(cli: CliRunner) -> None:
         "xhigh",
         "--permissions",
         "execute",
-        "--dry-run",
+        "--resolve",
     )
 
     assert result.exit_code == vocab.EXIT_OK
@@ -1100,7 +1100,7 @@ def test_unlisted_model_warns_on_run(cli: CliRunner, state_root: Path) -> None:
     assert "using adapter efforts low, medium, high" in result.stderr
 
 
-def test_listed_model_does_not_warn_on_dry_run(cli: CliRunner) -> None:
+def test_listed_model_does_not_warn_on_resolve(cli: CliRunner) -> None:
     result = invoke(
         cli,
         "run",
@@ -1112,7 +1112,7 @@ def test_listed_model_does_not_warn_on_dry_run(cli: CliRunner) -> None:
         "high",
         "--permissions",
         "execute",
-        "--dry-run",
+        "--resolve",
     )
 
     assert result.exit_code == vocab.EXIT_OK

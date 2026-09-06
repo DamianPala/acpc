@@ -1594,7 +1594,7 @@ def auto_prune(retention_seconds: float) -> None:
 
 
 def resolution_payload(resolution: CallResolution, *, cwd: str | None) -> dict[str, Any]:
-    """The `--dry-run` view: every resolved value and where it came from."""
+    """The `--resolve` view: every resolved value and where it came from."""
     entry = resolution.entry
     provenance: Mapping[str, Any] = resolution.provenance
     fields: dict[str, Any] = {
@@ -1670,7 +1670,7 @@ def session_resolution(
     cwd: str | None,
     permissions_source: str | None = None,
 ) -> dict[str, Any]:
-    """The persisted session shape, distinct from the printed dry-run view.
+    """The persisted session shape, distinct from the printed `--resolve` view.
 
     Stores the entry's **base** command (not CLI-injected spawn argv) so
     effort_via=cli can re-inject on continue without doubling flags.
@@ -1849,7 +1849,7 @@ def continue_request(
 
 
 def _source_label(source: Any) -> str:
-    """Render a `FieldSource` the way `--dry-run` and `agents <name>` show it."""
+    """Render a `FieldSource` the way `--resolve` and `agents <name>` show it."""
     if source is None:
         return "unset"
     kind = getattr(source, "kind", "unset")

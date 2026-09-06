@@ -24,7 +24,9 @@ from acpc import (
     cache,
     config,
     daemon_client,
+    effects,
     errors,
+    interaction,
     output,
     paths,
     proc,
@@ -182,11 +184,13 @@ Context care (agent callers):
 Maintenance and setup:
   status            running + the 5 most recent finished (--all for every session)
   stop <id>         stop a running session; it stays resumable with continue
-  rm <id>           delete a finished session's on-disk state
-  prune             delete finished sessions older than retention (--older-than D)
-  install <agent>   install the agent's adapter
+  rm <id> --yes     delete a finished session's on-disk state
+  prune --yes       delete finished sessions older than retention (--older-than D)
+  install <agent>   install the agent's adapter (--yes unless you are at a terminal)
   skills            list bundled how-to skills; skills <name> prints the body
   Killing acpc does not stop the session — acpc stop does.
+  Deleting needs --yes; --dry-run previews prune and bare daemon stop and
+  never needs it. --force is separate: it overrides a documented refusal.
 
 Common commands:
   run, continue, steer, wait, status, log, agents, skills, daemon,
@@ -328,6 +332,7 @@ def _friendly_usage_message(message: str, *, command_path: str | None = None) ->
     return message
 
 
+@effects.read_only
 @click.group(
     cls=_CheatSheetGroup,
     invoke_without_command=True,
@@ -346,15 +351,56 @@ def main(ctx: click.Context) -> None:
         click.echo(ctx.get_help())
 
 
-def _stdout_is_tty() -> bool:
+def _oversized_prompt(source: str, size: int) -> UsageProblem:
+    """The one failure every prompt source raises when it is too big."""
+    return UsageProblem(
+        f"prompt from {source} is {size} bytes; the limit is "
+        f"{vocab.MAX_PROMPT_BYTES} bytes ({vocab.MAX_PROMPT_LABEL})"
+    )
+
+
+def _checked_prompt(text: str, source: str) -> str:
+    """Return the prompt, or refuse it before anything has been created."""
+    size = len(text.encode("utf-8"))
+    if size > vocab.MAX_PROMPT_BYTES:
+        raise _oversized_prompt(source, size)
+    return text
+
+
+def _read_stdin_prompt() -> str:
+    """Read the prompt from stdin without buffering more than the limit.
+
+    A character is at least one UTF-8 byte, so a read capped one character
+    past the limit either returns everything there was or returns something
+    that is already over — either way the refusal is exact and the process
+    never holds an unbounded stream.
+    """
+    return _checked_prompt(sys.stdin.read(vocab.MAX_PROMPT_BYTES + 1), "-")
+
+
+def _read_prompt_file(prompt_file: str) -> str:
+    """Read the prompt file, refusing an oversized one without reading it."""
+    path = Path(prompt_file).expanduser()
     try:
-        return sys.stdout.isatty()
-    except (AttributeError, ValueError):
-        return False
+        size = path.stat().st_size
+    except OSError as error:
+        raise UsageProblem(f"--prompt-file {prompt_file}: {error.strerror}") from None
+    if size > vocab.MAX_PROMPT_BYTES:
+        raise _oversized_prompt("--prompt-file", size)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise UsageProblem(f"--prompt-file {prompt_file}: {error.strerror}") from None
+    return _checked_prompt(text, "--prompt-file")
 
 
 def _read_prompt(prompt_text: str | None, prompt_file: str | None) -> str:
-    """Resolve the single prompt source, or fail naming the options."""
+    """Resolve the single prompt source, or fail naming the options.
+
+    The size limit is enforced here, which is before any caller has created a
+    session directory or started a daemon: an oversized prompt leaves nothing
+    behind.
+    """
     sources = [
         name
         for name, present in (
@@ -370,13 +416,10 @@ def _read_prompt(prompt_text: str | None, prompt_file: str | None) -> str:
             f"(got {len(sources)})"
         )
     if prompt_text == "-":
-        return sys.stdin.read()
+        return _read_stdin_prompt()
     if prompt_file is not None:
-        try:
-            return Path(prompt_file).expanduser().read_text(encoding="utf-8")
-        except OSError as error:
-            raise UsageProblem(f"--prompt-file {prompt_file}: {error.strerror}") from None
-    return prompt_text or ""
+        return _read_prompt_file(prompt_file)
+    return _checked_prompt(prompt_text or "", "the prompt argument")
 
 
 def _normalize_permission(value: str | None) -> str | None:
@@ -651,23 +694,13 @@ def _select_resolution(resolution: CallResolution) -> CallResolution:
 def _tty_permission_prompt(kind: str, title: str) -> bool:
     """Ask the human on /dev/tty — never on stdin (SPEC *Output contract*).
 
-    The terminal is opened twice, once per direction: a single "r+" handle
-    raises `io.UnsupportedOperation: File or stream is not seekable`, which is
-    an OSError and would be caught below as a silent denial.
+    Denial is the default: an unanswered permission request must not widen
+    what the callee may do.
     """
-    try:
-        with (
-            open("/dev/tty", "w", encoding="utf-8") as ask,
-            open("/dev/tty", encoding="utf-8") as answer,
-        ):
-            ask.write(f"acpc: allow {kind}? {title} [y/N] ")
-            ask.flush()
-            return answer.readline().strip().lower() in {"y", "yes"}
-    except OSError:
-        return False
+    return interaction.ask_yes_no(f"acpc: allow {kind}? {title} [y/N] ", default=False)
 
 
-def _emit_dry_run(payload: dict[str, Any], *, json_mode: bool) -> None:
+def _emit_resolution(payload: dict[str, Any], *, json_mode: bool) -> None:
     if json_mode:
         import json
 
@@ -1307,6 +1340,7 @@ def _run_agents_view(
         raise _registry_problem(error) from None
 
 
+@effects.read_only
 @main.group(name="agents", cls=_AgentsGroup, invoke_without_command=True)
 @click.option("--models", is_flag=True, help="Show full advertised presets and models.")
 @click.option("--commands", is_flag=True, help="Show advertised slash commands.")
@@ -1334,6 +1368,7 @@ def agents_group(
         _run_agents_view(None, models, commands, check_live, json_mode)
 
 
+@effects.read_only
 @click.command(name="agent-view")
 @click.argument("name")
 @click.option("--models", is_flag=True, help="Show full advertised presets and models.")
@@ -1391,6 +1426,7 @@ def _agents_check(registry: AgentRegistry, name: str | None, *, json_mode: bool)
         )
 
 
+@effects.read_only
 @main.command(name="probe")
 @click.argument("entry")
 @click.option(
@@ -1430,6 +1466,7 @@ def probe_command(entry: str, discover: bool, json_mode: bool) -> None:
         _write_stdout(report.text())
 
 
+@effects.non_idempotent
 @agents_group.command(name="init")
 @click.argument("name")
 @click.option(
@@ -1465,6 +1502,9 @@ def agents_init_command(
     json_mode: bool,
 ) -> None:
     """Scaffold a variant entry.
+
+    A strict create: an existing entry of that name is a conflict, never an
+    overwrite. ``acpc agents delete`` removes what this wrote.
 
     Example: ``acpc agents init work --extends mock --permissions execute``
     """
@@ -1508,11 +1548,52 @@ def agents_init_command(
         paths.atomic_write(target, contents)
     except OSError as error:
         raise UsageProblem(f"cannot write {target}: {error}") from None
-    payload = {"name": name, "extends": parent, "path": str(target)}
+    payload = {"name": name, "extends": parent, "path": str(target), "changed": True}
     if json_mode:
         _emit_json(payload)
     else:
         _write_stdout(f"created {target}\n")
+
+
+@effects.non_idempotent
+@agents_group.command(name="delete")
+@click.argument("name")
+@_json_option("Emit the deleted entry as JSON.")
+@click.help_option("-h", "--help")
+def agents_delete_command(name: str, json_mode: bool) -> None:
+    """Delete one entry this machine owns, under ``$ACPC_HOME/agents``.
+
+    The counterpart to ``agents init``: it takes back exactly what that wrote,
+    which is why creating an entry needs no confirmation. Adapters acpc ships
+    are not this machine's to delete, so naming one is refused.
+
+    Example: ``acpc agents delete work``
+    """
+    target = paths.agents_dir() / f"{name}.toml"
+    try:
+        shipped = name in AgentRegistry().shipped_names
+    except RegistryError as error:
+        raise _registry_problem(error) from None
+    if shipped:
+        raise UsageProblem(
+            f"'{name}' is an adapter acpc ships, not an entry in {paths.agents_dir()} — "
+            "only entries created on this machine can be deleted"
+            + (f"; {target} only overrides it" if target.exists() else "")
+        )
+    if not target.exists():
+        raise _not_found(f"unknown agent entry '{name}'", hint="Run: acpc agents")
+    try:
+        target.unlink()
+    except OSError as error:
+        raise AcpcError(
+            f"cannot delete {target}: {error}",
+            kind=errors.OPERATION_FAILED,
+        ) from None
+    payload = {"name": name, "path": str(target), "changed": True}
+    if json_mode:
+        _emit_json(payload)
+    else:
+        _write_stdout(f"deleted {target}\n")
 
 
 def _run_skills_view(name: str | None, *, json_mode: bool) -> None:
@@ -1541,6 +1622,7 @@ def _run_skills_view(name: str | None, *, json_mode: bool) -> None:
     _echo_metadata(f"-- skill {skill.name} | dir {skill.path}")
 
 
+@effects.read_only
 @main.group(name="skills", cls=_SkillsGroup, invoke_without_command=True)
 @_json_option("Emit this view as JSON.")
 @click.help_option("-h", "--help")
@@ -1554,6 +1636,7 @@ def skills_group(ctx: click.Context, json_mode: bool) -> None:
         _run_skills_view(None, json_mode=json_mode)
 
 
+@effects.read_only
 @click.command(name="skill-view")
 @click.argument("name")
 @_json_option("Emit this view as JSON.")
@@ -1566,21 +1649,43 @@ def _skill_view_command(name: str, json_mode: bool) -> None:
     _run_skills_view(name, json_mode=json_mode)
 
 
+@effects.non_idempotent
 @main.command(name="install")
 @click.argument("agent")
+@click.option("--yes", "-y", "assume_yes", is_flag=True, help="Install without being asked.")
 @_json_option("Emit the install result as JSON.")
 @click.help_option("-h", "--help")
-def install_command(agent: str, json_mode: bool) -> None:
+def install_command(agent: str, assume_yes: bool, json_mode: bool) -> None:
     """Run an agent's install command from its registry entry.
 
     Resolves the agent like ``run`` does, runs its ``install_command`` and
-    relays the installer's output; a failing installer exits 1.
+    relays the installer's output; a failing installer exits 1. The installer
+    is the vendor's, and acpc has no matching uninstall, so it asks first: a
+    person is asked on the terminal, and every other caller passes ``--yes``.
 
-    Example: ``acpc install codex``
+    Example: ``acpc install codex --yes``
     """
     try:
         registry = AgentRegistry()
         registry.resolve(agent)
+        registry.install_command(agent)
+    except RegistryError as error:
+        # Nothing was installed and nothing ran: this is the failure itself,
+        # not a result, so it leaves as an envelope with no stdout behind it.
+        raise _registry_problem(error).with_context(agent=agent) from None
+
+    # Last, after every check that can refuse this call on its own: an unknown
+    # agent, or one with no trusted installer, must fail as that rather than
+    # ask to confirm an install that could never happen.
+    interaction.require_confirmation(
+        assume_yes,
+        message=f"install {agent}: running its installer needs confirmation",
+        hint=f"Run: acpc install {agent} --yes",
+        prompt=f"Install {agent}? [Y/n] ",
+        default=True,
+    )
+
+    try:
 
         def run_installer(args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
             return subprocess.run(
@@ -1611,7 +1716,12 @@ def install_command(agent: str, json_mode: bool) -> None:
     # The installer ran and reported for itself, so its report is this
     # command's declared output and stays on stdout; the envelope on stderr
     # is what says the command failed.
-    payload = {"agent": agent, "ok": return_code == 0, "returncode": return_code}
+    payload = {
+        "agent": agent,
+        "ok": return_code == 0,
+        "returncode": return_code,
+        "changed": return_code == 0,
+    }
     if json_mode:
         _emit_json(payload)
     elif return_code == 0:
@@ -1684,6 +1794,7 @@ def _maintenance_json(payload: Mapping[str, Any]) -> None:
     _write_stdout(json.dumps(dict(payload), ensure_ascii=False) + "\n")
 
 
+@effects.idempotent
 @main.command(name="stop")
 @click.argument("selector")
 @_json_option("Emit the result as JSON.")
@@ -1718,25 +1829,45 @@ def stop_command(selector: str, json_mode: bool) -> None:
     click.echo(f"-- stop {meta.session_id} · {meta.state}", err=True)
 
 
+@effects.non_idempotent
 @main.command(name="rm")
 @click.argument("selector")
+@click.option("--yes", "-y", "assume_yes", is_flag=True, help="Delete without being asked.")
 @_json_option("Emit the result as JSON.")
 @click.help_option("-h", "--help")
-def rm_command(selector: str, json_mode: bool) -> None:
+def rm_command(selector: str, assume_yes: bool, json_mode: bool) -> None:
     """Delete a finished session's on-disk state.
 
-    Errors on a starting or running session — stop it first. Prints the
-    removed session id; ``--json`` also lists the deleted paths.
+    Errors on a starting or running session — stop it first. The transcript,
+    the prompt and the answer go with it and acpc cannot bring them back, so
+    the call needs ``--yes``. Prints the removed session id; ``--json`` also
+    lists the deleted paths.
 
-    Example: ``acpc rm q7x2``
+    Example: ``acpc rm q7x2 --yes``
     """
     meta = _load_view_session(selector)
     advertised_paths = sessions.session_paths(meta.session_id)
     try:
+        # Both checks run before the gate: an unknown or still-running session
+        # fails as itself, and neither failure is one --yes could resolve.
+        sessions.ensure_deletable(meta)
+    except sessions.SessionStateError as error:
+        raise _session_problem(error).with_context(session_id=meta.session_id) from None
+    interaction.require_confirmation(
+        assume_yes,
+        message=f"rm {meta.session_id}: deleting a session's state needs confirmation",
+        hint=f"Run: acpc rm {meta.session_id} --yes",
+    )
+    try:
         sessions.delete_session(meta.session_id)
     except sessions.SessionStateError as error:
         raise _session_problem(error).with_context(session_id=meta.session_id) from None
-    payload = {"session_id": meta.session_id, "removed": True, "paths": advertised_paths}
+    payload = {
+        "session_id": meta.session_id,
+        "removed": True,
+        "changed": True,
+        "paths": advertised_paths,
+    }
     if json_mode:
         _maintenance_json(payload)
     else:
@@ -1744,12 +1875,14 @@ def rm_command(selector: str, json_mode: bool) -> None:
     click.echo(f"-- removed session {meta.session_id}", err=True)
 
 
+@effects.non_idempotent
 @main.command(name="prune")
 @click.option("--older-than", default=None, metavar="D", help="Age threshold, such as 7d.")
 @click.option("--dry-run", is_flag=True, help="List candidates without deleting them.")
+@click.option("--yes", "-y", "assume_yes", is_flag=True, help="Delete without being asked.")
 @_json_option("Emit the result as JSON.")
 @click.help_option("-h", "--help")
-def prune_command(older_than: str | None, dry_run: bool, json_mode: bool) -> None:
+def prune_command(older_than: str | None, dry_run: bool, assume_yes: bool, json_mode: bool) -> None:
     """Delete finished sessions older than the retention period.
 
     Bare ``prune`` uses the ``retention`` key in the global config
@@ -1757,6 +1890,9 @@ def prune_command(older_than: str | None, dry_run: bool, json_mode: bool) -> Non
     never "delete everything". ``--older-than`` overrides it for this call, and
     deleting every finished session takes an explicit ``--older-than 0d``. Age is
     measured from when the session finished. Running sessions are never touched.
+
+    It decides what to delete as it runs, so deleting needs ``--yes``;
+    ``--dry-run`` lists the same targets and never does.
 
     Example: ``acpc prune --older-than 7d --dry-run``
     """
@@ -1769,6 +1905,14 @@ def prune_command(older_than: str | None, dry_run: bool, json_mode: bool) -> Non
                 f"config retention '{settings.retention}' resolves to zero — bare prune would "
                 "delete every finished session; pass --older-than 0d to do that explicitly"
             )
+        if not dry_run:
+            # After the threshold resolved, so a bad --older-than fails as one;
+            # before anything is read for deletion, so a refusal costs nothing.
+            interaction.require_confirmation(
+                assume_yes,
+                message="prune: deleting the sessions it selects needs confirmation",
+                hint="Run: acpc prune --dry-run to see them, then repeat with --yes",
+            )
         candidates = sessions.prune_sessions(older_than=duration, dry_run=dry_run)
     except AcpcError:
         raise
@@ -1778,7 +1922,7 @@ def prune_command(older_than: str | None, dry_run: bool, json_mode: bool) -> Non
         raise UsageProblem(str(error)) from None
 
     session_ids = [meta.session_id for meta in candidates]
-    payload = {"sessions": session_ids, "dry_run": dry_run}
+    payload = {"targets": session_ids, "changed": bool(session_ids) and not dry_run}
     if json_mode:
         _maintenance_json(payload)
     elif session_ids:
@@ -1792,7 +1936,7 @@ def prune_command(older_than: str | None, dry_run: bool, json_mode: bool) -> Non
 def _load_view_session(selector: str) -> sessions.SessionMeta:
     """Verify liveness before a targeted view reports a session."""
     try:
-        session_id = sessions.resolve_selector(selector, allow_last=_stdout_is_tty())
+        session_id = sessions.resolve_selector(selector, allow_last=interaction.stdout_is_tty())
         return sessions.load(session_id)
     except sessions.SessionError as error:
         raise _session_problem(error) from None
@@ -1893,6 +2037,7 @@ def _latest_failure_message(session_id: str) -> str | None:
     return None
 
 
+@effects.read_only
 @main.command(name="status")
 @click.argument("selector", required=False)
 @click.option(
@@ -1944,6 +2089,7 @@ def status_command(selector: str | None, all_sessions: bool, json_mode: bool) ->
         _write_stdout(render.render_status_list(metas, all_sessions=all_sessions))
 
 
+@effects.read_only
 @main.command(name="log")
 @click.argument("selector")
 @click.option(
@@ -2315,10 +2461,16 @@ def _still_running_note(session_id: str, timeout: float | None) -> str:
     )
 
 
+@effects.non_idempotent
 @main.command(name="run")
 @click.argument("agent")
 @click.argument("prompt_text", required=False)
-@click.option("--prompt-file", "prompt_file", metavar="FILE", help="Read the prompt from a file.")
+@click.option(
+    "--prompt-file",
+    "prompt_file",
+    metavar="FILE",
+    help=f"Read the prompt from a file; at most {vocab.MAX_PROMPT_LABEL}.",
+)
 @click.option("--cwd", metavar="DIR", help="Working directory of the callee.")
 @click.option("--model", metavar="M", help="Model tier (fast/standard/max) or a raw model ID.")
 @click.option("--effort", metavar="E", help="Reasoning effort level.")
@@ -2350,7 +2502,9 @@ def _still_running_note(session_id: str, timeout: float | None) -> str:
     help="Cancel the session after this duration; absent, no wall-clock limit (the callee runs until it is done).",
 )
 @click.option("--name", "alias", metavar="ALIAS", help="Human-typeable handle for this session.")
-@click.option("--dry-run", is_flag=True, help="Print what this call resolves to, then exit.")
+@click.option(
+    "--resolve", "resolve", is_flag=True, help="Print what this call resolves to, then exit."
+)
 @click.option(
     "--max-output",
     type=click.IntRange(min=0),
@@ -2375,7 +2529,7 @@ def run_command(
     output_file: str | None,
     timeout: float | None,
     alias: str | None,
-    dry_run: bool,
+    resolve: bool,
     background: bool,
     max_output: int,
     quiet: bool,
@@ -2386,10 +2540,17 @@ def run_command(
     The default permission policy is ``ask`` on a TTY and ``read``
     otherwise.  Background calls always use the non-TTY rule.
 
+    The prompt comes from one source: the argument, ``-`` for stdin, or
+    ``--prompt-file``. Whichever it is, acpc reads at most 1 MiB (1048576
+    bytes) and refuses a larger one before it creates anything.
+
+    ``--resolve`` prints what the call resolves to — entry, command, and every
+    resolved value with its source — and starts nothing.
+
     Example: ``acpc run codex "Fix the failing test" --permissions execute``
     """
     permissions = _normalize_permission(permissions)
-    tty = _stdout_is_tty()
+    tty = interaction.stdout_is_tty()
 
     try:
         registry = AgentRegistry()
@@ -2412,7 +2573,7 @@ def run_command(
         permissions, resolution, tty=tty, background=background
     )
     # The TTY-resolved policy is part of the resolved invocation: meta.json
-    # stores everything --dry-run shows, and `continue` reuses it verbatim.
+    # stores everything --resolve shows, and `continue` reuses it verbatim.
     resolution = _select_resolution(
         replace(resolution, permissions=policy, permissions_clamp=permissions_clamp)
     )
@@ -2422,9 +2583,11 @@ def run_command(
     # caller's — and vendors reject a literal ".".
     resolved_cwd = str(Path(cwd).expanduser().resolve()) if cwd else os.getcwd()
 
-    if dry_run:
+    if resolve:
+        # A preview of the resolution, not of a mutation: nothing below this
+        # line runs, so no session directory and no daemon come into being.
         payload = runner.resolution_payload(resolution, cwd=resolved_cwd)
-        _emit_dry_run(payload, json_mode=json_mode)
+        _emit_resolution(payload, json_mode=json_mode)
         return
 
     prompt = _read_prompt(prompt_text, prompt_file)
@@ -2601,10 +2764,16 @@ def _dispatch_background(session_id: str, request: runner.TurnRequest, *, json_m
     _write_stdout(f"{session_id}\n{sessions.session_dir(session_id)}\n")
 
 
+@effects.non_idempotent
 @main.command(name="continue")
 @click.argument("selector")
 @click.argument("prompt_text", required=False)
-@click.option("--prompt-file", "prompt_file", metavar="FILE", help="Read the prompt from a file.")
+@click.option(
+    "--prompt-file",
+    "prompt_file",
+    metavar="FILE",
+    help=f"Read the prompt from a file; at most {vocab.MAX_PROMPT_LABEL}.",
+)
 @click.option("-o", "--output", "output_file", metavar="FILE", help="Write the answer to a file.")
 @click.option(
     "--permissions",
@@ -2675,7 +2844,9 @@ def _dispatch_background(session_id: str, request: runner.TurnRequest, *, json_m
     hidden=True,
     help="Run-only session name; continue reuses the stored name.",
 )
-@click.option("--dry-run", is_flag=True, hidden=True, help="Run-only resolution preview.")
+@click.option(
+    "--resolve", "resolve", is_flag=True, hidden=True, help="Run-only resolution preview."
+)
 @click.help_option("-h", "--help")
 def continue_command(
     selector: str,
@@ -2694,7 +2865,7 @@ def continue_command(
     cwd: str | None,
     home: str | None,
     alias: str | None,
-    dry_run: bool,
+    resolve: bool,
 ) -> None:
     """Continue a finished session using its stored adapter resolution.
 
@@ -2714,7 +2885,7 @@ def continue_command(
         "--cwd": cwd,
         "--home": home,
         "--name": alias,
-        "--dry-run": dry_run,
+        "--resolve": resolve,
     }
     for flag, value in run_only.items():
         if value not in (None, False):
@@ -2768,7 +2939,7 @@ def _dispatch_follow_up(
         raise _session_problem(error).with_context(session_id=meta.session_id) from None
     policy = permissions if permissions is not None else stored_policy
     policy, permissions_clamp = _clamp_inherited_ceiling(policy)
-    interactive = _stdout_is_tty() and not background
+    interactive = interaction.stdout_is_tty() and not background
     if policy == "ask" and not interactive:
         # Same split as `run`: the two causes are different situations and
         # "needs a terminal" is baffling advice to someone sitting at one.
@@ -2893,11 +3064,15 @@ def _steer_prompt(instruction: str) -> str:
     return f"{STEER_PREAMBLE}\n\n{instruction}"
 
 
+@effects.non_idempotent
 @main.command(name="steer")
 @click.argument("selector")
 @click.argument("instruction_text", required=False)
 @click.option(
-    "--prompt-file", "prompt_file", metavar="FILE", help="Read the instruction from a file."
+    "--prompt-file",
+    "prompt_file",
+    metavar="FILE",
+    help=f"Read the instruction from a file; at most {vocab.MAX_PROMPT_LABEL}.",
 )
 @click.option("-o", "--output", "output_file", metavar="FILE", help="Write the answer to a file.")
 @click.option("--bg", "background", is_flag=True, help="Dispatch and return the session id.")
@@ -2981,6 +3156,7 @@ def steer_command(
     )
 
 
+@effects.read_only
 @main.command(name="wait")
 @click.argument("selector")
 @click.option(
@@ -3076,6 +3252,7 @@ def _daemon_idle_column(idle_seconds: float | None) -> str:
     return f"idle {output.format_duration(idle_seconds)}"
 
 
+@effects.read_only
 @main.group(name="daemon", invoke_without_command=False)
 @click.help_option("-h", "--help")
 def daemon_group() -> None:
@@ -3085,6 +3262,7 @@ def daemon_group() -> None:
     """
 
 
+@effects.read_only
 @daemon_group.command(name="status")
 @click.argument("agent", required=False)
 @_json_option("Emit the status as JSON.")
@@ -3142,6 +3320,7 @@ async def _collect_daemon_status(
     return entries
 
 
+@effects.idempotent
 @daemon_group.command(name="stop")
 @click.argument("agent", required=False)
 @click.option(
@@ -3149,46 +3328,90 @@ async def _collect_daemon_status(
     is_flag=True,
     help="Stop even when the target has running or starting sessions; they are failed, not orphaned.",
 )
+@click.option("--dry-run", is_flag=True, help="List the daemons it would stop, and stop none.")
+@click.option("--yes", "-y", "assume_yes", is_flag=True, help="Stop them without being asked.")
+@_json_option("Emit the result as JSON.")
 @click.help_option("-h", "--help")
-def daemon_stop_command(agent: str | None, force: bool) -> None:
+def daemon_stop_command(
+    agent: str | None, force: bool, dry_run: bool, assume_yes: bool, json_mode: bool
+) -> None:
     """Stop daemons; active sessions refuse the stop unless ``--force``.
+
+    Named with an agent it stops that one daemon, which the next run starts
+    again. Bare, it addresses every daemon on this machine and cannot say in
+    advance which, so it needs ``--yes``; ``--dry-run`` names them first.
+
+    ``--yes`` and ``--force`` answer different questions and neither implies
+    the other: ``--yes`` confirms the stop, ``--force`` overrides the refusal
+    that active sessions raise.
 
     Example: ``acpc daemon stop mock``
     """
     import asyncio
 
-    stopped = asyncio.run(_stop_daemons(agent, force=force))
-    click.echo(f"-- stopped {stopped} daemon(s)", err=True)
-
-
-async def _stop_daemons(agent: str | None, *, force: bool = False) -> int:
     targets = runner.daemon_targets_for(agent) if agent else runner.all_daemon_targets()
     if not force:
-        addressed = set(targets)
-        active = [
-            meta for meta in sessions.list_sessions() if meta.target in addressed and meta.is_active
-        ]
-        if active:
-            count = len(active)
-            noun = "session" if count == 1 else "sessions"
-            scope = f" {agent}" if agent else ""
-            ids = ", ".join(meta.session_id for meta in active)
-            raise AcpcError(
-                f"daemon stop{scope}: {count} active {noun} ({ids}) — wait or stop them first",
-                kind=errors.PRECONDITION_FAILED,
-                hint=f"Run: acpc daemon stop{scope} --force",
-                context={"sessions": [meta.session_id for meta in active]},
-            )
+        _refuse_stop_over_active_sessions(agent, targets)
+    if agent is None and not dry_run:
+        # Last, after the precondition: a refusal caused by active sessions is
+        # not something confirming the stop would resolve.
+        interaction.require_confirmation(
+            assume_yes,
+            message="daemon stop: stopping every daemon on this machine needs confirmation",
+            hint="Run: acpc daemon stop --dry-run to see them, then repeat with --yes",
+        )
+    stopped = asyncio.run(_stop_daemons(targets, dry_run=dry_run))
+    payload = {"targets": stopped, "changed": bool(stopped) and not dry_run}
+    if json_mode:
+        _maintenance_json(payload)
+    click.echo(
+        f"-- {'would stop' if dry_run else 'stopped'} {len(stopped)} daemon(s)",
+        err=True,
+    )
 
-    stopped = 0
+
+def _refuse_stop_over_active_sessions(agent: str | None, targets: Sequence[str]) -> None:
+    """Refuse a stop that would fail live sessions, naming the override.
+
+    A documented precondition, not a bad call: `--force` is what overrides it,
+    and `--yes` never does.
+    """
+    addressed = set(targets)
+    active = [
+        meta for meta in sessions.list_sessions() if meta.target in addressed and meta.is_active
+    ]
+    if not active:
+        return
+    count = len(active)
+    noun = "session" if count == 1 else "sessions"
+    scope = f" {agent}" if agent else ""
+    ids = ", ".join(meta.session_id for meta in active)
+    raise AcpcError(
+        f"daemon stop{scope}: {count} active {noun} ({ids}) — wait or stop them first",
+        kind=errors.PRECONDITION_FAILED,
+        hint=f"Run: acpc daemon stop{scope} --force",
+        context={"sessions": [meta.session_id for meta in active]},
+    )
+
+
+async def _stop_daemons(targets: Sequence[str], *, dry_run: bool = False) -> list[str]:
+    """Stop the addressed daemons, returning the ones this call reached.
+
+    A preview reaches the same daemons and stops none, so the two calls report
+    the same targets.
+    """
+    reached: list[str] = []
     for target in targets:
         daemon = await daemon_client.connect(target)
         if daemon is None:
             continue
         try:
+            if dry_run:
+                reached.append(target)
+                continue
             reply = await daemon.stop()
         finally:
             await daemon.close()
         if reply.get("ok"):
-            stopped += 1
-    return stopped
+            reached.append(target)
+    return reached

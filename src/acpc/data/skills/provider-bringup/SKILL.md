@@ -118,7 +118,7 @@ URL, and a doubled segment comes back as a 404 dressed up as a model error.
 Only if you need to watch a whole exchange rather than one request is a
 forwarding proxy worth writing.
 
-### 5. Write the entry, dry-run before you run it
+### 5. Write the entry, resolve it before you run it
 
 Entry format and its traps are in *The entry* below. This skill assumes a
 variant (`extends`); a base adapter with `command` and no `extends` is
@@ -126,7 +126,7 @@ variant (`extends`); a base adapter with `command` and no `extends` is
 
 ```bash
 acpc agents <name>              # what the entry resolves to, with provenance
-acpc run <name> "x" --dry-run   # what this call resolves to, incl. env
+acpc run <name> "x" --resolve   # what this call resolves to, incl. env
 acpc run <name> "Reply with exactly: OK" --timeout 180
 ```
 

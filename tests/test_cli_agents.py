@@ -241,7 +241,7 @@ def test_agents_detail_shows_mode_and_its_source(cli: CliRunner) -> None:
 def test_entry_permission_alias_resolves_canonically_and_warns_on_run(
     cli: CliRunner, fresh_permission_alias_warnings: None
 ) -> None:
-    result = invoke(cli, "run", "builder", "probe", "--dry-run", "--json")
+    result = invoke(cli, "run", "builder", "probe", "--resolve", "--json")
 
     assert result.exit_code == vocab.EXIT_OK
     assert result.stdout
@@ -249,8 +249,8 @@ def test_entry_permission_alias_resolves_canonically_and_warns_on_run(
     assert "--permissions write is deprecated; use --permissions execute" in result.stderr
 
 
-def test_dry_run_renders_and_serializes_mode_escalation(cli: CliRunner) -> None:
-    text_result = invoke(cli, "run", "builder", "probe", "--dry-run")
+def test_resolve_renders_and_serializes_mode_escalation(cli: CliRunner) -> None:
+    text_result = invoke(cli, "run", "builder", "probe", "--resolve")
 
     assert text_result.exit_code == vocab.EXIT_OK
     mode_line = next(
@@ -262,7 +262,7 @@ def test_dry_run_renders_and_serializes_mode_escalation(cli: CliRunner) -> None:
     # The false case has to be pinned on the text view too: an unconditional
     # marker would claim in-vendor escalation for every mode and stay green.
     plain_text = invoke(
-        cli, "run", "mock", "probe", "--mode", "default", "--permissions", "read", "--dry-run"
+        cli, "run", "mock", "probe", "--mode", "default", "--permissions", "read", "--resolve"
     )
     plain_mode_line = next(
         line for line in plain_text.stdout.splitlines() if line.startswith("mode         ")
@@ -270,7 +270,7 @@ def test_dry_run_renders_and_serializes_mode_escalation(cli: CliRunner) -> None:
     assert " · acpc-delegated" in plain_mode_line
     assert "escalates" not in plain_mode_line
 
-    escalating = json.loads(invoke(cli, "run", "builder", "probe", "--dry-run", "--json").stdout)
+    escalating = json.loads(invoke(cli, "run", "builder", "probe", "--resolve", "--json").stdout)
     plain = json.loads(
         invoke(
             cli,
@@ -281,7 +281,7 @@ def test_dry_run_renders_and_serializes_mode_escalation(cli: CliRunner) -> None:
             "default",
             "--permissions",
             "read",
-            "--dry-run",
+            "--resolve",
             "--json",
         ).stdout
     )
@@ -664,7 +664,7 @@ def test_agents_init_writes_the_requested_variant_fields(cli: CliRunner, state_r
 
 
 def test_install_returns_one_for_a_failed_definition_command(cli: CliRunner) -> None:
-    result = invoke(cli, "install", "phantom")
+    result = invoke(cli, "install", "phantom", "--yes")
 
     assert result.exit_code == vocab.EXIT_AGENT_ERROR
     assert "install phantom failed" in result.stderr
@@ -699,10 +699,15 @@ def test_agents_json_keeps_cache_metadata_off_stdout(cli: CliRunner) -> None:
 
 
 def test_install_json_is_one_object(cli: CliRunner) -> None:
-    result = invoke(cli, "install", "mock", "--json")
+    result = invoke(cli, "install", "mock", "--yes", "--json")
 
     assert result.exit_code == vocab.EXIT_OK
-    assert json.loads(result.stdout) == {"agent": "mock", "ok": True, "returncode": 0}
+    assert json.loads(result.stdout) == {
+        "agent": "mock",
+        "ok": True,
+        "returncode": 0,
+        "changed": True,
+    }
 
 
 def test_agents_models_warns_when_resolved_model_has_no_row(

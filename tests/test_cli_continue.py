@@ -893,7 +893,7 @@ def test_continue_permissions_keeps_stored_effort_after_table_tightens(
         "mock-sonnet-5",
         "--effort",
         "high",
-        "--dry-run",
+        "--resolve",
     )
     assert refused.exit_code == vocab.EXIT_USAGE
     assert "supported levels: low" in refused.stderr
@@ -2402,9 +2402,9 @@ def test_continue_of_an_ask_session_needs_a_terminal(cli: CliRunner) -> None:
 def test_continue_of_an_ask_session_rejects_bg_by_name(
     cli: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from acpc import cli as cli_module
+    from acpc import interaction
 
-    monkeypatch.setattr(cli_module, "_stdout_is_tty", lambda: True)
+    monkeypatch.setattr(interaction, "stdout_is_tty", lambda: True)
     session_id = start_session(cli)
     _store_ask_policy(session_id)
 

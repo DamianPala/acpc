@@ -475,7 +475,7 @@ def test_stop_json_is_one_object_on_stdout(cli: CliRunner) -> None:
 def test_rm_deletes_a_finished_session(cli: CliRunner) -> None:
     session_id = _finished_session()
 
-    result = invoke(cli, "rm", session_id)
+    result = invoke(cli, "rm", session_id, "--yes")
 
     assert result.exit_code == vocab.EXIT_OK
     assert not sessions.session_dir(session_id).exists()
@@ -510,7 +510,7 @@ def test_rm_rejects_a_running_session_and_suggests_stop(cli: CliRunner) -> None:
 def test_rm_json_reports_the_removed_session(cli: CliRunner) -> None:
     session_id = _finished_session()
 
-    result = invoke(cli, "rm", session_id, "--json")
+    result = invoke(cli, "rm", session_id, "--yes", "--json")
 
     assert result.exit_code == vocab.EXIT_OK
     payload = json.loads(result.stdout)
@@ -539,7 +539,7 @@ def test_prune_measures_age_from_finished_at(cli: CliRunner, state_root: Path) -
     payload["started_at"] -= 200 * 86400
     path.write_text(json.dumps(payload), encoding="utf-8")
 
-    result = invoke(cli, "prune", "--older-than", "100d")
+    result = invoke(cli, "prune", "--older-than", "100d", "--yes")
 
     assert result.exit_code == vocab.EXIT_OK
     assert sessions.session_dir(session_id).exists()
@@ -552,7 +552,7 @@ def test_prune_never_deletes_an_active_session(cli: CliRunner, state_root: Path)
         pid=os.getpid(),
         process_start_time=proc.process_start_time(),
     )
-    result = invoke(cli, "prune", "--older-than", "1s")
+    result = invoke(cli, "prune", "--older-than", "1s", "--yes")
 
     assert result.exit_code == vocab.EXIT_OK
     assert sessions.session_dir(meta.session_id).exists()
@@ -563,7 +563,7 @@ def test_prune_uses_configured_retention_by_default(cli: CliRunner, state_root: 
     session_id = _finished_session()
     _backdate(state_root, session_id, finished=8 * 86400)
 
-    result = invoke(cli, "prune")
+    result = invoke(cli, "prune", "--yes")
 
     assert result.exit_code == vocab.EXIT_OK
     assert not sessions.session_dir(session_id).exists()
@@ -575,7 +575,7 @@ def test_bare_prune_zero_retention_is_safe_but_explicit_zero_deletes(
     (state_root / "config.toml").write_text('retention = "0d"\n', encoding="utf-8")
     session_id = _finished_session()
 
-    result = invoke(cli, "prune")
+    result = invoke(cli, "prune", "--yes")
 
     assert result.exit_code == vocab.EXIT_USAGE
     envelope = json.loads(result.stderr)["error"]
@@ -586,7 +586,7 @@ def test_bare_prune_zero_retention_is_safe_but_explicit_zero_deletes(
     )
     assert sessions.session_dir(session_id).exists()
 
-    explicit = invoke(cli, "prune", "--older-than", "0d")
+    explicit = invoke(cli, "prune", "--older-than", "0d", "--yes")
 
     assert explicit.exit_code == vocab.EXIT_OK
     assert not sessions.session_dir(session_id).exists()
@@ -605,7 +605,7 @@ def test_zero_retention_disables_the_auto_prune_sweep(cli: CliRunner, state_root
 def test_bare_prune_default_retention_keeps_a_fresh_finished_session(cli: CliRunner) -> None:
     session_id = _finished_session()
 
-    result = invoke(cli, "prune")
+    result = invoke(cli, "prune", "--yes")
 
     assert result.exit_code == vocab.EXIT_OK
     assert sessions.session_dir(session_id).exists()
@@ -618,7 +618,7 @@ def test_prune_json_is_one_object_on_stdout(cli: CliRunner, state_root: Path) ->
     result = invoke(cli, "prune", "--older-than", "100d", "--dry-run", "--json")
 
     assert result.exit_code == vocab.EXIT_OK
-    assert json.loads(result.stdout) == {"sessions": [session_id], "dry_run": True}
+    assert json.loads(result.stdout) == {"targets": [session_id], "changed": False}
     assert result.stderr.startswith("-- prune ")
 
 

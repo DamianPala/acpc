@@ -36,6 +36,13 @@ SESSION_STATES = (
 FINISHED_STATES = frozenset({"done", "failed", "cancelled", "timeout", "orphaned"})
 ACTIVE_STATES = frozenset({"starting", "running"})
 
+# Largest prompt acpc buffers from any single source: the prompt argument, `-`
+# on stdin, or `--prompt-file`.  Counted in UTF-8 bytes and enforced before a
+# session directory exists, so an oversized call leaves nothing behind.  Far
+# above a real prompt and far below anything that would burden a session dir.
+MAX_PROMPT_BYTES = 1_048_576
+MAX_PROMPT_LABEL = "1 MiB"
+
 # Fixed exit codes (SPEC.md *Output contract*).
 EXIT_OK = 0
 EXIT_AGENT_ERROR = 1

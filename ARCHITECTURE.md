@@ -28,6 +28,8 @@ cli.py                          argument parsing, verbs, help, exit codes, TTY d
   └── config.py                 config.toml (retention, daemon_ttl, daemon_max_concurrent)
 
 errors.py                       failure envelope: kinds, emission rule, exit status
+interaction.py                  interactive context, /dev/tty question, confirmation gate
+effects.py                      effect classification declared on each click command
 paths.py (frozen)               ~/.acpc layout, ACPC_HOME, atomic_write, 0700/0600
 proc.py (frozen)                process identity/liveness, kill_process_tree, pidfd
 permissions.py (frozen)         kind classification + approval policy
@@ -42,9 +44,11 @@ vocab.py (frozen)               efforts, permission values, session states, exit
 |--------|------|------------------|
 | `cli.py` | Verb surface, flag parsing, two-level `--help`, `-V`, TTY vs non-TTY rules, `last` selector, and the one place every failure is reported: it classifies what the layers below raise and renders it through `errors` | *Command surface*, *`--help`*, *TTY vs non-TTY* |
 | `errors.py` | The failure envelope: the `kind` vocabulary, `AcpcError` and its optional recovery fields, the rule that decides envelope vs one-line diagnostic (machine format or piped stderr), and the per-raise exit status. Depends on nothing above `vocab`, so any layer can raise a classified failure | *Output contract* (errors, exit codes) |
+| `interaction.py` | Whether acpc may ask the caller anything — the stdin/stdout terminal seams, `NO_INPUT`, and the one definition of an interactive context — plus the `/dev/tty` question and the confirmation gate every `--yes` command runs. Sits beside `errors`, below the command layer, so a gate is one call and one answer everywhere | *Output contract* (never asks on stdin), *Permissions* (the prompt) |
+| `effects.py` | The `read_only` / `idempotent` / `non_idempotent` declaration, attached to the Click command it describes so it can be read off the tree without running anything | *Command surface* |
 | `skills.py` | Bundled `data/skills/*/SKILL.md` discovery, hand-parsed descriptions, directory-name identity, body loading | *Bundled skills* |
 | `config.py` | `config.toml` strict load (3 keys, unknown key = hard error), defaults | *State on disk* (config) |
-| `registry.py` | Shipped adapter TOMLs (`data/agents/`), user entries (`agents/`), `extends` resolution with per-field provenance, presets (tier → model+effort), effort superset mapping, entry mode and measured mode tables, install status, `agents init` scaffolding | *Agent variants*, *`agents`*, *`install`* |
+| `registry.py` | Shipped adapter TOMLs (`data/agents/`), user entries (`agents/`), `extends` resolution with per-field provenance, presets (tier → model+effort), effort superset mapping, entry mode and measured mode tables, install status, which names are shipped rather than local, `agents init` scaffolding | *Agent variants*, *`agents`*, *`install`* |
 | `sessions.py` | Session ids (4 chars, 32-glyph alphabet, re-roll on collision), session dirs, `meta.json` lifecycle (atomic replace), state machine + orphan detection (via `proc`), 30s startup grace, per-session lock and ephemeral cross-process reservations, `--name` aliases, pre-slot turn rotation and ownership tokens, delivered-prompt markers, locked answer/state finalization including delivery-record incompleteness, rm/prune | *State on disk*, *Session states*, *`rm`*, *`prune`* |
 | `transcript.py` | `transcript.ndjson`: versioned header, whole-line appends, event schema, cursor = global event index, reader with `--since`/`--tail` selection, bounded read-only tail timestamp for `status` | *State on disk* (transcript), *`log`* (cursor semantics), *`status`* (idle age) |
 | `client.py` | `AcpcClient` (ACP Client impl): session/update → transcript events, `request_permission` answering via `permissions`, mode-switch handling, answer assembly (message chunks in stream order, thoughts/tools excluded), tokens/cost accounting; connection-owned routing captures validated session identity on every raw update, replay generations add per-frame identities, suppression uses validated session/generation tags, and accounted history has a bounded closed-generation backstop | *Output contract* ("the answer"), *Permissions* (runtime), replay silence |

@@ -62,7 +62,7 @@ Stale cache is yesterday's list:
 ```bash
 acpc agents --check "$NAME"      # live probe; refreshes cache
 acpc agents "$NAME" --models     # advertised ids + current presets
-acpc run "$NAME" "x" --dry-run   # today's default (no --model)
+acpc run "$NAME" "x" --resolve   # today's default (no --model)
 ```
 
 If resolve refuses because no mode grants the default policy (codex has
@@ -70,7 +70,7 @@ no `read` ceiling), retry with `--permissions edit` (live turns: `all`).
 That is not an overlay change.
 
 The advertised **models** list is the catalogue — not OpenRouter, a blog,
-or another entry. The dry-run `model` line is today's default id.
+or another entry. The `--resolve` `model` line is today's default id.
 
 | Bucket | Meaning |
 |---|---|
@@ -89,7 +89,7 @@ per level — wait for yes on that grid, or omit those rows.
 A new id does not inherit a sibling's effort list. Advertised is not
 runnable: if this account / plan rejects the model itself, omit the row.
 
-`--dry-run` only checks acpc's table. A live turn that exits 0 is not
+`--resolve` only checks acpc's table. A live turn that exits 0 is not
 enough: harnesses often fall back (unknown effort → default) and still
 answer. `meta.json` / `acpc status` record what acpc **sent**, not what
 the vendor applied.
@@ -178,13 +178,13 @@ key and comment. Date the catalogue comment.
 
 ```bash
 acpc agents "$NAME"
-acpc run "$NAME" "x" --dry-run
-acpc run "$NAME" --model fast --dry-run
-acpc run "$NAME" --model standard --dry-run
-acpc run "$NAME" --model max --dry-run
+acpc run "$NAME" "x" --resolve
+acpc run "$NAME" --model fast --resolve
+acpc run "$NAME" --model standard --resolve
+acpc run "$NAME" --model max --resolve
 ```
 
-Each dry-run must resolve the models you proposed. A preset whose effort
+Each `--resolve` must resolve the models you proposed. A preset whose effort
 the new row rejects means the overlay is wrong — fix the approved patch
 (no new proposal). A different model or effort choice needs a new yes.
 Report `$OVERLAY` and the diff.

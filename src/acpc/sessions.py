@@ -956,16 +956,24 @@ def _remove_tree(directory: Path) -> None:
     directory.rmdir()
 
 
+def ensure_deletable(meta: SessionMeta) -> None:
+    """Refuse an active session, so a caller can check before it commits.
+
+    SPEC.md `rm`: errors on `starting`/`running` — `stop` it first. Split out
+    so the CLI can run this check before it asks for confirmation: a running
+    session is a conflict, not something a confirmation would resolve.
+    """
+    if meta.is_active:
+        raise SessionStateError(f"session {meta.session_id} is {meta.state} — stop it before rm")
+
+
 def delete_session(session_id: str, *, clock: Clock | None = None) -> None:
     """Delete one session's on-disk state; active sessions are refused.
 
-    SPEC.md `rm`: errors on `starting`/`running` — `stop` it first. Liveness is
-    verified first, so a session whose process died is deletable.
+    Liveness is verified first, so a session whose process died is deletable.
     """
     resolved_clock = _resolve_clock(clock)
-    meta = load(session_id, clock=resolved_clock)
-    if meta.is_active:
-        raise SessionStateError(f"session {session_id} is {meta.state} — stop it before rm")
+    ensure_deletable(load(session_id, clock=resolved_clock))
     _remove_tree(session_dir(session_id))
 
 
