@@ -394,12 +394,16 @@ if section_ready S07-daemon-bg && section_ready S08-views \
     progress "SLOW2: continue/rm while running, wait --timeout, stop"
 
     run_acpc continue "$SLOW2_ID" "should be rejected"
-    assert_eq "continue on a running session is an error" "2" "$LAST_RC"
+    assert_eq "continue on a running session is an error" "1" "$LAST_RC"
     assert_contains "continue-while-running error mentions running" "$LAST_ERR" "running"
+    assert_eq "continue-while-running is a conflict" "conflict" \
+        "$(jq -r '.error.kind' <<<"$(tail -n1 <<<"$LAST_ERR")")"
 
     run_acpc rm "$SLOW2_ID"
-    assert_eq "rm on a running session is a usage error" "2" "$LAST_RC"
+    assert_eq "rm on a running session is a conflict" "1" "$LAST_RC"
     assert_contains "rm-while-running error suggests stop" "$LAST_ERR" "stop"
+    assert_eq "rm-while-running is a conflict" "conflict" \
+        "$(jq -r '.error.kind' <<<"$(tail -n1 <<<"$LAST_ERR")")"
 
     t0=$(date +%s)
     run_acpc wait "$SLOW2_ID" --timeout 2
@@ -683,9 +687,11 @@ ${BG1_DIR}" "$LAST_OUT"
     DSTOP_GUARD_ID="$(head -n1 <<<"$LAST_OUT")"
     sleep 1
     run_acpc daemon stop stopper
-    assert_eq "daemon stop refuses its active session" "2" "$LAST_RC"
+    assert_eq "daemon stop refuses its active session" "1" "$LAST_RC"
     assert_contains "daemon stop refusal names the active session" "$LAST_ERR" \
         "1 active session (${DSTOP_GUARD_ID})"
+    assert_eq "daemon stop refusal is a failed precondition" "precondition_failed" \
+        "$(jq -r '.error.kind' <<<"$(tail -n1 <<<"$LAST_ERR")")"
     run_acpc status "$DSTOP_GUARD_ID" --json
     assert_eq "guard leaves the session running" "running" \
         "$(json_field "$LAST_OUT" '.state')"
@@ -888,7 +894,9 @@ if begin_section S08-views "status list/detail, log default/--since/--tail/--pro
     run_acpc log "$UTIL_ID" --tail -1
     assert_eq "--tail negative is a usage error" "2" "$LAST_RC"
     run_acpc log "does-not-exist"
-    assert_eq "log on an unknown id is a usage error" "2" "$LAST_RC"
+    assert_eq "log on an unknown id fails" "1" "$LAST_RC"
+    assert_eq "log on an unknown id is not_found" "not_found" \
+        "$(jq -r '.error.kind' <<<"$(tail -n1 <<<"$LAST_ERR")")"
 
     # An explicit cursor past the transcript's end is a stderr note, not an
     # error; the quiet form suppresses the note with the footer.
@@ -934,7 +942,9 @@ if begin_section S09-continue "continue + steer: context, turn rotation, cursor 
     assert_contains "the error names the rule" "$LAST_ERR" "--model"
 
     run_acpc continue does-not-exist "hi"
-    assert_eq "continue on an unknown id is a usage error" "2" "$LAST_RC"
+    assert_eq "continue on an unknown id fails" "1" "$LAST_RC"
+    assert_eq "continue on an unknown id is not_found" "not_found" \
+        "$(jq -r '.error.kind' <<<"$(tail -n1 <<<"$LAST_ERR")")"
 
     # continue by --name alias
     run_acpc run mock "named session turn one" --quiet --name smoke-named --json
@@ -955,8 +965,10 @@ if begin_section S09-continue "continue + steer: context, turn rotation, cursor 
     assert_file "the interrupted turn's answer is parked" \
         "${ACPC_HOME}/sessions/${STEER_ID}/answer.1.md"
     run_acpc steer "$STEER_ID" "and once more"
-    assert_eq "steer on a finished session is a usage error" "2" "$LAST_RC"
+    assert_eq "steer on a finished session is a conflict" "1" "$LAST_RC"
     assert_contains "the finished-session error names continue" "$LAST_ERR" "acpc continue"
+    assert_eq "the finished-session refusal is a conflict" "conflict" \
+        "$(jq -r '.error.kind' <<<"$(tail -n1 <<<"$LAST_ERR")")"
 
     end_section S09-continue
 fi
@@ -1022,7 +1034,9 @@ if begin_section S10-agents "agents views, variants, advertised data, install"; 
     run_acpc install phantom
     assert_eq "install phantom (installer fails) exits 1" "1" "$LAST_RC"
     run_acpc install unknown-agent-xyz
-    assert_eq "install of an unknown agent is a usage error" "2" "$LAST_RC"
+    assert_eq "install of an unknown agent fails" "1" "$LAST_RC"
+    assert_eq "install of an unknown agent is not_found" "not_found" \
+        "$(jq -r '.error.kind' <<<"$(tail -n1 <<<"$LAST_ERR")")"
 
     run_acpc agents --json
     assert_json_valid "agents --json is valid" "$LAST_OUT"
@@ -1092,7 +1106,9 @@ if begin_section S11-maintenance "stop no-op semantics, rm, prune"; then
     run_acpc stop "$UTIL_ID"
     assert_eq "stop on a finished session is a no-op, exit 0" "0" "$LAST_RC"
     run_acpc stop does-not-exist
-    assert_eq "stop on an unknown id is a usage error" "2" "$LAST_RC"
+    assert_eq "stop on an unknown id fails" "1" "$LAST_RC"
+    assert_eq "stop on an unknown id is not_found" "not_found" \
+        "$(jq -r '.error.kind' <<<"$(tail -n1 <<<"$LAST_ERR")")"
 
     run_acpc run mock "session to be removed" --quiet --json
     RM_ID="$(json_field "$LAST_OUT" '.session_id')"
@@ -1101,7 +1117,9 @@ if begin_section S11-maintenance "stop no-op semantics, rm, prune"; then
     assert_true "rm deletes the session dir" \
         "$([[ ! -e "${ACPC_HOME}/sessions/${RM_ID}" ]] && echo 0 || echo 1)"
     run_acpc rm "$RM_ID"
-    assert_eq "rm on an already-gone id is a usage error" "2" "$LAST_RC"
+    assert_eq "rm on an already-gone id fails" "1" "$LAST_RC"
+    assert_eq "rm on an already-gone id is not_found" "not_found" \
+        "$(jq -r '.error.kind' <<<"$(tail -n1 <<<"$LAST_ERR")")"
 
     run_acpc prune --older-than 100d --dry-run
     assert_eq "prune --dry-run exits 0" "0" "$LAST_RC"
@@ -1395,20 +1413,24 @@ PYEOF
         assert_not_contains "unknown flag on '${verb_args}': no traceback" "$LAST_ERR" "Traceback"
     done
 
-    # Neighboring docker/systemctl spellings are hints, never aliases.
+    # Neighboring docker/systemctl spellings are hints, never aliases. stderr is
+    # a pipe here, so the actionable line rides inside the failure envelope.
     declare -A DAEMON_HINTS=(
-        ["daemon list"]="Error: no such command 'list' — the daemon view is: acpc daemon status"
-        ["daemon ls"]="Error: no such command 'ls' — the daemon view is: acpc daemon status"
-        ["daemon ps"]="Error: no such command 'ps' — the daemon view is: acpc daemon status"
-        ["daemon stop --all"]="Error: --all is not a daemon flag — bare acpc daemon stop already addresses every daemon"
-        ["daemon start"]="Error: no such command 'start' — daemons start on first use; acpc daemon stop <agent> and the next run is the restart"
-        ["daemon restart"]="Error: no such command 'restart' — daemons start on first use; acpc daemon stop <agent> and the next run is the restart"
+        ["daemon list"]="no such command 'list' — the daemon view is: acpc daemon status"
+        ["daemon ls"]="no such command 'ls' — the daemon view is: acpc daemon status"
+        ["daemon ps"]="no such command 'ps' — the daemon view is: acpc daemon status"
+        ["daemon stop --all"]="--all is not a daemon flag — bare acpc daemon stop already addresses every daemon"
+        ["daemon start"]="no such command 'start' — daemons start on first use; acpc daemon stop <agent> and the next run is the restart"
+        ["daemon restart"]="no such command 'restart' — daemons start on first use; acpc daemon stop <agent> and the next run is the restart"
     )
     for daemon_args in "${!DAEMON_HINTS[@]}"; do
         # shellcheck disable=SC2086
         run_acpc $daemon_args
         assert_eq "'$daemon_args' is a hint, not an alias" "2" "$LAST_RC"
-        assert_eq "'$daemon_args' has the pinned hint" "${DAEMON_HINTS[$daemon_args]}" "$LAST_ERR"
+        assert_eq "'$daemon_args' has the pinned hint" "${DAEMON_HINTS[$daemon_args]}" \
+            "$(jq -r '.error.message' <<<"$LAST_ERR")"
+        assert_eq "'$daemon_args' is invalid_input" "invalid_input" \
+            "$(jq -r '.error.kind' <<<"$LAST_ERR")"
         assert_eq "'$daemon_args' is one line" "1" "$(wc -l <<<"$LAST_ERR")"
         assert_not_contains "'$daemon_args' has no traceback" "$LAST_ERR" "Traceback"
     done
@@ -1452,7 +1474,9 @@ if begin_section S16-skills "bundled skill list, detail, metadata, and JSON"; th
     assert_contains "skills detail JSON has body text" "$LAST_OUT" "# Bringing up a provider"
 
     run_acpc skills does-not-exist
-    assert_eq "unknown skill exits 2" "2" "$LAST_RC"
+    assert_eq "unknown skill exits 1" "1" "$LAST_RC"
+    assert_eq "unknown skill is not_found" "not_found" \
+        "$(jq -r '.error.kind' <<<"$LAST_ERR")"
     assert_contains "unknown skill points at acpc skills" "$LAST_ERR" "acpc skills"
 
     for help_flag in -h --help; do

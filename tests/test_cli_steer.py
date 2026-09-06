@@ -156,9 +156,11 @@ def test_steer_on_a_finished_session_names_continue(cli: CliRunner) -> None:
 
     result = invoke(cli, "steer", session_id, "diagnose only")
 
-    assert result.exit_code == vocab.EXIT_USAGE
-    assert "there is no turn to interrupt" in result.stderr
-    assert f"acpc continue {session_id}" in result.stderr
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    envelope = json.loads(result.stderr.splitlines()[-1])["error"]
+    assert envelope["kind"] == "conflict"
+    assert "there is no turn to interrupt" in envelope["message"]
+    assert envelope["hint"] == f"Run: acpc continue {session_id}"
 
 
 def test_steer_degrades_to_a_plain_continue_when_the_turn_finished_first(
@@ -221,7 +223,8 @@ def test_steer_rejects_two_instruction_sources(cli: CliRunner, tmp_path: Path) -
 def test_steer_rejects_an_unknown_session(cli: CliRunner) -> None:
     result = invoke(cli, "steer", "does-not-exist", "diagnose only")
 
-    assert result.exit_code == vocab.EXIT_USAGE
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    assert json.loads(result.stderr)["error"]["kind"] == "not_found"
 
 
 def test_steer_bg_returns_the_session_id(cli: CliRunner, live_daemon: None) -> None:

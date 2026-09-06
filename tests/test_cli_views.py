@@ -574,10 +574,11 @@ def test_log_rejects_a_negative_tail_count(cli: CliRunner) -> None:
 
 
 def test_log_rejects_an_unknown_session(cli: CliRunner) -> None:
-    """Log reports an unknown session as a usage error."""
+    """Log reports an unknown session as a plain not-found failure."""
     result = invoke(cli, "log", "does-not-exist")
 
-    assert result.exit_code == vocab.EXIT_USAGE
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    assert json.loads(result.stderr)["error"]["kind"] == "not_found"
 
 
 def test_log_wait_new_timeout_prints_the_footer(cli: CliRunner) -> None:
@@ -854,7 +855,12 @@ def test_follow_cursor_covers_exactly_what_was_printed(cli: CliRunner) -> None:
 
     cut = invoke(cli, "log", meta.session_id, "--follow", "--since", "0", "--max-output", "300")
     assert cut.exit_code == vocab.EXIT_BUDGET
-    cursor = int(cut.stderr.rsplit("cursor:", 1)[1].strip())
+    footer = next(line for line in cut.stderr.splitlines() if "cursor:" in line)
+    cursor = int(footer.rsplit("cursor:", 1)[1].strip())
+    # The cut stream ends with the envelope, and it resumes from the same place.
+    envelope = json.loads(cut.stderr.splitlines()[-1])["error"]
+    assert envelope["kind"] == "outcome_unknown"
+    assert envelope["context"]["cursor"] == cursor
     printed = [
         line
         for line in cut.stdout.splitlines()

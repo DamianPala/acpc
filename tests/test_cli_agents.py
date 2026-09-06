@@ -679,10 +679,12 @@ def test_install_without_install_command_names_vendor_docs(cli: CliRunner) -> No
     assert "run 'acpc install grok'" not in result.stderr
 
 
-def test_install_unknown_agent_returns_usage_exit_two(cli: CliRunner) -> None:
+def test_install_unknown_agent_is_not_found(cli: CliRunner) -> None:
+    """The call is spelled correctly; the entry it names does not exist."""
     result = invoke(cli, "install", "unknown-agent-xyz")
 
-    assert result.exit_code == vocab.EXIT_USAGE
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    assert json.loads(result.stderr)["error"]["kind"] == "not_found"
 
 
 def test_agents_json_keeps_cache_metadata_off_stdout(cli: CliRunner) -> None:

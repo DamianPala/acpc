@@ -88,6 +88,15 @@ class SessionNameError(SessionError):
     """A `--name` alias or selector cannot be used as asked."""
 
 
+class SessionNameTaken(SessionNameError):
+    """The name is bound to a session that is still active.
+
+    Separate from its parent because the two fail for different reasons: a
+    reserved or empty name is a bad argument, while a live holder is state
+    that conflicts with the requested binding and clears on its own.
+    """
+
+
 @dataclass(slots=True, kw_only=True)
 class SessionMeta:
     """Typed view of `meta.json`.
@@ -926,7 +935,7 @@ def claim_name(name: str, *, clock: Clock | None = None) -> str | None:
         return None
     holder = _verify_liveness(holders[0], clock=resolved_clock)
     if holder.is_active:
-        raise SessionNameError(
+        raise SessionNameTaken(
             f"name {name!r} belongs to session {holder.session_id}, still {holder.state} — "
             f"stop it first or pick another name"
         )

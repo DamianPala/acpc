@@ -88,6 +88,12 @@ def invoke(cli: CliRunner, *args: str, stdin: str | None = None):
     return cli.invoke(main, list(args), input=stdin, catch_exceptions=False)
 
 
+def error_envelope(result) -> dict:
+    """The structured failure: always the last non-empty line of stderr."""
+    lines = [line for line in result.stderr.splitlines() if line.strip()]
+    return json.loads(lines[-1])["error"]
+
+
 def wire_events(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
@@ -226,10 +232,13 @@ def test_an_unreadable_prompt_file_is_a_usage_error(cli: CliRunner, tmp_path: Pa
 # --- unknown agents and missing binaries ------------------------------------
 
 
-def test_an_unknown_agent_is_a_usage_error(cli: CliRunner) -> None:
+def test_an_unknown_agent_is_not_found(cli: CliRunner) -> None:
     result = invoke(cli, "run", "no-such-agent", "hello")
 
-    assert result.exit_code == vocab.EXIT_USAGE
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    envelope = json.loads(result.stderr)["error"]
+    assert envelope["kind"] == "not_found"
+    assert envelope["hint"] == "Run: acpc agents"
 
 
 def test_a_missing_adapter_binary_exits_1_and_names_the_install(cli: CliRunner) -> None:
@@ -883,12 +892,18 @@ def test_a_refusal_exits_1(cli: CliRunner) -> None:
     result = invoke(cli, "run", "mock", "please fail this on purpose", "--quiet")
 
     assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    envelope = error_envelope(result)
+    assert envelope["kind"] == "agent_error"
+    assert envelope["context"]["session_id"]
 
 
 def test_a_timeout_exits_124(cli: CliRunner) -> None:
     result = invoke(cli, "run", "mock", "slow:30 cli timeout probe", "--timeout", "1", "--quiet")
 
     assert result.exit_code == vocab.EXIT_TIMEOUT
+    envelope = error_envelope(result)
+    assert envelope["kind"] == "timeout"
+    assert sessions.read_meta(envelope["context"]["session_id"]).state == "timeout"
 
 
 def test_a_bare_integer_timeout_is_seconds(cli: CliRunner) -> None:
@@ -908,9 +923,11 @@ def test_an_invalid_timeout_has_the_pinned_duration_error(cli: CliRunner) -> Non
     result = invoke(cli, "run", "mock", "hello", "--timeout", "5x")
 
     assert result.exit_code == vocab.EXIT_USAGE
-    assert result.stderr == (
-        "Error: Invalid value for '--timeout': '5x' is not a duration — "
-        "use seconds (90) or a suffixed value (90s, 5m, 1h, 1h30m)\n"
+    envelope = json.loads(result.stderr)["error"]
+    assert envelope["kind"] == "invalid_input"
+    assert envelope["message"] == (
+        "Invalid value for '--timeout': '5x' is not a duration — "
+        "use seconds (90) or a suffixed value (90s, 5m, 1h, 1h30m)"
     )
 
 
@@ -956,11 +973,14 @@ def test_an_execute_floor_refuses_policies_below_execute(
     result = invoke(cli, "run", "grok-floor", "probe")
 
     assert result.exit_code == vocab.EXIT_USAGE
-    assert result.stderr == (
-        "Error: no mode on grok-floor grants at most permissions read — "
+    envelope = error_envelope(result)
+    assert envelope["kind"] == "permission_denied"
+    assert envelope["message"] == (
+        "no mode on grok-floor grants at most permissions read — "
         "the lowest policy grok-floor runs under is execute; pass --permissions execute; "
-        "declared modes: bypass (grants all), default (grants execute)\n"
+        "declared modes: bypass (grants all), default (grants execute)"
     )
+    assert envelope["hint"] == "Run: acpc run grok-floor --permissions execute"
 
 
 def test_an_execute_floor_dry_run_refusal_names_the_permission_floor(
@@ -969,10 +989,10 @@ def test_an_execute_floor_dry_run_refusal_names_the_permission_floor(
     result = invoke(cli, "run", "grok-floor", "probe", "--dry-run")
 
     assert result.exit_code == vocab.EXIT_USAGE
-    assert result.stderr == (
-        "Error: no mode on grok-floor grants at most permissions read — "
+    assert error_envelope(result)["message"] == (
+        "no mode on grok-floor grants at most permissions read — "
         "the lowest policy grok-floor runs under is execute; pass --permissions execute; "
-        "declared modes: bypass (grants all), default (grants execute)\n"
+        "declared modes: bypass (grants all), default (grants execute)"
     )
 
 
@@ -984,11 +1004,12 @@ def test_an_execute_floor_ask_refusal_names_the_permission_floor(
     result = invoke(cli, "run", "grok-floor", "probe", "--permissions", "ask")
 
     assert result.exit_code == vocab.EXIT_USAGE
-    assert result.stderr == (
-        "Error: --permissions ask on grok-floor is not really asking anything: "
+    # The terminal is stdout's; stderr is still a pipe, so the envelope goes out.
+    assert error_envelope(result)["message"] == (
+        "--permissions ask on grok-floor is not really asking anything: "
         "no mode grants at most read, so no permission request can reach acpc — "
         "the lowest policy grok-floor runs under is execute; pass --permissions execute; "
-        "declared modes: bypass (grants all), default (grants execute)\n"
+        "declared modes: bypass (grants all), default (grants execute)"
     )
 
 
@@ -996,11 +1017,11 @@ def test_real_grok_refusal_names_the_permission_floor(cli: CliRunner) -> None:
     result = invoke(cli, "run", "grok", "probe")
 
     assert result.exit_code == vocab.EXIT_USAGE
-    assert result.stderr == (
-        "Error: no mode on grok grants at most permissions read — the lowest policy grok runs "
+    assert error_envelope(result)["message"] == (
+        "no mode on grok grants at most permissions read — the lowest policy grok runs "
         "under is execute; pass --permissions execute; declared modes: default (grants execute), "
         "acceptEdits (grants execute), plan (grants execute), auto (grants all), "
-        "dontAsk (grants execute), bypassPermissions (grants all)\n"
+        "dontAsk (grants execute), bypassPermissions (grants all)"
     )
 
 
@@ -1013,8 +1034,8 @@ def test_empty_modes_refusal_keeps_the_existing_message(cli: CliRunner, state_ro
 
     assert result.exit_code == vocab.EXIT_USAGE
     assert (
-        result.stderr
-        == "Error: no mode on empty grants at most permissions read; declared modes: none\n"
+        error_envelope(result)["message"]
+        == "no mode on empty grants at most permissions read; declared modes: none"
     )
 
 
@@ -1029,10 +1050,10 @@ def test_an_edit_floor_refusal_names_the_permission_floor(cli: CliRunner, state_
     result = invoke(cli, "run", "edit-floor", "probe")
 
     assert result.exit_code == vocab.EXIT_USAGE
-    assert result.stderr == (
-        "Error: no mode on edit-floor grants at most permissions read — the lowest policy "
+    assert error_envelope(result)["message"] == (
+        "no mode on edit-floor grants at most permissions read — the lowest policy "
         "edit-floor runs under is edit; pass --permissions edit; declared modes: bypass "
-        "(grants all), default (grants edit)\n"
+        "(grants all), default (grants edit)"
     )
 
 

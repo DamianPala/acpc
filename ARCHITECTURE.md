@@ -27,6 +27,7 @@ cli.py                          argument parsing, verbs, help, exit codes, TTY d
   ├── cache.py                  advertised models/modes/commands cache under cache/<agent>/
   └── config.py                 config.toml (retention, daemon_ttl, daemon_max_concurrent)
 
+errors.py                       failure envelope: kinds, emission rule, exit status
 paths.py (frozen)               ~/.acpc layout, ACPC_HOME, atomic_write, 0700/0600
 proc.py (frozen)                process identity/liveness, kill_process_tree, pidfd
 permissions.py (frozen)         kind classification + approval policy
@@ -39,7 +40,8 @@ vocab.py (frozen)               efforts, permission values, session states, exit
 
 | Module | Owns | SPEC.md sections |
 |--------|------|------------------|
-| `cli.py` | Verb surface, flag parsing, usage errors (exit 2), two-level `--help`, `-V`, TTY vs non-TTY rules, `last` selector | *Command surface*, *`--help`*, *TTY vs non-TTY* |
+| `cli.py` | Verb surface, flag parsing, two-level `--help`, `-V`, TTY vs non-TTY rules, `last` selector, and the one place every failure is reported: it classifies what the layers below raise and renders it through `errors` | *Command surface*, *`--help`*, *TTY vs non-TTY* |
+| `errors.py` | The failure envelope: the `kind` vocabulary, `AcpcError` and its optional recovery fields, the rule that decides envelope vs one-line diagnostic (machine format or piped stderr), and the per-raise exit status. Depends on nothing above `vocab`, so any layer can raise a classified failure | *Output contract* (errors, exit codes) |
 | `skills.py` | Bundled `data/skills/*/SKILL.md` discovery, hand-parsed descriptions, directory-name identity, body loading | *Bundled skills* |
 | `config.py` | `config.toml` strict load (3 keys, unknown key = hard error), defaults | *State on disk* (config) |
 | `registry.py` | Shipped adapter TOMLs (`data/agents/`), user entries (`agents/`), `extends` resolution with per-field provenance, presets (tier → model+effort), effort superset mapping, entry mode and measured mode tables, install status, `agents init` scaffolding | *Agent variants*, *`agents`*, *`install`* |

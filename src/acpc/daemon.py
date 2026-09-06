@@ -37,7 +37,7 @@ from typing import Any
 
 from acp import PROTOCOL_VERSION, text_block
 
-from acpc import __version__, config, ipc, paths, runner, sessions, transcript, vocab
+from acpc import __version__, config, errors, ipc, paths, runner, sessions, transcript, vocab
 from acpc.client import (
     REPLAY_GENERATION_KEY,
     VALIDATED_SESSION_ID_KEY,
@@ -67,6 +67,23 @@ class SpawnArgvMismatch(DaemonError):
 def log_path_for_target(target: str) -> Path:
     """Where this target's daemon and adapter stderr go (SPEC.md `daemon`)."""
     return paths.daemon_dir() / f"{target}.log"
+
+
+def _refusal_kind(error: BaseException) -> str | None:
+    """Classify a refused turn, so the client reports what the daemon saw.
+
+    The reply crosses a socket as text, and a message is not a contract: the
+    caller matches on the kind, which is why the side that knows sets it.
+    """
+    if isinstance(error, runner.ResumeRotationError):
+        return errors.CONFLICT if error.turn_token is None else errors.CORRUPT_STATE
+    if isinstance(error, sessions.SessionStateError):
+        return errors.CONFLICT
+    if isinstance(error, sessions.CorruptSessionError):
+        return errors.CORRUPT_STATE
+    if isinstance(error, sessions.SessionNotFound):
+        return errors.NOT_FOUND
+    return None
 
 
 @dataclass(slots=True)
@@ -613,7 +630,11 @@ class Daemon:
     async def _start(self, frame: dict[str, Any]) -> dict[str, Any]:
         session_id = frame.get("session_id", "")
         if session_id in self.turns:
-            return {"ok": False, "error": f"session {session_id} already has a turn in flight"}
+            return {
+                "ok": False,
+                "error": f"session {session_id} already has a turn in flight",
+                "kind": errors.CONFLICT,
+            }
         try:
             request = self._rebuild_request(frame.get("payload") or {})
         except Exception as error:  # noqa: BLE001
@@ -664,6 +685,7 @@ class Daemon:
             return {
                 "ok": False,
                 "error": runner.describe_error(error),
+                "kind": _refusal_kind(error),
                 "preserve_session": preparation,
             }
         except BaseException as error:  # noqa: BLE001
@@ -672,6 +694,7 @@ class Daemon:
             return {
                 "ok": False,
                 "error": runner.describe_error(error),
+                "kind": _refusal_kind(error),
                 "preserve_session": preparation,
             }
 

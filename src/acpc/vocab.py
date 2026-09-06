@@ -45,3 +45,22 @@ EXIT_TIMEOUT = 124
 EXIT_CANCELLED = 130
 EXIT_SIGPIPE = 141
 EXIT_SIGTERM = 143
+
+# One stable meaning per code, keyed by its decimal spelling so the table can
+# be published verbatim.  Finer-grained failure detail is the error envelope's
+# `kind`, never a new exit code.
+EXIT_DESCRIPTIONS: dict[str, str] = {
+    "0": "Success, including an empty result: the turn ended normally, or the view rendered.",
+    "1": "Generic failure: the agent errored — a crash, a refusal, exhausted context, "
+    "missing auth — or the command could not do what was asked.",
+    "2": "Usage error: bad flags, an unknown session, a mode that exceeds the policy, "
+    "or a policy no mode satisfies.",
+    "4": "Output budget exhausted: `log --follow` stopped because `--max-output` ran out "
+    "before the session ended; the footer's cursor covers what was printed.",
+    "124": "Timeout: `run` cancelled the session; `wait` and `log --wait-new` stopped waiting "
+    "and left it running.",
+    "130": "Cancelled by SIGINT or `acpc stop`. Answer-printing commands mirror the session "
+    "result, so `wait` on a cancelled session also exits 130.",
+    "141": "SIGPIPE: a downstream reader closed the pipe.",
+    "143": "SIGTERM: the client detached from a daemon-owned session, or ended the turn.",
+}

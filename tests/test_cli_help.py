@@ -339,8 +339,11 @@ def test_neighboring_tool_aliases_are_one_line_usage_errors(
     result = invoke(runner, *args)
 
     assert result.exit_code == vocab.EXIT_USAGE
-    assert result.stderr == f"{expected}\n"
+    # stderr is a pipe here, so the actionable line arrives inside the envelope.
     assert len(result.stderr.splitlines()) == 1
+    envelope = json.loads(result.stderr)["error"]
+    assert envelope["kind"] == "invalid_input"
+    assert f"Error: {envelope['message']}" == expected
     assert "Traceback" not in result.stderr
 
 

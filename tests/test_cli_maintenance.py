@@ -139,10 +139,11 @@ def test_stop_is_a_successful_noop_for_every_finished_state(cli: CliRunner, stat
     assert sessions.read_meta(session_id).state == state
 
 
-def test_stop_unknown_session_is_a_usage_error(cli: CliRunner) -> None:
+def test_stop_unknown_session_is_not_found(cli: CliRunner) -> None:
     result = invoke(cli, "stop", "does-not-exist")
 
-    assert result.exit_code == vocab.EXIT_USAGE
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    assert json.loads(result.stderr)["error"]["kind"] == "not_found"
 
 
 def test_daemon_status_with_no_daemons_is_a_successful_empty_report(cli: CliRunner) -> None:
@@ -317,12 +318,15 @@ def test_daemon_stop_refuses_a_running_session_and_leaves_daemon_alive(
 
     result = invoke(cli, "daemon", "stop", "mock")
 
-    assert result.exit_code == vocab.EXIT_USAGE
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
     assert result.stdout == ""
-    assert result.stderr == (
-        f"Error: daemon stop mock: 1 active session ({session_id}) — wait or stop them first, "
-        f"or pass --force\n"
+    envelope = json.loads(result.stderr)["error"]
+    assert envelope["kind"] == "precondition_failed"
+    assert envelope["message"] == (
+        f"daemon stop mock: 1 active session ({session_id}) — wait or stop them first"
     )
+    assert envelope["hint"] == "Run: acpc daemon stop mock --force"
+    assert envelope["context"]["sessions"] == [session_id]
     assert sessions.load(session_id).state == "running"
     assert _daemon_is_reachable(_target())
 
@@ -336,10 +340,11 @@ def test_daemon_stop_refuses_a_starting_session(cli: CliRunner, live_daemon: Non
 
     result = invoke(cli, "daemon", "stop", "mock")
 
-    assert result.exit_code == vocab.EXIT_USAGE
-    assert result.stderr == (
-        f"Error: daemon stop mock: 1 active session ({session.session_id}) — wait or stop them "
-        f"first, or pass --force\n"
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    envelope = json.loads(result.stderr)["error"]
+    assert envelope["kind"] == "precondition_failed"
+    assert envelope["message"] == (
+        f"daemon stop mock: 1 active session ({session.session_id}) — wait or stop them first"
     )
     assert sessions.read_meta(session.session_id).state == "starting"
     assert _daemon_is_reachable(target)
@@ -407,10 +412,11 @@ def test_multi_target_daemon_stop_refuses_before_stopping_any_target(
 
     result = invoke(cli, "daemon", "stop")
 
-    assert result.exit_code == vocab.EXIT_USAGE
-    assert result.stderr == (
-        f"Error: daemon stop: 1 active session ({session_id}) — wait or stop them first, "
-        f"or pass --force\n"
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    envelope = json.loads(result.stderr)["error"]
+    assert envelope["kind"] == "precondition_failed"
+    assert envelope["message"] == (
+        f"daemon stop: 1 active session ({session_id}) — wait or stop them first"
     )
     assert _daemon_is_reachable(_target())
     assert _daemon_is_reachable(other_target)
@@ -430,7 +436,7 @@ def test_daemon_stop_uses_singular_and_plural_active_session_wording(
     result = invoke(cli, "daemon", "stop", "mock")
 
     assert listed_ids == [second, first]
-    assert result.exit_code == vocab.EXIT_USAGE
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
     assert f"daemon stop mock: 2 active sessions ({second}, {first})" in result.stderr
     assert "1 active session" not in result.stderr
 
@@ -475,10 +481,11 @@ def test_rm_deletes_a_finished_session(cli: CliRunner) -> None:
     assert not sessions.session_dir(session_id).exists()
 
 
-def test_rm_unknown_session_is_a_usage_error(cli: CliRunner) -> None:
+def test_rm_unknown_session_is_not_found(cli: CliRunner) -> None:
     result = invoke(cli, "rm", "does-not-exist")
 
-    assert result.exit_code == vocab.EXIT_USAGE
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    assert json.loads(result.stderr)["error"]["kind"] == "not_found"
 
 
 def test_rm_rejects_a_running_session_and_suggests_stop(cli: CliRunner) -> None:
@@ -491,8 +498,12 @@ def test_rm_rejects_a_running_session_and_suggests_stop(cli: CliRunner) -> None:
 
     result = invoke(cli, "rm", meta.session_id)
 
-    assert result.exit_code == vocab.EXIT_USAGE
-    assert "stop" in result.stderr
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    envelope = json.loads(result.stderr)["error"]
+    assert envelope["kind"] == "conflict"
+    assert envelope["retryable"] is True
+    assert "stop" in envelope["message"]
+    assert envelope["context"]["session_id"] == meta.session_id
     assert sessions.session_dir(meta.session_id).exists()
 
 
@@ -567,9 +578,11 @@ def test_bare_prune_zero_retention_is_safe_but_explicit_zero_deletes(
     result = invoke(cli, "prune")
 
     assert result.exit_code == vocab.EXIT_USAGE
-    assert result.stderr == (
-        "Error: config retention '0d' resolves to zero — bare prune would delete every finished "
-        "session; pass --older-than 0d to do that explicitly\n"
+    envelope = json.loads(result.stderr)["error"]
+    assert envelope["kind"] == "invalid_input"
+    assert envelope["message"] == (
+        "config retention '0d' resolves to zero — bare prune would delete every finished "
+        "session; pass --older-than 0d to do that explicitly"
     )
     assert sessions.session_dir(session_id).exists()
 

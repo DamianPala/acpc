@@ -70,11 +70,32 @@ _ADAPTER_LIMIT_STOP_REASONS = frozenset({"max_tokens", "max_turn_requests"})
 
 
 class RunnerError(Exception):
-    """A turn could not be started; the message is one actionable line."""
+    """A turn could not be started; the message is one actionable line.
+
+    `kind` is set when the refusal arrived already classified — a daemon that
+    refused the turn knows why, and the client must report that rather than
+    re-derive it from the message text it was handed.
+    """
+
+    def __init__(self, message: str, *, kind: str | None = None) -> None:
+        super().__init__(message)
+        self.kind = kind
+
+
+class AdapterUnavailable(RunnerError):
+    """The adapter this call needs cannot be reached at all.
+
+    Distinct from the rest because nothing about the call is wrong and the
+    adapter never answered: the caller has to install or start something, not
+    fix an argument or read a refusal.
+    """
 
 
 class ResumePreparationError(RunnerError):
     """A cold resume failed before acpc opened the next turn on disk."""
+
+    def __init__(self, message: str, *, kind: str | None = None) -> None:
+        super().__init__(message, kind=kind)
 
 
 class ResumeVerificationError(ResumePreparationError):
@@ -84,8 +105,10 @@ class ResumeVerificationError(ResumePreparationError):
 class ResumeRotationError(RunnerError):
     """The verified continuation could not be opened on the session store."""
 
-    def __init__(self, message: str, *, turn_token: int | None = None) -> None:
-        super().__init__(message)
+    def __init__(
+        self, message: str, *, turn_token: int | None = None, kind: str | None = None
+    ) -> None:
+        super().__init__(message, kind=kind)
         self.turn_token = turn_token
 
 
@@ -518,7 +541,7 @@ def adapter_command(resolution: CallResolution) -> tuple[str, tuple[str, ...]]:
     except RegistryError as error:
         raise RunnerError(str(error)) from None
     if shutil.which(args[0]) is None:
-        raise RunnerError(entry.missing_binary_error())
+        raise AdapterUnavailable(entry.missing_binary_error())
     return args[0], args[1:]
 
 
@@ -1155,11 +1178,12 @@ async def _execute_via_daemon(
     try:
         started = await daemon.start_turn(session_id, daemon_payload(request))
         if not started.get("ok"):
+            reason = str(started.get("error", "the daemon refused the turn"))
+            refused_as = started.get("kind")
+            kind = str(refused_as) if isinstance(refused_as, str) else None
             if started.get("preserve_session"):
-                raise ResumePreparationError(
-                    str(started.get("error", "the daemon refused the turn"))
-                )
-            raise RunnerError(str(started.get("error", "the daemon refused the turn")))
+                raise ResumePreparationError(reason, kind=kind)
+            raise RunnerError(reason, kind=kind)
         queued = bool(started.get("queued"))
 
         waiting = asyncio.ensure_future(daemon.await_turn(session_id))

@@ -743,7 +743,13 @@ def test_daemon_reservation_contention_does_not_block_unrelated_sessions(
         )
         assert wait_for_process_exit(blocked) == vocab.EXIT_AGENT_ERROR
         _blocked_stdout, blocked_stderr = blocked.communicate(timeout=10)
-        assert "wait for the current turn" in blocked_stderr
+        # A real lock collision is the conflict case: the session is held, and
+        # the same call works once the holder lets go.
+        envelope = json.loads(blocked_stderr.splitlines()[-1])["error"]
+        assert envelope["kind"] == "conflict"
+        assert envelope["retryable"] is True
+        assert envelope["context"]["session_id"] == session_id
+        assert "wait for the current turn" in envelope["message"]
         assert sessions.read_meta(session_id).state == "done"
 
         result = invoke(cli, "run", "mock", "echo:unrelated", "--quiet", "--json")
@@ -1149,7 +1155,8 @@ def test_continue_post_rotation_failure_finalizes_the_new_turn(
     result = invoke(cli, "continue", session_id, "turn two")
 
     failed = sessions.load(session_id)
-    assert result.exit_code == vocab.EXIT_USAGE
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    assert json.loads(result.stderr.splitlines()[-1])["error"]["kind"] == "corrupt_state"
     assert failed.state == "failed"
     assert failed.turns == 2
     assert failed.stop_reason == "error"
@@ -2217,10 +2224,12 @@ def test_continue_permissions_refusal_names_the_permission_floor(
     result = invoke(cli, "continue", session_id, "turn two", "--permissions", "read")
 
     assert result.exit_code == vocab.EXIT_USAGE
-    assert result.stderr == (
-        "Error: no mode on floor grants at most permissions read — the lowest policy floor runs "
+    envelope = json.loads(result.stderr)["error"]
+    assert envelope["kind"] == "permission_denied"
+    assert envelope["message"] == (
+        "no mode on floor grants at most permissions read — the lowest policy floor runs "
         "under is execute; pass --permissions execute; declared modes: bypass (grants all), "
-        "default (grants execute)\n"
+        "default (grants execute)"
     )
 
 
@@ -2252,8 +2261,10 @@ def test_continue_validation_failure_does_not_rotate_session(cli: CliRunner) -> 
     result = invoke(cli, "continue", session_id, "turn two")
 
     unchanged = sessions.load(session_id)
-    assert result.exit_code == vocab.EXIT_USAGE
-    assert "cannot be continued" in result.stderr
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    envelope = json.loads(result.stderr)["error"]
+    assert envelope["kind"] == "corrupt_state"
+    assert "cannot be continued" in envelope["message"]
     assert unchanged.state == "done"
     assert unchanged.turns == 1
 
@@ -2267,8 +2278,10 @@ def test_continue_rejects_a_malformed_stored_resolution(cli: CliRunner) -> None:
 
     result = invoke(cli, "continue", session_id, "turn two")
 
-    assert result.exit_code == vocab.EXIT_USAGE
-    assert "stored permission resolution" in result.stderr
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    envelope = json.loads(result.stderr)["error"]
+    assert envelope["kind"] == "corrupt_state"
+    assert "stored permission resolution" in envelope["message"]
 
 
 def test_continue_write_alias_is_canonical_and_warns(
@@ -2315,8 +2328,11 @@ def test_continue_on_a_running_session_is_a_usage_error(cli: CliRunner, live_dae
 
     continued = invoke(cli, "continue", session_id, "turn two")
 
-    assert continued.exit_code == vocab.EXIT_USAGE
-    assert "running" in continued.stderr
+    assert continued.exit_code == vocab.EXIT_AGENT_ERROR
+    envelope = json.loads(continued.stderr)["error"]
+    assert envelope["kind"] == "conflict"
+    assert envelope["retryable"] is True
+    assert "running" in envelope["message"]
 
 
 def test_continue_preserves_the_global_transcript_cursor(cli: CliRunner) -> None:

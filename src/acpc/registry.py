@@ -85,6 +85,15 @@ class RegistryError(ValueError):
     """A registry entry cannot be parsed or resolved."""
 
 
+class AgentNotFound(RegistryError):
+    """The named agent has no entry, here or in an entry's `extends` chain.
+
+    Separate from its parent so a caller can tell "you named something that
+    does not exist" from "the entry that does exist is malformed"; the two
+    need different fixes and the envelope has to say which.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class FieldSource:
     """Where a resolved field value came from."""
@@ -771,7 +780,7 @@ class AgentRegistry:
     def permission_alias(self, name: str) -> str | None:
         """Return the deprecated permissions alias declared by an entry, if any."""
         if name not in self._entries:
-            raise RegistryError(f"unknown agent '{name}'")
+            raise AgentNotFound(f"unknown agent '{name}'")
         parsed = self._entries[name]
         if "permissions" in parsed.data:
             return parsed.permission_alias
@@ -784,8 +793,8 @@ class AgentRegistry:
         if name not in self._entries:
             if stack:
                 parent = stack[-1]
-                raise RegistryError(f"agent '{parent}': missing base '{name}'")
-            raise RegistryError(f"unknown agent '{name}'")
+                raise AgentNotFound(f"agent '{parent}': missing base '{name}'")
+            raise AgentNotFound(f"unknown agent '{name}'")
         if name in stack:
             cycle = " -> ".join((*stack, name))
             raise RegistryError(f"agent inheritance cycle: {cycle}")

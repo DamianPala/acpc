@@ -184,11 +184,13 @@ def test_json_views_include_paths_body_and_null_description(
     assert json.loads(before_the_name.stdout) == detail_payload
 
 
-def test_unknown_skill_is_usage_error_pointing_at_listing_command(cli: CliRunner) -> None:
+def test_unknown_skill_is_not_found_pointing_at_listing_command(cli: CliRunner) -> None:
     result = invoke(cli, "skills", "does-not-exist")
 
-    assert result.exit_code == vocab.EXIT_USAGE
-    assert "acpc skills" in result.stderr
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    envelope = json.loads(result.stderr)["error"]
+    assert envelope["kind"] == "not_found"
+    assert envelope["hint"] == "Run: acpc skills"
 
 
 def test_directory_without_skill_file_is_skipped(

@@ -15,7 +15,7 @@ from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 import click
 
@@ -24,6 +24,7 @@ from acpc import (
     cache,
     config,
     daemon_client,
+    errors,
     output,
     paths,
     proc,
@@ -35,8 +36,10 @@ from acpc import (
     vocab,
 )
 from acpc import probe as probe_engine
+from acpc.errors import AcpcError, AgentProblem, UsageProblem
 from acpc.permissions import ModeSelectionError, PermissionLevel, select_mode
 from acpc.registry import (
+    AgentNotFound,
     AgentRegistry,
     CallResolution,
     FieldSource,
@@ -46,24 +49,60 @@ from acpc.registry import (
 
 _PERMISSION_CHOICES = (*vocab.PERMISSION_VALUES, *vocab.PERMISSION_ALIASES)
 _WARNED_PERMISSION_ALIASES: set[str] = set()
+_json_option = errors.json_option
 
 
-class UsageProblem(click.ClickException):
-    """A usage error: one actionable line on stderr, exit 2."""
+def _not_found(message: str, *, hint: str) -> AcpcError:
+    """A named target does not exist: exit 1, because the call was well formed.
 
-    exit_code = vocab.EXIT_USAGE
+    Exit 2 means the caller wrote the command wrong.  `acpc status q7x2` for a
+    session that was pruned is spelled correctly and asks a fair question, so
+    the answer is a plain failure carrying `not_found` for the caller to match.
+    """
+    return AcpcError(message, kind=errors.NOT_FOUND, hint=hint)
 
-    def format_message(self) -> str:
-        return self.message
+
+def _registry_problem(error: RegistryError) -> AcpcError:
+    """Classify a registry failure: a missing entry is not a bad flag."""
+    if isinstance(error, AgentNotFound):
+        return _not_found(str(error), hint="Run: acpc agents")
+    return UsageProblem(str(error))
 
 
-class AgentProblem(click.ClickException):
-    """An agent-side failure: one actionable line on stderr, exit 1."""
+def _probe_problem(error: Exception) -> AcpcError:
+    """An adapter acpc had to reach did not launch or did not answer."""
+    return AgentProblem(str(error), kind=errors.UNAVAILABLE)
 
-    exit_code = vocab.EXIT_AGENT_ERROR
 
-    def format_message(self) -> str:
-        return self.message
+def _runner_problem(error: runner.RunnerError) -> AcpcError:
+    """Classify a turn that never started, by what stopped it."""
+    if isinstance(error, runner.AdapterUnavailable):
+        return AgentProblem(str(error), kind=errors.UNAVAILABLE)
+    if error.kind is not None:
+        # The owning daemon already classified this refusal; keep its answer.
+        return AgentProblem(
+            str(error),
+            kind=error.kind,
+            retryable=True if error.kind == errors.CONFLICT else None,
+        )
+    return AgentProblem(str(error))
+
+
+def _session_problem(error: sessions.SessionError) -> AcpcError:
+    """Classify a session-store failure by what the caller has to do next.
+
+    The store raises one exception per situation, so the mapping lives here
+    rather than at fifty `raise` sites: not found, occupied, damaged, or an
+    argument the store will never accept.
+    """
+    if isinstance(error, sessions.SessionNotFound):
+        return _not_found(str(error), hint="Run: acpc status --all")
+    if isinstance(error, sessions.CorruptSessionError):
+        return AcpcError(str(error), kind=errors.CORRUPT_STATE)
+    if isinstance(error, sessions.SessionNameTaken | sessions.SessionStateError):
+        # The session is busy or bound; the same call works once it settles.
+        return AcpcError(str(error), kind=errors.CONFLICT, retryable=True)
+    return UsageProblem(str(error))
 
 
 class TimeoutParamType(click.ParamType):
@@ -171,20 +210,60 @@ class _CheatSheetGroup(click.Group):
         return _ROOT_HELP
 
     def main(self, *args: Any, **kwargs: Any) -> Any:
-        """Render Click usage errors as the CLI's single actionable line."""
+        """Report every failure once, in one place, in one shape.
+
+        Click parses before any command runs, so a bad flag fails here rather
+        than inside a command that could have known the output format.  The
+        raw arguments are read first for exactly that reason: a caller that
+        asked for JSON gets the failure as JSON even when nothing else ran.
+        """
         if not kwargs.get("standalone_mode", True):
             return super().main(*args, **kwargs)
         kwargs["standalone_mode"] = False
+        errors.reset(_invocation_args(args, kwargs))
         try:
             return super().main(*args, **kwargs)
         except click.UsageError as error:
             command_path = error.ctx.command_path if error.ctx is not None else None
             message = _friendly_usage_message(error.format_message(), command_path=command_path)
-            click.echo(f"Error: {message}", err=True)
-            raise SystemExit(error.exit_code) from None
+            _fail(UsageProblem(message, exit_code=error.exit_code))
+        except AcpcError as error:
+            _fail(error)
         except click.ClickException as error:
-            error.show()
-            raise SystemExit(error.exit_code) from None
+            _fail(AcpcError(error.format_message(), exit_code=error.exit_code))
+        except (click.Abort, KeyboardInterrupt):
+            # Click turns Ctrl-C into Abort; a stack trace here would say the
+            # tool broke, when the caller simply stopped it.
+            _fail(_interrupted())
+
+
+def _invocation_args(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Sequence[str]:
+    """The argument list Click is about to parse, however it was handed over.
+
+    The console script passes none and lets Click read `sys.argv`; in-process
+    callers pass their own list, and reading theirs is what keeps a test or an
+    embedded call from reporting on the arguments of the process around it.
+    """
+    given = kwargs.get("args", args[0] if args else None)
+    if given is None:
+        return sys.argv[1:]
+    return [str(item) for item in given]
+
+
+def _interrupted(**context: Any) -> AcpcError:
+    """The failure a Ctrl-C produces, wherever it lands."""
+    return AcpcError(
+        "interrupted",
+        kind=errors.INTERRUPTED,
+        exit_code=vocab.EXIT_CANCELLED,
+        context=context or None,
+    )
+
+
+def _fail(error: AcpcError) -> NoReturn:
+    """Write the failure to stderr and leave with its code."""
+    errors.emit(error)
+    raise SystemExit(error.exit_status) from None
 
 
 def _friendly_usage_message(message: str, *, command_path: str | None = None) -> str:
@@ -341,7 +420,11 @@ def _stored_permission_policy(meta: sessions.SessionMeta) -> str:
     """Read and normalize the permission policy from a validated session."""
     resolved = meta.resolution.get("resolved")
     if not isinstance(resolved, dict):
-        raise UsageProblem(f"session {meta.session_id} has no stored permission resolution")
+        raise AcpcError(
+            f"session {meta.session_id} has no stored permission resolution",
+            kind=errors.CORRUPT_STATE,
+            context={"session_id": meta.session_id},
+        )
     permissions = resolved.get("permissions")
     if not isinstance(permissions, dict):
         return "read"
@@ -383,7 +466,7 @@ def _continue_selection(
             resolution = replace(resolution, mode=None, provenance=provenance)
         return _select_resolution(resolution)
     except RegistryError as error:
-        raise UsageProblem(str(error)) from None
+        raise _registry_problem(error) from None
 
 
 def _updated_session_resolution(
@@ -397,7 +480,11 @@ def _updated_session_resolution(
     payload = deepcopy(meta.resolution)
     resolved = payload.get("resolved")
     if not isinstance(resolved, dict):
-        raise UsageProblem(f"session {meta.session_id} has no stored resolution object")
+        raise AcpcError(
+            f"session {meta.session_id} has no stored resolution object",
+            kind=errors.CORRUPT_STATE,
+            context={"session_id": meta.session_id},
+        )
     current_mode = runner.resolution_payload(resolution, cwd=None)["resolved"]["mode"]
     resolved["mode"] = current_mode
     permission_source = "call flag" if policy_changed else "stored"
@@ -473,7 +560,8 @@ def _clamp_inherited_ceiling(policy: str) -> tuple[str, tuple[str, str] | None]:
             supported = ", ".join(numeric_policies)
             raise UsageProblem(
                 f"--permissions ask exceeds inherited ceiling {ceiling}; "
-                f"available policies: {supported}"
+                f"available policies: {supported}",
+                kind=errors.PERMISSION_DENIED,
             )
         effective = policy
     elif PermissionLevel(policy).rank > PermissionLevel(ceiling).rank:
@@ -495,7 +583,7 @@ def _mode_list(entry: ResolvedEntry) -> str:
 def _mode_selection_error(
     resolution: CallResolution,
     error: ModeSelectionError,
-) -> UsageProblem:
+) -> AcpcError:
     """Turn a policy/mode mismatch into an actionable CLI usage error."""
     entry = resolution.entry
     modes = _mode_list(entry)
@@ -529,14 +617,20 @@ def _mode_selection_error(
         )
     else:
         reason = f"no mode on {entry.entry} grants at most permissions {error.policy}"
+    # No mode admits the requested policy: the call is spelled correctly and
+    # the entry refuses it, which is a denial rather than a malformed flag.
     if not error.modes:
-        return UsageProblem(f"{reason}; declared modes: {modes}")
+        return UsageProblem(f"{reason}; declared modes: {modes}", kind=errors.PERMISSION_DENIED)
     floor = min(
         (PermissionLevel(spec.grants) for spec in error.modes.values()),
         key=lambda level: level.rank,
     ).value
     reason = f"{reason} — the lowest policy {entry.entry} runs under is {floor}"
-    return UsageProblem(f"{reason}; pass --permissions {floor}; declared modes: {modes}")
+    return UsageProblem(
+        f"{reason}; pass --permissions {floor}; declared modes: {modes}",
+        kind=errors.PERMISSION_DENIED,
+        hint=f"Run: acpc run {entry.entry} --permissions {floor}",
+    )
 
 
 def _select_resolution(resolution: CallResolution) -> CallResolution:
@@ -1208,15 +1302,9 @@ def _run_agents_view(
                 else:
                     _write_stdout(text + advertised_text)
     except cache.ProbeError as error:
-        if json_mode:
-            _emit_json({"error": str(error)})
-            raise SystemExit(vocab.EXIT_AGENT_ERROR) from None
-        raise AgentProblem(str(error)) from None
+        raise _probe_problem(error) from None
     except RegistryError as error:
-        if json_mode:
-            _emit_json({"error": str(error)})
-            raise SystemExit(vocab.EXIT_USAGE) from None
-        raise UsageProblem(str(error)) from None
+        raise _registry_problem(error) from None
 
 
 @main.group(name="agents", cls=_AgentsGroup, invoke_without_command=True)
@@ -1228,7 +1316,7 @@ def _run_agents_view(
     is_flag=True,
     help="Launch, authenticate and apply the resolved options.",
 )
-@click.option("--json", "json_mode", is_flag=True, help="Emit this view as JSON.")
+@_json_option("Emit this view as JSON.")
 @click.help_option("-h", "--help")
 @click.pass_context
 def agents_group(
@@ -1256,7 +1344,7 @@ def agents_group(
     is_flag=True,
     help="Launch, authenticate and apply the resolved options.",
 )
-@click.option("--json", "json_mode", is_flag=True, help="Emit this view as JSON.")
+@_json_option("Emit this view as JSON.")
 @click.help_option("-h", "--help")
 def _agent_view_command(
     name: str, models: bool, commands: bool, check_live: bool, json_mode: bool
@@ -1292,8 +1380,15 @@ def _agents_check(registry: AgentRegistry, name: str | None, *, json_mode: bool)
                 _write_stdout(f"{result['agent']} ok\n")
             else:
                 _write_stdout(f"{result['agent']} failed: {result['error']}\n")
-    if any(not result["ok"] for result in results):
-        raise SystemExit(vocab.EXIT_AGENT_ERROR)
+    # The report is a successful survey in which an entry may say `ok: false`,
+    # so it stays on stdout; the envelope says the command as a whole failed.
+    failed = [str(result["agent"]) for result in results if not result["ok"]]
+    if failed:
+        raise AgentProblem(
+            f"live check failed for {', '.join(failed)}",
+            kind=errors.UNAVAILABLE,
+            context={"agents": failed},
+        )
 
 
 @main.command(name="probe")
@@ -1303,7 +1398,7 @@ def _agents_check(registry: AgentRegistry, name: str | None, *, json_mode: bool)
     is_flag=True,
     help="Read the advertised modes; opens and releases a session and sends zero turns.",
 )
-@click.option("--json", "json_mode", is_flag=True, help="Emit the report as JSON.")
+@_json_option("Emit the report as JSON.")
 @click.help_option("-h", "--help")
 def probe_command(entry: str, discover: bool, json_mode: bool) -> None:
     """Read an adapter's advertised modes, without editing its registry entry.
@@ -1326,15 +1421,9 @@ def probe_command(entry: str, discover: bool, json_mode: bool) -> None:
     try:
         report = probe_engine.run(entry)
     except RegistryError as error:
-        if json_mode:
-            _emit_json({"error": str(error)})
-            raise SystemExit(vocab.EXIT_USAGE) from None
-        raise UsageProblem(str(error)) from None
+        raise _registry_problem(error) from None
     except probe_engine.ProbeError as error:
-        if json_mode:
-            _emit_json({"error": str(error)})
-            raise SystemExit(vocab.EXIT_AGENT_ERROR) from None
-        raise AgentProblem(str(error)) from None
+        raise _probe_problem(error) from None
     if json_mode:
         _emit_json(report.payload())
     else:
@@ -1363,7 +1452,7 @@ def probe_command(entry: str, discover: bool, json_mode: bool) -> None:
     ),
 )
 @click.option("--home", metavar="DIR", help="Vendor home override for the variant.")
-@click.option("--json", "json_mode", is_flag=True, help="Emit the created entry as JSON.")
+@_json_option("Emit the created entry as JSON.")
 @click.help_option("-h", "--help")
 def agents_init_command(
     name: str,
@@ -1386,15 +1475,18 @@ def agents_init_command(
         if effort is not None:
             registry.resolve_call(parent, model=model, effort=effort)
     except RegistryError as error:
-        if json_mode:
-            _emit_json({"error": str(error)})
-            raise SystemExit(vocab.EXIT_USAGE) from None
-        raise UsageProblem(str(error)) from None
+        raise _registry_problem(error) from None
     if not name or "/" in name or "\\" in name or name in {".", ".."}:
         raise UsageProblem(f"invalid agent name '{name}'")
     target = paths.agents_dir() / f"{name}.toml"
     if target.exists():
-        raise UsageProblem(f"agent entry already exists: {target}")
+        # A strict create whose target already exists: nothing is malformed,
+        # the name is simply taken.
+        raise AcpcError(
+            f"agent entry already exists: {target}",
+            kind=errors.CONFLICT,
+            hint="Pick another name, or edit the entry in place.",
+        )
     fields = [
         ("extends", parent),
         ("model", model),
@@ -1440,7 +1532,7 @@ def _run_skills_view(name: str | None, *, json_mode: bool) -> None:
     try:
         skill = skills.get_skill(name)
     except skills.SkillNotFoundError:
-        raise UsageProblem(f"unknown skill {name!r} — use acpc skills") from None
+        raise _not_found(f"unknown skill {name!r}", hint="Run: acpc skills") from None
 
     if json_mode:
         _emit_json(_skill_payload(skill, include_body=True))
@@ -1450,7 +1542,7 @@ def _run_skills_view(name: str | None, *, json_mode: bool) -> None:
 
 
 @main.group(name="skills", cls=_SkillsGroup, invoke_without_command=True)
-@click.option("--json", "json_mode", is_flag=True, help="Emit this view as JSON.")
+@_json_option("Emit this view as JSON.")
 @click.help_option("-h", "--help")
 @click.pass_context
 def skills_group(ctx: click.Context, json_mode: bool) -> None:
@@ -1464,7 +1556,7 @@ def skills_group(ctx: click.Context, json_mode: bool) -> None:
 
 @click.command(name="skill-view")
 @click.argument("name")
-@click.option("--json", "json_mode", is_flag=True, help="Emit this view as JSON.")
+@_json_option("Emit this view as JSON.")
 @click.help_option("-h", "--help")
 def _skill_view_command(name: str, json_mode: bool) -> None:
     """Render one named bundled skill.
@@ -1476,7 +1568,7 @@ def _skill_view_command(name: str, json_mode: bool) -> None:
 
 @main.command(name="install")
 @click.argument("agent")
-@click.option("--json", "json_mode", is_flag=True, help="Emit the install result as JSON.")
+@_json_option("Emit the install result as JSON.")
 @click.help_option("-h", "--help")
 def install_command(agent: str, json_mode: bool) -> None:
     """Run an agent's install command from its registry entry.
@@ -1502,30 +1594,33 @@ def install_command(agent: str, json_mode: bool) -> None:
 
         result = registry.execute_install(agent, runner=run_installer)
     except RegistryError as error:
-        if json_mode:
-            _emit_json({"agent": agent, "ok": False, "error": str(error)})
-            raise SystemExit(vocab.EXIT_USAGE) from None
-        raise UsageProblem(str(error)) from None
+        # Nothing was installed and nothing ran: this is the failure itself,
+        # not a result, so it leaves as an envelope with no stdout behind it.
+        raise _registry_problem(error).with_context(agent=agent) from None
     except OSError as error:
-        message = f"install {agent} failed: {error}"
-        if json_mode:
-            _emit_json({"agent": agent, "ok": False, "error": message})
-            raise SystemExit(vocab.EXIT_AGENT_ERROR) from None
-        raise AgentProblem(message) from None
+        raise AgentProblem(
+            f"install {agent} failed: {error}",
+            kind=errors.UNAVAILABLE,
+            context={"agent": agent},
+        ) from None
 
     for stream in (getattr(result, "stdout", None), getattr(result, "stderr", None)):
         if stream:
             click.echo(stream.rstrip("\n"), err=True)
     return_code = getattr(result, "returncode", 1)
+    # The installer ran and reported for itself, so its report is this
+    # command's declared output and stays on stdout; the envelope on stderr
+    # is what says the command failed.
     payload = {"agent": agent, "ok": return_code == 0, "returncode": return_code}
     if json_mode:
         _emit_json(payload)
     elif return_code == 0:
         _write_stdout(f"installed {agent}\n")
-    else:
-        raise AgentProblem(f"install {agent} failed (exit {return_code})")
     if return_code != 0:
-        raise SystemExit(vocab.EXIT_AGENT_ERROR)
+        raise AgentProblem(
+            f"install {agent} failed (exit {return_code})",
+            context={"agent": agent, "returncode": return_code},
+        )
 
 
 async def _cancel_with_daemon(target: str, session_id: str) -> bool | None:
@@ -1575,7 +1670,13 @@ def _cancel_session(meta: sessions.SessionMeta) -> sessions.SessionMeta:
         )
     result = proc.kill_process_tree(meta.pid, meta.process_start_time)
     if result == "refused":
-        raise UsageProblem(f"could not stop session {meta.session_id}: refused to signal it")
+        # The process is there and would not take the signal, so acpc did not
+        # observe the stop it was asked for and must not report one.
+        raise AcpcError(
+            f"could not stop session {meta.session_id}: refused to signal it",
+            kind=errors.UNAVAILABLE,
+            context={"session_id": meta.session_id},
+        )
     return _wait_for_stop(meta.session_id)
 
 
@@ -1585,7 +1686,7 @@ def _maintenance_json(payload: Mapping[str, Any]) -> None:
 
 @main.command(name="stop")
 @click.argument("selector")
-@click.option("--json", "json_mode", is_flag=True, help="Emit the result as JSON.")
+@_json_option("Emit the result as JSON.")
 @click.help_option("-h", "--help")
 def stop_command(selector: str, json_mode: bool) -> None:
     """Stop a running session; it stays resumable with ``acpc continue``.
@@ -1619,7 +1720,7 @@ def stop_command(selector: str, json_mode: bool) -> None:
 
 @main.command(name="rm")
 @click.argument("selector")
-@click.option("--json", "json_mode", is_flag=True, help="Emit the result as JSON.")
+@_json_option("Emit the result as JSON.")
 @click.help_option("-h", "--help")
 def rm_command(selector: str, json_mode: bool) -> None:
     """Delete a finished session's on-disk state.
@@ -1634,7 +1735,7 @@ def rm_command(selector: str, json_mode: bool) -> None:
     try:
         sessions.delete_session(meta.session_id)
     except sessions.SessionStateError as error:
-        raise UsageProblem(str(error)) from None
+        raise _session_problem(error).with_context(session_id=meta.session_id) from None
     payload = {"session_id": meta.session_id, "removed": True, "paths": advertised_paths}
     if json_mode:
         _maintenance_json(payload)
@@ -1646,7 +1747,7 @@ def rm_command(selector: str, json_mode: bool) -> None:
 @main.command(name="prune")
 @click.option("--older-than", default=None, metavar="D", help="Age threshold, such as 7d.")
 @click.option("--dry-run", is_flag=True, help="List candidates without deleting them.")
-@click.option("--json", "json_mode", is_flag=True, help="Emit the result as JSON.")
+@_json_option("Emit the result as JSON.")
 @click.help_option("-h", "--help")
 def prune_command(older_than: str | None, dry_run: bool, json_mode: bool) -> None:
     """Delete finished sessions older than the retention period.
@@ -1669,9 +1770,11 @@ def prune_command(older_than: str | None, dry_run: bool, json_mode: bool) -> Non
                 "delete every finished session; pass --older-than 0d to do that explicitly"
             )
         candidates = sessions.prune_sessions(older_than=duration, dry_run=dry_run)
-    except UsageProblem:
+    except AcpcError:
         raise
-    except (config.ConfigError, ValueError, sessions.SessionError) as error:
+    except sessions.SessionError as error:
+        raise _session_problem(error) from None
+    except (config.ConfigError, ValueError) as error:
         raise UsageProblem(str(error)) from None
 
     session_ids = [meta.session_id for meta in candidates]
@@ -1692,7 +1795,7 @@ def _load_view_session(selector: str) -> sessions.SessionMeta:
         session_id = sessions.resolve_selector(selector, allow_last=_stdout_is_tty())
         return sessions.load(session_id)
     except sessions.SessionError as error:
-        raise UsageProblem(str(error)) from None
+        raise _session_problem(error) from None
 
 
 async def _collect_preparing_sessions(targets: Sequence[str]) -> set[str]:
@@ -1775,7 +1878,7 @@ def _read_transcript_page(
             next_cursor = page.next_cursor
         return transcript.TranscriptPage(selected, next_cursor)
     except transcript.TranscriptError as error:
-        raise UsageProblem(str(error)) from None
+        raise AcpcError(str(error), kind=errors.CORRUPT_STATE) from None
 
 
 def _latest_failure_message(session_id: str) -> str | None:
@@ -1798,7 +1901,7 @@ def _latest_failure_message(session_id: str) -> str | None:
     is_flag=True,
     help="Show every session, not just running + the 5 most recent finished.",
 )
-@click.option("--json", "json_mode", is_flag=True, help="Emit a JSON status object.")
+@_json_option("Emit a JSON status object.")
 @click.help_option("-h", "--help")
 def status_command(selector: str | None, all_sessions: bool, json_mode: bool) -> None:
     """Show liveness-verified session metadata without reading transcripts.
@@ -1858,7 +1961,7 @@ def status_command(selector: str | None, all_sessions: bool, json_mode: bool) ->
     help="Show only the last N selected events; without --since or --tail, show the last 20 events.",
 )
 @click.option("--prose", is_flag=True, help="Render full agent messages.")
-@click.option("--json", "json_mode", is_flag=True, help="Emit raw transcript events as NDJSON.")
+@_json_option("Emit raw transcript events as NDJSON.")
 @click.option(
     "--max-output",
     type=click.IntRange(min=0),
@@ -1916,7 +2019,9 @@ def log_command(
     try:
         transcript_file = transcript.Transcript(sessions.transcript_path(meta.session_id))
     except transcript.TranscriptError as error:
-        raise UsageProblem(str(error)) from None
+        raise AcpcError(
+            str(error), kind=errors.CORRUPT_STATE, context={"session_id": meta.session_id}
+        ) from None
     explicit_since = since is not None
     cursor = 0 if since is None else since
     # Only an explicit --since is checked, so the extra read that finds the
@@ -2013,7 +2118,14 @@ def log_command(
         )
         _echo_metadata(footer)
     if timed_out:
-        raise SystemExit(vocab.EXIT_TIMEOUT)
+        raise AcpcError(
+            f"no new events on session {meta.session_id} within the window",
+            kind=errors.TIMEOUT,
+            exit_code=vocab.EXIT_TIMEOUT,
+            retryable=True,
+            hint=f"Run: acpc log {meta.session_id} --wait-new --since {rendered.next_cursor}",
+            context={"session_id": meta.session_id, "cursor": rendered.next_cursor},
+        )
 
 
 def _sleep_until(deadline: float | None) -> None:
@@ -2159,9 +2271,24 @@ def _follow_log(
             )
         )
     if exhausted:
-        raise SystemExit(vocab.EXIT_BUDGET)
+        # A cut stream is not a completed follow, and the cursor in `context`
+        # is exactly what a caller needs to resume without a gap or a repeat.
+        raise AcpcError(
+            f"stopped following session {meta.session_id}: --max-output {max_output} exhausted",
+            kind=errors.OUTCOME_UNKNOWN,
+            exit_code=vocab.EXIT_BUDGET,
+            hint=f"Run: acpc log {meta.session_id} --follow --since {cursor}",
+            context={"session_id": meta.session_id, "cursor": cursor},
+        )
     if timed_out:
-        raise SystemExit(vocab.EXIT_TIMEOUT)
+        raise AcpcError(
+            f"gave up following session {meta.session_id}",
+            kind=errors.TIMEOUT,
+            exit_code=vocab.EXIT_TIMEOUT,
+            retryable=True,
+            hint=f"Run: acpc log {meta.session_id} --follow --since {cursor}",
+            context={"session_id": meta.session_id, "cursor": cursor},
+        )
 
 
 def _budget_exhausted_note(session_id: str, max_output: int, cursor: int) -> str:
@@ -2233,7 +2360,7 @@ def _still_running_note(session_id: str, timeout: float | None) -> str:
 )
 @click.option("--bg", "background", is_flag=True, help="Dispatch and return the session id.")
 @click.option("--quiet", is_flag=True, help="Suppress the stderr summary line.")
-@click.option("--json", "json_mode", is_flag=True, help="Emit this command's output as JSON.")
+@_json_option("Emit this command's output as JSON.")
 @click.help_option("-h", "--help")
 def run_command(
     agent: str,
@@ -2278,7 +2405,7 @@ def run_command(
             _warn_permission_alias(registry.permission_alias(agent))
         _warn_unlisted_effort_model(resolution)
     except RegistryError as error:
-        raise UsageProblem(str(error)) from None
+        raise _registry_problem(error) from None
 
     defaulted_permissions = permissions is None and resolution.permissions is None
     policy, permissions_clamp = _resolve_permissions(
@@ -2305,14 +2432,14 @@ def run_command(
     try:
         command_head = runner.adapter_command(resolution)[0]
     except runner.RunnerError as error:
-        raise AgentProblem(str(error)) from None
+        raise _runner_problem(error) from None
     del command_head
 
     if alias is not None:
         try:
             warning = sessions.claim_name(alias)
         except sessions.SessionNameError as error:
-            raise UsageProblem(str(error)) from None
+            raise _session_problem(error) from None
         if warning:
             click.echo(f"-- {warning}", err=True)
 
@@ -2350,7 +2477,7 @@ def run_command(
     try:
         outcome = runner.execute_turn(meta.session_id, request)
     except runner.RunnerError as error:
-        raise AgentProblem(str(error)) from None
+        raise _runner_problem(error).with_context(session_id=meta.session_id) from None
 
     final = sessions.read_meta(meta.session_id)
     if output_file is not None:
@@ -2372,12 +2499,67 @@ def run_command(
             f"-- detached, still RUNNING: {meta.session_id}"
             f" — answer: acpc wait {meta.session_id} · cancel: acpc stop {meta.session_id}"
         )
-        raise SystemExit(outcome.exit_code)
+        _end_turn(meta.session_id, outcome.state, outcome.stop_reason, outcome.exit_code)
 
     if not quiet:
         _echo_metadata(output.format_summary(final, route_note=_route_note(outcome)))
 
-    raise SystemExit(outcome.exit_code)
+    _end_turn(meta.session_id, outcome.state, outcome.stop_reason, outcome.exit_code)
+
+
+# What a finished turn means when it did not end in `done`.  The exit code
+# already says which ending it was; the kind is what a caller matches on.
+_TURN_FAILURE_KINDS = {
+    "failed": errors.AGENT_ERROR,
+    "orphaned": errors.AGENT_ERROR,
+    "cancelled": errors.INTERRUPTED,
+    "timeout": errors.TIMEOUT,
+    # The daemon still owns the turn: acpc stopped watching without seeing how
+    # it ends, and saying "failed" would claim knowledge it does not have.
+    "detached": errors.OUTCOME_UNKNOWN,
+    "terminated": errors.INTERRUPTED,
+}
+
+_TURN_FAILURE_MESSAGES = {
+    "failed": "session {id} failed",
+    "orphaned": "session {id} is orphaned: the process behind it is gone",
+    "cancelled": "session {id} was cancelled",
+    "timeout": "session {id} timed out",
+    "detached": "acpc detached from session {id}; the turn is still running",
+    "terminated": "session {id} was terminated",
+}
+
+
+def _end_turn(session_id: str, state: str, stop_reason: str | None, exit_code: int) -> NoReturn:
+    """Leave an answer-printing command, saying in one shape how it ended.
+
+    The exit code has always mirrored the session result; this adds the
+    machine-readable reason next to it, carrying the session id so a caller
+    that was cut off mid-turn can still reach the work (R7a).
+    """
+    if exit_code == vocab.EXIT_OK:
+        raise SystemExit(exit_code)
+    if stop_reason == "permission_denied":
+        kind = errors.PERMISSION_DENIED
+        message = f"session {session_id} was denied a permission it needed"
+    else:
+        kind = _TURN_FAILURE_KINDS.get(state, errors.AGENT_ERROR)
+        template = _TURN_FAILURE_MESSAGES.get(state, "session {id} did not finish")
+        message = template.format(id=session_id)
+    if state in {"failed", "orphaned"} and (detail := _latest_failure_message(session_id)):
+        message = f"{message}: {detail}"
+    hint = (
+        f"Run: acpc wait {session_id}"
+        if state == "detached"
+        else f"Run: acpc log {session_id} --since 0"
+    )
+    raise AcpcError(
+        message,
+        kind=kind,
+        exit_code=exit_code,
+        hint=hint,
+        context={"session_id": session_id},
+    )
 
 
 def _route_note(outcome: runner.TurnOutcome) -> str | None:
@@ -2404,7 +2586,9 @@ def _dispatch_background(session_id: str, request: runner.TurnRequest, *, json_m
 
     problem = asyncio.run(runner.dispatch_background(session_id, request))
     if problem is not None:
-        raise AgentProblem(problem)
+        # The session exists by now: the caller has to be able to reach it
+        # even though the dispatch that would have run it failed (R7a).
+        raise AgentProblem(problem, context={"session_id": session_id})
     if json_mode:
         import json
 
@@ -2449,7 +2633,7 @@ def _dispatch_background(session_id: str, request: runner.TurnRequest, *, json_m
     help="Cap on stdout bytes; 0 disables the cap.",
 )
 @click.option("--quiet", is_flag=True, help="Suppress the stderr summary line.")
-@click.option("--json", "json_mode", is_flag=True, help="Emit this command's output as JSON.")
+@_json_option("Emit this command's output as JSON.")
 @click.option(
     "--model",
     metavar="M",
@@ -2540,8 +2724,12 @@ def continue_command(
     prompt = _read_prompt(prompt_text, prompt_file)
     meta = _load_view_session(selector)
     if meta.is_active:
-        raise UsageProblem(
-            f"session {meta.session_id} is {meta.state} — wait for the current turn to finish"
+        raise AcpcError(
+            f"session {meta.session_id} is {meta.state} — wait for the current turn to finish",
+            kind=errors.CONFLICT,
+            retryable=True,
+            hint=f"Run: acpc wait {meta.session_id}",
+            context={"session_id": meta.session_id},
         )
     _dispatch_follow_up(
         meta,
@@ -2577,7 +2765,7 @@ def _dispatch_follow_up(
         current = sessions.read_meta(meta.session_id)
         stored_policy = _stored_permission_policy(current)
     except sessions.SessionError as error:
-        raise UsageProblem(str(error)) from None
+        raise _session_problem(error).with_context(session_id=meta.session_id) from None
     policy = permissions if permissions is not None else stored_policy
     policy, permissions_clamp = _clamp_inherited_ceiling(policy)
     interactive = _stdout_is_tty() and not background
@@ -2596,7 +2784,11 @@ def _dispatch_follow_up(
     try:
         stored_resolution = runner.resolution_from_session(current)
     except runner.RunnerError as error:
-        raise UsageProblem(str(error)) from None
+        # Everything this call can fail on is a value read back from
+        # `meta.json`, so the session's own record is what is wrong.
+        raise AcpcError(
+            str(error), kind=errors.CORRUPT_STATE, context={"session_id": meta.session_id}
+        ) from None
     selection: CallResolution | None = None
     if (
         permissions is not None
@@ -2630,10 +2822,19 @@ def _dispatch_follow_up(
             defer_rotation=True,
             rotation_resolution=updated_resolution,
         )
-    except (runner.RunnerError, sessions.SessionError, OSError, UsageProblem) as error:
-        if isinstance(error, UsageProblem):
-            raise
-        raise UsageProblem(str(error)) from None
+    except AcpcError:
+        raise
+    except sessions.SessionError as error:
+        raise _session_problem(error).with_context(session_id=meta.session_id) from None
+    except runner.RunnerError as error:
+        # Every value this build validates was read back from `meta.json`.
+        raise AcpcError(
+            str(error), kind=errors.CORRUPT_STATE, context={"session_id": meta.session_id}
+        ) from None
+    except OSError as error:
+        raise AgentProblem(
+            str(error), kind=errors.UNAVAILABLE, context={"session_id": meta.session_id}
+        ) from None
 
     if background:
         _dispatch_background(meta.session_id, request, json_mode=json_mode)
@@ -2645,9 +2846,18 @@ def _dispatch_follow_up(
     try:
         outcome = runner.execute_turn(meta.session_id, request)
     except runner.ResumeRotationError as error:
-        raise UsageProblem(str(error)) from None
+        # Without a turn token the store never opened the turn — something
+        # else holds the session.  With one, the turn opened and the record it
+        # rotated onto turned out to be unusable.
+        held = error.turn_token is None
+        raise AcpcError(
+            str(error),
+            kind=errors.CONFLICT if held else errors.CORRUPT_STATE,
+            retryable=True if held else None,
+            context={"session_id": meta.session_id},
+        ) from None
     except runner.RunnerError as error:
-        raise AgentProblem(str(error)) from None
+        raise _runner_problem(error).with_context(session_id=meta.session_id) from None
 
     final = sessions.read_meta(meta.session_id)
     if output_file is not None:
@@ -2666,10 +2876,10 @@ def _dispatch_follow_up(
             f"-- detached, still RUNNING: {meta.session_id}"
             f" — answer: acpc wait {meta.session_id} · cancel: acpc stop {meta.session_id}"
         )
-        raise SystemExit(outcome.exit_code)
+        _end_turn(meta.session_id, outcome.state, outcome.stop_reason, outcome.exit_code)
     if not quiet:
         _echo_metadata(output.format_summary(final, route_note=_route_note(outcome)))
-    raise SystemExit(outcome.exit_code)
+    _end_turn(meta.session_id, outcome.state, outcome.stop_reason, outcome.exit_code)
 
 
 # SPEC `steer`: the preamble is fixed text, so the callee reads the redirect
@@ -2705,7 +2915,7 @@ def _steer_prompt(instruction: str) -> str:
     help="Cap on stdout bytes; 0 disables the cap.",
 )
 @click.option("--quiet", is_flag=True, help="Suppress the stderr summary line.")
-@click.option("--json", "json_mode", is_flag=True, help="Emit this command's output as JSON.")
+@_json_option("Emit this command's output as JSON.")
 @click.help_option("-h", "--help")
 def steer_command(
     selector: str,
@@ -2735,9 +2945,11 @@ def steer_command(
     if not meta.is_active:
         meta = _status_view_meta(meta)
     if not meta.is_active and meta.state != "preparing":
-        raise UsageProblem(
-            f"session {meta.session_id} is {meta.state} — there is no turn to interrupt; "
-            f"the follow-up verb for a finished session is: acpc continue {meta.session_id}"
+        raise AcpcError(
+            f"session {meta.session_id} is {meta.state} — there is no turn to interrupt",
+            kind=errors.CONFLICT,
+            hint=f"Run: acpc continue {meta.session_id}",
+            context={"session_id": meta.session_id},
         )
 
     meta = _cancel_session(meta)
@@ -2787,7 +2999,7 @@ def steer_command(
     help="Cap rendered output bytes; 0 disables the cap.",
 )
 @click.option("--quiet", is_flag=True, help="Suppress the stderr summary line.")
-@click.option("--json", "json_mode", is_flag=True, help="Emit this command's output as JSON.")
+@_json_option("Emit this command's output as JSON.")
 @click.help_option("-h", "--help")
 def wait_command(
     selector: str,
@@ -2813,7 +3025,14 @@ def wait_command(
         # SPEC `wait`: the timeout stops waiting only — the session runs on.
         if not quiet:
             _echo_metadata(_still_running_note(meta.session_id, timeout))
-        raise SystemExit(vocab.EXIT_TIMEOUT)
+        raise AcpcError(
+            f"gave up waiting for session {meta.session_id}; it is still running",
+            kind=errors.TIMEOUT,
+            exit_code=vocab.EXIT_TIMEOUT,
+            retryable=True,
+            hint=f"Run: acpc wait {meta.session_id}",
+            context={"session_id": meta.session_id},
+        )
 
     final = sessions.read_meta(meta.session_id)
     answer = _answer_text(meta.session_id)
@@ -2835,7 +3054,12 @@ def wait_command(
         ):
             summary += f" | failure: {failure_message}"
         _echo_metadata(summary)
-    raise SystemExit(runner.exit_code_for(final.state, final.stop_reason))
+    _end_turn(
+        final.session_id,
+        final.state,
+        final.stop_reason,
+        runner.exit_code_for(final.state, final.stop_reason),
+    )
 
 
 def _answer_text(session_id: str) -> str:
@@ -2863,7 +3087,7 @@ def daemon_group() -> None:
 
 @daemon_group.command(name="status")
 @click.argument("agent", required=False)
-@click.option("--json", "json_mode", is_flag=True, help="Emit the status as JSON.")
+@_json_option("Emit the status as JSON.")
 @click.help_option("-h", "--help")
 def daemon_status_command(agent: str | None, json_mode: bool) -> None:
     """Report each live daemon with its acpc version, pid, uptime, idle age and log path.
@@ -2949,9 +3173,11 @@ async def _stop_daemons(agent: str | None, *, force: bool = False) -> int:
             noun = "session" if count == 1 else "sessions"
             scope = f" {agent}" if agent else ""
             ids = ", ".join(meta.session_id for meta in active)
-            raise UsageProblem(
-                f"daemon stop{scope}: {count} active {noun} ({ids}) — wait or stop them first, "
-                "or pass --force"
+            raise AcpcError(
+                f"daemon stop{scope}: {count} active {noun} ({ids}) — wait or stop them first",
+                kind=errors.PRECONDITION_FAILED,
+                hint=f"Run: acpc daemon stop{scope} --force",
+                context={"sessions": [meta.session_id for meta in active]},
             )
 
     stopped = 0
