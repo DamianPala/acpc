@@ -632,16 +632,16 @@ def test_a_daemon_routed_failure_still_reports_the_result(
 ) -> None:
     """A turn that ran and failed is a result, not an aborted command.
 
-    The daemon has already finalized it on disk, so a blocking client must
-    mirror that — answer, summary line, `--json` envelope — instead of raising
-    the adapter's error and printing nothing an agent caller can parse.
+    The daemon has already finalized it on disk, so the failure is reported by
+    the shared error envelope on stderr; machine stdout remains empty.
     """
     result = invoke(cli, "run", "mock", "auth:vendor rejected the request", "--json")
 
     assert result.exit_code == vocab.EXIT_AGENT_ERROR
-    payload = json.loads(result.stdout)
-    assert payload["state"] == "failed"
-    assert "mock login" in payload["answer"]
+    payload = error_envelope(result)
+    assert payload["kind"] == "operation_failed"
+    assert payload["context"]["status"] == "failed"
+    assert result.stdout == ""
     assert "-- failed" in result.stderr
 
 
@@ -853,9 +853,12 @@ def test_the_stored_resolution_carries_the_default_cwd(
 def test_output_file_receives_the_answer(cli: CliRunner, tmp_path: Path) -> None:
     target = tmp_path / "answer.md"
 
-    result = invoke(cli, "run", "mock", "echo:written to a file", "-o", str(target), "--quiet")
+    result = invoke(
+        cli, "run", "mock", "echo:written to a file", "--output-file", str(target), "--quiet"
+    )
 
     assert result.exit_code == vocab.EXIT_OK
+    assert result.stdout == ""
     assert "written to a file" in target.read_text(encoding="utf-8")
 
 

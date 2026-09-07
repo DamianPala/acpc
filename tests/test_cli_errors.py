@@ -130,17 +130,17 @@ def test_a_person_at_a_terminal_gets_the_line_and_its_hint_instead(
     assert result.exit_code == vocab.EXIT_AGENT_ERROR
     assert result.stderr.splitlines() == [
         "Error: unknown session 'does-not-exist'",
-        "Run: acpc status --all",
+        "Run: acpc status",
     ]
 
 
 def test_a_terminal_failure_without_a_hint_is_one_line(
     cli: CliRunner, terminal_stderr: None
 ) -> None:
-    result = invoke(cli, "status", "some-id", "--all")
+    result = invoke(cli, "status", "some-id", "--plain", "--limit", "1")
 
     assert result.exit_code == vocab.EXIT_USAGE
-    assert result.stderr == "Error: --all cannot be used with a session id\n"
+    assert result.stderr == "Error: --plain is available only for the status collection\n"
 
 
 # --- failures raised before the format was resolved -------------------------
@@ -175,7 +175,7 @@ def test_a_command_that_parses_json_itself_refines_the_argument_scan(
     The scan runs before Click and sees the word. The command then reports
     what it actually parsed, so a person at a terminal keeps their prose.
     """
-    result = invoke(cli, "run", "no-such-agent", "-o", "--json", "hello")
+    result = invoke(cli, "run", "no-such-agent", "--output-file", "--json", "hello")
 
     assert result.exit_code == vocab.EXIT_AGENT_ERROR
     assert result.stderr.splitlines() == [
@@ -188,12 +188,12 @@ def test_a_command_that_parses_json_itself_refines_the_argument_scan(
 
 
 def test_optional_fields_are_absent_rather_than_null(cli: CliRunner) -> None:
-    result = invoke(cli, "status", "some-id", "--all")
+    result = invoke(cli, "status", "some-id", "--plain", "--limit", "1")
 
     assert result.exit_code == vocab.EXIT_USAGE
     assert envelope(result) == {
         "kind": "invalid_input",
-        "message": "--all cannot be used with a session id",
+        "message": "--plain is available only for the status collection",
     }
 
 
@@ -375,7 +375,7 @@ def test_ctrl_c_on_a_turn_cancels_it_and_names_the_session(cli: CliRunner) -> No
     error = json.loads(stderr.splitlines()[-1])["error"]
     assert error["kind"] == "interrupted"
     assert error["context"]["session_id"] == session_id
-    assert sessions.read_meta(session_id).state == "cancelled"
+    assert sessions.read_meta(session_id).state == "canceled"
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal semantics")
@@ -400,7 +400,7 @@ def test_interrupted_is_this_command_being_stopped_not_a_cancelled_session() -> 
             watcher.wait(timeout=10)
         if pid is not None:
             proc.kill_process_tree(pid, None)
-    sessions.transition(meta.session_id, "cancelled")
+    sessions.transition(meta.session_id, "canceled")
 
     observer = run_cli("wait", meta.session_id)
     _stdout, observed_stderr = observer.communicate(timeout=10)
@@ -411,7 +411,7 @@ def test_interrupted_is_this_command_being_stopped_not_a_cancelled_session() -> 
     assert observer.returncode == vocab.EXIT_CANCELLED
     observed = json.loads(observed_stderr.splitlines()[-1])["error"]
     assert observed["kind"] == "operation_failed"
-    assert observed["context"] == {"session_id": meta.session_id, "status": "cancelled"}
+    assert observed["context"] == {"session_id": meta.session_id, "status": "canceled"}
 
 
 # --- kinds that are not the caller's syntax ---------------------------------

@@ -278,7 +278,7 @@ def test_every_listed_name_reaches_the_published_argument(
     help of the call says where it went, and asking for it starts nothing.
     """
     assert [arg["name"] for arg in read_detail(runner, group)["args"]] == ["name"]
-    listed = json.loads(invoke(runner, group, "--json").stdout)[group]
+    listed = json.loads(invoke(runner, group, "--json").stdout)["items"]
     names = [item["name"] for item in listed]
     assert names
     for name in names:

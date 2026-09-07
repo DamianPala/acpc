@@ -321,7 +321,13 @@ def test_record_prompt_usage_reads_prompt_response_meta(tmp_path: Path) -> None:
     assert client.cost == pytest.approx(0.1)
     events = transcript.read().events
     assert [e for e in events if e.get("type") == "usage"] == [
-        {"type": "usage", "tokens": 120, "cost": 0.1, "ts": 1.0, "i": 1}
+        {
+            "type": "usage",
+            "tokens": 120,
+            "cost": 0.1,
+            "ts": "1970-01-01T00:00:01.000000Z",
+            "i": 1,
+        }
     ]
 
 

@@ -80,7 +80,7 @@ def test_root_help_is_a_compact_cheat_sheet(runner: CliRunner) -> None:
     assert "--permissions execute" in result.stdout
     assert "request_permission" in result.stdout
     assert (
-        "status            running + the 5 most recent finished (--all for every session)"
+        "status            running + the 20 most recent sessions (--limit N to change)"
         in result.stdout
     )
     assert (
@@ -160,7 +160,7 @@ def test_help_names_behavioral_defaults_and_global_output_default(runner: CliRun
     assert "absent, no wall-clock limit (the callee runs until it is done)" in steer_help
     assert "absent, it blocks indefinitely" in wait_help
     assert "absent, it blocks indefinitely" in log_help
-    assert "without --since or --tail, show the last 20 events" in log_help
+    assert "without --since or --limit, show the last 20 events" in log_help
     assert (
         "absent, ask when acpc could put the question — stdin and stdout both terminals, "
         "no --json, NO_INPUT unset — and read in every other case"
@@ -183,11 +183,8 @@ def test_help_explains_session_lifecycle_and_retention(runner: CliRunner) -> Non
 
     assert "Stop a running session; it stays resumable with ``acpc continue``." in stop_help
     assert "Cancels the turn in flight (ACP ``session/cancel``)" in stop_help
-    assert "Show every session, not just running + the 5 most recent finished." in status_help
-    assert (
-        "With no id and no ``--all``: every running session plus the 5 most recent finished ones."
-        in status_help
-    )
+    assert "With no id: a bounded collection of sessions." in status_help
+    assert "Return at most N sessions" in status_help
     assert "and exit 124; the session keeps running" in wait_help
     assert "The exit code mirrors the session result." in wait_help
     assert "the free way to reprint an answer." in wait_help

@@ -56,7 +56,7 @@ def invoke(cli: CliRunner, *args: str):
     return cli.invoke(main, list(args), catch_exceptions=False)
 
 
-def _finished_session(state: str = "done") -> str:
+def _finished_session(state: str = "succeeded") -> str:
     meta = sessions.create_session(entry="mock", base_adapter="mock", prompt="maintenance")
     sessions.mark_running(
         meta.session_id,
@@ -71,7 +71,9 @@ def _backdate(root: Path, session_id: str, *, finished: float | None = None) -> 
     path = root / "sessions" / session_id / "meta.json"
     payload = json.loads(path.read_text(encoding="utf-8"))
     if finished is not None and payload["finished_at"] is not None:
-        payload["finished_at"] -= finished
+        timestamp = sessions.parse_timestamp(payload["finished_at"], "finished_at", path)
+        assert timestamp is not None
+        payload["finished_at"] = sessions.format_timestamp(timestamp - finished)
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
@@ -79,7 +81,7 @@ def _wait_until_running(cli: CliRunner, session_id: str) -> None:
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline:
         result = invoke(cli, "status", session_id, "--json")
-        if json.loads(result.stdout)["state"] == "running":
+        if json.loads(result.stdout)["status"] == "running":
             return
         time.sleep(0.05)
     pytest.fail(f"session {session_id} never became running")
@@ -164,7 +166,7 @@ def _finished_target_session(target: str, *, finished_at: float = 110.0) -> str:
         target=target,
         clock=lambda: 100.0,
     )
-    sessions.transition(meta.session_id, "done", clock=lambda: finished_at, exit_code=0)
+    sessions.transition(meta.session_id, "succeeded", clock=lambda: finished_at, exit_code=0)
     return meta.session_id
 
 
@@ -200,7 +202,7 @@ def test_daemon_status_renders_the_acpc_version(cli: CliRunner, live_daemon: Non
     text_result = invoke(cli, "daemon", "status", "mock")
     json_result = invoke(cli, "daemon", "status", "mock", "--json")
     row = _daemon_status_line(text_result, target)
-    entry = json.loads(json_result.stdout)["daemons"][0]
+    entry = json.loads(json_result.stdout)["items"][0]
 
     assert row.startswith(f"{target}  acpc {__version__}  pid ")
     assert row.count(f"acpc {__version__}") == 1
@@ -237,7 +239,7 @@ def test_daemon_status_running_target_renders_dot_and_json_null(
     json_result = invoke(cli, "daemon", "status", "mock", "--json")
     target = _target()
     row = _daemon_status_line(text_result, target)
-    entry = json.loads(json_result.stdout)["daemons"][0]
+    entry = json.loads(json_result.stdout)["items"][0]
 
     assert "idle " not in row
     assert "· ·" in row
@@ -257,7 +259,7 @@ def test_daemon_status_starting_target_renders_dot_and_json_null(
     text_result = invoke(cli, "daemon", "status", "mock")
     json_result = invoke(cli, "daemon", "status", "mock", "--json")
     row = _daemon_status_line(text_result, target)
-    entry = json.loads(json_result.stdout)["daemons"][0]
+    entry = json.loads(json_result.stdout)["items"][0]
 
     assert "idle " not in row
     assert "· ·" in row
@@ -276,7 +278,7 @@ def test_daemon_status_json_idle_age_matches_text(cli: CliRunner, live_daemon: N
     finally:
         cli_module.time = original_time
 
-    entry = json.loads(json_result.stdout)["daemons"][0]
+    entry = json.loads(json_result.stdout)["items"][0]
     assert entry["idle_seconds"] == 10.0
     assert "idle 0m10s" in _daemon_status_line(text_result, target)
     assert (
@@ -293,7 +295,7 @@ def test_daemon_status_never_served_target_has_no_idle_age(
     text_result = invoke(cli, "daemon", "status", "mock")
     json_result = invoke(cli, "daemon", "status", "mock", "--json")
     row = _daemon_status_line(text_result, target)
-    entry = json.loads(json_result.stdout)["daemons"][0]
+    entry = json.loads(json_result.stdout)["items"][0]
 
     assert "idle " not in row
     assert "· ·" in row
@@ -446,7 +448,7 @@ def test_stop_running_session_cancels_daemon_and_preserves_artifacts(
     stopped = invoke(cli, "stop", session_id)
 
     assert stopped.exit_code == vocab.EXIT_OK
-    assert sessions.read_meta(session_id).state == "cancelled"
+    assert sessions.read_meta(session_id).state == "canceled"
     assert sessions.transcript_path(session_id).exists()
     answer = sessions.answer_path(session_id)
     assert answer.exists()
@@ -460,8 +462,9 @@ def test_stop_json_is_one_object_on_stdout(cli: CliRunner) -> None:
     assert result.exit_code == vocab.EXIT_OK
     assert json.loads(result.stdout) == {
         "session_id": session_id,
-        "state": "done",
+        "status": "succeeded",
         "stop_reason": "test",
+        "changed": False,
     }
     assert result.stderr.startswith("-- stop ")
 
@@ -529,8 +532,11 @@ def test_prune_measures_age_from_finished_at(cli: CliRunner, state_root: Path) -
     session_id = _finished_session()
     path = state_root / "sessions" / session_id / "meta.json"
     payload = json.loads(path.read_text(encoding="utf-8"))
-    payload["created_at"] -= 200 * 86400
-    payload["started_at"] -= 200 * 86400
+    created_at = sessions.parse_timestamp(payload["created_at"], "created_at", path)
+    started_at = sessions.parse_timestamp(payload["started_at"], "started_at", path)
+    assert created_at is not None and started_at is not None
+    payload["created_at"] = sessions.format_timestamp(created_at - 200 * 86400)
+    payload["started_at"] = sessions.format_timestamp(started_at - 200 * 86400)
     path.write_text(json.dumps(payload), encoding="utf-8")
 
     result = invoke(cli, "prune", "--older-than", "100d", "--yes")

@@ -13,6 +13,7 @@ from acpc.output import format_duration, format_tokens
 
 Clock = Callable[[], float]
 DEFAULT_LOG_MAX_OUTPUT = 128 * 1024
+DEFAULT_STATUS_LIMIT = 20
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,13 +83,28 @@ def _event_timestamp(event: Mapping[str, Any]) -> str:
     if isinstance(value, bool) or not isinstance(value, (int, float, str)):
         return "??:??:??"
     try:
-        return datetime.fromtimestamp(float(value), tz=UTC).astimezone().strftime("%H:%M:%S")
+        if isinstance(value, str):
+            candidate = value[:-1] + "+00:00" if value.endswith("Z") else value
+            timestamp = datetime.fromisoformat(candidate)
+        else:
+            timestamp = datetime.fromtimestamp(float(value), tz=UTC)
+        return timestamp.astimezone().strftime("%H:%M:%S")
     except (TypeError, ValueError, OverflowError, OSError):
         return "??:??:??"
 
 
 def _single_line(value: object) -> str:
     return " ".join(str(value).split())
+
+
+def safe_text(value: object) -> str:
+    """Make caller-controlled terminal text visible without control bytes."""
+    return _single_line(value).replace("\x1b", "^[")
+
+
+def _safe_text(value: object) -> str:
+    """Backward-compatible private name for the status renderer."""
+    return safe_text(value)
 
 
 def snippet(text: str, *, limit: int = 200) -> str:
@@ -446,7 +462,7 @@ def _status_active(meta: sessions.SessionMeta) -> bool:
 
 
 def _status_selection(
-    sessions_in: Sequence[sessions.SessionMeta], *, all_sessions: bool
+    sessions_in: Sequence[sessions.SessionMeta], *, all_sessions: bool, limit: int
 ) -> list[sessions.SessionMeta]:
     if all_sessions:
         return list(sessions_in)
@@ -462,8 +478,15 @@ def _status_selection(
             meta.session_id,
         ),
         reverse=True,
-    )[:5]
-    return active + finished
+    )
+    return (active + finished)[:limit]
+
+
+def status_items(
+    sessions_in: Sequence[sessions.SessionMeta], *, limit: int = DEFAULT_STATUS_LIMIT
+) -> list[sessions.SessionMeta]:
+    """Return the bounded status collection in its documented order."""
+    return _status_selection(sessions_in, all_sessions=False, limit=limit)
 
 
 def _status_row(meta: sessions.SessionMeta, *, clock: Clock | None) -> tuple[str, ...]:
@@ -471,14 +494,14 @@ def _status_row(meta: sessions.SessionMeta, *, clock: Clock | None) -> tuple[str
     runtime = format_duration(runtime_seconds)
     idle_seconds = _idle_seconds(meta, now=now)
     idle = f"idle {format_duration(idle_seconds)}" if idle_seconds is not None else "·"
-    name = meta.name or "·"
+    name = _safe_text(meta.name) if meta.name else "·"
     model = meta.resolved_model or "·"
     snippet = json.dumps(meta.prompt_snippet, ensure_ascii=False)
     return (
         meta.session_id,
-        meta.entry,
-        model,
-        meta.state,
+        safe_text(meta.entry),
+        safe_text(model),
+        safe_text(meta.state),
         runtime,
         idle,
         name,
@@ -522,24 +545,23 @@ def render_status_list(
     sessions_in: Sequence[sessions.SessionMeta],
     *,
     all_sessions: bool = False,
+    limit: int = DEFAULT_STATUS_LIMIT,
     clock: Clock | None = None,
 ) -> str:
     """Render the status list and its in-view summary footer."""
-    selected = _status_selection(sessions_in, all_sessions=all_sessions)
+    selected = _status_selection(sessions_in, all_sessions=all_sessions, limit=limit)
     lines = format_table(
         [_status_row(meta, clock=clock) for meta in selected],
-        header=("id", "entry", "model", "state", "runtime", "idle", "name", "prompt"),
+        header=("id", "entry", "model", "status", "runtime", "idle", "name", "prompt"),
         separator="  ",
     )
     running_count = sum(_status_active(meta) for meta in sessions_in)
-    finished_count = len([meta for meta in sessions_in if meta.is_finished])
     if all_sessions:
         footer = f"-- {running_count} running · {len(sessions_in)} sessions"
     else:
-        footer = (
-            f"-- {running_count} running · {min(5, finished_count)} recent · "
-            f"--all for all {len(sessions_in)}"
-        )
+        footer = f"-- {len(selected)} z {len(sessions_in)}"
+        if len(selected) < len(sessions_in):
+            footer += " — --limit żeby zmienić"
     lines.append(footer)
     return "\n".join(lines) + "\n"
 
@@ -565,16 +587,21 @@ def render_status_detail(
     idle = f" · idle {format_duration(idle_seconds)}" if idle_seconds is not None else ""
     exit_text = f"exit {meta.exit_code}" if meta.exit_code is not None else "exit ·"
     tokens = format_tokens(meta.tokens)
-    name = meta.name or "·"
+    name = _safe_text(meta.name) if meta.name else "·"
     directory = _display_path(sessions.session_dir(meta.session_id))
     model = meta.resolved_model or "·"
     lines = [
-        f"state    {meta.state}{idle} · {exit_text} · {runtime} · {tokens}",
-        f"agent    {meta.entry} ({meta.base_adapter}) · model: {model} · name: {name}",
+        f"status   {safe_text(meta.state)}{idle} · {exit_text} · {runtime} · {tokens}",
+        (
+            f"agent    {safe_text(meta.entry)} ({safe_text(meta.base_adapter)}) · "
+            f"model: {safe_text(model)} · name: {name}"
+        ),
         f"dir      {directory} · answer: {Path(sessions.answer_path(meta.session_id)).name}",
     ]
     if meta.failure is not None:
-        lines.append(f"failure  {meta.failure} · continue: acpc continue {meta.session_id}")
+        lines.append(
+            f"failure  {safe_text(meta.failure)} · continue: acpc continue {meta.session_id}"
+        )
     return "\n".join(lines) + "\n"
 
 
@@ -582,10 +609,11 @@ def status_list_json(
     sessions_in: Sequence[sessions.SessionMeta],
     *,
     all_sessions: bool = False,
+    limit: int = DEFAULT_STATUS_LIMIT,
     clock: Clock | None = None,
 ) -> dict[str, Any]:
     """Build the JSON shape for ``status`` without an id."""
-    selected = _status_selection(sessions_in, all_sessions=all_sessions)
+    selected = _status_selection(sessions_in, all_sessions=all_sessions, limit=limit)
     rows = []
     for meta in selected:
         runtime_seconds, now = _status_timing(meta, clock=clock)
@@ -594,14 +622,21 @@ def status_list_json(
                 "session_id": meta.session_id,
                 "entry": meta.entry,
                 "model": meta.resolved_model,
-                "state": meta.state,
+                "status": meta.state,
                 "name": meta.name,
                 "prompt_snippet": meta.prompt_snippet,
-                "runtime": runtime_seconds,
+                "runtime_seconds": runtime_seconds,
                 "idle_seconds": _idle_seconds(meta, now=now),
+                "created_at": _timestamp_or_none(meta.created_at),
+                "started_at": _timestamp_or_none(meta.started_at),
+                "finished_at": _timestamp_or_none(meta.finished_at),
             }
         )
-    return {"sessions": rows}
+    return {"items": rows, "has_more": len(selected) < len(sessions_in)}
+
+
+def _timestamp_or_none(value: float | None) -> str | None:
+    return sessions.format_timestamp(value) if value is not None else None
 
 
 def status_detail_json(
@@ -613,14 +648,14 @@ def status_detail_json(
     runtime_seconds, now = _status_timing(meta, clock=clock)
     return {
         "session_id": meta.session_id,
-        "state": meta.state,
+        "status": meta.state,
         "pid": meta.pid,
         "turns": meta.turns,
         "entry": meta.entry,
         "base_adapter": meta.base_adapter,
         "model": meta.resolved_model,
         "name": meta.name,
-        "runtime": runtime_seconds,
+        "runtime_seconds": runtime_seconds,
         "idle_seconds": _idle_seconds(meta, now=now),
         "tokens": meta.tokens,
         "cost": meta.cost,
@@ -628,4 +663,7 @@ def status_detail_json(
         "stop_reason": meta.stop_reason,
         "failure": meta.failure,
         "paths": sessions.session_paths(meta.session_id),
+        "created_at": _timestamp_or_none(meta.created_at),
+        "started_at": _timestamp_or_none(meta.started_at),
+        "finished_at": _timestamp_or_none(meta.finished_at),
     }

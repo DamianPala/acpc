@@ -39,7 +39,7 @@ STANDARD_VERSION = "0.1.0-draft.5"
 
 # Default output format per context.  acpc renders text in both today; a
 # command that has a machine shape offers it behind its own `--json`.
-FORMAT_DEFAULTS: dict[str, str] = {"tty": "text", "non_tty": "text"}
+FORMAT_DEFAULTS: dict[str, str] = {"tty": "text", "non_tty": "json"}
 
 # Flags accepted by *every* command entry, and therefore not repeated in any
 # D8 document.  A flag belongs here if and only if it is in the intersection
@@ -56,7 +56,23 @@ GLOBAL_FLAGS: list[dict[str, Any]] = [
         "type": "boolean",
         "required": False,
         "default": False,
-    }
+    },
+    {
+        "name": "format",
+        "description": (
+            "Select the command's human or machine representation; accepted values depend on "
+            "the command, and --json is its machine alias."
+        ),
+        "type": "string",
+        "required": False,
+    },
+    {
+        "name": "color",
+        "description": "Color policy for human output: auto, always or never.",
+        "type": "string",
+        "required": False,
+        "default": "auto",
+    },
 ]
 
 _GLOBAL_FLAG_NAMES = frozenset(flag["name"] for flag in GLOBAL_FLAGS)
@@ -69,6 +85,7 @@ INTERACTIVE = False
 _DESCRIPTIONS = "_acpc_schema_descriptions"
 _STDIN = "_acpc_schema_stdin"
 _STREAM = "_acpc_schema_stream"
+_FORMAT_DEFAULTS = "_acpc_schema_format_defaults"
 
 
 class SchemaError(Exception):
@@ -115,6 +132,18 @@ def emits_record_stream[C: click.Command](command: C) -> C:
     """Mark a command whose success is a stream of records, not one document."""
     setattr(command, _STREAM, True)
     return command
+
+
+def format_defaults[C: click.Command](**defaults: str) -> Callable[[C], C]:
+    """Declare a command's exception to the tool-wide output defaults."""
+    if set(defaults) != {"tty", "non_tty"}:
+        raise SchemaError("format defaults must declare tty and non_tty")
+
+    def apply(command: C) -> C:
+        setattr(command, _FORMAT_DEFAULTS, dict(defaults))
+        return command
+
+    return apply
 
 
 # Click type names mapped onto the four types a descriptor may declare.
@@ -331,6 +360,9 @@ def detail(name: str, command: click.Command) -> dict[str, Any]:
     }
     if getattr(command, _STREAM, False):
         document["stream"] = True
+    defaults = getattr(command, _FORMAT_DEFAULTS, None)
+    if defaults is not None:
+        document["format_defaults"] = dict(defaults)
     return document
 
 

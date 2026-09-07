@@ -126,13 +126,13 @@ def test_exit_code_ignores_the_stop_reason_for_a_finished_turn() -> None:
 def test_a_successful_turn_finishes_the_session_on_disk() -> None:
     session_id, outcome = start_turn("summarize the module layout")
 
-    assert outcome.state == "done"
+    assert outcome.state == "succeeded"
     assert outcome.exit_code == vocab.EXIT_OK
     assert "summarize the module layout" in outcome.answer
     assert not any(event.get("type") == "error" for event in transcript_events(session_id))
 
     meta = sessions.read_meta(session_id)
-    assert meta.state == "done"
+    assert meta.state == "succeeded"
     assert meta.exit_code == vocab.EXIT_OK
     assert meta.finished_at is not None
 
@@ -348,7 +348,7 @@ def test_prompt_marker_is_retried_before_a_successful_finalization(
     monkeypatch.setattr(sessions, "mark_prompt_delivered", fail_once)
     session_id, outcome = start_turn("persist the outgoing prompt")
 
-    assert outcome.state == "done"
+    assert outcome.state == "succeeded"
     assert attempts >= 2
     delivered = sessions.read_meta(session_id).extra["delivered_prompts"]
     assert [record["turn"] for record in delivered] == [1]
@@ -369,10 +369,10 @@ def test_prompt_marker_failure_keeps_the_answer_and_marks_the_record_incomplete(
     session_id, outcome = start_turn("marker must not disappear")
 
     assert attempts == 4  # the observer attempt plus the three existing retries
-    assert outcome.state == "done"
+    assert outcome.state == "succeeded"
     assert "marker must not disappear" in outcome.answer
     meta = sessions.read_meta(session_id)
-    assert meta.state == "done"
+    assert meta.state == "succeeded"
     assert meta.extra[sessions.DELIVERY_RECORD_INCOMPLETE] is True
     assert sessions.answer_path(session_id).read_text(encoding="utf-8") == outcome.answer
     errors = [event for event in transcript_events(session_id) if event.get("type") == "error"]
@@ -430,7 +430,7 @@ def test_unobservable_delivery_finishes_and_stays_unverified_on_cold_resume(
         runner.TurnRequest(resolution=resolution, prompt="the unobservable prompt"),
     )
 
-    assert first.state == "done"
+    assert first.state == "succeeded"
     assert "the unobservable prompt" in sessions.answer_path(session_id).read_text(encoding="utf-8")
     meta = sessions.load(session_id)
     assert meta.extra[sessions.DELIVERY_RECORD_INCOMPLETE] is True
@@ -439,7 +439,7 @@ def test_unobservable_delivery_finishes_and_stays_unverified_on_cold_resume(
     request = runner.continue_request(meta, "the cold follow-up", defer_rotation=True)
     second = runner.execute_turn(session_id, request)
 
-    assert second.state == "done"
+    assert second.state == "succeeded"
     resumed = sessions.load(session_id)
     assert resumed.extra["resume"] == "unverified — delivery record incomplete"
     assert "the cold follow-up" in sessions.answer_path(session_id).read_text(encoding="utf-8")
@@ -483,7 +483,7 @@ def test_pre_send_prompt_failure_with_observer_keeps_record_complete(
         runner.continue_request(first_meta, "later prompt", defer_rotation=True),
     )
 
-    assert second.state == "done"
+    assert second.state == "succeeded"
     resumed = sessions.load(session_id)
     assert resumed.extra["resume"] == "verified"
     assert "later prompt" in sessions.answer_path(session_id).read_text(encoding="utf-8")
@@ -498,7 +498,7 @@ def test_a_turn_records_its_start_and_end_as_state_events() -> None:
         if event.get("type") == "state"
     ]
     assert ("starting", "running") in transitions
-    assert ("running", "done") in transitions
+    assert ("running", "succeeded") in transitions
 
 
 def test_token_usage_reaches_the_session_metadata() -> None:
@@ -682,9 +682,9 @@ def test_sigint_during_a_turn_cancels_it_and_exits_130() -> None:
 
     session_id, outcome = start_turn("slow:30 sigint probe")
 
-    assert outcome.state == "cancelled"
+    assert outcome.state == "canceled"
     assert outcome.exit_code == vocab.EXIT_CANCELLED
-    assert sessions.read_meta(session_id).state == "cancelled"
+    assert sessions.read_meta(session_id).state == "canceled"
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal semantics")
@@ -695,7 +695,7 @@ def test_sigterm_on_the_direct_path_cancels_too_but_exits_143() -> None:
     session_id, outcome = start_turn("slow:30 sigterm probe")
 
     assert outcome.exit_code == vocab.EXIT_SIGTERM
-    assert sessions.read_meta(session_id).state == "cancelled"
+    assert sessions.read_meta(session_id).state == "canceled"
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal semantics")
@@ -964,8 +964,8 @@ def test_a_broken_cache_never_fails_a_turn_that_produced_an_answer(
 
     session_id, outcome = start_turn("survive a broken cache")
 
-    assert outcome.state == "done"
-    assert sessions.read_meta(session_id).state == "done"
+    assert outcome.state == "succeeded"
+    assert sessions.read_meta(session_id).state == "succeeded"
 
 
 def test_auto_prune_swallows_a_failing_sweep(monkeypatch: pytest.MonkeyPatch) -> None:

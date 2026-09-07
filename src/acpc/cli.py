@@ -91,6 +91,54 @@ _WARNED_PERMISSION_ALIASES: set[str] = set()
 _json_option = errors.json_option
 
 
+def _color_option() -> Any:
+    """Accept the standard color policy without contaminating machine output."""
+    return click.option(
+        "--color",
+        type=click.Choice(("auto", "always", "never")),
+        default="auto",
+        expose_value=False,
+        help="Color policy for human output; NO_COLOR and TERM=dumb disable color.",
+    )
+
+
+def _stdout_is_tty() -> bool:
+    try:
+        return sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def _select_format(
+    format_name: str | None,
+    json_mode: bool,
+    *,
+    stream: bool = False,
+    native_text: bool = False,
+    plain: bool = False,
+) -> str:
+    """Resolve explicit format flags and the stdout-dependent default."""
+    machine_name = "ndjson" if stream else "json"
+    if json_mode and format_name not in (None, machine_name):
+        raise UsageProblem("--json and --format select different output formats")
+    if plain and (json_mode or format_name not in (None, "plain")):
+        raise UsageProblem("--plain cannot be combined with another output format")
+    selected = "plain" if plain else format_name
+    if selected is None:
+        selected = "text" if native_text or _stdout_is_tty() else machine_name
+    if json_mode:
+        selected = machine_name
+    errors.note_machine_format(selected in {"json", "ndjson"})
+    return selected
+
+
+def _write_rendered_file(path: str | None, result: output.OutputResult) -> bool:
+    if path is None:
+        return False
+    output.write_output_file(path, result.text)
+    return True
+
+
 def _not_found(message: str, *, hint: str) -> AcpcError:
     """A named target does not exist: exit 1, because the call was well formed.
 
@@ -143,7 +191,7 @@ def _session_problem(error: sessions.SessionError) -> AcpcError:
     argument the store will never accept.
     """
     if isinstance(error, sessions.SessionNotFound):
-        return _not_found(str(error), hint="Run: acpc status --all")
+        return _not_found(str(error), hint="Run: acpc status")
     if isinstance(error, sessions.CorruptSessionError):
         return AcpcError(str(error), kind=errors.CORRUPT_STATE)
     if isinstance(error, sessions.SessionIdsExhausted):
@@ -256,13 +304,13 @@ Heredoc prompt:
 Context care (agent callers):
   log's default view is condensed one-liners, last 20 events; full via --prose.
   --json = this command's output as a machine envelope, any command. On
-  run/wait it embeds the answer; add -o FILE to keep the answer out of it.
+  run/wait it embeds the answer; add --output-file FILE to keep the answer out of it.
   Content reads best as markdown: answer.md, log --prose.
   Tight context: lower the cap, e.g. --max-output 16384.
   Every --timeout takes seconds (90) or a duration (90s, 5m, 1h).
 
 Maintenance and setup:
-  status            running + the 5 most recent finished (--all for every session)
+  status            running + the 20 most recent sessions (--limit N to change)
   stop <id>         stop a running session; it stays resumable with continue
   rm <id> --yes     delete a finished session's on-disk state
   prune --yes       delete finished sessions older than retention (--older-than D)
@@ -1088,7 +1136,7 @@ _ROSTER_DESCRIPTION_LIMIT = 80
 def _agent_row(entry: ResolvedEntry) -> tuple[str, ...]:
     status = entry.roster_install_status()
     description = (
-        render.snippet(entry.description, limit=_ROSTER_DESCRIPTION_LIMIT)
+        render.snippet(render.safe_text(entry.description), limit=_ROSTER_DESCRIPTION_LIMIT)
         if entry.description is not None
         else ""
     )
@@ -1101,7 +1149,7 @@ def _variant_row(entry: ResolvedEntry) -> tuple[str, ...]:
         for field in ("model", "effort", "permissions", "home")
     }
     description = (
-        render.snippet(entry.description, limit=_ROSTER_DESCRIPTION_LIMIT)
+        render.snippet(render.safe_text(entry.description), limit=_ROSTER_DESCRIPTION_LIMIT)
         if entry.description is not None
         else ""
     )
@@ -1117,7 +1165,7 @@ def _variant_row(entry: ResolvedEntry) -> tuple[str, ...]:
 
 def _skill_row(skill: skills.Skill) -> tuple[str, ...]:
     description = (
-        render.snippet(skill.description, limit=_ROSTER_DESCRIPTION_LIMIT)
+        render.snippet(render.safe_text(skill.description), limit=_ROSTER_DESCRIPTION_LIMIT)
         if skill.description is not None
         else ""
     )
@@ -1162,7 +1210,7 @@ def _agent_list_payload(registry: AgentRegistry) -> dict[str, Any]:
                     "description": variant.description,
                 }
             )
-    return {"agents": rows}
+    return {"items": rows, "has_more": False}
 
 
 def _cache_footer(record: cache.CachedAdvertised | None) -> str:
@@ -1273,7 +1321,7 @@ def _render_entry_detail(
     else:
         lines.append(f"adapter      {entry.name} · {entry.install_status} · {entry.command_head}")
     if entry.description is not None:
-        lines.append(f"description  {entry.description}")
+        lines.append(f"description  {render.safe_text(entry.description)}")
 
     resolved_values = {
         "model": resolution.model,
@@ -1499,8 +1547,12 @@ def _run_agents_view(
     commands: bool,
     check_live: bool,
     json_mode: bool,
+    selected_format: str = "text",
+    limit: int = render.DEFAULT_STATUS_LIMIT,
+    plain: bool = False,
 ) -> None:
     """List adapters and variants, or inspect advertised adapter data."""
+    json_mode = selected_format == "json"
     if models and commands:
         raise UsageProblem("--models and --commands are mutually exclusive views")
     try:
@@ -1541,46 +1593,69 @@ def _run_agents_view(
                 _write_stdout(text)
         elif name is None:
             payload = _agent_list_payload(registry)
-            if json_mode:
+            all_items = list(payload["items"])
+            items = all_items[:limit]
+            payload = {"items": items, "has_more": len(items) < len(all_items)}
+            if selected_format == "json":
                 _emit_json(payload)
+            elif selected_format == "plain":
+                _write_stdout("".join(f"{item['name']}\n" for item in items))
             else:
-                variants = {
-                    adapter.entry: [
-                        item for item in registry.variants if item.base_adapter == adapter.entry
-                    ]
-                    for adapter in registry.adapters
-                }
-                adapter_items = list(registry.adapters)
-                adapter_lines = render.format_table(
-                    [_agent_row(adapter) for adapter in adapter_items], separator="  "
-                )
-                adapter_lines_by_entry = {
-                    adapter.entry: adapter_lines[index]
-                    for index, adapter in enumerate(adapter_items)
-                }
-                variant_items = [
-                    item for adapter in registry.adapters for item in variants[adapter.entry]
-                ]
-                variant_lines = render.format_table(
-                    [_variant_row(item) for item in variant_items],
-                    header=("entry", "model", "effort", "permissions", "home", "description"),
-                    prefix="  ",
-                    separator="  ",
-                )
-                variant_lines_by_entry = {
-                    item.entry: variant_lines[index + 1] for index, item in enumerate(variant_items)
-                }
-                lines: list[str] = []
-                variant_header_added = False
-                for adapter in adapter_items:
-                    lines.append(adapter_lines_by_entry[adapter.entry])
-                    if variants[adapter.entry] and not variant_header_added:
-                        lines.append(variant_lines[0])
-                        variant_header_added = True
-                    lines.extend(
-                        variant_lines_by_entry[item.entry] for item in variants[adapter.entry]
+                if len(items) == len(all_items):
+                    variants = {
+                        adapter.entry: [
+                            item for item in registry.variants if item.base_adapter == adapter.entry
+                        ]
+                        for adapter in registry.adapters
+                    }
+                    adapter_items = list(registry.adapters)
+                    adapter_lines = render.format_table(
+                        [_agent_row(adapter) for adapter in adapter_items], separator="  "
                     )
-                _write_stdout("\n".join(lines) + "\n")
+                    adapter_lines_by_entry = {
+                        adapter.entry: adapter_lines[index]
+                        for index, adapter in enumerate(adapter_items)
+                    }
+                    variant_items = [
+                        item for adapter in registry.adapters for item in variants[adapter.entry]
+                    ]
+                    variant_lines = render.format_table(
+                        [_variant_row(item) for item in variant_items],
+                        header=("entry", "model", "effort", "permissions", "home", "description"),
+                        prefix="  ",
+                        separator="  ",
+                    )
+                    variant_lines_by_entry = {
+                        item.entry: variant_lines[index + 1]
+                        for index, item in enumerate(variant_items)
+                    }
+                    lines: list[str] = []
+                    variant_header_added = False
+                    for adapter in adapter_items:
+                        lines.append(adapter_lines_by_entry[adapter.entry])
+                        if variants[adapter.entry] and not variant_header_added:
+                            lines.append(variant_lines[0])
+                            variant_header_added = True
+                        lines.extend(
+                            variant_lines_by_entry[item.entry] for item in variants[adapter.entry]
+                        )
+                else:
+                    rows = [
+                        (
+                            str(item["name"]),
+                            str(item.get("display_name", item.get("base_adapter", "variant"))),
+                            str(item.get("status", "variant")),
+                            render.snippet(
+                                render.safe_text(str(item.get("description") or "")),
+                                limit=_ROSTER_DESCRIPTION_LIMIT,
+                            ),
+                        )
+                        for item in items
+                    ]
+                    lines = render.format_table(rows, separator="  ")
+                _write_stdout("\n".join(lines) + ("\n" if lines else ""))
+                if len(items) < len(all_items):
+                    _echo_metadata(f"-- {len(items)} z {len(all_items)} — --limit żeby zmienić")
         else:
             entry = registry.resolve(name)
             if entry.is_variant:
@@ -1615,6 +1690,23 @@ def _run_agents_view(
     is_flag=True,
     help="Launch, authenticate and apply the resolved options.",
 )
+@click.option(
+    "--limit",
+    type=click.IntRange(min=0),
+    default=render.DEFAULT_STATUS_LIMIT,
+    show_default=True,
+    help="Return at most N agents in the collection view.",
+)
+@click.option(
+    "--plain", is_flag=True, help="Print one agent name per line; requires explicit --limit."
+)
+@click.option(
+    "--format",
+    "format_name",
+    type=click.Choice(("text", "json", "plain")),
+    help="Select text, JSON, or one-item-per-line output.",
+)
+@_color_option()
 @_json_option("Emit this view as JSON.")
 @click.help_option("-h", "--help")
 @click.pass_context
@@ -1624,13 +1716,31 @@ def agents_group(
     commands: bool,
     check_live: bool,
     json_mode: bool,
+    limit: int,
+    plain: bool,
+    format_name: str | None,
 ) -> None:
     """List adapters and variants, or inspect advertised adapter data.
 
     Example: ``acpc agents mock --models``
     """
     if ctx.invoked_subcommand is None:
-        _run_agents_view(None, models, commands, check_live, json_mode)
+        selected_format = _select_format(format_name, json_mode, plain=plain)
+        if (
+            selected_format == "plain"
+            and ctx.get_parameter_source("limit") is not click.core.ParameterSource.COMMANDLINE
+        ):
+            raise UsageProblem("--plain requires an explicit --limit")
+        _run_agents_view(
+            None,
+            models,
+            commands,
+            check_live,
+            json_mode,
+            selected_format=selected_format,
+            limit=limit,
+            plain=plain,
+        )
 
 
 @effects.read_only
@@ -1651,16 +1761,29 @@ def agents_group(
     is_flag=True,
     help="Launch, authenticate and apply the resolved options.",
 )
+@click.option(
+    "--format",
+    "format_name",
+    type=click.Choice(("text", "json")),
+    help="Select text or JSON output.",
+)
+@_color_option()
 @_json_option("Emit this view as JSON.")
 @click.help_option("-h", "--help")
 def _agent_view_command(
-    name: str, models: bool, commands: bool, check_live: bool, json_mode: bool
+    name: str,
+    models: bool,
+    commands: bool,
+    check_live: bool,
+    format_name: str | None,
+    json_mode: bool,
 ) -> None:
     """Render one named adapter or variant.
 
     Example: ``acpc agents mock --commands``
     """
-    _run_agents_view(name, models, commands, check_live, json_mode)
+    selected_format = _select_format(format_name, json_mode)
+    _run_agents_view(name, models, commands, check_live, json_mode, selected_format=selected_format)
 
 
 def _agents_check(registry: AgentRegistry, name: str | None, *, json_mode: bool) -> None:
@@ -1707,9 +1830,16 @@ def _agents_check(registry: AgentRegistry, name: str | None, *, json_mode: bool)
     is_flag=True,
     help="Read the advertised modes; opens and releases a session and sends zero turns.",
 )
+@click.option(
+    "--format",
+    "format_name",
+    type=click.Choice(("text", "json")),
+    help="Select text or JSON output.",
+)
+@_color_option()
 @_json_option("Emit the report as JSON.")
 @click.help_option("-h", "--help")
-def probe_command(entry: str, discover: bool, json_mode: bool) -> None:
+def probe_command(entry: str, discover: bool, format_name: str | None, json_mode: bool) -> None:
     """Read an adapter's advertised modes, without editing its registry entry.
 
     ``--discover`` opens a session, reads the advertised mode catalogue and releases it,
@@ -1733,7 +1863,8 @@ def probe_command(entry: str, discover: bool, json_mode: bool) -> None:
         raise _registry_problem(error) from None
     except probe_engine.ProbeError as error:
         raise _probe_problem(error) from None
-    if json_mode:
+    selected_format = _select_format(format_name, json_mode)
+    if selected_format == "json":
         _emit_json(report.payload())
     else:
         _write_stdout(report.text())
@@ -1798,7 +1929,14 @@ def _agent_entry_path(name: str) -> Path:
     ),
 )
 @click.option("--home", metavar="DIR", help="Vendor home override for the variant.")
+@click.option(
+    "--format",
+    "format_name",
+    type=click.Choice(("text", "json")),
+    help="Select text or JSON output.",
+)
 @_json_option("Emit the created entry as JSON.")
+@_color_option()
 @click.help_option("-h", "--help")
 def agents_init_command(
     name: str,
@@ -1808,6 +1946,7 @@ def agents_init_command(
     mode: str | None,
     permissions: str | None,
     home: str | None,
+    format_name: str | None,
     json_mode: bool,
 ) -> None:
     """Scaffold a variant entry.
@@ -1817,6 +1956,7 @@ def agents_init_command(
 
     Example: ``acpc agents init work --extends mock --permissions execute``
     """
+    selected_format = _select_format(format_name, json_mode)
     if name in agents_group.commands:
         # `acpc agents <name>` would dispatch the subcommand, so the entry
         # would be listed and never reachable. Refuse the name instead.
@@ -1877,7 +2017,7 @@ def agents_init_command(
             kind=errors.UNAVAILABLE,
         ) from None
     payload = {"name": name, "extends": parent, "path": str(target), "changed": True}
-    if json_mode:
+    if selected_format == "json":
         _emit_json(payload)
     else:
         _write_stdout(f"created {target}\n")
@@ -1893,9 +2033,16 @@ def agents_init_command(
 )
 @agents_group.command(name="delete")
 @click.argument("name")
+@click.option(
+    "--format",
+    "format_name",
+    type=click.Choice(("text", "json")),
+    help="Select text or JSON output.",
+)
 @_json_option("Emit the deleted entry as JSON.")
+@_color_option()
 @click.help_option("-h", "--help")
-def agents_delete_command(name: str, json_mode: bool) -> None:
+def agents_delete_command(name: str, format_name: str | None, json_mode: bool) -> None:
     """Delete one entry this machine owns, under ``$ACPC_HOME/agents``.
 
     The counterpart to ``agents init``: it takes back exactly what that wrote,
@@ -1905,6 +2052,7 @@ def agents_delete_command(name: str, json_mode: bool) -> None:
 
     Example: ``acpc agents delete work``
     """
+    selected_format = _select_format(format_name, json_mode)
     target = _agent_entry_path(name)
     try:
         shipped = name in AgentRegistry().shipped_names
@@ -1927,24 +2075,38 @@ def agents_delete_command(name: str, json_mode: bool) -> None:
             kind=errors.OPERATION_FAILED,
         ) from None
     payload = {"name": name, "path": str(target), "changed": True}
-    if json_mode:
+    if selected_format == "json":
         _emit_json(payload)
     else:
         _write_stdout(f"deleted {target}\n")
 
 
-def _run_skills_view(name: str | None, *, json_mode: bool) -> None:
+def _run_skills_view(
+    name: str | None,
+    *,
+    json_mode: bool,
+    selected_format: str = "text",
+    limit: int = render.DEFAULT_STATUS_LIMIT,
+    plain: bool = False,
+) -> None:
     """List bundled skills or render one skill's body and directory."""
     if name is None:
         bundled = skills.list_skills()
-        if json_mode:
-            _emit_json({"skills": [_skill_payload(skill, include_body=False) for skill in bundled]})
+        items = [_skill_payload(skill, include_body=False) for skill in bundled]
+        items = items[:limit]
+        if selected_format == "json":
+            _emit_json({"items": items, "has_more": len(items) < len(bundled)})
+            return
+        if selected_format == "plain":
+            _write_stdout("".join(f"{item['name']}\n" for item in items))
             return
         rows = render.format_table(
-            [_skill_row(skill) for skill in bundled],
+            [_skill_row(skill) for skill in bundled[:limit]],
             header=("name", "description"),
         )
         _write_stdout("\n".join(rows) + "\n")
+        if len(items) < len(bundled):
+            _echo_metadata(f"-- {len(items)} z {len(bundled)} — --limit żeby zmienić")
         return
 
     try:
@@ -1952,7 +2114,7 @@ def _run_skills_view(name: str | None, *, json_mode: bool) -> None:
     except skills.SkillNotFoundError:
         raise _not_found(f"unknown skill {name!r}", hint="Run: acpc skills") from None
 
-    if json_mode:
+    if selected_format == "json":
         _emit_json(_skill_payload(skill, include_body=True))
     else:
         _write_stdout(skill.body)
@@ -1961,16 +2123,51 @@ def _run_skills_view(name: str | None, *, json_mode: bool) -> None:
 
 @effects.read_only
 @main.group(name="skills", cls=_SkillsGroup, invoke_without_command=True)
+@click.option(
+    "--limit",
+    type=click.IntRange(min=0),
+    default=render.DEFAULT_STATUS_LIMIT,
+    show_default=True,
+    help="Return at most N skills in the collection view.",
+)
+@click.option(
+    "--plain", is_flag=True, help="Print one skill name per line; requires explicit --limit."
+)
+@click.option(
+    "--format",
+    "format_name",
+    type=click.Choice(("text", "json", "plain")),
+    help="Select text, JSON, or one-item-per-line output.",
+)
+@_color_option()
 @_json_option("Emit this view as JSON.")
 @click.help_option("-h", "--help")
 @click.pass_context
-def skills_group(ctx: click.Context, json_mode: bool) -> None:
+def skills_group(
+    ctx: click.Context,
+    json_mode: bool,
+    limit: int,
+    plain: bool,
+    format_name: str | None,
+) -> None:
     """List bundled skills, or render one named skill.
 
     Example: ``acpc skills provider-bringup``
     """
     if ctx.invoked_subcommand is None:
-        _run_skills_view(None, json_mode=json_mode)
+        selected_format = _select_format(format_name, json_mode, plain=plain)
+        if (
+            selected_format == "plain"
+            and ctx.get_parameter_source("limit") is not click.core.ParameterSource.COMMANDLINE
+        ):
+            raise UsageProblem("--plain requires an explicit --limit")
+        _run_skills_view(
+            None,
+            json_mode=json_mode,
+            selected_format=selected_format,
+            limit=limit,
+            plain=plain,
+        )
 
 
 @effects.read_only
@@ -1982,14 +2179,22 @@ def skills_group(ctx: click.Context, json_mode: bool) -> None:
 )
 @click.command(name="skill-view")
 @click.argument("name")
+@click.option(
+    "--format",
+    "format_name",
+    type=click.Choice(("text", "json")),
+    help="Select text or JSON output.",
+)
+@_color_option()
 @_json_option("Emit this view as JSON.")
 @click.help_option("-h", "--help")
-def _skill_view_command(name: str, json_mode: bool) -> None:
+def _skill_view_command(name: str, format_name: str | None, json_mode: bool) -> None:
     """Render one named bundled skill.
 
     Example: ``acpc skills provider-bringup``
     """
-    _run_skills_view(name, json_mode=json_mode)
+    selected_format = _select_format(format_name, json_mode, native_text=True)
+    _run_skills_view(name, json_mode=json_mode, selected_format=selected_format)
 
 
 @effects.non_idempotent
@@ -1997,9 +2202,16 @@ def _skill_view_command(name: str, json_mode: bool) -> None:
 @main.command(name="install")
 @click.argument("agent")
 @click.option("--yes", "-y", "assume_yes", is_flag=True, help="Install without being asked.")
+@click.option(
+    "--format",
+    "format_name",
+    type=click.Choice(("text", "json")),
+    help="Select text or JSON output.",
+)
 @_json_option("Emit the install result as JSON.")
+@_color_option()
 @click.help_option("-h", "--help")
-def install_command(agent: str, assume_yes: bool, json_mode: bool) -> None:
+def install_command(agent: str, assume_yes: bool, format_name: str | None, json_mode: bool) -> None:
     """Run an agent's install command from its registry entry.
 
     Resolves the agent like ``run`` does, runs its ``install_command`` and
@@ -2009,6 +2221,7 @@ def install_command(agent: str, assume_yes: bool, json_mode: bool) -> None:
 
     Example: ``acpc install codex --yes``
     """
+    selected_format = _select_format(format_name, json_mode)
     try:
         registry = AgentRegistry()
         registry.resolve(agent)
@@ -2066,7 +2279,7 @@ def install_command(agent: str, assume_yes: bool, json_mode: bool) -> None:
         "returncode": return_code,
         "changed": return_code == 0,
     }
-    if json_mode:
+    if selected_format == "json" and return_code == 0:
         _emit_json(payload)
     elif return_code == 0:
         _write_stdout(f"installed {agent}\n")
@@ -2118,7 +2331,7 @@ def _cancel_session(meta: sessions.SessionMeta) -> sessions.SessionMeta:
     if meta.pid is None:
         return sessions.transition(
             meta.session_id,
-            "cancelled",
+            "canceled",
             exit_code=vocab.EXIT_CANCELLED,
             stop_reason="stopped by user",
         )
@@ -2142,9 +2355,16 @@ def _maintenance_json(payload: Mapping[str, Any]) -> None:
 @schema.describes(selector=_SELECTOR_HELP)
 @main.command(name="stop")
 @click.argument("selector")
+@click.option(
+    "--format",
+    "format_name",
+    type=click.Choice(("text", "json")),
+    help="Select text or JSON output.",
+)
 @_json_option("Emit the result as JSON.")
+@_color_option()
 @click.help_option("-h", "--help")
-def stop_command(selector: str, json_mode: bool) -> None:
+def stop_command(selector: str, format_name: str | None, json_mode: bool) -> None:
     """Stop a running session; it stays resumable with ``acpc continue``.
 
     Cancels the turn in flight (ACP ``session/cancel``) and waits up to 10s for the
@@ -2156,18 +2376,21 @@ def stop_command(selector: str, json_mode: bool) -> None:
 
     Example: ``acpc stop q7x2``
     """
+    selected_format = _select_format(format_name, json_mode)
     meta = _load_view_session(selector)
     if not meta.is_active:
         meta = _status_view_meta(meta)
-    if meta.is_active or meta.state == "preparing":
+    changed = meta.is_active or meta.state == "preparing"
+    if changed:
         meta = _cancel_session(meta)
 
     payload = {
         "session_id": meta.session_id,
-        "state": meta.state,
+        "status": vocab.normalize_session_state(meta.state),
         "stop_reason": meta.stop_reason,
+        "changed": changed,
     }
-    if json_mode:
+    if selected_format == "json":
         _maintenance_json(payload)
     else:
         _write_stdout(f"{meta.session_id} {meta.state}\n")
@@ -2179,9 +2402,16 @@ def stop_command(selector: str, json_mode: bool) -> None:
 @main.command(name="rm")
 @click.argument("selector")
 @click.option("--yes", "-y", "assume_yes", is_flag=True, help="Delete without being asked.")
+@click.option(
+    "--format",
+    "format_name",
+    type=click.Choice(("text", "json")),
+    help="Select text or JSON output.",
+)
 @_json_option("Emit the result as JSON.")
+@_color_option()
 @click.help_option("-h", "--help")
-def rm_command(selector: str, assume_yes: bool, json_mode: bool) -> None:
+def rm_command(selector: str, assume_yes: bool, format_name: str | None, json_mode: bool) -> None:
     """Delete a finished session's on-disk state.
 
     Errors on a starting or running session — stop it first. The transcript,
@@ -2191,6 +2421,7 @@ def rm_command(selector: str, assume_yes: bool, json_mode: bool) -> None:
 
     Example: ``acpc rm q7x2 --yes``
     """
+    selected_format = _select_format(format_name, json_mode)
     meta = _load_view_session(selector)
     advertised_paths = sessions.session_paths(meta.session_id)
     try:
@@ -2214,7 +2445,7 @@ def rm_command(selector: str, assume_yes: bool, json_mode: bool) -> None:
         "changed": True,
         "paths": advertised_paths,
     }
-    if json_mode:
+    if selected_format == "json":
         _maintenance_json(payload)
     else:
         _write_stdout(f"removed {meta.session_id}\n")
@@ -2234,9 +2465,22 @@ def rm_command(selector: str, assume_yes: bool, json_mode: bool) -> None:
 )
 @click.option("--dry-run", is_flag=True, help="List candidates without deleting them.")
 @click.option("--yes", "-y", "assume_yes", is_flag=True, help="Delete without being asked.")
+@click.option(
+    "--format",
+    "format_name",
+    type=click.Choice(("text", "json")),
+    help="Select text or JSON output.",
+)
 @_json_option("Emit the result as JSON.")
+@_color_option()
 @click.help_option("-h", "--help")
-def prune_command(older_than: str | None, dry_run: bool, assume_yes: bool, json_mode: bool) -> None:
+def prune_command(
+    older_than: str | None,
+    dry_run: bool,
+    assume_yes: bool,
+    format_name: str | None,
+    json_mode: bool,
+) -> None:
     """Delete finished sessions older than the retention period.
 
     Bare ``prune`` uses the ``retention`` key in the global config
@@ -2250,6 +2494,7 @@ def prune_command(older_than: str | None, dry_run: bool, assume_yes: bool, json_
 
     Example: ``acpc prune --older-than 7d --dry-run``
     """
+    selected_format = _select_format(format_name, json_mode)
     try:
         settings = config.load_config()
         raw_duration = older_than if older_than is not None else settings.retention
@@ -2277,7 +2522,7 @@ def prune_command(older_than: str | None, dry_run: bool, assume_yes: bool, json_
 
     session_ids = [meta.session_id for meta in candidates]
     payload = {"targets": session_ids, "changed": bool(session_ids) and not dry_run}
-    if json_mode:
+    if selected_format == "json":
         _maintenance_json(payload)
     elif session_ids:
         _write_stdout("\n".join(session_ids) + "\n")
@@ -2399,24 +2644,42 @@ def _latest_failure_message(session_id: str) -> str | None:
 
 
 @effects.read_only
-@schema.describes(
-    selector=f"{_SELECTOR_HELP} Absent, it reports the whole list instead of one session."
-)
+@schema.describes(selector=f"{_SELECTOR_HELP} Absent, it reports a bounded collection of sessions.")
 @main.command(name="status")
 @click.argument("selector", required=False)
 @click.option(
-    "--all",
-    "all_sessions",
-    is_flag=True,
-    help="Show every session, not just running + the 5 most recent finished.",
+    "--limit",
+    type=click.IntRange(min=0),
+    default=render.DEFAULT_STATUS_LIMIT,
+    show_default=True,
+    metavar="N",
+    help="Return at most N sessions; the default is finite and has_more reports the rest.",
 )
+@click.option(
+    "--plain", is_flag=True, help="Print one session id per line; requires explicit --limit."
+)
+@click.option(
+    "--format",
+    "format_name",
+    type=click.Choice(("text", "json", "plain")),
+    help="Select text, JSON, or one-item-per-line output.",
+)
+@_color_option()
 @_json_option("Emit a JSON status object.")
 @click.help_option("-h", "--help")
-def status_command(selector: str | None, all_sessions: bool, json_mode: bool) -> None:
+@click.pass_context
+def status_command(
+    ctx: click.Context,
+    selector: str | None,
+    limit: int,
+    plain: bool,
+    format_name: str | None,
+    json_mode: bool,
+) -> None:
     """Show liveness-verified session metadata without reading transcripts.
 
-    With no id and no ``--all``: every running session plus the 5 most recent
-    finished ones. With an id: that session's vitals. State is verified against the
+    With no id: a bounded collection of sessions. With an id: that session's vitals.
+    State is verified against the
     process behind it, so a ``running`` session whose process is gone reads
     ``orphaned`` rather than a stale ``running``. A daemon-owned continuation in
     its pre-prompt window is shown as ``preparing`` from the daemon's in-memory
@@ -2424,13 +2687,17 @@ def status_command(selector: str | None, all_sessions: bool, json_mode: bool) ->
 
     Example: ``acpc status <session-id> --json``
     """
-    if selector is not None and all_sessions:
-        raise UsageProblem("--all cannot be used with a session id")
+    selected_format = _select_format(format_name, json_mode, plain=plain)
+    explicit_limit = ctx.get_parameter_source("limit") is click.core.ParameterSource.COMMANDLINE
+    if selected_format == "plain" and not explicit_limit:
+        raise UsageProblem("--plain requires an explicit --limit")
+    if selector is not None and selected_format == "plain":
+        raise UsageProblem("--plain is available only for the status collection")
 
     if selector is not None:
         meta = _load_view_session(selector)
         meta = _status_view_meta(meta)
-        if json_mode:
+        if selected_format == "json":
             _write_stdout(json.dumps(render.status_detail_json(meta), ensure_ascii=False) + "\n")
         else:
             _write_stdout(render.render_status_detail(meta))
@@ -2442,28 +2709,29 @@ def status_command(selector: str | None, all_sessions: bool, json_mode: bool) ->
     metas = [
         replace(meta, state="preparing") if meta.session_id in preparing else meta for meta in metas
     ]
-    if json_mode:
+    if selected_format == "json":
         _write_stdout(
-            json.dumps(
-                render.status_list_json(metas, all_sessions=all_sessions), ensure_ascii=False
-            )
-            + "\n"
+            json.dumps(render.status_list_json(metas, limit=limit), ensure_ascii=False) + "\n"
         )
+    elif selected_format == "plain":
+        selected = render.status_items(metas, limit=limit)
+        _write_stdout("".join(f"{meta.session_id}\n" for meta in selected))
     else:
-        _write_stdout(render.render_status_list(metas, all_sessions=all_sessions))
+        _write_stdout(render.render_status_list(metas, limit=limit))
 
 
 @effects.read_only
 @schema.emits_record_stream
+@schema.format_defaults(tty="text", non_tty="text")
 @schema.describes(
     selector=_SELECTOR_HELP,
     since=(
-        "Show only events after this cursor; 0 or greater. Without --since or --tail, "
+        "Show only events after this cursor; 0 or greater. Without --since or --limit, "
         "the last 20 events."
     ),
-    tail=(
-        "Show only the last N selected events; 0 or greater, and 0 selects none. Without "
-        "--since or --tail, the last 20 events."
+    limit=(
+        "Bound records returned by this read; 0 or greater. Without --follow the default is "
+        "20; with --follow an omitted limit is unbounded."
     ),
 )
 @main.command(name="log")
@@ -2473,17 +2741,24 @@ def status_command(selector: str | None, all_sessions: bool, json_mode: bool) ->
     type=click.IntRange(min=0),
     default=None,
     metavar="N",
-    help="Show only events after this cursor; without --since or --tail, show the last 20 events.",
+    help="Show only events after this cursor; without --since or --limit, show the last 20 events.",
 )
 @click.option(
-    "--tail",
+    "--limit",
     type=click.IntRange(min=0),
     default=None,
     metavar="N",
-    help="Show only the last N selected events; without --since or --tail, show the last 20 events.",
+    help="Bound records; without --follow the default is 20, while --follow has no default limit.",
 )
 @click.option("--prose", is_flag=True, help="Render full agent messages.")
 @_json_option("Emit raw transcript events as NDJSON.")
+@click.option(
+    "--format",
+    "format_name",
+    type=click.Choice(("text", "ndjson")),
+    help="Select text or NDJSON output; --json is the NDJSON spelling.",
+)
+@_color_option()
 @click.option(
     "--max-output",
     type=click.IntRange(min=0),
@@ -2514,9 +2789,10 @@ def status_command(selector: str | None, all_sessions: bool, json_mode: bool) ->
 def log_command(
     selector: str,
     since: int | None,
-    tail: int | None,
+    limit: int | None,
     prose: bool,
     json_mode: bool,
+    format_name: str | None,
     max_output: int,
     wait_new: bool,
     follow: bool,
@@ -2525,10 +2801,12 @@ def log_command(
 ) -> None:
     """Render selected transcript events and keep metadata on stderr.
 
-    Without --since or --tail this shows the last 20 events.
+    Without --since or --limit this shows the last 20 events.
 
     Example: ``acpc log <session-id> --prose --since 0``
     """
+    selected_format = _select_format(format_name, json_mode, stream=True, native_text=True)
+    json_mode = selected_format == "ndjson"
     if prose and json_mode:
         raise UsageProblem("--prose and --json are mutually exclusive views")
     if wait_new and follow:
@@ -2554,16 +2832,17 @@ def log_command(
         highest_cursor = _read_transcript_page(transcript_file).next_cursor
         if cursor > highest_cursor:
             since_note = _since_past_end_note(cursor, highest_cursor)
-    selection_tail = tail
-    if selection_tail is None and not explicit_since:
-        selection_tail = _FOLLOW_DEFAULT_TAIL if follow else _LOG_DEFAULT_TAIL
+    selection_tail = None if follow else limit
+    if selection_tail is None and not explicit_since and not follow:
+        selection_tail = _LOG_DEFAULT_TAIL
 
     if follow:
         _follow_log(
             meta,
             transcript_file,
             cursor=cursor,
-            tail=selection_tail,
+            limit=limit,
+            replay_tail=None if limit is not None else _FOLLOW_DEFAULT_TAIL,
             prose=prose,
             json_mode=json_mode,
             max_output=max_output,
@@ -2743,7 +3022,7 @@ def _follow_start_cursor(
     """Turn the replay depth into the cursor the follow starts from.
 
     SPEC `log --follow`: the replay is a start point, not a filter on the
-    stream — `--tail 0` means "from here on", so with nothing to replay the
+    stream — an explicit `--limit 0` means "from here on", so with nothing to replay the
     cursor moves to the transcript's current end rather than staying put and
     letting the first page hand back the whole history.
     """
@@ -2760,7 +3039,8 @@ def _follow_log(
     transcript_file: transcript.Transcript,
     *,
     cursor: int,
-    tail: int | None,
+    limit: int | None,
+    replay_tail: int | None,
     prose: bool,
     json_mode: bool,
     max_output: int,
@@ -2773,16 +3053,25 @@ def _follow_log(
     budget runs out — SPEC `log --follow`'s three endings, one exit code each."""
     transcript_path = sessions.transcript_path(meta.session_id)
     deadline = None if timeout is None else time.monotonic() + timeout
-    cursor = _follow_start_cursor(transcript_file, since=cursor, tail=tail, condense=condense)
+    if limit is None:
+        cursor = _follow_start_cursor(
+            transcript_file, since=cursor, tail=replay_tail, condense=condense
+        )
     used = 0
     exhausted = False
     timed_out = False
+    read_count = 0
     page_start: int | None = None
     page_end: int | None = None
 
     while True:
         page = _read_transcript_page(transcript_file, since=cursor)
         if page.events:
+            if limit is not None:
+                remaining = limit - read_count
+                if remaining <= 0:
+                    break
+                page = transcript.TranscriptPage(page.events[:remaining], page.events[0]["i"] - 1)
             cursor, used, exhausted, rendered_start, rendered_end = _emit_follow_page(
                 page.events,
                 prose=prose,
@@ -2793,10 +3082,13 @@ def _follow_log(
                 cursor=cursor,
             )
             if rendered_start is not None:
+                read_count += len(page.events)
                 if page_start is None:
                     page_start = rendered_start
                 page_end = rendered_end
             if exhausted:
+                break
+            if limit is not None and read_count >= limit:
                 break
             continue
         meta = _load_view_session(meta.session_id)
@@ -2873,6 +3165,7 @@ def _still_running_note(session_id: str, timeout: float | None) -> str:
 
 
 @effects.non_idempotent
+@schema.format_defaults(tty="text", non_tty="text")
 @schema.reads_stdin("prompt_text")
 @schema.describes(
     agent="Registry entry to dispatch: an adapter or a variant, as `acpc agents` lists them.",
@@ -2936,7 +3229,13 @@ def _still_running_note(session_id: str, timeout: float | None) -> str:
 @click.option(
     "--home", metavar="DIR", help="Vendor home override; absent, the entry's configured home."
 )
-@click.option("-o", "--output", "output_file", metavar="FILE", help=_OUTPUT_FILE_HELP)
+@click.option("--output-file", "output_file", metavar="FILE", help=_OUTPUT_FILE_HELP)
+@click.option(
+    "--format",
+    "format_name",
+    type=click.Choice(("text", "json")),
+    help="Select text or JSON output; absent, the default follows stdout's TTY state.",
+)
 @click.option(
     "--timeout",
     type=TimeoutParamType(),
@@ -2980,6 +3279,7 @@ def _still_running_note(session_id: str, timeout: float | None) -> str:
 )
 @click.option("--quiet", is_flag=True, help="Suppress the stderr summary line.")
 @_json_option("Emit this command's output as JSON.")
+@_color_option()
 @click.help_option("-h", "--help")
 def run_command(
     agent: str,
@@ -2992,6 +3292,7 @@ def run_command(
     mode: str | None,
     home: str | None,
     output_file: str | None,
+    format_name: str | None,
     timeout: float | None,
     alias: str | None,
     resolve: bool,
@@ -3017,6 +3318,8 @@ def run_command(
 
     Example: ``acpc run codex "Fix the failing test" --permissions execute``
     """
+    selected_format = _select_format(format_name, json_mode, native_text=True)
+
     # The limit above is spelled out because Click renders this docstring
     # verbatim; `vocab.MAX_PROMPT_BYTES` is where it actually lives, and that
     # constant carries the pointer back here.
@@ -3059,7 +3362,7 @@ def run_command(
         payload = runner.resolution_payload(
             previewed, cwd=resolved_cwd, permissions_source=permissions_source
         )
-        _emit_resolution(payload, json_mode=json_mode)
+        _emit_resolution(payload, json_mode=selected_format == "json")
         return
 
     prompt = _read_prompt(prompt_text, prompt_file)
@@ -3118,7 +3421,13 @@ def run_command(
     )
 
     if background:
-        _dispatch_background(meta.session_id, request, json_mode=json_mode)
+        _dispatch_background(
+            meta.session_id,
+            request,
+            json_mode=selected_format == "json",
+            output_file=output_file,
+            max_output=max_output,
+        )
         return
 
     if not quiet:
@@ -3130,17 +3439,18 @@ def run_command(
         raise _runner_problem(error).with_context(session_id=meta.session_id) from None
 
     final = sessions.read_meta(meta.session_id)
-    if output_file is not None:
-        output.write_output_file(output_file, outcome.answer)
 
     result = output.render_result(
         final,
         outcome.answer,
-        json_mode=json_mode,
-        output_file=output_file,
+        json_mode=selected_format == "json",
         max_output=max_output,
     )
-    _write_stdout(result.text)
+    if outcome.exit_code == vocab.EXIT_OK:
+        if not _write_rendered_file(output_file, result):
+            _write_stdout(result.text)
+    elif selected_format == "text" and output_file is None:
+        _write_stdout(result.text)
 
     if outcome.state == "detached":
         # SPEC *Output contract*: the session outlives this client, so the way
@@ -3169,7 +3479,7 @@ def run_command(
 _TURN_FAILURE_KINDS = {
     "failed": errors.OPERATION_FAILED,
     "orphaned": errors.OPERATION_FAILED,
-    "cancelled": errors.OPERATION_FAILED,
+    "canceled": errors.OPERATION_FAILED,
     "timeout": errors.TIMEOUT,
     # The daemon still owns the turn: acpc stopped watching without seeing how
     # it ends, and saying "failed" would claim knowledge it does not have.
@@ -3180,12 +3490,12 @@ _TURN_FAILURE_KINDS = {
 # States `runner.exit_code_for` settles on their own, before it looks at
 # `stop_reason`.  `_end_turn` has to weigh the two in the same order, or a
 # turn could leave with one story in its exit code and another in its kind.
-_SIGNAL_STATES = frozenset({"cancelled", "timeout", "detached", "terminated"})
+_SIGNAL_STATES = frozenset({"canceled", "timeout", "detached", "terminated"})
 
 _TURN_FAILURE_MESSAGES = {
     "failed": "session {id} failed",
     "orphaned": "session {id} is orphaned: the process behind it is gone",
-    "cancelled": "session {id} was cancelled",
+    "canceled": "session {id} was canceled",
     "timeout": "session {id} timed out",
     "detached": "acpc detached from session {id}; the turn is still running",
     "terminated": "session {id} was terminated",
@@ -3222,6 +3532,7 @@ def _end_turn(
     stopped by its caller's Ctrl-C is a different failure from a command that
     watched an operation end badly.
     """
+    state = vocab.normalize_session_state(state)
     if exit_code == vocab.EXIT_OK:
         raise SystemExit(exit_code)
     if interrupted:
@@ -3270,7 +3581,14 @@ def _queue_note(outcome: runner.TurnOutcome) -> str | None:
     return "queued for a daemon slot" if outcome.queued else None
 
 
-def _dispatch_background(session_id: str, request: runner.TurnRequest, *, json_mode: bool) -> None:
+def _dispatch_background(
+    session_id: str,
+    request: runner.TurnRequest,
+    *,
+    json_mode: bool,
+    output_file: str | None = None,
+    max_output: int = output.DEFAULT_MAX_OUTPUT,
+) -> None:
     """Hand the turn to the daemon and print what the caller needs to find it.
 
     SPEC `run --bg`: stdout is exactly the session id and its directory, so a
@@ -3283,19 +3601,19 @@ def _dispatch_background(session_id: str, request: runner.TurnRequest, *, json_m
         # The session exists by now: the caller has to be able to reach it
         # even though the dispatch that would have run it failed (R7a).
         raise AgentProblem(problem, context={"session_id": session_id})
-    if json_mode:
-        import json
-
-        payload = {"session_id": session_id, "paths": sessions.session_paths(session_id)}
-        resume = sessions.read_meta(session_id).extra.get("resume")
-        if isinstance(resume, str):
-            payload["resume"] = resume
-        _write_stdout(json.dumps(payload, ensure_ascii=False) + "\n")
-        return
-    _write_stdout(f"{session_id}\n{sessions.session_dir(session_id)}\n")
+    meta = sessions.read_meta(session_id)
+    result = output.render_result(
+        meta,
+        json_mode=json_mode,
+        background=True,
+        max_output=max_output,
+    )
+    if not _write_rendered_file(output_file, result):
+        _write_stdout(result.text)
 
 
 @effects.non_idempotent
+@schema.format_defaults(tty="text", non_tty="text")
 @schema.reads_stdin("prompt_text")
 @schema.describes(
     selector=_SELECTOR_HELP,
@@ -3314,7 +3632,13 @@ def _dispatch_background(session_id: str, request: runner.TurnRequest, *, json_m
         "prompt sources with the argument and `-`, exactly one of which must be given."
     ),
 )
-@click.option("-o", "--output", "output_file", metavar="FILE", help=_OUTPUT_FILE_HELP)
+@click.option("--output-file", "output_file", metavar="FILE", help=_OUTPUT_FILE_HELP)
+@click.option(
+    "--format",
+    "format_name",
+    type=click.Choice(("text", "json")),
+    help="Select text or JSON output; absent, the default is text.",
+)
 @click.option(
     "--permissions",
     type=click.Choice(_PERMISSION_CHOICES),
@@ -3355,6 +3679,7 @@ def _dispatch_background(session_id: str, request: runner.TurnRequest, *, json_m
 )
 @click.option("--quiet", is_flag=True, help="Suppress the stderr summary line.")
 @_json_option("Emit this command's output as JSON.")
+@_color_option()
 @click.option(
     "--model",
     metavar="M",
@@ -3405,6 +3730,7 @@ def continue_command(
     prompt_text: str | None,
     prompt_file: str | None,
     output_file: str | None,
+    format_name: str | None,
     background: bool,
     timeout: float | None,
     max_output: int,
@@ -3429,6 +3755,7 @@ def continue_command(
 
     Example: ``acpc continue <session-id> "Run the tests again"``
     """
+    selected_format = _select_format(format_name, json_mode, native_text=True)
     permissions = _normalize_permission(permissions)
     run_only = {
         "--model": model,
@@ -3463,7 +3790,7 @@ def continue_command(
         timeout=timeout,
         max_output=max_output,
         quiet=quiet,
-        json_mode=json_mode,
+        json_mode=selected_format == "json",
     )
 
 
@@ -3569,7 +3896,13 @@ def _dispatch_follow_up(
     )
 
     if background:
-        _dispatch_background(meta.session_id, request, json_mode=json_mode)
+        _dispatch_background(
+            meta.session_id,
+            request,
+            json_mode=json_mode,
+            output_file=output_file,
+            max_output=max_output,
+        )
         return
 
     if not quiet:
@@ -3592,17 +3925,18 @@ def _dispatch_follow_up(
         raise _runner_problem(error).with_context(session_id=meta.session_id) from None
 
     final = sessions.read_meta(meta.session_id)
-    if output_file is not None:
-        output.write_output_file(output_file, outcome.answer)
 
     result = output.render_result(
         final,
         outcome.answer,
         json_mode=json_mode,
-        output_file=output_file,
         max_output=max_output,
     )
-    _write_stdout(result.text)
+    if outcome.exit_code == vocab.EXIT_OK:
+        if not _write_rendered_file(output_file, result):
+            _write_stdout(result.text)
+    elif not json_mode and output_file is None:
+        _write_stdout(result.text)
     if outcome.state == "detached":
         _echo_metadata(
             f"-- detached, still RUNNING: {meta.session_id}"
@@ -3626,6 +3960,7 @@ def _steer_prompt(instruction: str) -> str:
 
 
 @effects.non_idempotent
+@schema.format_defaults(tty="text", non_tty="text")
 @schema.reads_stdin("instruction_text")
 @schema.describes(
     selector=_SELECTOR_HELP,
@@ -3648,7 +3983,13 @@ def _steer_prompt(instruction: str) -> str:
         "sources with the argument and `-`, exactly one of which must be given."
     ),
 )
-@click.option("-o", "--output", "output_file", metavar="FILE", help=_OUTPUT_FILE_HELP)
+@click.option("--output-file", "output_file", metavar="FILE", help=_OUTPUT_FILE_HELP)
+@click.option(
+    "--format",
+    "format_name",
+    type=click.Choice(("text", "json")),
+    help="Select text or JSON output; absent, the default is text.",
+)
 @click.option("--bg", "background", is_flag=True, help="Dispatch and return the session id.")
 @click.option(
     "--timeout",
@@ -3668,12 +4009,14 @@ def _steer_prompt(instruction: str) -> str:
 )
 @click.option("--quiet", is_flag=True, help="Suppress the stderr summary line.")
 @_json_option("Emit this command's output as JSON.")
+@_color_option()
 @click.help_option("-h", "--help")
 def steer_command(
     selector: str,
     instruction_text: str | None,
     prompt_file: str | None,
     output_file: str | None,
+    format_name: str | None,
     background: bool,
     timeout: float | None,
     max_output: int,
@@ -3693,6 +4036,7 @@ def steer_command(
 
     Example: ``acpc steer x7k2 "Stop editing; diagnose only"``
     """
+    selected_format = _select_format(format_name, json_mode, native_text=True)
     instruction = _read_prompt(instruction_text, prompt_file)
     meta = _load_view_session(selector)
     if not meta.is_active:
@@ -3707,7 +4051,7 @@ def steer_command(
 
     meta = _cancel_session(meta)
     interrupted = (
-        meta.state == "cancelled" and meta.stop_reason != runner.PREPARATION_CANCELLED_REASON
+        meta.state == "canceled" and meta.stop_reason != runner.PREPARATION_CANCELLED_REASON
     )
     if not interrupted and not quiet:
         # SPEC `steer`: nothing was interrupted, so the preamble would lie.
@@ -3730,11 +4074,12 @@ def steer_command(
         timeout=timeout,
         max_output=max_output,
         quiet=quiet,
-        json_mode=json_mode,
+        json_mode=selected_format == "json",
     )
 
 
 @effects.read_only
+@schema.format_defaults(tty="text", non_tty="text")
 @schema.describes(selector=_SELECTOR_HELP, output_file=_OUTPUT_FILE_DESCRIPTION)
 @main.command(name="wait")
 @click.argument("selector")
@@ -3748,7 +4093,13 @@ def steer_command(
         "session keeps running; absent, it blocks indefinitely."
     ),
 )
-@click.option("-o", "--output", "output_file", metavar="FILE", help=_OUTPUT_FILE_HELP)
+@click.option("--output-file", "output_file", metavar="FILE", help=_OUTPUT_FILE_HELP)
+@click.option(
+    "--format",
+    "format_name",
+    type=click.Choice(("text", "json")),
+    help="Select text or JSON output; absent, the default is text.",
+)
 @click.option(
     "--max-output",
     type=click.IntRange(min=0),
@@ -3758,11 +4109,13 @@ def steer_command(
 )
 @click.option("--quiet", is_flag=True, help="Suppress the stderr summary line.")
 @_json_option("Emit this command's output as JSON.")
+@_color_option()
 @click.help_option("-h", "--help")
 def wait_command(
     selector: str,
     timeout: float | None,
     output_file: str | None,
+    format_name: str | None,
     max_output: int,
     quiet: bool,
     json_mode: bool,
@@ -3777,6 +4130,7 @@ def wait_command(
 
     Example: ``acpc wait <session-id> --timeout 120``
     """
+    selected_format = _select_format(format_name, json_mode, native_text=True)
     meta = _load_view_session(selector)
     state = runner.wait_for_session(meta.session_id, timeout=timeout)
     if state is None:
@@ -3794,17 +4148,19 @@ def wait_command(
 
     final = sessions.read_meta(meta.session_id)
     answer = _answer_text(meta.session_id)
-    if output_file is not None:
-        output.write_output_file(output_file, answer)
 
     result = output.render_result(
         final,
         answer,
-        json_mode=json_mode,
-        output_file=output_file,
+        json_mode=selected_format == "json",
         max_output=max_output,
     )
-    _write_stdout(result.text)
+    exit_code = runner.exit_code_for(final.state, final.stop_reason)
+    if exit_code == vocab.EXIT_OK:
+        if not _write_rendered_file(output_file, result):
+            _write_stdout(result.text)
+    elif selected_format == "text" and output_file is None:
+        _write_stdout(result.text)
     if not quiet:
         summary = output.format_summary(final)
         if final.state == "failed" and (
@@ -3816,7 +4172,7 @@ def wait_command(
         final.session_id,
         final.state,
         final.stop_reason,
-        runner.exit_code_for(final.state, final.stop_reason),
+        exit_code,
     )
 
 
@@ -3850,20 +4206,61 @@ def daemon_group() -> None:
 )
 @daemon_group.command(name="status")
 @click.argument("agent", required=False)
+@click.option(
+    "--limit",
+    type=click.IntRange(min=0),
+    default=render.DEFAULT_STATUS_LIMIT,
+    show_default=True,
+    help="Return at most N daemons.",
+)
+@click.option(
+    "--plain", is_flag=True, help="Print one daemon target per line; requires explicit --limit."
+)
+@click.option(
+    "--format",
+    "format_name",
+    type=click.Choice(("text", "json", "plain")),
+    help="Select text, JSON, or one-item-per-line output.",
+)
 @_json_option("Emit the status as JSON.")
+@_color_option()
 @click.help_option("-h", "--help")
-def daemon_status_command(agent: str | None, json_mode: bool) -> None:
+@click.pass_context
+def daemon_status_command(
+    ctx: click.Context,
+    agent: str | None,
+    limit: int,
+    plain: bool,
+    format_name: str | None,
+    json_mode: bool,
+) -> None:
     """Report each live daemon with its acpc version, pid, uptime, idle age and log path.
 
     Example: ``acpc daemon status --json``
     """
+    selected_format = _select_format(format_name, json_mode, plain=plain)
+    if (
+        selected_format == "plain"
+        and ctx.get_parameter_source("limit") is not click.core.ParameterSource.COMMANDLINE
+    ):
+        raise UsageProblem("--plain requires an explicit --limit")
     import asyncio
 
-    entries = asyncio.run(_collect_daemon_status(agent))
-    if json_mode:
+    all_entries = asyncio.run(_collect_daemon_status(agent))
+    entries = all_entries[:limit]
+    if selected_format == "json":
         import json
 
-        _write_stdout(json.dumps({"daemons": entries}, ensure_ascii=False) + "\n")
+        _write_stdout(
+            json.dumps(
+                {"items": entries, "has_more": len(entries) < len(all_entries)},
+                ensure_ascii=False,
+            )
+            + "\n"
+        )
+        return
+    if selected_format == "plain":
+        _write_stdout("".join(f"{item['target']}\n" for item in entries))
         return
     if not entries:
         click.echo("-- no daemons running", err=True)
@@ -3873,7 +4270,7 @@ def daemon_status_command(agent: str | None, json_mode: bool) -> None:
             str(item["target"]),
             f"acpc {item['version']}",
             f"pid {item['pid']}",
-            f"up {output.format_duration(item['uptime'])}",
+            f"up {output.format_duration(item['uptime_seconds'])}",
             f"· {_daemon_idle_column(item['idle_seconds'])}",
             f"· {len(item['sessions'])} sessions",
             f"· {item['log']}",
@@ -3882,6 +4279,8 @@ def daemon_status_command(agent: str | None, json_mode: bool) -> None:
     ]
     lines = render.format_table(rows, separator="  ")
     _write_stdout("\n".join(lines) + "\n")
+    if len(entries) < len(all_entries):
+        _echo_metadata(f"-- {len(entries)} z {len(all_entries)} — --limit żeby zmienić")
 
 
 async def _collect_daemon_status(
@@ -3923,10 +4322,22 @@ async def _collect_daemon_status(
 )
 @click.option("--dry-run", is_flag=True, help="List the daemons it would stop, and stop none.")
 @click.option("--yes", "-y", "assume_yes", is_flag=True, help="Stop them without being asked.")
+@click.option(
+    "--format",
+    "format_name",
+    type=click.Choice(("text", "json")),
+    help="Select text or JSON output.",
+)
 @_json_option("Emit the result as JSON.")
+@_color_option()
 @click.help_option("-h", "--help")
 def daemon_stop_command(
-    agent: str | None, force: bool, dry_run: bool, assume_yes: bool, json_mode: bool
+    agent: str | None,
+    force: bool,
+    dry_run: bool,
+    assume_yes: bool,
+    format_name: str | None,
+    json_mode: bool,
 ) -> None:
     """Stop daemons; active sessions refuse the stop unless ``--force``.
 
@@ -3940,6 +4351,7 @@ def daemon_stop_command(
 
     Example: ``acpc daemon stop mock``
     """
+    selected_format = _select_format(format_name, json_mode)
     import asyncio
 
     targets = runner.daemon_targets_for(agent) if agent else runner.all_daemon_targets()
@@ -3961,7 +4373,7 @@ def daemon_stop_command(
     else:
         stopped = asyncio.run(_stop_daemons(targets))
     payload = {"targets": stopped, "changed": bool(stopped) and not dry_run}
-    if json_mode:
+    if selected_format == "json":
         _maintenance_json(payload)
     click.echo(
         f"-- {'would stop' if dry_run else 'stopped'} {len(stopped)} daemon(s)",

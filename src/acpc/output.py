@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO
 
-from acpc import paths, permissions, sessions
+from acpc import paths, permissions, sessions, vocab
 
 DEFAULT_MAX_OUTPUT = 128 * 1024
 
@@ -76,23 +76,24 @@ def result_envelope(
     *,
     truncated: bool = False,
     background: bool = False,
-    output_file: Path | str | None = None,
 ) -> dict[str, Any]:
     """Build the pinned JSON shape for an answer-printing command."""
     if background:
         envelope = {
             "session_id": meta.session_id,
-            "state": meta.state,
+            "status": vocab.normalize_session_state(meta.state),
             "paths": sessions.session_paths(meta.session_id),
+            "truncated": False,
             "denied": _denial_payload(meta),
             "permissions_clamp": _permissions_clamp(meta),
+            "next": [f"acpc wait {meta.session_id}"],
         }
         if resume := _resume_status(meta):
             envelope["resume"] = resume
         return envelope
 
     envelope: dict[str, Any] = {
-        "state": meta.state,
+        "status": vocab.normalize_session_state(meta.state),
         "session_id": meta.session_id,
         "stop_reason": meta.stop_reason,
         "paths": sessions.session_paths(meta.session_id),
@@ -101,12 +102,12 @@ def result_envelope(
         "truncated": truncated,
         "denied": _denial_payload(meta),
         "permissions_clamp": _permissions_clamp(meta),
+        "next": [f"acpc continue {meta.session_id}"],
     }
     if resume := _resume_status(meta):
         envelope["resume"] = resume
-    if output_file is not None:
-        envelope["output_file"] = str(output_file)
-        envelope.pop("answer")
+    if truncated:
+        envelope["output_file"] = str(sessions.answer_path(meta.session_id))
     return envelope
 
 
@@ -149,7 +150,7 @@ def _json_answer(
 
 
 def write_output_file(path: Path | str, answer: str) -> int:
-    """Atomically write a complete ``-o`` answer and return its byte size."""
+    """Atomically write the exact stdout representation to a destination."""
     target = Path(path).expanduser()
     paths.atomic_write(target, answer)
     return len(answer.encode("utf-8"))
@@ -173,14 +174,6 @@ def render_result(
             text = _json_text(result_envelope(meta, "", background=True))
         else:
             text = f"{meta.session_id}\n{sessions.session_dir(meta.session_id)}\n"
-        return OutputResult(text, False, len(text.encode("utf-8")))
-
-    if output_file is not None:
-        if json_mode:
-            text = _json_text(result_envelope(meta, "", output_file=output_file))
-        else:
-            size = len(answer.encode("utf-8"))
-            text = f"answer: {output_file} ({size} bytes) · session: {meta.session_id}\n"
         return OutputResult(text, False, len(text.encode("utf-8")))
 
     if json_mode:

@@ -264,11 +264,11 @@ def test_daemon_status_leaves_a_daemon_of_another_build_running(
     first = cli.invoke(main, ["daemon", "status", "--json"], catch_exceptions=False)
     second = cli.invoke(main, ["daemon", "status", "--json"], catch_exceptions=False)
 
-    reported = json.loads(first.stdout)["daemons"]
+    reported = json.loads(first.stdout)["items"]
     assert [entry["target"] for entry in reported] == [target()]
     assert reported[0]["version"] == __version__
     # Still there for the next look: the first one changed nothing.
-    assert json.loads(second.stdout)["daemons"][0]["pid"] == reported[0]["pid"]
+    assert json.loads(second.stdout)["items"][0]["pid"] == reported[0]["pid"]
 
 
 # --- routing ----------------------------------------------------------------
@@ -281,9 +281,9 @@ def test_a_turn_runs_on_the_daemon_and_finishes_the_session(
 
     outcome = run_turn(session_id, "a daemon turn")
 
-    assert outcome.state == "done"
+    assert outcome.state == "succeeded"
     assert outcome.route_note is None
-    assert sessions.read_meta(session_id).state == "done"
+    assert sessions.read_meta(session_id).state == "succeeded"
 
 
 def test_warm_daemon_rejects_a_changed_spawn_argv(
@@ -376,7 +376,7 @@ def test_cancel_before_daemon_acceptance_is_the_no_such_turn_case(
 
     assert reply["ok"] is False
     assert "not running here" in reply["error"]
-    assert sessions.read_meta(session_id).state == "done"
+    assert sessions.read_meta(session_id).state == "succeeded"
 
 
 def test_daemon_replay_tag_survives_restore_client_release_and_live_rebind(
@@ -769,7 +769,7 @@ def test_a_turn_is_not_started_if_daemon_task_registration_fails(
 
     assert reply["ok"] is False
     failed = sessions.read_meta(session_id)
-    assert failed.state == "done"
+    assert failed.state == "succeeded"
     assert failed.turns == 1
 
 
@@ -810,8 +810,8 @@ def test_a_refused_switch_leaves_the_daemon_warm_for_continue(
     continued = next_turn(session_id, "multi:after the refused switch")
 
     assert continued.route_note is None
-    assert continued.state == "done"
-    assert sessions.read_meta(session_id).state == "done"
+    assert continued.state == "succeeded"
+    assert sessions.read_meta(session_id).state == "succeeded"
     assert "turn 2: after the refused switch" in sessions.answer_path(session_id).read_text()
 
 
@@ -877,11 +877,11 @@ def test_daemon_carries_incomplete_delivery_into_a_cold_resume(
 
     first, resume_status, second = asyncio.run(run_daemon_turns())
 
-    assert first.state == "done"
+    assert first.state == "succeeded"
     assert first.delivery_record_incomplete is True
     assert sessions.read_meta(session_id).extra[sessions.DELIVERY_RECORD_INCOMPLETE] is True
     assert resume_status == "unverified — delivery record incomplete"
-    assert second["state"] == "done"
+    assert second["state"] == "succeeded"
 
 
 def test_daemon_keeps_a_pre_send_failure_record_complete_on_cold_resume(
@@ -937,7 +937,7 @@ def test_daemon_keeps_a_pre_send_failure_record_complete_on_cold_resume(
             await instance._await_preparation({"session_id": session_id})
             resume_status = sessions.read_meta(session_id).extra["resume"]
             outcome = await instance._await({"session_id": session_id})
-            assert outcome["outcome"]["state"] == "done"
+            assert outcome["outcome"]["state"] == "succeeded"
             return resume_status
         finally:
             await instance.host.close()
@@ -961,8 +961,8 @@ def test_one_daemon_serves_several_sessions(state_root: Path, live_daemon: None)
             await connection.close()
 
     assert asyncio.run(pids()) > 0
-    assert sessions.read_meta(first).state == "done"
-    assert sessions.read_meta(second).state == "done"
+    assert sessions.read_meta(first).state == "succeeded"
+    assert sessions.read_meta(second).state == "succeeded"
 
 
 # --- warm versus cold, the contract `continue` depends on -------------------
@@ -1260,7 +1260,7 @@ def test_daemon_stop_leaves_an_already_finished_session_alone(
 
     asyncio.run(_stop_target())
 
-    assert sessions.read_meta(session_id).state == "done"
+    assert sessions.read_meta(session_id).state == "succeeded"
 
 
 async def _stop_target() -> None:
@@ -1277,7 +1277,7 @@ def test_the_target_heals_after_its_adapter_dies(state_root: Path, live_daemon: 
     import signal
 
     first = new_session("warm the adapter")
-    assert run_turn(first, "warm the adapter").state == "done"
+    assert run_turn(first, "warm the adapter").state == "succeeded"
 
     daemon_pid = asyncio.run(_daemon_pid())
     children_path = Path(f"/proc/{daemon_pid}/task/{daemon_pid}/children")
@@ -1293,7 +1293,7 @@ def test_the_target_heals_after_its_adapter_dies(state_root: Path, live_daemon: 
     while time.monotonic() < deadline:
         session_id = new_session("after the crash")
         try:
-            if run_turn(session_id, "after the crash").state == "done":
+            if run_turn(session_id, "after the crash").state == "succeeded":
                 return
         except runner.RunnerError:
             pass  # the daemon may still be tearing the dead turn down
@@ -1372,7 +1372,7 @@ def test_status_reports_the_pid_uptime_and_log_path(state_root: Path, live_daemo
     reply = asyncio.run(status())
 
     assert reply["pid"] > 0
-    assert reply["uptime"] >= 0
+    assert reply["uptime_seconds"] >= 0
     assert reply["log"] == str(daemon.log_path_for_target(target()))
 
 
@@ -1432,7 +1432,10 @@ def test_concurrent_sessions_never_land_on_each_others_transcripts(
         for session_id in ids:
             _wait_for_finished(session_id)
 
-    assert [sessions.read_meta(session_id).state for session_id in ids] == ["done", "done"]
+    assert [sessions.read_meta(session_id).state for session_id in ids] == [
+        "succeeded",
+        "succeeded",
+    ]
 
 
 async def _start_together(work: list[tuple[str, str]]) -> None:

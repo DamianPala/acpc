@@ -31,6 +31,7 @@ import threading
 import time
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from dataclasses import dataclass, field, fields
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -63,9 +64,45 @@ _ID_ALLOCATION_ATTEMPTS = 64
 # SPEC.md *Session states*. Finished states are terminal for the current turn;
 # a new turn re-opens the session through `rotate_turn`.
 _ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
-    "starting": frozenset({"running", "done", "failed", "cancelled", "timeout", "orphaned"}),
-    "running": frozenset({"done", "failed", "cancelled", "timeout", "orphaned"}),
+    "starting": frozenset({"running", "succeeded", "failed", "canceled", "timeout", "orphaned"}),
+    "running": frozenset({"succeeded", "failed", "canceled", "timeout", "orphaned"}),
 }
+
+_TIMESTAMP_FIELDS = frozenset({"created_at", "started_at", "finished_at"})
+_RFC3339_TIMESTAMP = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$"
+)
+
+
+def format_timestamp(value: float) -> str:
+    """Render one timestamp precision everywhere acpc publishes time."""
+    return (
+        datetime.fromtimestamp(value, tz=UTC)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def parse_timestamp(value: Any, key: str, path: Path) -> float | None:
+    """Read RFC 3339 timestamps, tolerating numeric pre-1.0 metadata."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise CorruptSessionError(f"{path}: {key} is not a timestamp")
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, str):
+        raise CorruptSessionError(f"{path}: {key} is not a timestamp")
+    if _RFC3339_TIMESTAMP.fullmatch(value) is None:
+        raise CorruptSessionError(f"{path}: {key} is not RFC 3339")
+    candidate = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError as error:
+        raise CorruptSessionError(f"{path}: {key} is not RFC 3339") from error
+    if parsed.tzinfo is None:
+        raise CorruptSessionError(f"{path}: {key} has no timezone")
+    return parsed.timestamp()
 
 
 class SessionError(Exception):
@@ -149,7 +186,13 @@ class SessionMeta:
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        data: dict[str, Any] = {name: getattr(self, name) for name in _META_FIELDS}
+        data: dict[str, Any] = {
+            ("status" if name == "state" else name): getattr(self, name) for name in _META_FIELDS
+        }
+        for name in _TIMESTAMP_FIELDS:
+            value = data.get(name)
+            if value is not None:
+                data[name] = format_timestamp(float(value))
         data.update(self.extra)
         return data
 
@@ -411,17 +454,22 @@ def meta_from_dict(data: Mapping[str, Any], *, path: Path) -> SessionMeta:
     `path` only shapes the error message: SPEC.md's output contract wants one
     actionable line naming the file, never a traceback.
     """
-    known = {key: value for key, value in data.items() if key in _META_FIELDS}
-    extra = {key: value for key, value in data.items() if key not in _META_FIELDS}
+    known = {key: value for key, value in data.items() if key in _META_FIELDS or key == "status"}
+    extra = {
+        key: value
+        for key, value in data.items()
+        if key not in _META_FIELDS and key not in {"status", "state"}
+    }
 
     session_id = _coerce_str(known.get("session_id"), "session_id", path)
     entry = _coerce_str(known.get("entry"), "entry", path)
     if not session_id or not entry:
         raise CorruptSessionError(f"{path}: missing session_id or entry")
 
-    state = _coerce_str(known.get("state"), "state", path) or "starting"
+    raw_state = known.get("status", known.get("state"))
+    state = vocab.normalize_session_state(_coerce_str(raw_state, "status", path) or "starting")
     if state not in vocab.SESSION_STATES:
-        raise CorruptSessionError(f"{path}: unknown session state {state!r}")
+        raise CorruptSessionError(f"{path}: unknown session status {state!r}")
 
     resolution = known.get("resolution") or {}
     if not isinstance(resolution, dict):
@@ -435,9 +483,9 @@ def meta_from_dict(data: Mapping[str, Any], *, path: Path) -> SessionMeta:
         state=state,
         pid=_coerce_int(known.get("pid"), "pid", path),
         process_start_time=_coerce_str(known.get("process_start_time"), "process_start_time", path),
-        created_at=_coerce_float(known.get("created_at"), "created_at", path),
-        started_at=_coerce_float(known.get("started_at"), "started_at", path),
-        finished_at=_coerce_float(known.get("finished_at"), "finished_at", path),
+        created_at=parse_timestamp(known.get("created_at"), "created_at", path),
+        started_at=parse_timestamp(known.get("started_at"), "started_at", path),
+        finished_at=parse_timestamp(known.get("finished_at"), "finished_at", path),
         turns=_coerce_int(known.get("turns"), "turns", path) or 1,
         exit_code=_coerce_int(known.get("exit_code"), "exit_code", path),
         stop_reason=_coerce_str(known.get("stop_reason"), "stop_reason", path),
@@ -673,8 +721,9 @@ def transition(
     entering any finished state stamps `finished_at`.
     """
     resolved_clock = _resolve_clock(clock)
+    to_state = vocab.normalize_session_state(to_state)
     if to_state not in vocab.SESSION_STATES:
-        raise ValueError(f"unknown session state {to_state!r}")
+        raise ValueError(f"unknown session status {to_state!r}")
     unknown = set(changes) - set(_META_FIELDS)
     if unknown:
         raise ValueError(f"unknown meta fields: {', '.join(sorted(unknown))}")
@@ -715,8 +764,9 @@ def finalize_turn(
     owner from writing its answer into the replacement turn.
     """
     resolved_clock = _resolve_clock(clock)
+    to_state = vocab.normalize_session_state(to_state)
     if to_state not in vocab.SESSION_STATES:
-        raise ValueError(f"unknown session state {to_state!r}")
+        raise ValueError(f"unknown session status {to_state!r}")
     unknown = set(changes) - set(_META_FIELDS)
     if unknown:
         raise ValueError(f"unknown meta fields: {', '.join(sorted(unknown))}")

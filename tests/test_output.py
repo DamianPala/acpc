@@ -53,7 +53,7 @@ def test_json_envelope_has_pinned_fields_and_truncates_answer_only() -> None:
     payload = json.loads(result.text)
 
     assert set(payload) == {
-        "state",
+        "status",
         "session_id",
         "stop_reason",
         "paths",
@@ -62,6 +62,8 @@ def test_json_envelope_has_pinned_fields_and_truncates_answer_only() -> None:
         "truncated",
         "denied",
         "permissions_clamp",
+        "next",
+        "output_file",
     }
     assert payload["truncated"] is True
     assert payload["denied"] == []
@@ -83,16 +85,18 @@ def test_background_and_output_file_shapes_are_separate(tmp_path: Path) -> None:
 
     assert set(background) == {
         "session_id",
-        "state",
+        "status",
         "paths",
         "denied",
         "permissions_clamp",
+        "truncated",
+        "next",
     }
     assert background["denied"] == []
     assert background["permissions_clamp"] is None
-    assert "answer" not in written_json
-    assert written_json["output_file"] == str(output_file)
-    assert "answer.md" in written.text
+    assert written_json["answer"] == answer
+    assert "output_file" not in written_json
+    assert written.text == answer
 
     size = output.write_output_file(output_file, answer)
     assert output_file.read_text(encoding="utf-8") == answer
@@ -168,7 +172,7 @@ def test_summary_is_one_prefixed_stderr_line() -> None:
     meta = make_session(Path("."))
     meta = sessions.transition(
         meta.session_id,
-        "done",
+        "succeeded",
         clock=lambda: 112.0,
         exit_code=0,
         stop_reason="end_turn",
@@ -189,7 +193,7 @@ def test_summary_places_continue_command_before_route_note() -> None:
     meta = make_session(Path("."))
     meta = sessions.transition(
         meta.session_id,
-        "done",
+        "succeeded",
         clock=lambda: 112.0,
         exit_code=0,
         stop_reason="end_turn",

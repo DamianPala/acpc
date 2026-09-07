@@ -351,7 +351,7 @@ def test_log_footer_groups_state_qualifier_and_matches_spec() -> None:
     )
     done = sessions.transition(
         meta.session_id,
-        "done",
+        "succeeded",
         clock=lambda: 160.0,
         exit_code=0,
         stop_reason="end_turn",
@@ -369,7 +369,7 @@ def test_log_footer_groups_state_qualifier_and_matches_spec() -> None:
 
     assert running_footer == "-- running 3m12s | events 26–45 of 45 | cursor: 45"
     assert done_footer == (
-        f"-- done exit 0 | 3m12s | 41k tok | answer: {sessions.answer_path(done.session_id)} "
+        f"-- succeeded exit 0 | 3m12s | 41k tok | answer: {sessions.answer_path(done.session_id)} "
         "| events 26–45 of 45 | cursor: 45"
     )
 
@@ -377,20 +377,20 @@ def test_log_footer_groups_state_qualifier_and_matches_spec() -> None:
 def test_status_list_limits_finished_sessions_and_json_preserves_fields() -> None:
     finished = [make_session(session_id_hint=f"finished {index}") for index in range(6)]
     finished = [
-        sessions.transition(meta.session_id, "done", clock=lambda: 110.0, exit_code=0)
+        sessions.transition(meta.session_id, "succeeded", clock=lambda: 110.0, exit_code=0)
         for meta in finished
     ]
     active = make_session(session_id_hint="active prompt")
     all_sessions = [active, *finished]
 
-    text = render.render_status_list(all_sessions, clock=lambda: 120.0)
-    payload = render.status_list_json(all_sessions, clock=lambda: 120.0)
+    text = render.render_status_list(all_sessions, limit=6, clock=lambda: 120.0)
+    payload = render.status_list_json(all_sessions, limit=6, clock=lambda: 120.0)
 
     assert "active prompt" in text
     assert text.count("finished") == 5
-    assert "--all for all 7" in text
-    assert len(payload["sessions"]) == 6
-    assert payload["sessions"][0]["prompt_snippet"] == "active prompt"
+    assert "-- 6 z 7 — --limit żeby zmienić" in text
+    assert len(payload["items"]) == 6
+    assert payload["items"][0]["prompt_snippet"] == "active prompt"
 
 
 def test_status_keeps_the_last_finished_session_even_if_it_started_first() -> None:
@@ -403,7 +403,7 @@ def test_status_keeps_the_last_finished_session_even_if_it_started_first() -> No
     long_run = sessions.create_session(
         entry="mock", base_adapter="mock", prompt="long run", clock=lambda: 10.0
     )
-    sessions.transition(long_run.session_id, "done", clock=lambda: 900.0, exit_code=0)
+    sessions.transition(long_run.session_id, "succeeded", clock=lambda: 900.0, exit_code=0)
     short_runs = [
         sessions.create_session(
             entry="mock",
@@ -415,14 +415,14 @@ def test_status_keeps_the_last_finished_session_even_if_it_started_first() -> No
     ]
     for index, meta in enumerate(short_runs):
         sessions.transition(
-            meta.session_id, "done", clock=lambda index=index: 200.0 + index, exit_code=0
+            meta.session_id, "succeeded", clock=lambda index=index: 200.0 + index, exit_code=0
         )
 
     # As `list_sessions` hands them over: most recently started first.
     ordered = [sessions.read_meta(meta.session_id) for meta in reversed(short_runs)]
     ordered.append(sessions.read_meta(long_run.session_id))
 
-    text = render.render_status_list(ordered, clock=lambda: 1000.0)
+    text = render.render_status_list(ordered, limit=5, clock=lambda: 1000.0)
 
     assert "long run" in text
     assert "short run 0" not in text  # finished first, so it is the one cut
@@ -456,7 +456,7 @@ def test_status_list_has_one_lowercase_header_and_aligns_long_columns() -> None:
     text = render.render_status_list([short, long], all_sessions=True, clock=lambda: 120.0)
     lines = text.splitlines()
     header = lines[0]
-    headings = ("ID", "ENTRY", "MODEL", "STATE", "RUNTIME", "IDLE", "NAME", "PROMPT")
+    headings = ("ID", "ENTRY", "MODEL", "STATUS", "RUNTIME", "IDLE", "NAME", "PROMPT")
 
     assert header.split() == list(headings)
     assert lines.count(header) == 1
@@ -529,7 +529,7 @@ def test_status_views_fall_back_to_a_dot_when_no_model_was_resolved() -> None:
 
     assert row.split()[:4] == [meta.session_id, "mock", "·", meta.state]
     assert "model: ·" in detail
-    assert render.status_list_json([meta], clock=lambda: 120.0)["sessions"][0]["model"] is None
+    assert render.status_list_json([meta], clock=lambda: 120.0)["items"][0]["model"] is None
     assert render.status_detail_json(meta, clock=lambda: 120.0)["model"] is None
 
 
@@ -540,7 +540,7 @@ def test_status_json_carries_the_resolved_model_in_both_shapes() -> None:
     detail_payload = render.status_detail_json(meta, clock=lambda: 120.0)
     detail_text = render.render_status_detail(meta, clock=lambda: 120.0)
 
-    assert list_payload["sessions"][0]["model"] == "gpt-5.6-terra"
+    assert list_payload["items"][0]["model"] == "gpt-5.6-terra"
     assert detail_payload["model"] == "gpt-5.6-terra"
     assert "model: gpt-5.6-terra" in detail_text
 
@@ -573,7 +573,7 @@ def test_status_list_renders_idle_age_for_active_and_dot_for_finished() -> None:
     add_transcript_event(active, 115.0)
     finished = sessions.transition(
         make_session(session_id_hint="finished prompt").session_id,
-        "done",
+        "succeeded",
         clock=lambda: 110.0,
         exit_code=0,
     )
@@ -593,7 +593,7 @@ def test_status_detail_labels_idle_age_only_for_active_sessions() -> None:
     add_transcript_event(active, 115.0)
     finished = sessions.transition(
         make_session().session_id,
-        "done",
+        "succeeded",
         clock=lambda: 110.0,
         exit_code=0,
     )
@@ -615,8 +615,8 @@ def test_status_ages_distinguish_fresh_and_stale_activity_and_grow_with_time() -
     text = render.render_status_list([fresh, stale], clock=lambda: 120.0, all_sessions=True)
     initial = render.status_list_json([fresh, stale], all_sessions=True, clock=lambda: 120.0)
     later = render.status_list_json([fresh, stale], all_sessions=True, clock=lambda: 130.0)
-    initial_rows = {row["session_id"]: row for row in initial["sessions"]}
-    later_rows = {row["session_id"]: row for row in later["sessions"]}
+    initial_rows = {row["session_id"]: row for row in initial["items"]}
+    later_rows = {row["session_id"]: row for row in later["items"]}
 
     assert "idle " in status_line(text, fresh)
     assert "idle " in status_line(text, stale)
@@ -635,7 +635,7 @@ def test_status_json_idle_seconds_match_text_and_finished_sessions_are_null() ->
     add_transcript_event(active, 115.0)
     finished = sessions.transition(
         make_session().session_id,
-        "done",
+        "succeeded",
         clock=lambda: 110.0,
         exit_code=0,
     )
@@ -644,7 +644,7 @@ def test_status_json_idle_seconds_match_text_and_finished_sessions_are_null() ->
     list_payload = render.status_list_json(
         [active, finished], all_sessions=True, clock=lambda: 120.0
     )
-    list_rows = {row["session_id"]: row for row in list_payload["sessions"]}
+    list_rows = {row["session_id"]: row for row in list_payload["items"]}
     active_idle = list_rows[active.session_id]["idle_seconds"]
     finished_idle = list_rows[finished.session_id]["idle_seconds"]
     text = render.render_status_list([active, finished], all_sessions=True, clock=lambda: 120.0)
@@ -668,7 +668,7 @@ def test_status_without_a_transcript_shows_dot_and_null() -> None:
 
     assert "·" in status_line(text, active)
     assert "idle " not in status_line(text, active)
-    assert payload["sessions"][0]["idle_seconds"] is None
+    assert payload["items"][0]["idle_seconds"] is None
 
 
 def test_status_detail_json_contains_pinned_vitals() -> None:
@@ -677,7 +677,7 @@ def test_status_detail_json_contains_pinned_vitals() -> None:
     payload = render.status_detail_json(meta, clock=lambda: 120.0)
 
     assert payload["session_id"] == meta.session_id
-    assert payload["state"] == "starting"
+    assert payload["status"] == "starting"
     assert payload["pid"] is None
     assert payload["turns"] == 1
 
@@ -701,7 +701,7 @@ def test_status_detail_text_remains_the_existing_labeled_view() -> None:
     text = render.render_status_detail(meta, clock=lambda: 120.0)
 
     assert text == (
-        "state    starting · exit · · 0m20s · 0 tok\n"
+        "status   starting · exit · · 0m20s · 0 tok\n"
         "agent    mock (mock) · model: mock-sonnet-5 · name: ·\n"
         f"dir      {sessions.session_dir(meta.session_id)} · answer: answer.md\n"
     )

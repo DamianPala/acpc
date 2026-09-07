@@ -501,6 +501,9 @@ class TurnOutcome:
     # operation end badly. Only the side that received the signal knows which.
     interrupted: bool = False
 
+    def __post_init__(self) -> None:
+        self.state = vocab.normalize_session_state(self.state)
+
     @property
     def exit_code(self) -> int:
         return exit_code_for(self.state, self.stop_reason)
@@ -508,11 +511,12 @@ class TurnOutcome:
 
 def exit_code_for(state: str, stop_reason: str | None = None) -> int:
     """Map a finished session's state to SPEC's fixed exit codes."""
-    if state == "done":
+    state = vocab.normalize_session_state(state)
+    if state == "succeeded":
         return vocab.EXIT_OK
     if state == "timeout":
         return vocab.EXIT_TIMEOUT
-    if state == "cancelled":
+    if state == "canceled":
         return vocab.EXIT_CANCELLED
     # Detached (daemon path) and terminated (direct path) are both "SIGTERM
     # ended this client"; they differ only in whether the session survives it.
@@ -526,9 +530,9 @@ def exit_code_for(state: str, stop_reason: str | None = None) -> int:
 
 def _state_for_stop_reason(stop_reason: str | None) -> str:
     if stop_reason == "end_turn":
-        return "done"
+        return "succeeded"
     if stop_reason == "cancelled":
-        return "cancelled"
+        return "canceled"
     if stop_reason in _FAILURE_STOP_REASONS:
         return "failed"
     return "failed"
@@ -628,7 +632,7 @@ class _CancelSignal:
 
     def _signal_state(self) -> str | None:
         if self.received_signal == signal.SIGINT:
-            return "cancelled"
+            return "canceled"
         if self.received_signal == signal.SIGTERM and self._daemon_routed is not None:
             return "detached" if self._daemon_routed else "terminated"
         return None
@@ -988,7 +992,7 @@ async def _await_prompt(
         if prompt_task.done():
             return _stop_reason_of(prompt_task, usage_client=usage_client)
         prompt_task.cancel()
-        return "cancelled"
+        return "canceled"
     finally:
         waiter.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -1003,7 +1007,7 @@ def _stop_reason_of(
     """Read a finished prompt task's stop reason, preserving adapter errors."""
     error = prompt_task.exception() if not prompt_task.cancelled() else None
     if prompt_task.cancelled():
-        return "cancelled"
+        return "canceled"
     if error is not None:
         raise error
     result = prompt_task.result()
@@ -1381,7 +1385,7 @@ def _finalize(
         outcome.answer = answer
     state = outcome.state
     if state == "terminated":
-        state = "cancelled"
+        state = "canceled"
     if state == "detached":
         state = "running"
 

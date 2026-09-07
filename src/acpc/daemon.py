@@ -604,7 +604,7 @@ class Daemon:
             "version": __version__,
             "target": self.target,
             "pid": os.getpid(),
-            "uptime": time.time() - self.started_at,
+            "uptime_seconds": time.time() - self.started_at,
             "log": str(log_path_for_target(self.target)),
             "sessions": sorted(self.turns),
             "preparing": sorted(
@@ -619,7 +619,7 @@ class Daemon:
         turn = self.turns.get(session_id)
         if turn is None:
             return {"ok": False, "error": f"session {session_id} is not running here"}
-        turn.cancel.request("cancelled")
+        turn.cancel.request("canceled")
         if turn.phase == "preparing" and turn.preparation_cancelable and turn.task is not None:
             # Preparation has no prompt task whose ACP cancellation can wind it
             # down. Cancelling the daemon-owned preparation task runs its
@@ -755,7 +755,7 @@ class Daemon:
             raise
         except asyncio.CancelledError:
             if (
-                turn.cancel.state == "cancelled"
+                turn.cancel.state == "canceled"
                 and turn.phase == "preparing"
                 and turn.preparation_cancelable
             ):
@@ -767,7 +767,7 @@ class Daemon:
                 except sessions.SessionError:
                     expected_turn = current_request.turn_token
                 outcome = runner.TurnOutcome(
-                    state="cancelled",
+                    state="canceled",
                     stop_reason=runner.PREPARATION_CANCELLED_REASON,
                     answer=runner.preparation_cancelled_answer(session_id),
                     turn_token=expected_turn,
@@ -1081,14 +1081,14 @@ class Daemon:
                 )
                 preparing_cancel = (
                     isinstance(caught, asyncio.CancelledError)
-                    and turn.cancel.state == "cancelled"
+                    and turn.cancel.state == "canceled"
                     and turn.phase == "preparing"
                     and turn.preparation_cancelable
                 )
                 if preparing_cancel:
                     error = None
                 outcome = runner.TurnOutcome(
-                    state=("cancelled" if preparing_cancel else turn.cancel.state or "failed"),
+                    state=("canceled" if preparing_cancel else turn.cancel.state or "failed"),
                     stop_reason=(
                         runner.PREPARATION_CANCELLED_REASON
                         if preparing_cancel
@@ -1202,7 +1202,7 @@ class Daemon:
                 )
                 if cancel.requested.is_set() and request.resume_prepared:
                     return runner.TurnOutcome(
-                        state="cancelled",
+                        state="canceled",
                         stop_reason=runner.PREPARATION_CANCELLED_REASON,
                         answer=runner.preparation_cancelled_answer(session_id),
                         adapter_session_id=adapter_session_id,
@@ -1280,7 +1280,7 @@ class Daemon:
             return
         state = outcome.state
         if state == "terminated":
-            state = "cancelled"
+            state = "canceled"
         payload = {
             "state": state,
             "exit_code": outcome.exit_code,

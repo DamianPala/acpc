@@ -134,7 +134,7 @@ def wait_for_preparing(cli: CliRunner, session_id: str, timeout: float = 10.0) -
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         result = invoke(cli, "status", session_id, "--json")
-        if result.exit_code == vocab.EXIT_OK and json.loads(result.stdout)["state"] == "preparing":
+        if result.exit_code == vocab.EXIT_OK and json.loads(result.stdout)["status"] == "preparing":
             return
         time.sleep(0.05)
     pytest.fail(f"session {session_id} never became preparing")
@@ -321,7 +321,7 @@ def test_status_exposes_daemon_resume_preparation(cli: CliRunner, live_daemon: N
         process.wait(timeout=10)
 
     assert process.returncode == vocab.EXIT_OK
-    assert sessions.load(session_id).state == "done"
+    assert sessions.load(session_id).state == "succeeded"
 
 
 def test_stop_during_daemon_preparation_is_cancelled_and_resumable(
@@ -357,7 +357,7 @@ def test_stop_during_daemon_preparation_is_cancelled_and_resumable(
         stopped = invoke(cli, "stop", session_id, "--json")
 
         assert stopped.exit_code == vocab.EXIT_OK, stopped.stderr
-        assert json.loads(stopped.stdout)["state"] == "cancelled"
+        assert json.loads(stopped.stdout)["status"] == "canceled"
         answer = sessions.answer_path(session_id).read_text(encoding="utf-8")
         assert answer == runner.preparation_cancelled_answer(session_id)
         release.touch()
@@ -399,7 +399,7 @@ def test_ctrl_c_during_daemon_restore_cancels_without_a_diagnosis(
     process.wait(timeout=10)
 
     assert process.returncode == vocab.EXIT_CANCELLED
-    assert sessions.load(session_id).state == "cancelled"
+    assert sessions.load(session_id).state == "canceled"
     assert "no prompt was sent" in sessions.answer_path(session_id).read_text(encoding="utf-8")
 
 
@@ -439,7 +439,7 @@ def test_ctrl_c_during_daemon_routing_cancels_a_new_turn_without_overwriting_his
         stdout, stderr = process.communicate(timeout=10)
         assert returncode == vocab.EXIT_CANCELLED, (stdout, stderr)
         final = sessions.read_meta(session_id)
-        assert final.state == "cancelled"
+        assert final.state == "canceled"
         assert final.turns == 2
         assert final.stop_reason == runner.PREPARATION_CANCELLED_REASON
         assert sessions.answer_path(session_id).read_text(encoding="utf-8") == (
@@ -493,7 +493,7 @@ def test_sigterm_during_daemon_routing_cancels_a_new_turn_and_exits_143(
         stdout, stderr = process.communicate(timeout=10)
         assert returncode == vocab.EXIT_SIGTERM, (stdout, stderr)
         final = sessions.read_meta(session_id)
-        assert final.state == "cancelled"
+        assert final.state == "canceled"
         assert final.turns == 2
         assert final.stop_reason == runner.PREPARATION_CANCELLED_REASON
         assert sessions.answer_path(session_id).read_text(encoding="utf-8") == (
@@ -542,7 +542,7 @@ def test_cancelled_restore_drops_late_frame_after_mux_release(
         wait_for_path(restore_ready)
         stopped = invoke(cli, "stop", session_id, "--json")
         assert stopped.exit_code == vocab.EXIT_OK, stopped.stderr
-        assert json.loads(stopped.stdout)["state"] == "cancelled"
+        assert json.loads(stopped.stdout)["status"] == "canceled"
         assert sessions.answer_path(session_id).read_text(encoding="utf-8") == (
             runner.preparation_cancelled_answer(session_id)
         )
@@ -750,7 +750,7 @@ def test_daemon_reservation_contention_does_not_block_unrelated_sessions(
         assert envelope["retryable"] is True
         assert envelope["context"]["session_id"] == session_id
         assert "wait for the current turn" in envelope["message"]
-        assert sessions.read_meta(session_id).state == "done"
+        assert sessions.read_meta(session_id).state == "succeeded"
 
         result = invoke(cli, "run", "mock", "echo:unrelated", "--quiet", "--json")
         assert result.exit_code == vocab.EXIT_OK, result.stderr
@@ -1268,13 +1268,9 @@ def test_continue_without_permissions_uses_stored_mode_facts_after_registry_edit
     result = invoke(cli, "continue", session_id, "perm scenario", "--json")
 
     assert result.exit_code == vocab.EXIT_USAGE
-    assert json.loads(result.stdout)["denied"][-1] == {
-        "category": "switch_mode",
-        "target": "yolo",
-        "count": 1,
-        "minimum_policy": "all",
-        "remedy": "pass --permissions all",
-    }
+    error = json.loads([line for line in result.stderr.splitlines() if line.strip()][-1])["error"]
+    assert error["kind"] == "permission_denied"
+    assert "yolo" in error["message"]
 
     stored = sessions.load(session_id).resolution["adapter"]["modes"]
     assert stored["yolo"] == {"grants": "all", "delegates": False}
@@ -1487,7 +1483,7 @@ def test_exhausted_marker_retries_keep_the_turn_and_report_incomplete_resume(
     session_id = json.loads(first.stdout)["session_id"]
     first_meta = sessions.load(session_id)
     assert attempts == 4
-    assert first_meta.state == "done"
+    assert first_meta.state == "succeeded"
     assert first_meta.extra[sessions.DELIVERY_RECORD_INCOMPLETE] is True
     assert "first prompt" in sessions.answer_path(session_id).read_text(encoding="utf-8")
 
@@ -1533,7 +1529,7 @@ def test_incomplete_marker_cannot_be_lost_when_its_separate_write_fails(
     assert marker_attempts == 4
     session_id = json.loads(first.stdout)["session_id"]
     first_meta = sessions.load(session_id)
-    assert first_meta.state == "done"
+    assert first_meta.state == "succeeded"
     assert first_meta.extra[sessions.DELIVERY_RECORD_INCOMPLETE] is True
     assert "first prompt" in sessions.answer_path(session_id).read_text(encoding="utf-8")
 
@@ -1611,7 +1607,7 @@ def test_replay_only_mismatch_fails_before_rotation(
 
     assert result.exit_code == vocab.EXIT_AGENT_ERROR
     after = sessions.read_meta(session_id)
-    assert after.state == before.state == "done"
+    assert after.state == before.state == "succeeded"
     assert after.turns == before.turns == 1
     assert sessions.prompt_path(session_id).read_text(encoding="utf-8") == "recorded context"
 
@@ -1684,7 +1680,7 @@ def test_a_stored_but_undelivered_prompt_is_not_required_on_later_resume(
     resumed = invoke(cli, "continue", session_id, "later prompt", "--quiet")
 
     assert resumed.exit_code == vocab.EXIT_OK
-    assert sessions.load(session_id).state == "done"
+    assert sessions.load(session_id).state == "succeeded"
     assert "later prompt" in sessions.answer_path(session_id).read_text(encoding="utf-8")
 
 
@@ -1742,7 +1738,7 @@ def test_process_death_after_claim_is_orphaned_and_can_be_cold_resumed(
     resumed = invoke(cli, "continue", session_id, "cold follow-up", "--quiet")
 
     assert resumed.exit_code == vocab.EXIT_OK
-    assert sessions.load(session_id).state == "done"
+    assert sessions.load(session_id).state == "succeeded"
     assert "cold follow-up" in sessions.answer_path(session_id).read_text(encoding="utf-8")
 
 
@@ -1788,7 +1784,7 @@ def test_a_cwd_mismatch_fails_before_rotation_or_prompt_dispatch(
     assert result.exit_code == vocab.EXIT_AGENT_ERROR
     assert "cwd" in result.stderr
     assert "must not run" not in sessions.prompt_path(session_id).read_text(encoding="utf-8")
-    assert sessions.read_meta(session_id).state == "done"
+    assert sessions.read_meta(session_id).state == "succeeded"
     for name, content in before.items():
         assert {
             "meta": sessions.meta_path(session_id),
@@ -1817,7 +1813,7 @@ def test_a_replay_prompt_mismatch_fails_before_the_new_prompt(
 
     assert result.exit_code == vocab.EXIT_AGENT_ERROR
     assert "stored prompt" in result.stderr
-    assert sessions.read_meta(session_id).state == "done"
+    assert sessions.read_meta(session_id).state == "succeeded"
     assert sessions.prompt_path(session_id).read_bytes() == before_prompt
     assert sessions.answer_path(session_id).read_bytes() == before_answer
     assert sessions.transcript_path(session_id).read_bytes() == before_transcript
@@ -1946,7 +1942,7 @@ def test_inherited_ceiling_clamps_a_background_continue_and_stop_uses_new_target
     stopped = invoke(cli, "stop", session_id)
 
     assert stopped.exit_code == vocab.EXIT_OK
-    assert sessions.load(session_id).state == "cancelled"
+    assert sessions.load(session_id).state == "canceled"
 
 
 def test_a_daemon_cold_resume_reports_list_verification_without_replay(
@@ -2035,7 +2031,7 @@ def test_a_daemon_verification_failure_preserves_the_finished_session(
     result = invoke(cli, "continue", session_id, "must not run", "--quiet")
 
     assert result.exit_code == vocab.EXIT_AGENT_ERROR
-    assert sessions.read_meta(session_id).state == "done"
+    assert sessions.read_meta(session_id).state == "succeeded"
     assert sessions.read_meta(session_id).turns == 1
     assert {path: path.read_bytes() for path in before} == before
 
@@ -2097,7 +2093,7 @@ def test_concurrent_continuations_have_one_atomic_winner(cli: CliRunner, live_da
     assert sum(returncode == vocab.EXIT_OK for returncode, _output, _error in outcomes) == 1
     assert sum(returncode != vocab.EXIT_OK for returncode, _output, _error in outcomes) == 1
     meta = sessions.load(session_id)
-    assert meta.state == "done"
+    assert meta.state == "succeeded"
     assert meta.turns == 2
     prompt = sessions.prompt_path(session_id).read_text(encoding="utf-8")
     assert "first winner" in prompt or "second contender" in prompt
@@ -2154,7 +2150,7 @@ def test_same_target_cold_continuations_cannot_steal_replay(
 
     assert first.returncode != vocab.EXIT_OK, (first_output, first_error)
     assert second.returncode != vocab.EXIT_OK, (second_output, second_error)
-    assert sessions.read_meta(session_id).state == "done"
+    assert sessions.read_meta(session_id).state == "succeeded"
     assert sessions.read_meta(session_id).turns == 1
     assert "must not run" not in store_path.read_text(encoding="utf-8")
 
@@ -2261,7 +2257,7 @@ def test_continue_validation_failure_does_not_rotate_session(cli: CliRunner) -> 
     envelope = json.loads(result.stderr)["error"]
     assert envelope["kind"] == "corrupt_state"
     assert "cannot be continued" in envelope["message"]
-    assert unchanged.state == "done"
+    assert unchanged.state == "succeeded"
     assert unchanged.turns == 1
 
 
@@ -2467,5 +2463,5 @@ def test_background_policy_change_updates_wait_and_stop_target(
     connected.clear()
     stopped = invoke(cli, "stop", session_id)
     assert stopped.exit_code == vocab.EXIT_OK
-    assert sessions.load(session_id).state == "cancelled"
+    assert sessions.load(session_id).state == "canceled"
     assert connected == [new_target]

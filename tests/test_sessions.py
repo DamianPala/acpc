@@ -52,7 +52,7 @@ def make_session(
     )
 
 
-def finished_session(*, state: str = "done", finished_offset: float = 60.0) -> str:
+def finished_session(*, state: str = "succeeded", finished_offset: float = 60.0) -> str:
     meta = make_session(clock=at())
     sessions.mark_running(meta.session_id, pid=1, process_start_time="token", clock=at(1.0))
     sessions.transition(meta.session_id, state, exit_code=0, clock=at(finished_offset))
@@ -102,7 +102,7 @@ class TestCreateSession:
             "name",
             "entry",
             "base_adapter",
-            "state",
+            "status",
             "pid",
             "process_start_time",
             "created_at",
@@ -119,12 +119,30 @@ class TestCreateSession:
             "target",
         ):
             assert key in on_disk, key
-        assert on_disk["state"] == "starting"
-        assert on_disk["state"] in vocab.SESSION_STATES
+        assert on_disk["status"] == "starting"
+        assert on_disk["status"] in vocab.SESSION_STATES
         assert on_disk["turns"] == 1
-        assert on_disk["created_at"] == BASE_TIME
+        assert on_disk["created_at"] == "2025-10-09T08:53:20.000000Z"
         assert on_disk["started_at"] is None
         assert on_disk["name"] == "researcher"
+
+    def test_legacy_meta_is_read_and_rewritten_with_canonical_fields(self) -> None:
+        meta = make_session()
+        path = sessions.meta_path(meta.session_id)
+        payload = json.loads(path.read_text())
+        payload["state"] = "done"
+        payload.pop("status")
+        payload["created_at"] = BASE_TIME
+        path.write_text(json.dumps(payload))
+
+        loaded = sessions.read_meta(meta.session_id)
+        assert loaded.state == "succeeded"
+
+        sessions.update_meta(meta.session_id, name="rewritten")
+        rewritten = json.loads(path.read_text())
+        assert rewritten["status"] == "succeeded"
+        assert "state" not in rewritten
+        assert rewritten["created_at"] == "2025-10-09T08:53:20.000000Z"
 
     def test_a_fresh_session_has_no_answer_yet(self) -> None:
         meta = make_session()
@@ -169,19 +187,19 @@ class TestTransitions:
         sessions.mark_running(meta.session_id, pid=4711, process_start_time="tok", clock=at(1.0))
         done = sessions.transition(
             meta.session_id,
-            "done",
+            "succeeded",
             exit_code=0,
             stop_reason="end_turn",
             tokens=41_000,
             clock=at(90.0),
         )
-        assert done.state == "done"
+        assert done.state == "succeeded"
         assert done.finished_at == BASE_TIME + 90.0
         assert done.exit_code == 0
         assert done.stop_reason == "end_turn"
         assert done.tokens == 41_000
 
-    @pytest.mark.parametrize("final", ["done", "failed", "cancelled", "timeout", "orphaned"])
+    @pytest.mark.parametrize("final", ["succeeded", "failed", "canceled", "timeout", "orphaned"])
     def test_every_final_state_is_reachable_from_running(self, final: str) -> None:
         meta = make_session()
         sessions.mark_running(meta.session_id, pid=1, process_start_time="tok", clock=at(1.0))
@@ -189,7 +207,7 @@ class TestTransitions:
 
     def test_a_finished_session_cannot_transition_again(self) -> None:
         session_id = finished_session()
-        with pytest.raises(sessions.SessionStateError, match="done"):
+        with pytest.raises(sessions.SessionStateError, match="succeeded"):
             sessions.transition(session_id, "running", clock=at(120.0))
 
     def test_a_running_session_cannot_go_back_to_starting(self) -> None:
@@ -200,7 +218,7 @@ class TestTransitions:
 
     def test_an_unknown_state_is_rejected(self) -> None:
         meta = make_session()
-        with pytest.raises(ValueError, match="unknown session state"):
+        with pytest.raises(ValueError, match="unknown session status"):
             sessions.transition(meta.session_id, "wedged", clock=at(1.0))
 
     def test_update_meta_refuses_to_move_state(self) -> None:
@@ -240,10 +258,10 @@ class TestLivenessAndOrphans:
 
         assert sessions.load(meta.session_id, clock=at(2.0)).state == "orphaned"
         on_disk = json.loads(sessions.meta_path(meta.session_id).read_text())
-        assert on_disk["state"] == "orphaned"
+        assert on_disk["status"] == "orphaned"
         assert on_disk["stop_reason"] == "orphaned"
         assert on_disk["exit_code"] == vocab.EXIT_AGENT_ERROR
-        assert on_disk["finished_at"] == BASE_TIME + 2.0
+        assert on_disk["finished_at"] == "2025-10-09T08:53:22.000000Z"
 
     def test_orphan_detection_does_not_wait_for_the_startup_grace(self) -> None:
         # Once a pid is recorded, liveness decides immediately — smoke kills a
@@ -327,7 +345,7 @@ class TestLivenessAndOrphans:
     def test_a_finished_session_is_never_re_probed(self) -> None:
         session_id = finished_session()
         sessions.update_meta(session_id, pid=_dead_pid())
-        assert sessions.load(session_id, clock=at(9999.0)).state == "done"
+        assert sessions.load(session_id, clock=at(9999.0)).state == "succeeded"
 
     def test_read_meta_reports_the_stored_state_verbatim(self) -> None:
         meta = make_session()
@@ -366,7 +384,7 @@ class TestTurnRotation:
         sessions.rotate_turn(session_id, clock=at(100.0))
         sessions.write_prompt(session_id, "second prompt")
         sessions.mark_running(session_id, pid=1, process_start_time="tok", clock=at(101.0))
-        sessions.transition(session_id, "done", exit_code=0, clock=at(102.0))
+        sessions.transition(session_id, "succeeded", exit_code=0, clock=at(102.0))
         sessions.write_answer(session_id, "answer two")
         sessions.rotate_turn(session_id, clock=at(200.0))
 
@@ -443,7 +461,7 @@ class TestTurnRotation:
 
         finalized = sessions.finalize_turn(
             session_id,
-            "done",
+            "succeeded",
             answer="stale answer",
             expected_turn=1,
             exit_code=0,
@@ -467,7 +485,7 @@ class TestNamesAndSelectors:
     def test_rebinding_off_a_finished_session_warns(self) -> None:
         meta = make_session(name="researcher")
         sessions.mark_running(meta.session_id, pid=1, process_start_time="tok", clock=at(1.0))
-        sessions.transition(meta.session_id, "done", exit_code=0, clock=at(2.0))
+        sessions.transition(meta.session_id, "succeeded", exit_code=0, clock=at(2.0))
 
         warning = sessions.claim_name("researcher", clock=at(3.0))
 
@@ -512,7 +530,7 @@ class TestNamesAndSelectors:
     def test_a_rebound_name_resolves_to_the_newest_session(self) -> None:
         old = make_session(name="researcher", clock=at())
         sessions.mark_running(old.session_id, pid=1, process_start_time="tok", clock=at(1.0))
-        sessions.transition(old.session_id, "done", exit_code=0, clock=at(2.0))
+        sessions.transition(old.session_id, "succeeded", exit_code=0, clock=at(2.0))
         new = make_session(name="researcher", clock=at(10.0))
 
         assert sessions.resolve_selector("researcher", clock=at(11.0)) == new.session_id
@@ -587,7 +605,7 @@ class TestDamagedState:
     def test_a_state_outside_the_vocabulary_is_damage(self) -> None:
         meta = make_session()
         payload = json.loads(sessions.meta_path(meta.session_id).read_text())
-        payload["state"] = "confused"
+        payload["status"] = "confused"
         sessions.meta_path(meta.session_id).write_text(json.dumps(payload))
         with pytest.raises(sessions.CorruptSessionError, match="confused"):
             sessions.read_meta(meta.session_id)
@@ -726,7 +744,7 @@ class TestPrune:
         # Created long ago, finished just now: the threshold must spare it.
         session_id = make_session(clock=at()).session_id
         sessions.mark_running(session_id, pid=1, process_start_time="tok", clock=at(1.0))
-        sessions.transition(session_id, "done", exit_code=0, clock=at(500_000.0))
+        sessions.transition(session_id, "succeeded", exit_code=0, clock=at(500_000.0))
 
         assert sessions.prune_sessions(older_than=86_400.0, clock=at(500_100.0)) == []
         assert sessions.session_dir(session_id).exists()

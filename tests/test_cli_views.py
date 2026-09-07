@@ -65,7 +65,14 @@ def run_mock(
     """Run the real mock adapter and return its session id."""
     result = invoke(cli, "run", "mock", prompt, "--quiet", "--json")
     assert result.exit_code == expected_exit
-    return json.loads(result.stdout)["session_id"]
+    if expected_exit == vocab.EXIT_OK:
+        return json.loads(result.stdout)["session_id"]
+    lines = [line for line in result.stderr.splitlines() if line.strip()]
+    if lines and lines[-1].startswith("{"):
+        error = json.loads(lines[-1])["error"]
+        if session_id := error.get("context", {}).get("session_id"):
+            return session_id
+    return sessions.list_sessions()[0].session_id
 
 
 def finished_session(prompt: str = "finished session", *, clock_value: float = 100.0):
@@ -78,7 +85,7 @@ def finished_session(prompt: str = "finished session", *, clock_value: float = 1
     )
     return sessions.transition(
         meta.session_id,
-        "done",
+        "succeeded",
         exit_code=0,
         clock=lambda: clock_value + 1,
     )
@@ -114,22 +121,22 @@ def running_session(prompt: str = "running session"):
     )
 
 
-def test_status_hides_finished_sessions_beyond_the_recent_five(cli: CliRunner) -> None:
-    """The default status list contains only the five newest finished sessions."""
+def test_status_limit_hides_finished_sessions_beyond_the_bound(cli: CliRunner) -> None:
+    """A finite status limit bounds the collection and reports the rest."""
     for index in range(6):
         finished_session(f"old prompt {index}", clock_value=100 + index)
 
-    result = invoke(cli, "status")
+    result = invoke(cli, "status", "--limit", "5")
 
     assert "old prompt 0" not in result.stdout and "old prompt 5" in result.stdout
 
 
-def test_status_all_includes_older_finished_sessions(cli: CliRunner) -> None:
-    """Status --all includes finished sessions outside the recent window."""
+def test_status_limit_includes_older_finished_sessions(cli: CliRunner) -> None:
+    """A larger status limit includes finished sessions outside the small view."""
     for index in range(6):
         finished_session(f"old prompt {index}", clock_value=100 + index)
 
-    result = invoke(cli, "status", "--all")
+    result = invoke(cli, "status", "--limit", "6")
 
     assert "old prompt 0" in result.stdout
 
@@ -151,7 +158,7 @@ def test_status_json_with_an_id_reports_detail_fields(cli: CliRunner) -> None:
     result = invoke(cli, "status", meta.session_id, "--json")
 
     payload = json.loads(result.stdout)
-    assert payload["state"] == "done"
+    assert payload["status"] == "succeeded"
     assert payload["idle_seconds"] is None
 
 
@@ -161,7 +168,7 @@ def test_status_reports_the_model_a_real_dispatch_resolved(cli: CliRunner) -> No
 
     text = invoke(cli, "status", session_id).stdout
     detail = json.loads(invoke(cli, "status", session_id, "--json").stdout)
-    row = json.loads(invoke(cli, "status", "--json").stdout)["sessions"][0]
+    row = json.loads(invoke(cli, "status", "--json").stdout)["items"][0]
 
     assert detail["model"] == "mock-sonnet-5"
     assert row["model"] == "mock-sonnet-5"
@@ -232,7 +239,7 @@ def test_status_json_without_an_id_returns_a_session_list(cli: CliRunner) -> Non
 
     result = invoke(cli, "status", "--json")
 
-    row = json.loads(result.stdout)["sessions"][0]
+    row = json.loads(result.stdout)["items"][0]
     assert row["session_id"] == meta.session_id
     assert row["idle_seconds"] is None
     assert result.stdout == json.dumps(json.loads(result.stdout), ensure_ascii=False) + "\n"
@@ -249,11 +256,11 @@ def test_status_without_a_transcript_is_clean_for_an_active_session(cli: CliRunn
     assert json.loads(json_result.stdout)["idle_seconds"] is None
 
 
-def test_status_rejects_all_with_a_session_id(cli: CliRunner) -> None:
-    """Status refuses --all when a particular session was selected."""
+def test_status_plain_is_collection_only(cli: CliRunner) -> None:
+    """Status refuses one-item-per-line output for a particular session."""
     meta = finished_session()
 
-    result = invoke(cli, "status", meta.session_id, "--all")
+    result = invoke(cli, "status", meta.session_id, "--plain", "--limit", "1")
 
     assert result.exit_code == vocab.EXIT_USAGE
 
@@ -269,7 +276,7 @@ def test_status_reports_a_dead_running_session_as_orphaned(cli: CliRunner) -> No
 
     result = invoke(cli, "status", meta.session_id, "--json")
 
-    assert json.loads(result.stdout)["state"] == "orphaned"
+    assert json.loads(result.stdout)["status"] == "orphaned"
     assert not sessions.transcript_path(meta.session_id).exists()
 
 
@@ -285,7 +292,7 @@ def test_log_keeps_events_on_stdout_and_footer_on_stderr(cli: CliRunner) -> None
 def test_failed_log_and_wait_surface_the_recorded_cause(cli: CliRunner) -> None:
     run_result = invoke(cli, "run", "mock", "auth:missing credentials", "--quiet", "--json")
     assert run_result.exit_code == vocab.EXIT_AGENT_ERROR
-    session_id = json.loads(run_result.stdout)["session_id"]
+    session_id = sessions.list_sessions()[0].session_id
 
     log_result = invoke(cli, "log", session_id, "--quiet")
     wait_result = invoke(cli, "wait", session_id, "--quiet")
@@ -391,10 +398,10 @@ def test_negative_timeout_is_a_usage_error_for_waiting_views(
 
 
 def test_log_tail_limits_the_selected_events(cli: CliRunner) -> None:
-    """Log --tail limits the number of rendered event lines."""
+    """Log --limit bounds the number of rendered event lines."""
     session_id = run_mock(cli)
 
-    result = invoke(cli, "log", session_id, "--tail", "1")
+    result = invoke(cli, "log", session_id, "--limit", "1")
 
     assert len(result.stdout.splitlines()) <= 1
 
@@ -452,10 +459,10 @@ def test_log_max_output_truncates_between_events_and_names_the_transcript(cli: C
 
 
 def test_log_applies_tail_after_since(cli: CliRunner) -> None:
-    """Log combines --since and --tail by tailing the post-cursor events."""
+    """Log combines --since and --limit by bounding post-cursor events."""
     meta = session_with_messages(5)
 
-    result = invoke(cli, "log", meta.session_id, "--since", "1", "--tail", "2")
+    result = invoke(cli, "log", meta.session_id, "--since", "1", "--limit", "2")
 
     assert (
         "event-1" not in result.stdout
@@ -566,9 +573,9 @@ def test_log_rejects_a_negative_since_cursor(cli: CliRunner) -> None:
     assert result.exit_code == vocab.EXIT_USAGE
 
 
-def test_log_rejects_a_negative_tail_count(cli: CliRunner) -> None:
-    """Log rejects a negative --tail count as a usage error."""
-    result = invoke(cli, "log", "does-not-exist", "--tail", "-1")
+def test_log_rejects_a_negative_limit(cli: CliRunner) -> None:
+    """Log rejects a negative --limit count as a usage error."""
+    result = invoke(cli, "log", "does-not-exist", "--limit", "-1")
 
     assert result.exit_code == vocab.EXIT_USAGE
 
@@ -599,7 +606,7 @@ def test_log_wait_new_timeout_prints_the_footer(cli: CliRunner) -> None:
 
     assert result.exit_code == vocab.EXIT_TIMEOUT
     assert result.stdout == ""
-    assert "-- done" in result.stderr
+    assert "-- succeeded" in result.stderr
     assert "cursor:" in result.stderr
 
 
@@ -612,7 +619,7 @@ def test_wait_new_footer_reports_the_state_reached_during_the_wait(cli: CliRunne
 
     def finish_session() -> None:
         time.sleep(0.05)
-        sessions.transition(meta.session_id, "done", exit_code=0, stop_reason="end_turn")
+        sessions.transition(meta.session_id, "succeeded", exit_code=0, stop_reason="end_turn")
         transcript_file.append("msg", text="the last word")
 
     writer = threading.Thread(target=finish_session)
@@ -623,7 +630,7 @@ def test_wait_new_footer_reports_the_state_reached_during_the_wait(cli: CliRunne
         writer.join(timeout=2)
 
     assert "the last word" in result.stdout
-    assert result.stderr.lstrip().startswith("-- done")
+    assert result.stderr.lstrip().startswith("-- succeeded")
 
 
 def test_log_rejects_timeout_without_wait_new(cli: CliRunner) -> None:
@@ -643,7 +650,7 @@ def test_wait_new_on_a_finished_session_returns_at_once(cli: CliRunner) -> None:
 
     assert time.monotonic() - started < 5
     assert result.exit_code == vocab.EXIT_TIMEOUT
-    assert "-- done" in result.stderr
+    assert "-- succeeded" in result.stderr
 
 
 def test_wait_new_notes_only_an_explicit_past_end_cursor(cli: CliRunner) -> None:
@@ -746,11 +753,11 @@ def test_follow_replays_the_last_ten_events_by_default(cli: CliRunner) -> None:
     assert '"event-14"' not in result.stdout
 
 
-def test_follow_tail_zero_replays_nothing(cli: CliRunner) -> None:
-    """--tail 0 is the new-events-only start point."""
+def test_follow_limit_zero_replays_nothing(cli: CliRunner) -> None:
+    """--limit 0 is the new-events-only start point."""
     meta = session_with_messages(5)
 
-    result = invoke(cli, "log", meta.session_id, "--follow", "--tail", "0")
+    result = invoke(cli, "log", meta.session_id, "--follow", "--limit", "0")
 
     assert result.exit_code == vocab.EXIT_OK
     assert result.stdout == ""
@@ -761,7 +768,7 @@ def test_follow_notes_only_an_explicit_past_end_cursor(cli: CliRunner) -> None:
     meta = session_with_messages(3)
 
     explicit = invoke(cli, "log", meta.session_id, "--follow", "--since", "999")
-    implicit = invoke(cli, "log", meta.session_id, "--follow", "--tail", "0")
+    implicit = invoke(cli, "log", meta.session_id, "--follow", "--limit", "0")
 
     assert explicit.exit_code == vocab.EXIT_OK
     assert explicit.stdout == ""
@@ -793,7 +800,7 @@ def test_follow_on_a_finished_session_returns_at_once(cli: CliRunner) -> None:
 
     assert time.monotonic() - started < 5
     assert result.exit_code == vocab.EXIT_OK
-    assert result.stderr.lstrip().startswith("-- done")
+    assert result.stderr.lstrip().startswith("-- succeeded")
 
 
 def test_follow_ends_when_the_session_finishes(cli: CliRunner) -> None:
@@ -807,7 +814,7 @@ def test_follow_ends_when_the_session_finishes(cli: CliRunner) -> None:
         transcript_file.append("msg", text="mid-follow event")
         time.sleep(0.05)
         transcript_file.append("msg", text="the last word")
-        sessions.transition(meta.session_id, "done", exit_code=0, stop_reason="end_turn")
+        sessions.transition(meta.session_id, "succeeded", exit_code=0, stop_reason="end_turn")
 
     writer = threading.Thread(target=finish)
     writer.start()
@@ -819,7 +826,7 @@ def test_follow_ends_when_the_session_finishes(cli: CliRunner) -> None:
     assert result.exit_code == vocab.EXIT_OK
     assert "mid-follow event" in result.stdout
     assert "the last word" in result.stdout
-    assert result.stderr.lstrip().startswith("-- done")
+    assert result.stderr.lstrip().startswith("-- succeeded")
 
 
 def test_follow_timeout_exits_124_and_leaves_the_session_alone(cli: CliRunner) -> None:
@@ -900,8 +907,6 @@ def test_follow_budget_spans_the_whole_stream(cli: CliRunner) -> None:
             "log",
             meta.session_id,
             "--follow",
-            "--tail",
-            "0",
             "--max-output",
             "200",
             "--timeout",

@@ -129,7 +129,7 @@ def test_agents_views_render_present_and_absent_descriptions(cli: CliRunner) -> 
     assert "description  " not in mock_detail.stdout
 
     list_json = json.loads(invoke(cli, "agents", "--json").stdout)
-    descriptions = {item["name"]: item["description"] for item in list_json["agents"]}
+    descriptions = {item["name"]: item["description"] for item in list_json["items"]}
     assert descriptions["builder"] == "Implements a task against a plan."
     assert descriptions["mock"] is None
 
@@ -178,10 +178,11 @@ def test_agents_list_truncates_but_detail_and_json_keep_full_description(
     assert len(mock_snippet) <= 80
 
     detail = invoke(cli, "agents", "builder")
-    assert f"description  {full_description}" in detail.stdout
+    collapsed_description = " ".join(full_description.split())
+    assert f"description  {collapsed_description}" in detail.stdout
 
     list_payload = json.loads(invoke(cli, "agents", "--json").stdout)
-    descriptions = {item["name"]: item["description"] for item in list_payload["agents"]}
+    descriptions = {item["name"]: item["description"] for item in list_payload["items"]}
     assert descriptions["builder"] == full_description
     assert descriptions["mock"] == adapter_description
 

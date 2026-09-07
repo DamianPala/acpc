@@ -269,7 +269,13 @@ def test_replay_is_silent_and_collects_user_messages_without_flushing_pending_pr
     assert client.cost is None
     events_after = transcript.read()
     assert events_after.events == [
-        {"type": "usage", "tokens": 7, "cost": None, "ts": 100.0, "i": 1}
+        {
+            "type": "usage",
+            "tokens": 7,
+            "cost": None,
+            "ts": "1970-01-01T00:01:40.000000Z",
+            "i": 1,
+        }
     ]
     assert events_after.next_cursor == cursor_before
     client.flush()
@@ -1127,7 +1133,7 @@ def test_answer_keeps_interleaved_narration_and_excludes_tool_events(
         "args_summary": "notes.md",
         "status": "completed",
         "duration_ms": 0,
-        "ts": 100.0,
+        "ts": "1970-01-01T00:01:40.000000Z",
         "i": 3,
     }
     assert "hidden tool output" not in client.answer
@@ -1391,7 +1397,13 @@ def test_tool_usage_and_advertised_data_are_captured(tmp_path: Path, monkeypatch
     ]
     assert all(event["duration_ms"] == 0 for event in tools)
     assert [event for event in events if event["type"] == "usage"] == [
-        {"type": "usage", "tokens": 1200, "cost": None, "ts": 100.0, "i": 5}
+        {
+            "type": "usage",
+            "tokens": 1200,
+            "cost": None,
+            "ts": "1970-01-01T00:01:40.000000Z",
+            "i": 5,
+        }
     ]
     assert [event["i"] for event in events] == list(range(1, len(events) + 1))
 
@@ -1569,7 +1581,7 @@ def test_filesystem_refusal_is_an_acp_error_and_connection_survives(
     assert permission["kind"] == "fs/write_text_file"
     assert permission["decision"] == "deny"
     assert permission["auto"] is True
-    assert permission["ts"] == 100.0
+    assert permission["ts"] == "1970-01-01T00:01:40.000000Z"
     assert client.denial_details == {
         "edit": {
             "category": "edit",

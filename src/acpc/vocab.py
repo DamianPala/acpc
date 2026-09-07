@@ -24,17 +24,26 @@ def normalize_permission(value: str | None) -> str | None:
 SESSION_STATES = (
     "starting",
     "running",
-    "done",
+    "preparing",
+    "succeeded",
     "failed",
-    "cancelled",
+    "canceled",
     "timeout",
     "orphaned",
 )
 
 # States that count as finished: `continue` accepts them, `rm`/`prune` delete
 # them, `wait` returns immediately. `orphaned` is finished by definition.
-FINISHED_STATES = frozenset({"done", "failed", "cancelled", "timeout", "orphaned"})
+FINISHED_STATES = frozenset({"succeeded", "failed", "canceled", "timeout", "orphaned"})
 ACTIVE_STATES = frozenset({"starting", "running"})
+
+LEGACY_SESSION_STATES = {"done": "succeeded", "cancelled": "canceled"}
+
+
+def normalize_session_state(value: str) -> str:
+    """Map the two pre-1.0 state spellings to the published vocabulary."""
+    return LEGACY_SESSION_STATES.get(value, value)
+
 
 # Largest prompt acpc buffers from any single source: the prompt argument, `-`
 # on stdin, or `--prompt-file`.  Counted in UTF-8 bytes and enforced before a

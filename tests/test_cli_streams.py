@@ -17,6 +17,10 @@ from click.testing import CliRunner
 from acpc import interaction, sessions, vocab
 from acpc.cli import main
 
+pytestmark = pytest.mark.filterwarnings(
+    "ignore:This process .* is multi-threaded.*:DeprecationWarning"
+)
+
 MOCK_AGENT_SCRIPT = str(Path(__file__).with_name("mock_agent.py"))
 
 MOCK_ENTRY = f"""

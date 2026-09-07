@@ -107,7 +107,7 @@ def test_steer_cancels_the_turn_and_runs_the_instruction(cli: CliRunner) -> None
 
     assert result.exit_code == vocab.EXIT_OK, result.stderr
     assert "stop editing; diagnose only" in result.stdout
-    assert sessions.load(session_id).state == "done"
+    assert sessions.load(session_id).state == "succeeded"
     assert sessions.read_meta(session_id).turns == turns_before + 1
 
 
@@ -173,7 +173,7 @@ def test_steer_degrades_to_a_plain_continue_when_the_turn_finished_first(
     async def finish_instead_of_cancelling(target: str, selector: str) -> bool:
         # Stands in for the daemon — another process — reporting a cancel that
         # reached a turn which had already ended on its own.
-        sessions.transition(selector, "done", exit_code=0, stop_reason="end_turn")
+        sessions.transition(selector, "succeeded", exit_code=0, stop_reason="end_turn")
         return True
 
     monkeypatch.setattr(daemon_client, "cancel_turn", finish_instead_of_cancelling)
