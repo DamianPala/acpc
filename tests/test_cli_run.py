@@ -414,12 +414,14 @@ def test_nested_ask_remains_ask_under_an_all_ceiling(
     cli: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("ACPC_CEILING", "all")
+    # `ask` needs the interactive context, which `--json` would revoke.
+    monkeypatch.setattr(interaction, "stdin_is_tty", lambda: True)
     monkeypatch.setattr(interaction, "stdout_is_tty", lambda: True)
 
-    result = invoke(cli, "run", "mock", "probe", "--permissions", "ask", "--resolve", "--json")
+    result = invoke(cli, "run", "mock", "probe", "--permissions", "ask", "--resolve")
 
     assert result.exit_code == vocab.EXIT_OK
-    assert json.loads(result.stdout)["resolved"]["permissions"]["value"] == "ask"
+    assert "permissions ask" in " ".join(result.stdout.split())
 
 
 def test_invalid_inherited_ceiling_is_a_usage_error(
@@ -480,12 +482,13 @@ def test_prompt_alias_resolves_to_ask_on_a_tty(
     fresh_permission_alias_warnings: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(interaction, "stdin_is_tty", lambda: True)
     monkeypatch.setattr(interaction, "stdout_is_tty", lambda: True)
 
-    result = invoke(cli, "run", "mock", "probe", "--permissions", "prompt", "--resolve", "--json")
+    result = invoke(cli, "run", "mock", "probe", "--permissions", "prompt", "--resolve")
 
     assert result.exit_code == vocab.EXIT_OK
-    assert json.loads(result.stdout)["resolved"]["permissions"]["value"] == "ask"
+    assert "permissions ask" in " ".join(result.stdout.split())
     assert "--permissions prompt is deprecated; use --permissions ask" in result.stderr
 
 
@@ -992,6 +995,7 @@ def test_an_execute_floor_resolve_refusal_names_the_permission_floor(
 def test_an_execute_floor_ask_refusal_names_the_permission_floor(
     cli: CliRunner, grok_floor_entry: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(interaction, "stdin_is_tty", lambda: True)
     monkeypatch.setattr(interaction, "stdout_is_tty", lambda: True)
 
     result = invoke(cli, "run", "grok-floor", "probe", "--permissions", "ask")

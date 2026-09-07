@@ -893,14 +893,17 @@ def resolve_selector(
 ) -> str:
     """Map a session id, a `--name` alias or `last` to a session id.
 
-    `last` is TTY-only (SPEC.md *TTY vs non-TTY*): a stale "last" misleads an
-    agent caller, so a non-TTY caller gets a reasoned rejection instead.
+    `last` resolves only in an interactive context, which the caller settles:
+    a stale "last" misleads a script or an agent, which cannot see that it
+    picked up somebody else's session.
     """
     resolved_clock = _resolve_clock(clock)
     if selector == RESERVED_NAME:
         if not allow_last:
             raise SessionNameError(
-                "`last` works on a TTY only — pass a session id, or name sessions with --name"
+                "`last` resolves only in an interactive context, and this call is not one "
+                "(a TTY on stdin, no --json, NO_INPUT unset) — pass a session id, or name "
+                "sessions with --name"
             )
         candidates = list_sessions(clock=resolved_clock, verify=False)
         if not candidates:

@@ -57,7 +57,8 @@ from acpc.registry import (
 # should not have to find the rule somewhere else.
 _SELECTOR_HELP = (
     "Session id, the `--name` alias given at dispatch, or `last` for the most recent "
-    "session; `last` resolves only at a terminal, so a script must name the session."
+    "session; `last` resolves only in an interactive context — stdin a terminal, no "
+    "--json, NO_INPUT unset — so a script must name the session."
 )
 
 # The prompt argument's contract, shared by the verbs that take one: one
@@ -739,31 +740,69 @@ def _resolve_permissions(
     explicit: str | None,
     resolution: CallResolution,
     *,
-    tty: bool,
     background: bool = False,
 ) -> tuple[str, tuple[str, str] | None]:
-    """Apply SPEC's TTY rules to the resolved permission policy.
+    """Settle the permission policy against the streams this call was given.
 
-    A background client has already gone away by the time a permission
-    request arrives, so `--bg` follows the non-TTY rule even when stdout is
-    a terminal — and says so, because "needs a terminal" is baffling advice
-    to someone who is sitting at one.
+    Two separate questions (see `interaction`): whether acpc may ask at all,
+    which stdin and the stdout format decide, and whether it asks unprompted,
+    which additionally wants a terminal on stdout.  Redirecting the result to
+    a file lowers the default; it does not withdraw an explicit `ask`.
+
+    `--bg` is the one case that neither answers.  Accepting the work instead
+    of waiting for it may change only how long the command waits, never what
+    the callee may do, so `--bg` no longer quietly drops the default to
+    `read`: it asks for the policy up front and carries the answer into the
+    session.
     """
-    interactive = tty and not background
     policy = explicit if explicit is not None else resolution.permissions
     if policy is None:
-        policy = "ask" if interactive else "read"
+        policy = _default_policy(background=background)
     policy, clamp = _clamp_inherited_ceiling(policy)
-    if policy == "ask" and not interactive:
+    if policy == "ask":
         cause = (
             "cannot be used with --bg, which returns before a request could be answered"
             if background
-            else "needs a terminal to ask on"
+            else interaction.why_not_interactive()
         )
-        raise UsageProblem(
-            f"--permissions ask {cause}; pass --permissions none, read, edit, execute or all"
-        )
+        if cause is not None:
+            raise UsageProblem(
+                f"--permissions ask {cause}; pass --permissions none, read, edit, execute or all"
+            )
     return policy, clamp
+
+
+def _default_policy(*, background: bool) -> str:
+    """The policy for a caller that named none."""
+    if not interaction.ask_by_default():
+        return "read"
+    if not background:
+        return "ask"
+    return _ask_background_policy()
+
+
+def _ask_background_policy() -> str:
+    """Ask once, before dispatch, which policy the detached session runs under.
+
+    `ask` is not on offer: nobody will be attached to answer, so accepting it
+    here would promise a dialogue that can never happen.  Silence is not
+    consent — an unanswered question fails the call by name rather than
+    settling on `read` behind the caller's back.
+    """
+    choices = list(vocab.PERMISSION_VALUES[:-1])
+    default = "read"
+    chosen = interaction.ask_choice(
+        "acpc: --bg detaches this session, so nothing can answer a permission request.\n"
+        f"acpc: policy for this session [{', '.join(choices)}] ({default}): ",
+        choices=choices,
+        default=default,
+    )
+    if chosen is None:
+        raise UsageProblem(
+            "--bg needs a permission policy chosen before it detaches; "
+            "pass --permissions none, read, edit, execute or all"
+        )
+    return chosen
 
 
 def _clamp_inherited_ceiling(policy: str) -> tuple[str, tuple[str, str] | None]:
@@ -1208,7 +1247,7 @@ def _render_entry_detail(
         if field == "home":
             rendered = _display_home(value)
         elif field == "permissions" and value is None:
-            rendered = "ask on TTY, read otherwise"
+            rendered = "ask at a terminal, read otherwise"
         else:
             rendered = "·" if value is None else str(value)
         rendered_source = _source_text(resolution.provenance.get(field))
@@ -2170,7 +2209,12 @@ def prune_command(older_than: str | None, dry_run: bool, assume_yes: bool, json_
 def _load_view_session(selector: str) -> sessions.SessionMeta:
     """Verify liveness before a targeted view reports a session."""
     try:
-        session_id = sessions.resolve_selector(selector, allow_last=interaction.stdout_is_tty())
+        # `last` is a convenience for whoever is at the keyboard, so it turns
+        # on the same rule as every other question acpc puts to a person.
+        # Collecting the output in a file does not move that person away.
+        session_id = sessions.resolve_selector(
+            selector, allow_last=interaction.interactive_context()
+        )
         return sessions.load(session_id)
     except sessions.SessionError as error:
         raise _session_problem(error) from None
@@ -2781,9 +2825,11 @@ def _still_running_note(session_id: str, timeout: float | None) -> str:
     metavar="P",
     help=(
         "\b\n"
-        "Permission scale: none, read, edit, execute, all or ask; absent, ask on a TTY and "
-        "read otherwise (--bg counts as non-TTY). execute permits read, edit and execute; "
-        "write and prompt are deprecated aliases for execute and ask."
+        "Permission scale: none, read, edit, execute, all or ask; absent, ask when stdin "
+        "and stdout are both terminals and read otherwise, and --bg asks which policy to "
+        "detach with. ask itself needs a terminal on stdin and refuses under --json, --bg "
+        "or a set NO_INPUT. execute permits read, edit and execute; write and prompt are "
+        "deprecated aliases for execute and ask."
     ),
 )
 @click.option(
@@ -2854,8 +2900,10 @@ def run_command(
 ) -> None:
     """Dispatch one agent; block and print the final answer.
 
-    The default permission policy is ``ask`` on a TTY and ``read``
-    otherwise.  Background calls always use the non-TTY rule.
+    The default permission policy is ``ask`` when stdin and stdout are both
+    terminals, and ``read`` otherwise.  ``--bg`` cannot answer a request once
+    it has detached, so it asks for the policy before dispatching instead of
+    lowering it silently.
 
     The prompt comes from one source: the argument, ``-`` for stdin, or
     ``--prompt-file``. Whichever it is, acpc reads at most 1 MiB (1048576
@@ -2870,7 +2918,6 @@ def run_command(
     # verbatim; `vocab.MAX_PROMPT_BYTES` is where it actually lives, and that
     # constant carries the pointer back here.
     permissions = _normalize_permission(permissions)
-    tty = interaction.stdout_is_tty()
 
     try:
         registry = AgentRegistry()
@@ -2889,10 +2936,8 @@ def run_command(
         raise _registry_problem(error) from None
 
     defaulted_permissions = permissions is None and resolution.permissions is None
-    policy, permissions_clamp = _resolve_permissions(
-        permissions, resolution, tty=tty, background=background
-    )
-    # The TTY-resolved policy is part of the resolved invocation: meta.json
+    policy, permissions_clamp = _resolve_permissions(permissions, resolution, background=background)
+    # The stream-resolved policy is part of the resolved invocation: meta.json
     # stores everything --resolve shows, and `continue` reuses it verbatim.
     resolution = _select_resolution(
         replace(resolution, permissions=policy, permissions_clamp=permissions_clamp)
@@ -3153,7 +3198,7 @@ def _dispatch_background(session_id: str, request: runner.TurnRequest, *, json_m
     metavar="P",
     help=(
         "Permission scale for this and later turns: none, read, edit, execute, all or ask; "
-        "the run default is ask on a TTY and read otherwise (--bg counts as non-TTY). "
+        "the run default is ask when stdin and stdout are both terminals and read otherwise. "
         "Without this flag, continue reuses its stored policy. write and prompt are "
         "deprecated aliases for execute and ask; --permissions re-runs mode selection against "
         "the adapter's current [modes]."
@@ -3311,14 +3356,14 @@ def _follow_up_request(
         raise _follow_up_problem(error, session_id) from None
     policy = permissions if permissions is not None else stored_policy
     policy, permissions_clamp = _clamp_inherited_ceiling(policy)
-    interactive = interaction.stdout_is_tty() and not background
+    interactive = interaction.interactive_context() and not background
     if policy == "ask" and not interactive:
-        # Same split as `run`: the two causes are different situations and
+        # Same split as `run`: each cause is a different situation, and
         # "needs a terminal" is baffling advice to someone sitting at one.
         cause = (
             "cannot be continued with --bg, which returns before a request could be answered"
             if background
-            else "needs a terminal to ask on"
+            else interaction.why_not_interactive()
         )
         raise UsageProblem(
             f"this session uses --permissions ask, which {cause}; "
