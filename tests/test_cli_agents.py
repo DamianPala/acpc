@@ -671,9 +671,11 @@ def test_install_returns_one_for_a_failed_definition_command(cli: CliRunner) -> 
 
 
 def test_install_without_install_command_names_vendor_docs(cli: CliRunner) -> None:
+    """The entry is there and the call is fine; acpc has no installer to run."""
     result = invoke(cli, "install", "grok")
 
-    assert result.exit_code == vocab.EXIT_USAGE
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    assert json.loads(result.stderr.splitlines()[-1])["error"]["kind"] == "not_supported"
     assert "https://docs.x.ai/build/overview" in result.stderr
     assert "already registered" in result.stderr
     assert "run 'acpc install grok'" not in result.stderr

@@ -60,8 +60,8 @@ EXIT_DESCRIPTIONS: dict[str, str] = {
     "0": "Success, including an empty result: the turn ended normally, or the view rendered.",
     "1": "Generic failure: the agent errored — a crash, a refusal, exhausted context, "
     "missing auth — or the command could not do what was asked.",
-    "2": "Usage error: bad flags, an unknown session, a mode that exceeds the policy, "
-    "or a policy no mode satisfies.",
+    "2": "Usage error: the call cannot be accepted in this form — bad flags, a mode that "
+    "exceeds the policy, or a policy no declared mode satisfies.",
     "4": "Output budget exhausted: `log --follow` stopped because `--max-output` ran out "
     "before the session ended; the footer's cursor covers what was printed.",
     "124": "Timeout: `run` cancelled the session; `wait` and `log --wait-new` stopped waiting "

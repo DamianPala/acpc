@@ -38,17 +38,26 @@ PRECONDITION_FAILED = "precondition_failed"
 
 # Kinds acpc defines because no shared kind carries the distinction.
 #
-# `agent_error`: the agent-side program acpc invoked ran and reported its own
-# failure — a refused or crashed turn, an exhausted context, a failing
-# installer.  acpc reached it and it answered, so `unavailable` would be a
-# lie, and nothing acpc manages is in conflict.
+# `agent_error`: an external program acpc invoked reported its own failure —
+# an `install_command` returning non-zero, an adapter answering with an error
+# acpc has no better name for.  acpc reached it and it answered, so
+# `unavailable` would be a lie, and nothing acpc manages is in conflict.  A
+# turn that ends badly is not this: the operation ran to an end acpc did not
+# ask for, which is `operation_failed`.
 #
-# `corrupt_state`: a session acpc owns exists on disk and cannot be trusted —
-# `meta.json` is unreadable or holds a value outside its vocabulary.  The
-# target was found, the call was valid, and re-running changes nothing, so
-# `not_found`, `invalid_input` and `unavailable` all misdescribe it.
+# `corrupt_state`: state acpc owns exists on disk and cannot be trusted —
+# `meta.json` or an agent entry is unreadable or holds a value outside its
+# vocabulary.  The target was found, the call was valid, and re-running
+# changes nothing, so `not_found`, `invalid_input` and `unavailable` all
+# misdescribe it.
+#
+# `not_supported`: the target exists and the call is well formed, but this
+# operation is not offered for it — `install` on an entry that carries no
+# trusted installer.  No flag overrides it and no wait changes it, which is
+# what separates it from `precondition_failed` and `unavailable`.
 AGENT_ERROR = "agent_error"
 CORRUPT_STATE = "corrupt_state"
+NOT_SUPPORTED = "not_supported"
 
 KINDS = (
     INVALID_INPUT,
@@ -66,6 +75,7 @@ KINDS = (
     PRECONDITION_FAILED,
     AGENT_ERROR,
     CORRUPT_STATE,
+    NOT_SUPPORTED,
 )
 
 # Who can act on the failure, when acpc knows.

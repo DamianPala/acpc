@@ -299,14 +299,14 @@ def test_install_of_an_unknown_agent_is_not_found_rather_than_a_gate(cli: CliRun
     assert envelope(result)["kind"] == "not_found"
 
 
-def test_install_without_an_installer_is_invalid_input_rather_than_a_gate(
+def test_install_without_an_installer_is_not_supported_rather_than_a_gate(
     cli: CliRunner,
 ) -> None:
     """`mock` here declares no `install_command`, so no confirmation could help."""
     result = invoke(cli, "install", "mock")
 
-    assert result.exit_code == vocab.EXIT_USAGE
-    assert envelope(result)["kind"] == "invalid_input"
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    assert envelope(result)["kind"] == "not_supported"
 
 
 def _install_under_a_pty(answer: str | None) -> tuple[int, str]:

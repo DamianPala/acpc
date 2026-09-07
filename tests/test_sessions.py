@@ -427,7 +427,7 @@ class TestTurnRotation:
 
         rotated = sessions.rotate_turn(
             session_id,
-            permissions_from_meta=lambda meta: meta.resolution["resolved"]["permissions"]["value"],
+            resolution_from_meta=lambda meta: meta.resolution,
             clock=at(100.0),
         )
 

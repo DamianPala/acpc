@@ -94,6 +94,23 @@ class AgentNotFound(RegistryError):
     """
 
 
+class CorruptEntry(RegistryError):
+    """An entry file on disk cannot be parsed; the message names the file.
+
+    This is state acpc reads, not an argument a caller typed, so it must not
+    be reported as a usage error: nothing about the call was wrong and no
+    rewriting of the call fixes it.
+    """
+
+
+class InstallNotSupported(RegistryError):
+    """The entry resolves but carries no trusted `install_command`.
+
+    A documented refusal rather than a defect: the entry exists, the call is
+    well formed, and the next step is the vendor's own instructions.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class FieldSource:
     """Where a resolved field value came from."""
@@ -478,7 +495,7 @@ def _parse_entry(
     except OSError as exc:
         raise RegistryError(f"{path}: cannot read agent definition: {exc}") from None
     except tomllib.TOMLDecodeError as exc:
-        raise RegistryError(f"{path}: invalid TOML: {exc}") from None
+        raise CorruptEntry(f"{path}: invalid TOML: {exc}") from None
     unknown = sorted(set(raw) - _ENTRY_KEYS)
     if unknown:
         names = ", ".join(repr(key) for key in unknown)
@@ -869,7 +886,7 @@ class AgentRegistry:
         entry = self.resolve(name)
         command = entry.install_command
         if not command:
-            raise RegistryError(
+            raise InstallNotSupported(
                 f"agent '{name}' has no install_command — {entry.install_next_step()}"
             )
         return command

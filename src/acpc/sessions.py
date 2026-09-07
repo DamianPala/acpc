@@ -84,6 +84,24 @@ class SessionStateError(SessionError):
     """The session's state does not accept this operation."""
 
 
+class SessionBusy(SessionStateError):
+    """The session is mid-turn or its lock is held by someone else.
+
+    Separate from its parent because this is the only state conflict that
+    clears on its own: the same call works once the turn ends, which is what
+    lets the envelope say `retryable`.  Every other `SessionStateError` is an
+    invariant a repeat will never satisfy.
+    """
+
+
+class SessionIdsExhausted(SessionError):
+    """No free session id was found; finished sessions have to be cleared.
+
+    Not a bad argument and not a missing target: acpc's own id space could not
+    serve the request, and only deleting state frees it.
+    """
+
+
 class SessionNameError(SessionError):
     """A `--name` alias or selector cannot be used as asked."""
 
@@ -268,11 +286,9 @@ def _try_acquire_file_lock(fd: int) -> bool:
     return True
 
 
-def _session_busy(session_id: str) -> SessionStateError:
+def _session_busy(session_id: str) -> SessionBusy:
     """Use continue's existing actionable message for a preparation collision."""
-    return SessionStateError(
-        f"session {session_id} is running — wait for the current turn to finish"
-    )
+    return SessionBusy(f"session {session_id} is running — wait for the current turn to finish")
 
 
 @contextlib.contextmanager
@@ -319,7 +335,7 @@ async def session_reservation(session_id: str) -> AsyncIterator[None]:
         _lock_depth.held.add(session_id)
         meta = read_meta(session_id)
         if meta.is_active:
-            raise SessionStateError(
+            raise SessionBusy(
                 f"session {session_id} is {meta.state} — wait for the current turn to finish"
             )
         yield
@@ -554,7 +570,7 @@ def allocate_session_id(*, rng: random.Random | None = None) -> str:
             continue
         paths.ensure_private_dir(directory)
         return candidate
-    raise SessionError(
+    raise SessionIdsExhausted(
         f"could not allocate a free session id after {_ID_ALLOCATION_ATTEMPTS} attempts — "
         f"run 'acpc prune' to clear finished sessions"
     )
@@ -765,7 +781,6 @@ def rotate_turn(
     session_id: str,
     *,
     clock: Clock | None = None,
-    permissions_from_meta: Callable[[SessionMeta], str | None] | None = None,
     resolution_from_meta: Callable[[SessionMeta], Mapping[str, Any]] | None = None,
     target_from_meta: Callable[[SessionMeta], str] | None = None,
     prompt: str | None = None,
@@ -783,27 +798,14 @@ def rotate_turn(
     with session_lock(session_id):
         meta = read_meta(session_id)
         if meta.is_active:
-            raise SessionStateError(
+            raise SessionBusy(
                 f"session {session_id} is {meta.state} — wait for the current turn to finish"
             )
         # Any value derived from session state must be a callback. The callback
         # receives this locked re-read, so a caller cannot accidentally compute
         # a snapshot value before the lock and write it after the lock.
-        if resolution_from_meta is not None and permissions_from_meta is not None:
-            raise SessionStateError(
-                f"session {session_id} received both resolution and permissions updates"
-            )
         if resolution_from_meta is not None:
             meta.resolution = dict(resolution_from_meta(meta))
-        elif permissions_from_meta is not None:
-            permissions = permissions_from_meta(meta)
-            if permissions is None:
-                raise SessionStateError(f"session {session_id} has no permission update")
-            resolved = meta.resolution.get("resolved")
-            if not isinstance(resolved, dict):
-                raise SessionStateError(f"session {session_id} has no stored permission resolution")
-            resolved["permissions"] = {"value": permissions, "source": "call flag"}
-            meta.resolution.pop("permissions_source", None)
         if target_from_meta is not None:
             meta.target = target_from_meta(meta)
         turn = meta.turns
@@ -964,7 +966,7 @@ def ensure_deletable(meta: SessionMeta) -> None:
     session is a conflict, not something a confirmation would resolve.
     """
     if meta.is_active:
-        raise SessionStateError(f"session {meta.session_id} is {meta.state} — stop it before rm")
+        raise SessionBusy(f"session {meta.session_id} is {meta.state} — stop it before rm")
 
 
 def delete_session(session_id: str, *, clock: Clock | None = None) -> None:

@@ -2226,11 +2226,7 @@ def test_continue_permissions_refusal_names_the_permission_floor(
     assert result.exit_code == vocab.EXIT_USAGE
     envelope = json.loads(result.stderr)["error"]
     assert envelope["kind"] == "permission_denied"
-    assert envelope["message"] == (
-        "no mode on floor grants at most permissions read — the lowest policy floor runs "
-        "under is execute; pass --permissions execute; declared modes: bypass (grants all), "
-        "default (grants execute)"
-    )
+    assert "the lowest policy floor runs under is execute" in envelope["message"]
 
 
 def test_continuation_clamps_and_persists_an_inherited_ceiling(

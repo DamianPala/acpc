@@ -495,6 +495,11 @@ class TurnOutcome:
     finalized_elsewhere: bool = False
     queued: bool = False
     turn_token: int | None = None
+    # True when this process's own Ctrl-C ended the turn. A session that reads
+    # `cancelled` says nothing about who cancelled it, and the two answers need
+    # different failure kinds: the command was stopped, or it watched an
+    # operation end badly. Only the side that received the signal knows which.
+    interrupted: bool = False
 
     @property
     def exit_code(self) -> int:
@@ -1080,7 +1085,16 @@ async def _route(request: TurnRequest) -> tuple[Any | None, str | None]:
 
 
 async def _execute(session_id: str, request: TurnRequest) -> TurnOutcome:
+    """Run the turn and record whether this process's Ctrl-C ended it."""
     cancel = _CancelSignal()
+    outcome = await _execute_routed(session_id, request, cancel)
+    outcome.interrupted = cancel.received_signal == signal.SIGINT
+    return outcome
+
+
+async def _execute_routed(
+    session_id: str, request: TurnRequest, cancel: _CancelSignal
+) -> TurnOutcome:
     loop = asyncio.get_running_loop()
     _install_signal_handlers(loop, cancel)
 

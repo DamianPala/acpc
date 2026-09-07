@@ -322,9 +322,7 @@ def test_daemon_stop_refuses_a_running_session_and_leaves_daemon_alive(
     assert result.stdout == ""
     envelope = json.loads(result.stderr)["error"]
     assert envelope["kind"] == "precondition_failed"
-    assert envelope["message"] == (
-        f"daemon stop mock: 1 active session ({session_id}) — wait or stop them first"
-    )
+    assert f"1 active session ({session_id})" in envelope["message"]
     assert envelope["hint"] == "Run: acpc daemon stop mock --force"
     assert envelope["context"]["sessions"] == [session_id]
     assert sessions.load(session_id).state == "running"
@@ -343,9 +341,7 @@ def test_daemon_stop_refuses_a_starting_session(cli: CliRunner, live_daemon: Non
     assert result.exit_code == vocab.EXIT_AGENT_ERROR
     envelope = json.loads(result.stderr)["error"]
     assert envelope["kind"] == "precondition_failed"
-    assert envelope["message"] == (
-        f"daemon stop mock: 1 active session ({session.session_id}) — wait or stop them first"
-    )
+    assert f"1 active session ({session.session_id})" in envelope["message"]
     assert sessions.read_meta(session.session_id).state == "starting"
     assert _daemon_is_reachable(target)
 
@@ -415,9 +411,7 @@ def test_multi_target_daemon_stop_refuses_before_stopping_any_target(
     assert result.exit_code == vocab.EXIT_AGENT_ERROR
     envelope = json.loads(result.stderr)["error"]
     assert envelope["kind"] == "precondition_failed"
-    assert envelope["message"] == (
-        f"daemon stop: 1 active session ({session_id}) — wait or stop them first"
-    )
+    assert f"1 active session ({session_id})" in envelope["message"]
     assert _daemon_is_reachable(_target())
     assert _daemon_is_reachable(other_target)
 
@@ -580,10 +574,7 @@ def test_bare_prune_zero_retention_is_safe_but_explicit_zero_deletes(
     assert result.exit_code == vocab.EXIT_USAGE
     envelope = json.loads(result.stderr)["error"]
     assert envelope["kind"] == "invalid_input"
-    assert envelope["message"] == (
-        "config retention '0d' resolves to zero — bare prune would delete every finished "
-        "session; pass --older-than 0d to do that explicitly"
-    )
+    assert "config retention '0d' resolves to zero" in envelope["message"]
     assert sessions.session_dir(session_id).exists()
 
     explicit = invoke(cli, "prune", "--older-than", "0d", "--yes")

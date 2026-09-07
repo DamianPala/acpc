@@ -44,7 +44,9 @@ from acpc.registry import (
     AgentNotFound,
     AgentRegistry,
     CallResolution,
+    CorruptEntry,
     FieldSource,
+    InstallNotSupported,
     RegistryError,
     ResolvedEntry,
 )
@@ -68,6 +70,14 @@ def _registry_problem(error: RegistryError) -> AcpcError:
     """Classify a registry failure: a missing entry is not a bad flag."""
     if isinstance(error, AgentNotFound):
         return _not_found(str(error), hint="Run: acpc agents")
+    if isinstance(error, CorruptEntry):
+        # A file acpc reads, not a flag the caller typed: no rewriting of the
+        # call fixes it, and the message already names the file to repair.
+        return AcpcError(str(error), kind=errors.CORRUPT_STATE, action="user")
+    if isinstance(error, InstallNotSupported):
+        # The entry exists and the call is well formed; acpc simply has no
+        # trusted installer to run for it, and no flag turns one up.
+        return AcpcError(str(error), kind=errors.NOT_SUPPORTED, action="user")
     return UsageProblem(str(error))
 
 
@@ -101,10 +111,45 @@ def _session_problem(error: sessions.SessionError) -> AcpcError:
         return _not_found(str(error), hint="Run: acpc status --all")
     if isinstance(error, sessions.CorruptSessionError):
         return AcpcError(str(error), kind=errors.CORRUPT_STATE)
-    if isinstance(error, sessions.SessionNameTaken | sessions.SessionStateError):
+    if isinstance(error, sessions.SessionIdsExhausted):
+        # acpc's own id space is full.  Nothing about the call is wrong and no
+        # repeat frees an id; only deleting finished sessions does.
+        return AcpcError(
+            str(error),
+            kind=errors.UNAVAILABLE,
+            action="user",
+            hint="Run: acpc prune --yes",
+        )
+    if isinstance(error, sessions.SessionNameTaken | sessions.SessionBusy):
         # The session is busy or bound; the same call works once it settles.
         return AcpcError(str(error), kind=errors.CONFLICT, retryable=True)
+    if isinstance(error, sessions.SessionStateError):
+        # A state conflict that will not clear on its own — an invariant the
+        # session cannot satisfy.  `retryable` stays absent rather than false:
+        # acpc is not asserting anything either way about a repeat.
+        return AcpcError(str(error), kind=errors.CONFLICT)
     return UsageProblem(str(error))
+
+
+def _follow_up_problem(error: Exception, session_id: str) -> AcpcError:
+    """Classify a failure raised while preparing a follow-up turn.
+
+    Preparation reads the session's own record back and hands it to the
+    runner, so a runner complaint here is about stored state rather than
+    about the call — which is what separates this from `_runner_problem`.
+    Everything reported from here names the session, because the caller has
+    to be able to reach the work either way.
+    """
+    if isinstance(error, AcpcError):
+        problem = error
+    elif isinstance(error, sessions.SessionError):
+        problem = _session_problem(error)
+    elif isinstance(error, runner.RunnerError):
+        # Every value these calls validate was read back from `meta.json`.
+        problem = AcpcError(str(error), kind=errors.CORRUPT_STATE)
+    else:
+        problem = AgentProblem(str(error), kind=errors.UNAVAILABLE)
+    return problem.with_context(session_id=session_id)
 
 
 class TimeoutParamType(click.ParamType):
@@ -221,10 +266,13 @@ class _CheatSheetGroup(click.Group):
         raw arguments are read first for exactly that reason: a caller that
         asked for JSON gets the failure as JSON even when nothing else ran.
         """
+        # Unconditional: `_machine_format` is module state, so an in-process
+        # caller that skips standalone mode would otherwise report this
+        # invocation in the format the previous one selected.
+        errors.reset(_invocation_args(args, kwargs))
         if not kwargs.get("standalone_mode", True):
             return super().main(*args, **kwargs)
         kwargs["standalone_mode"] = False
-        errors.reset(_invocation_args(args, kwargs))
         try:
             return super().main(*args, **kwargs)
         except click.UsageError as error:
@@ -239,6 +287,41 @@ class _CheatSheetGroup(click.Group):
             # Click turns Ctrl-C into Abort; a stack trace here would say the
             # tool broke, when the caller simply stopped it.
             _fail(_interrupted())
+        except BrokenPipeError:
+            # The reader is gone, so there is no one to hand an envelope to;
+            # SPEC's 141 is the whole answer.
+            _leave_on_broken_pipe()
+        except Exception as error:  # noqa: BLE001
+            # Last resort.  Anything that reaches here is a failure no command
+            # classified, and the caller still gets one object rather than a
+            # stack trace: `SystemExit` is not an `Exception`, so a command
+            # that already chose its exit code passes straight through.
+            _fail(_unclassified_problem(error))
+
+
+def _unclassified_problem(error: Exception) -> AcpcError:
+    """The envelope for a failure that reached the top level unnamed.
+
+    The message names the exception's type and nothing else.  acpc has no
+    story about what went wrong here, and an exception's own text carries
+    paths, arguments and internals that the rest of the tool never prints.
+
+    A refusal from the filesystem is the one thing still worth naming: it is
+    somebody's to fix rather than a defect, and `permission_denied` with
+    `action: user` is what says so.
+    """
+    if isinstance(error, PermissionError):
+        return AcpcError(
+            f"acpc was refused access it needed ({type(error).__name__})",
+            kind=errors.PERMISSION_DENIED,
+            action="user",
+            hint="Check the permissions on the acpc state root (ACPC_HOME).",
+        )
+    return AcpcError(
+        f"acpc failed unexpectedly ({type(error).__name__})",
+        kind=errors.OPERATION_FAILED,
+        action="none",
+    )
 
 
 def _invocation_args(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Sequence[str]:
@@ -378,19 +461,32 @@ def _read_stdin_prompt() -> str:
     return _checked_prompt(sys.stdin.read(vocab.MAX_PROMPT_BYTES + 1), "-")
 
 
+def _prompt_file_problem(prompt_file: str, error: OSError) -> AcpcError:
+    """Classify a `--prompt-file` that could not be read.
+
+    A path that is not there is the caller's own argument, so it stays a usage
+    error.  A path that is there and refused is the filesystem's answer, and
+    no rewriting of the call changes it.
+    """
+    message = f"--prompt-file {prompt_file}: {error.strerror}"
+    if isinstance(error, PermissionError):
+        return AcpcError(message, kind=errors.PERMISSION_DENIED, action="user")
+    return UsageProblem(message)
+
+
 def _read_prompt_file(prompt_file: str) -> str:
     """Read the prompt file, refusing an oversized one without reading it."""
     path = Path(prompt_file).expanduser()
     try:
         size = path.stat().st_size
     except OSError as error:
-        raise UsageProblem(f"--prompt-file {prompt_file}: {error.strerror}") from None
+        raise _prompt_file_problem(prompt_file, error) from None
     if size > vocab.MAX_PROMPT_BYTES:
         raise _oversized_prompt("--prompt-file", size)
     try:
         text = path.read_text(encoding="utf-8")
     except OSError as error:
-        raise UsageProblem(f"--prompt-file {prompt_file}: {error.strerror}") from None
+        raise _prompt_file_problem(prompt_file, error) from None
     return _checked_prompt(text, "--prompt-file")
 
 
@@ -738,6 +834,13 @@ def _emit_resolution(payload: dict[str, Any], *, json_mode: bool) -> None:
 _stdout_line_open = False
 
 
+def _leave_on_broken_pipe() -> NoReturn:
+    """Leave with SPEC's 141 without letting the shutdown flush raise again."""
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, sys.stdout.fileno())
+    raise SystemExit(vocab.EXIT_SIGPIPE)
+
+
 def _write_stdout(text: str) -> None:
     """Write the answer, turning a closed stdout into SPEC's exit 141."""
     global _stdout_line_open
@@ -745,10 +848,7 @@ def _write_stdout(text: str) -> None:
         sys.stdout.write(text)
         sys.stdout.flush()
     except BrokenPipeError:
-        # Keep the interpreter's own shutdown flush from raising again.
-        devnull = os.open(os.devnull, os.O_WRONLY)
-        os.dup2(devnull, sys.stdout.fileno())
-        sys.exit(vocab.EXIT_SIGPIPE)
+        _leave_on_broken_pipe()
     if text:
         _stdout_line_open = not text.endswith("\n")
 
@@ -1546,8 +1646,22 @@ def agents_init_command(
     try:
         paths.ensure_private_dir(paths.agents_dir())
         paths.atomic_write(target, contents)
+    except PermissionError as error:
+        # A directory a person has to fix, not a call anyone can rewrite, so
+        # the caller is told to stop rather than to try something else.
+        raise AcpcError(
+            f"cannot write {target}: {error.strerror}",
+            kind=errors.PERMISSION_DENIED,
+            action="user",
+            hint=f"Make {paths.agents_dir()} writable, then run the command again.",
+        ) from None
     except OSError as error:
-        raise UsageProblem(f"cannot write {target}: {error}") from None
+        # A full disk, a read-only mount, a failing device: the machine could
+        # not serve the write, which may or may not still be true later.
+        raise AcpcError(
+            f"cannot write {target}: {error.strerror}",
+            kind=errors.UNAVAILABLE,
+        ) from None
     payload = {"name": name, "extends": parent, "path": str(target), "changed": True}
     if json_mode:
         _emit_json(payload)
@@ -2197,6 +2311,44 @@ def log_command(
         )
         return
 
+    _render_log_page(
+        meta,
+        transcript_file,
+        cursor=cursor,
+        tail=selection_tail,
+        prose=prose,
+        json_mode=json_mode,
+        max_output=max_output,
+        wait_new=wait_new,
+        explicit_since=explicit_since,
+        timeout=timeout,
+        quiet=quiet,
+        since_note=since_note,
+    )
+
+
+def _render_log_page(
+    meta: sessions.SessionMeta,
+    transcript_file: transcript.Transcript,
+    *,
+    cursor: int,
+    tail: int | None,
+    prose: bool,
+    json_mode: bool,
+    max_output: int,
+    wait_new: bool,
+    explicit_since: bool,
+    timeout: float | None,
+    quiet: bool,
+    since_note: str | None,
+) -> None:
+    """Print one page of a transcript, optionally waiting for it to exist.
+
+    This is `log` without `--follow`: a single read that either has events
+    already or waits once for the first new one, then the footer that tells a
+    poller where to resume and whether the session is still going.
+    """
+    selection_tail = tail
     if wait_new and not explicit_since:
         cursor = _read_transcript_page(transcript_file).next_cursor
     page = _read_transcript_page(
@@ -2417,15 +2569,11 @@ def _follow_log(
             )
         )
     if exhausted:
-        # A cut stream is not a completed follow, and the cursor in `context`
-        # is exactly what a caller needs to resume without a gap or a repeat.
-        raise AcpcError(
-            f"stopped following session {meta.session_id}: --max-output {max_output} exhausted",
-            kind=errors.OUTCOME_UNKNOWN,
-            exit_code=vocab.EXIT_BUDGET,
-            hint=f"Run: acpc log {meta.session_id} --follow --since {cursor}",
-            context={"session_id": meta.session_id, "cursor": cursor},
-        )
+        # Not a failure: the caller asked for at most `--max-output` bytes and
+        # got them.  Reaching a read limit ends that read, it does not end the
+        # transcript, so the way out is the budget code and the footer's
+        # cursor — no envelope, because nothing went wrong.
+        raise SystemExit(vocab.EXIT_BUDGET)
     if timed_out:
         raise AcpcError(
             f"gave up following session {meta.session_id}",
@@ -2609,18 +2757,21 @@ def run_command(
     settings = config.load_config()
     runner.auto_prune(settings.retention_seconds)
 
-    meta = sessions.create_session(
-        entry=resolution.entry.entry,
-        base_adapter=resolution.entry.base_adapter,
-        prompt=prompt,
-        resolution=runner.session_resolution(
-            resolution,
-            cwd=resolved_cwd,
-            permissions_source="default" if defaulted_permissions else None,
-        ),
-        target=runner.call_target(resolution),
-        name=alias,
-    )
+    try:
+        meta = sessions.create_session(
+            entry=resolution.entry.entry,
+            base_adapter=resolution.entry.base_adapter,
+            prompt=prompt,
+            resolution=runner.session_resolution(
+                resolution,
+                cwd=resolved_cwd,
+                permissions_source="default" if defaulted_permissions else None,
+            ),
+            target=runner.call_target(resolution),
+            name=alias,
+        )
+    except sessions.SessionError as error:
+        raise _session_problem(error) from None
 
     request = runner.TurnRequest(
         resolution=resolution,
@@ -2662,26 +2813,38 @@ def run_command(
             f"-- detached, still RUNNING: {meta.session_id}"
             f" — answer: acpc wait {meta.session_id} · cancel: acpc stop {meta.session_id}"
         )
-        _end_turn(meta.session_id, outcome.state, outcome.stop_reason, outcome.exit_code)
+        _end_turn_for(meta.session_id, outcome)
 
     if not quiet:
         _echo_metadata(output.format_summary(final, route_note=_route_note(outcome)))
 
-    _end_turn(meta.session_id, outcome.state, outcome.stop_reason, outcome.exit_code)
+    _end_turn_for(meta.session_id, outcome)
 
 
 # What a finished turn means when it did not end in `done`.  The exit code
 # already says which ending it was; the kind is what a caller matches on.
+#
+# A command that waits for the turn it started reports any terminal state
+# other than success as `operation_failed`: the operation ran to an end and
+# that end was not the one asked for.  `interrupted` is reserved for a command
+# that was itself cut short — Ctrl-C — not for observing a session somebody
+# else cancelled, which is a finished operation like any other.  The state
+# that separates them travels in `context.status`.
 _TURN_FAILURE_KINDS = {
-    "failed": errors.AGENT_ERROR,
-    "orphaned": errors.AGENT_ERROR,
-    "cancelled": errors.INTERRUPTED,
+    "failed": errors.OPERATION_FAILED,
+    "orphaned": errors.OPERATION_FAILED,
+    "cancelled": errors.OPERATION_FAILED,
     "timeout": errors.TIMEOUT,
     # The daemon still owns the turn: acpc stopped watching without seeing how
     # it ends, and saying "failed" would claim knowledge it does not have.
     "detached": errors.OUTCOME_UNKNOWN,
-    "terminated": errors.INTERRUPTED,
+    "terminated": errors.OPERATION_FAILED,
 }
+
+# States `runner.exit_code_for` settles on their own, before it looks at
+# `stop_reason`.  `_end_turn` has to weigh the two in the same order, or a
+# turn could leave with one story in its exit code and another in its kind.
+_SIGNAL_STATES = frozenset({"cancelled", "timeout", "detached", "terminated"})
 
 _TURN_FAILURE_MESSAGES = {
     "failed": "session {id} failed",
@@ -2693,20 +2856,45 @@ _TURN_FAILURE_MESSAGES = {
 }
 
 
-def _end_turn(session_id: str, state: str, stop_reason: str | None, exit_code: int) -> NoReturn:
+def _end_turn_for(session_id: str, outcome: runner.TurnOutcome) -> NoReturn:
+    """Leave on a turn this command ran, reading the ending off its outcome."""
+    _end_turn(
+        session_id,
+        outcome.state,
+        outcome.stop_reason,
+        outcome.exit_code,
+        interrupted=outcome.interrupted,
+    )
+
+
+def _end_turn(
+    session_id: str,
+    state: str,
+    stop_reason: str | None,
+    exit_code: int,
+    *,
+    interrupted: bool = False,
+) -> NoReturn:
     """Leave an answer-printing command, saying in one shape how it ended.
 
     The exit code has always mirrored the session result; this adds the
     machine-readable reason next to it, carrying the session id so a caller
     that was cut off mid-turn can still reach the work (R7a).
+
+    `interrupted` is the one thing the session's own state cannot tell: a
+    `cancelled` session looks the same whoever cancelled it, and a command
+    stopped by its caller's Ctrl-C is a different failure from a command that
+    watched an operation end badly.
     """
     if exit_code == vocab.EXIT_OK:
         raise SystemExit(exit_code)
-    if stop_reason == "permission_denied":
+    if interrupted:
+        raise _interrupted(session_id=session_id)
+    if state not in _SIGNAL_STATES and stop_reason == "permission_denied":
         kind = errors.PERMISSION_DENIED
         message = f"session {session_id} was denied a permission it needed"
     else:
-        kind = _TURN_FAILURE_KINDS.get(state, errors.AGENT_ERROR)
+        kind = _TURN_FAILURE_KINDS.get(state, errors.OPERATION_FAILED)
         template = _TURN_FAILURE_MESSAGES.get(state, "session {id} did not finish")
         message = template.format(id=session_id)
     if state in {"failed", "orphaned"} and (detail := _latest_failure_message(session_id)):
@@ -2716,12 +2904,19 @@ def _end_turn(session_id: str, state: str, stop_reason: str | None, exit_code: i
         if state == "detached"
         else f"Run: acpc log {session_id} --since 0"
     )
+    context: dict[str, Any] = {"session_id": session_id}
+    if kind == errors.OPERATION_FAILED:
+        # `operation_failed` promises the identifier *and* the state it ended
+        # in: the kind says the operation finished badly, and `status` is what
+        # says which badly — a refusal and a cancellation need different next
+        # steps and share this kind.
+        context["status"] = state
     raise AcpcError(
         message,
         kind=kind,
         exit_code=exit_code,
         hint=hint,
-        context={"session_id": session_id},
+        context=context,
     )
 
 
@@ -2915,28 +3110,25 @@ def continue_command(
     )
 
 
-def _dispatch_follow_up(
-    meta: sessions.SessionMeta,
+def _follow_up_request(
+    session_id: str,
     prompt: str,
     *,
-    output_file: str | None,
     permissions: str | None,
     background: bool,
     timeout: float | None,
-    max_output: int,
-    quiet: bool,
-    json_mode: bool,
-) -> None:
-    """Run the next turn on a finished session — `continue`'s machinery.
+) -> tuple[sessions.SessionMeta, runner.TurnRequest]:
+    """Build the next turn on a finished session from its stored resolution.
 
-    `steer` is `continue` with a cancel in front of it, so both verbs end
-    here: one turn on the session's stored resolution, one output contract.
+    The session is re-read here rather than reusing the caller's snapshot: the
+    policy, the mode selection and the request all have to describe the same
+    version of the record.
     """
     try:
-        current = sessions.read_meta(meta.session_id)
+        current = sessions.read_meta(session_id)
         stored_policy = _stored_permission_policy(current)
     except sessions.SessionError as error:
-        raise _session_problem(error).with_context(session_id=meta.session_id) from None
+        raise _follow_up_problem(error, session_id) from None
     policy = permissions if permissions is not None else stored_policy
     policy, permissions_clamp = _clamp_inherited_ceiling(policy)
     interactive = interaction.stdout_is_tty() and not background
@@ -2955,11 +3147,7 @@ def _dispatch_follow_up(
     try:
         stored_resolution = runner.resolution_from_session(current)
     except runner.RunnerError as error:
-        # Everything this call can fail on is a value read back from
-        # `meta.json`, so the session's own record is what is wrong.
-        raise AcpcError(
-            str(error), kind=errors.CORRUPT_STATE, context={"session_id": meta.session_id}
-        ) from None
+        raise _follow_up_problem(error, session_id) from None
     selection: CallResolution | None = None
     if (
         permissions is not None
@@ -2993,19 +3181,35 @@ def _dispatch_follow_up(
             defer_rotation=True,
             rotation_resolution=updated_resolution,
         )
-    except AcpcError:
-        raise
-    except sessions.SessionError as error:
-        raise _session_problem(error).with_context(session_id=meta.session_id) from None
-    except runner.RunnerError as error:
-        # Every value this build validates was read back from `meta.json`.
-        raise AcpcError(
-            str(error), kind=errors.CORRUPT_STATE, context={"session_id": meta.session_id}
-        ) from None
-    except OSError as error:
-        raise AgentProblem(
-            str(error), kind=errors.UNAVAILABLE, context={"session_id": meta.session_id}
-        ) from None
+    except (AcpcError, sessions.SessionError, runner.RunnerError, OSError) as error:
+        raise _follow_up_problem(error, session_id) from None
+    return current, request
+
+
+def _dispatch_follow_up(
+    meta: sessions.SessionMeta,
+    prompt: str,
+    *,
+    output_file: str | None,
+    permissions: str | None,
+    background: bool,
+    timeout: float | None,
+    max_output: int,
+    quiet: bool,
+    json_mode: bool,
+) -> None:
+    """Run the next turn on a finished session — `continue`'s machinery.
+
+    `steer` is `continue` with a cancel in front of it, so both verbs end
+    here: one turn on the session's stored resolution, one output contract.
+    """
+    current, request = _follow_up_request(
+        meta.session_id,
+        prompt,
+        permissions=permissions,
+        background=background,
+        timeout=timeout,
+    )
 
     if background:
         _dispatch_background(meta.session_id, request, json_mode=json_mode)
@@ -3047,10 +3251,10 @@ def _dispatch_follow_up(
             f"-- detached, still RUNNING: {meta.session_id}"
             f" — answer: acpc wait {meta.session_id} · cancel: acpc stop {meta.session_id}"
         )
-        _end_turn(meta.session_id, outcome.state, outcome.stop_reason, outcome.exit_code)
+        _end_turn_for(meta.session_id, outcome)
     if not quiet:
         _echo_metadata(output.format_summary(final, route_note=_route_note(outcome)))
-    _end_turn(meta.session_id, outcome.state, outcome.stop_reason, outcome.exit_code)
+    _end_turn_for(meta.session_id, outcome)
 
 
 # SPEC `steer`: the preamble is fixed text, so the callee reads the redirect

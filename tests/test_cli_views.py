@@ -838,7 +838,11 @@ def test_follow_timeout_exits_124_and_leaves_the_session_alone(cli: CliRunner) -
 
 def test_follow_budget_exhaustion_exits_four_and_says_how_to_resume(cli: CliRunner) -> None:
     """SPEC exit codes: a cut stream is not a completed follow, so it gets its
-    own code and a way back into the stream."""
+    own code and a way back into the stream.
+
+    It is not a failure either: the caller asked for at most this many bytes
+    and got them, so there is no failure object — only the footer's cursor.
+    """
     meta = session_with_messages(25)
 
     result = invoke(cli, "log", meta.session_id, "--follow", "--since", "0", "--max-output", "300")
@@ -847,6 +851,9 @@ def test_follow_budget_exhaustion_exits_four_and_says_how_to_resume(cli: CliRunn
     assert "output truncated" in result.stdout
     assert "--max-output 300 exhausted" in result.stderr
     assert f"acpc log {meta.session_id} --follow --since" in result.stderr
+    assert "cursor:" in result.stderr
+    last = [line for line in result.stderr.splitlines() if line.strip()][-1]
+    assert not last.startswith("{")
 
 
 def test_follow_cursor_covers_exactly_what_was_printed(cli: CliRunner) -> None:
@@ -857,10 +864,6 @@ def test_follow_cursor_covers_exactly_what_was_printed(cli: CliRunner) -> None:
     assert cut.exit_code == vocab.EXIT_BUDGET
     footer = next(line for line in cut.stderr.splitlines() if "cursor:" in line)
     cursor = int(footer.rsplit("cursor:", 1)[1].strip())
-    # The cut stream ends with the envelope, and it resumes from the same place.
-    envelope = json.loads(cut.stderr.splitlines()[-1])["error"]
-    assert envelope["kind"] == "outcome_unknown"
-    assert envelope["context"]["cursor"] == cursor
     printed = [
         line
         for line in cut.stdout.splitlines()

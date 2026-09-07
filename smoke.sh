@@ -1046,7 +1046,9 @@ if begin_section S10-agents "agents views, variants, advertised data, install"; 
     # Malformed entry TOML: clean error, recovers once removed
     echo 'this is not valid toml [[[' >"${ACPC_HOME}/agents/broken.toml"
     run_acpc agents
-    assert_eq "a malformed entry file is a clean error" "2" "$LAST_RC"
+    assert_eq "a malformed entry file is a clean error" "1" "$LAST_RC"
+    assert_eq "a malformed entry file is corrupt_state" "corrupt_state" \
+        "$(jq -r '.error.kind' <<<"$(tail -n1 <<<"$LAST_ERR")")"
     assert_not_contains "malformed entry error has no traceback" "$LAST_ERR" "Traceback"
     rm -f "${ACPC_HOME}/agents/broken.toml"
     run_acpc agents

@@ -202,7 +202,9 @@ def test_the_document_has_exactly_one_top_level_field(cli: CliRunner) -> None:
 
     document = json.loads(result.stderr.splitlines()[-1])
     assert list(document) == ["error"]
-    assert list(document["error"]) == ["kind", "message", "hint"]
+    # Which fields are there, not what order they came in: key order in a JSON
+    # object is not part of the contract, and unset fields are absent.
+    assert set(document["error"]) == {"kind", "message", "hint"}
 
 
 def test_a_failure_after_the_session_exists_carries_its_id(cli: CliRunner) -> None:
@@ -262,7 +264,7 @@ def test_the_kind_vocabulary_carries_the_shared_meanings() -> None:
         "precondition_failed",
     }
     assert shared <= set(errors.KINDS)
-    assert set(errors.KINDS) - shared == {"agent_error", "corrupt_state"}
+    assert set(errors.KINDS) - shared == {"agent_error", "corrupt_state", "not_supported"}
     assert len(errors.KINDS) == len(set(errors.KINDS))
 
 
@@ -374,3 +376,144 @@ def test_ctrl_c_on_a_turn_cancels_it_and_names_the_session(cli: CliRunner) -> No
     assert error["kind"] == "interrupted"
     assert error["context"]["session_id"] == session_id
     assert sessions.read_meta(session_id).state == "cancelled"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal semantics")
+def test_interrupted_is_this_command_being_stopped_not_a_cancelled_session() -> None:
+    """The two readings of `cancelled` are different failures.
+
+    Ctrl-C on `wait` stops the command: nothing about the session changed and
+    the caller already knows why it ended. `wait` on a session somebody else
+    cancelled watched an operation run to a bad end, which is what
+    `operation_failed` and its `status` say.
+    """
+    meta, pid = running_session(live=True)
+
+    watcher = run_cli("wait", meta.session_id)
+    try:
+        wait_until_ready(watcher)
+        watcher.send_signal(signal.SIGINT)
+        _stdout, interrupted_stderr = watcher.communicate(timeout=10)
+    finally:
+        if watcher.poll() is None:
+            watcher.kill()
+            watcher.wait(timeout=10)
+        if pid is not None:
+            proc.kill_process_tree(pid, None)
+    sessions.transition(meta.session_id, "cancelled")
+
+    observer = run_cli("wait", meta.session_id)
+    _stdout, observed_stderr = observer.communicate(timeout=10)
+
+    assert watcher.returncode == vocab.EXIT_CANCELLED
+    assert json.loads(interrupted_stderr.splitlines()[-1])["error"]["kind"] == "interrupted"
+
+    assert observer.returncode == vocab.EXIT_CANCELLED
+    observed = json.loads(observed_stderr.splitlines()[-1])["error"]
+    assert observed["kind"] == "operation_failed"
+    assert observed["context"] == {"session_id": meta.session_id, "status": "cancelled"}
+
+
+# --- kinds that are not the caller's syntax ---------------------------------
+
+
+def test_a_state_root_acpc_cannot_write_is_a_refusal_not_a_stack_trace(
+    cli: CliRunner, state_root: Path
+) -> None:
+    """Nothing classifies this deep down, so the last-resort catcher must."""
+    state_root.chmod(0o555)
+    try:
+        result = invoke(cli, "run", "mock", "hello", "--json")
+    finally:
+        state_root.chmod(0o755)
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    assert "Traceback" not in result.stderr
+    error = envelope(result)
+    assert error["kind"] == "permission_denied"
+    assert error["action"] == "user"
+    assert result.stdout == ""
+
+
+def test_an_unreadable_agent_entry_is_corrupt_state_not_a_bad_call(
+    cli: CliRunner, state_root: Path
+) -> None:
+    """A file acpc reads is not an argument the caller typed."""
+    (state_root / "agents" / "broken.toml").write_text("name = ", encoding="utf-8")
+
+    result = invoke(cli, "run", "broken", "hello")
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    assert envelope(result)["kind"] == "corrupt_state"
+
+
+def test_an_exhausted_session_id_pool_is_unavailable_and_names_prune(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """acpc's own id space, not the call and not a missing target."""
+    monkeypatch.setattr(sessions, "_ID_ALLOCATION_ATTEMPTS", 0)
+
+    result = invoke(cli, "run", "mock", "hello")
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    error = envelope(result)
+    assert error["kind"] == "unavailable"
+    assert error["action"] == "user"
+    assert "prune" in error["hint"]
+
+
+def test_an_unreadable_prompt_file_is_a_refusal_and_a_missing_one_is_not(
+    cli: CliRunner, tmp_path: Path
+) -> None:
+    """The caller typed the path either way; only one of the two is theirs."""
+    unreadable = tmp_path / "prompt.md"
+    unreadable.write_text("hello", encoding="utf-8")
+    unreadable.chmod(0o000)
+
+    refused = invoke(cli, "run", "mock", "--prompt-file", str(unreadable))
+    missing = invoke(cli, "run", "mock", "--prompt-file", str(tmp_path / "gone.md"))
+    unreadable.chmod(0o600)
+
+    assert envelope(refused)["kind"] == "permission_denied"
+    assert refused.exit_code == vocab.EXIT_AGENT_ERROR
+    assert envelope(missing)["kind"] == "invalid_input"
+    assert missing.exit_code == vocab.EXIT_USAGE
+
+
+def test_an_entry_directory_that_refuses_the_write_is_not_a_usage_error(
+    cli: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`agents init` was spelled correctly; the filesystem said no."""
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o555)
+    monkeypatch.setenv("ACPC_HOME", str(locked))
+    try:
+        result = invoke(cli, "agents", "init", "variant", "--extends", "codex")
+    finally:
+        locked.chmod(0o755)
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    error = envelope(result)
+    assert error["kind"] == "permission_denied"
+    assert error["action"] == "user"
+    assert "agents" in error["hint"]
+
+
+def test_retryable_is_absent_where_repeating_the_call_cannot_help(
+    cli: CliRunner, state_root: Path
+) -> None:
+    """F3b: `true` authorizes a retry, and `false` would still be a claim.
+
+    A busy session settles on its own, so the same call may work. A damaged
+    file on disk will read the same on every repeat, and the field is left out
+    rather than guessed in either direction.
+    """
+    meta, _pid = running_session()
+    (state_root / "agents" / "broken.toml").write_text("name = ", encoding="utf-8")
+
+    busy = invoke(cli, "continue", meta.session_id, "turn two")
+    damaged = invoke(cli, "run", "broken", "hello")
+
+    assert envelope(busy)["retryable"] is True
+    assert "retryable" not in envelope(damaged)
