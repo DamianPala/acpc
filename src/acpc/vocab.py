@@ -40,6 +40,10 @@ ACTIVE_STATES = frozenset({"starting", "running"})
 # on stdin, or `--prompt-file`.  Counted in UTF-8 bytes and enforced before a
 # session directory exists, so an oversized call leaves nothing behind.  Far
 # above a real prompt and far below anything that would burden a session dir.
+#
+# Changing either value means editing `run`'s docstring too: Click renders a
+# docstring verbatim, so that one help text spells the number out instead of
+# reading it from here, and D1 asks the two to agree.
 MAX_PROMPT_BYTES = 1_048_576
 MAX_PROMPT_LABEL = "1 MiB"
 

@@ -257,7 +257,7 @@ class ResolvedEntry:
     def install_next_step(self) -> str:
         """Actionable next step when the adapter binary is not on PATH."""
         if self.install_command:
-            return f"run 'acpc install {self.base_adapter}'"
+            return f"run 'acpc install {self.base_adapter} --yes'"
         if self.install_docs:
             return f"adapter is already registered; install the vendor CLI from {self.install_docs}"
         return f"install '{self.command_head}' from the vendor"
@@ -271,7 +271,7 @@ class ResolvedEntry:
         if self.installed:
             return "installed"
         if self.install_command:
-            return f"missing → acpc install {self.entry}"
+            return f"missing → acpc install {self.entry} --yes"
         if self.install_docs:
             return f"missing → {self.install_docs}"
         return "missing"

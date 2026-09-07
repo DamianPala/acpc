@@ -22,8 +22,10 @@ import pytest
 from acp import text_block
 from acp.client import ClientSideConnection
 from acp.schema import AgentMessageChunk
+from click.testing import CliRunner
 
-from acpc import daemon, daemon_client, ipc, output, proc, runner, sessions, vocab
+from acpc import __version__, daemon, daemon_client, ipc, output, proc, runner, sessions, vocab
+from acpc.cli import main
 from acpc.client import REPLAY_GENERATION_KEY, AcpcClient
 from acpc.permissions import PermissionLevel, select_mode
 from acpc.registry import AgentRegistry
@@ -244,6 +246,29 @@ def test_daemon_acceptance_has_a_running_disk_claim_before_the_turn_task_runs(
         await instance.host.close()
 
     asyncio.run(scenario())
+
+
+def test_daemon_status_leaves_a_daemon_of_another_build_running(
+    state_root: Path, live_daemon: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A read-only command reports a version it does not share; it does not resolve it.
+
+    Greeting is what stands a daemon of another build down, taking its
+    sessions with it, so the observing path must not greet.
+    """
+    session_id = new_session("a daemon turn")
+    run_turn(session_id, "a daemon turn")
+    monkeypatch.setattr(daemon_client, "__version__", "0.0.0-another-build")
+    cli = CliRunner()
+
+    first = cli.invoke(main, ["daemon", "status", "--json"], catch_exceptions=False)
+    second = cli.invoke(main, ["daemon", "status", "--json"], catch_exceptions=False)
+
+    reported = json.loads(first.stdout)["daemons"]
+    assert [entry["target"] for entry in reported] == [target()]
+    assert reported[0]["version"] == __version__
+    # Still there for the next look: the first one changed nothing.
+    assert json.loads(second.stdout)["daemons"][0]["pid"] == reported[0]["pid"]
 
 
 # --- routing ----------------------------------------------------------------

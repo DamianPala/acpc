@@ -264,7 +264,7 @@ Shape references (not values to copy): package `data/agents/claude.toml`,
 | `probe --discover` → 0 advertised | Catalogue missing on the wire — not proof the binary has no permission modes. Path B. |
 | Mode name from another adapter "should work" | Mode ids are vendor-local. |
 | `the adapter rejected model|effort '…'` with Method not found, Unknown config option, or similar | Config-option path missing — set `model_via` / `effort_via` after proving the alternate wire, or drop pins. |
-| `missing → acpc install …` | argv[0] not on PATH and the entry has `install_command`. |
+| `missing → acpc install … --yes` | argv[0] not on PATH and the entry has `install_command`. |
 | `missing → https://…` | argv[0] not on PATH; entry has `install_docs`, no `install_command`. Install the vendor CLI. |
 | Auth fails only under acpc | Passthrough or `home`/`home_env` wrong; re-run bare with the same env (rung 2). |
 | Daemon shares traffic with another entry | Same target key (agent + home + declared env + policy). Own `home`. |

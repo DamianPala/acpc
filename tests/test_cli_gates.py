@@ -8,6 +8,7 @@ controlling terminal and gets one through `pty.fork`.
 import json
 import os
 import pty
+import re
 import sys
 from collections.abc import Iterator
 from pathlib import Path
@@ -17,7 +18,7 @@ import pytest
 from click.testing import CliRunner
 
 from acpc import cli as cli_module
-from acpc import effects, proc, sessions, vocab
+from acpc import daemon_client, effects, proc, sessions, vocab
 from acpc.cli import main
 
 MOCK_AGENT_SCRIPT = str(Path(__file__).with_name("mock_agent.py"))
@@ -222,6 +223,16 @@ def test_prune_preview_and_mutation_share_one_shape_and_differ_in_changed(
     assert not sessions.session_dir(session_id).exists()
 
 
+def test_prune_refuses_an_unreadable_age_rather_than_asking_for_yes(cli: CliRunner) -> None:
+    """The gate is last: no confirmation could make `nonsense` an age."""
+    finished_session()
+
+    result = invoke(cli, "prune", "--older-than", "nonsense")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert envelope(result)["kind"] == "invalid_input"
+
+
 def test_prune_that_selects_nothing_reports_no_change(cli: CliRunner) -> None:
     finished_session()
 
@@ -253,6 +264,44 @@ def test_bare_daemon_stop_dry_run_needs_no_yes(cli: CliRunner) -> None:
 
     assert result.exit_code == vocab.EXIT_OK
     assert json.loads(result.stdout) == {"targets": [], "changed": False}
+
+
+def _known_daemon_target(state_root: Path, name: str = "mock") -> str:
+    """A target is known once its lock file exists; nothing answers on it."""
+    (state_root / "daemon").mkdir(parents=True, exist_ok=True)
+    (state_root / "daemon" / f"{name}.lock").write_text("", encoding="utf-8")
+    return name
+
+
+def test_a_daemon_stop_preview_opens_no_connection(
+    cli: CliRunner, state_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Greeting a daemon can stand it down, so a preview greets nothing."""
+    target = _known_daemon_target(state_root)
+
+    async def refuse(name: str) -> None:
+        raise AssertionError(f"the preview reached out to {name}")
+
+    monkeypatch.setattr(daemon_client, "connect", refuse)
+    monkeypatch.setattr(daemon_client, "observe", refuse)
+
+    result = invoke(cli, "daemon", "stop", "--dry-run", "--json")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert json.loads(result.stdout) == {"targets": [target], "changed": False}
+
+
+def test_daemon_stop_preview_and_call_share_one_shape(cli: CliRunner, state_root: Path) -> None:
+    target = _known_daemon_target(state_root)
+
+    preview = json.loads(invoke(cli, "daemon", "stop", "--dry-run", "--json").stdout)
+    real = json.loads(invoke(cli, "daemon", "stop", "--yes", "--json").stdout)
+
+    assert preview.keys() == real.keys()
+    assert preview == {"targets": [target], "changed": False}
+    # Nothing answers on that socket, so the call reached nothing and changed
+    # nothing — the preview still had to name what it would have addressed.
+    assert real["changed"] is False
 
 
 def test_force_does_not_confirm_and_confirming_does_not_force(
@@ -309,17 +358,59 @@ def test_install_without_an_installer_is_not_supported_rather_than_a_gate(
     assert envelope(result)["kind"] == "not_supported"
 
 
-def _install_under_a_pty(answer: str | None) -> tuple[int, str]:
+def _spelled_install_calls(text: str) -> list[str]:
+    """Lines that spell out an `acpc install` call, as opposed to naming the command.
+
+    A placeholder in angle brackets or a closing backtick right after the verb
+    is prose about the command; anything else is a line someone can copy.
+    """
+    calls = []
+    for line in text.splitlines():
+        for match in re.finditer(r"acpc install\s*(\S*)", line):
+            argument = match.group(1)
+            if not argument or argument[0] in "<`\"'":
+                continue
+            calls.append(line.strip())
+    return calls
+
+
+def test_nothing_acpc_ships_tells_a_caller_to_install_without_yes() -> None:
+    """D1: the tool's own hints and its shipped skills lead to calls that can succeed.
+
+    Outside a terminal `acpc install <name>` fails `confirmation_required`, so
+    a hint or a skill step without `--yes` sends its reader into a dead end.
+    """
+    package = Path(cli_module.__file__).parent
+    offenders = [
+        f"{path.relative_to(package)}: {line}"
+        for path in sorted(package.rglob("*"))
+        if path.is_file() and path.suffix in {".py", ".md", ".toml"}
+        for line in _spelled_install_calls(path.read_text(encoding="utf-8"))
+        if "--yes" not in line
+    ]
+
+    assert offenders == []
+
+
+def _install_under_a_pty(answer: str | None) -> tuple[int, str, str]:
     """Run `install` in a child that owns a real controlling terminal.
 
     `pty.fork` is the only way to exercise the `/dev/tty` branch: the prompt
     deliberately ignores stdin.  `answer=None` writes nothing and closes the
     terminal, which is how a caller that never answers looks from inside.
+
+    The child's stderr is a pipe rather than the terminal, so a failure comes
+    back as the envelope a caller matches on while stdin stays a real
+    terminal and the prompt still happens.  Returns the wait status, what the
+    terminal saw, and what stderr carried.
     """
     child = "from acpc.cli import main; main(['install', 'mock'])"
+    reading, writing = os.pipe()
     pid, fd = pty.fork()
     if pid == 0:  # pragma: no cover - replaced by execv in the child
+        os.dup2(writing, 2)
         os.execv(sys.executable, [sys.executable, "-c", child])
+    os.close(writing)
     if answer is not None:
         os.write(fd, answer.encode())
     else:
@@ -333,13 +424,21 @@ def _install_under_a_pty(answer: str | None) -> tuple[int, str]:
             pass  # EIO is how a pty master reports the child closing its end
         finally:
             os.close(fd)
-    return os.waitpid(pid, 0)[1], asked.decode(errors="replace")
+    failure = b""
+    while chunk := os.read(reading, 1024):
+        failure += chunk
+    os.close(reading)
+    return (
+        os.waitpid(pid, 0)[1],
+        asked.decode(errors="replace"),
+        failure.decode(errors="replace"),
+    )
 
 
 # forkpty warns about threads (xdist runs us multi-threaded); the child execs at once.
 @pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
 def test_a_person_at_a_terminal_is_asked_and_can_agree(installer: Path) -> None:
-    status, asked = _install_under_a_pty("y\n")
+    status, asked, _ = _install_under_a_pty("y\n")
 
     assert status == 0
     assert "Install mock?" in asked
@@ -349,21 +448,37 @@ def test_a_person_at_a_terminal_is_asked_and_can_agree(installer: Path) -> None:
 @pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
 @pytest.mark.parametrize(
     ("answer", "what"),
-    [("n\n", "a refusal"), ("\x04", "end of input"), (None, "a closed terminal")],
+    [("n\n", "a refusal"), ("\x04", "end of input")],
 )
 def test_nothing_but_agreement_lets_the_install_through(
     installer: Path, answer: str | None, what: str
 ) -> None:
     """`\\x04` ends the read without closing the terminal: EOF, not an answer."""
-    status, _ = _install_under_a_pty(answer)
+    status, _, failure = _install_under_a_pty(answer)
 
     assert status != 0, what
     assert not installer.exists(), what
+    # The same failure a missing `--yes` produces, not merely a non-zero exit.
+    assert json.loads(failure.splitlines()[-1])["error"]["kind"] == "confirmation_required", what
+
+
+@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
+def test_a_closed_terminal_installs_nothing(installer: Path) -> None:
+    """A terminal that is gone before the child starts leaves nothing to report to.
+
+    The kind cannot be asserted here: with the terminal closed the child does
+    not live long enough to say anything.  What has to hold is that the
+    installer never ran.
+    """
+    status, _, _ = _install_under_a_pty(None)
+
+    assert status != 0
+    assert not installer.exists()
 
 
 @pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
 def test_a_bare_enter_takes_the_offered_default(installer: Path) -> None:
-    status, _ = _install_under_a_pty("\n")
+    status, _, _ = _install_under_a_pty("\n")
 
     assert status == 0
     assert installer.exists()
@@ -393,9 +508,69 @@ def test_agents_delete_removes_the_entry_agents_init_wrote(
 def test_agents_delete_refuses_an_adapter_acpc_ships(cli: CliRunner) -> None:
     result = invoke(cli, "agents", "delete", "codex")
 
+    assert envelope(result)["kind"] == "not_found"
+    assert "ships" in envelope(result)["message"]
+
+
+def test_agents_delete_takes_back_an_override_of_a_shipped_adapter(
+    cli: CliRunner, state_root: Path
+) -> None:
+    invoke(cli, "agents", "init", "codex", "--extends", "mock")
+    target = state_root / "agents" / "codex.toml"
+    assert target.exists()
+
+    result = invoke(cli, "agents", "delete", "codex", "--json")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert json.loads(result.stdout)["changed"] is True
+    assert not target.exists()
+
+
+def test_agents_delete_refuses_a_name_that_climbs_out_of_the_agents_directory(
+    cli: CliRunner, state_root: Path
+) -> None:
+    victim = state_root / "config.toml"
+    victim.write_text("keep me\n", encoding="utf-8")
+
+    result = invoke(cli, "agents", "delete", "../config", "--json")
+
     assert result.exit_code == vocab.EXIT_USAGE
     assert envelope(result)["kind"] == "invalid_input"
-    assert "ships" in envelope(result)["message"]
+    assert victim.exists()
+
+
+def test_agents_delete_refuses_an_absolute_name(cli: CliRunner, tmp_path: Path) -> None:
+    victim = tmp_path / "victim.toml"
+    victim.write_text("keep me\n", encoding="utf-8")
+
+    result = invoke(cli, "agents", "delete", str(tmp_path / "victim"))
+
+    assert envelope(result)["kind"] == "invalid_input"
+    assert victim.exists()
+
+
+def test_agents_delete_refuses_a_link_that_points_out_of_the_directory(
+    cli: CliRunner, state_root: Path, tmp_path: Path
+) -> None:
+    """The character check cannot see this one; resolving the path can."""
+    victim = tmp_path / "victim.toml"
+    victim.write_text("keep me\n", encoding="utf-8")
+    (state_root / "agents").mkdir(parents=True, exist_ok=True)
+    (state_root / "agents" / "escape.toml").symlink_to(victim)
+
+    result = invoke(cli, "agents", "delete", "escape")
+
+    assert envelope(result)["kind"] == "invalid_input"
+    assert victim.exists()
+
+
+def test_agents_init_refuses_a_name_that_climbs_out_of_the_agents_directory(
+    cli: CliRunner, state_root: Path
+) -> None:
+    result = invoke(cli, "agents", "init", "../escapee", "--extends", "mock")
+
+    assert envelope(result)["kind"] == "invalid_input"
+    assert not (state_root / "escapee.toml").exists()
 
 
 def test_agents_delete_of_an_unknown_entry_is_not_found(cli: CliRunner) -> None:
@@ -446,6 +621,22 @@ def test_an_oversized_prompt_on_stdin_creates_no_session(cli: CliRunner, state_r
     assert result.exit_code == vocab.EXIT_USAGE
     assert envelope(result)["kind"] == "invalid_input"
     assert "from -" in envelope(result)["message"]
+    # A capped read never measured the rest of the stream, so the size it
+    # reports is a floor and the message says so instead of inventing one.
+    assert "at least" in envelope(result)["message"]
+    assert not (state_root / "sessions").exists()
+
+
+@pytest.mark.skipif(not Path("/dev/zero").exists(), reason="needs an endless character device")
+def test_a_prompt_file_that_never_ends_is_refused_without_buffering_it(
+    cli: CliRunner, state_root: Path
+) -> None:
+    """`stat` reports zero bytes for a device, a FIFO and a `/proc` entry alike."""
+    result = invoke(cli, "run", "mock", "--prompt-file", "/dev/zero")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert envelope(result)["kind"] == "invalid_input"
+    assert "--prompt-file" in envelope(result)["message"]
     assert not (state_root / "sessions").exists()
 
 
@@ -477,10 +668,12 @@ def test_the_limit_covers_steer_too(cli: CliRunner) -> None:
 
 
 def test_the_prompt_limit_is_named_in_help(cli: CliRunner) -> None:
+    """The number has to be there; how Click lays the page out is its business."""
     help_text = " ".join(invoke(cli, "run", "--help").stdout.split())
 
-    assert "--prompt-file FILE Read the prompt from a file; at most 1 MiB." in help_text
-    assert "at most 1 MiB (1048576 bytes)" in help_text
+    assert "--prompt-file" in help_text
+    assert vocab.MAX_PROMPT_LABEL in help_text
+    assert str(vocab.MAX_PROMPT_BYTES) in help_text
 
 
 # --- run --resolve ----------------------------------------------------------

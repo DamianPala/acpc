@@ -434,19 +434,26 @@ def main(ctx: click.Context) -> None:
         click.echo(ctx.get_help())
 
 
-def _oversized_prompt(source: str, size: int) -> UsageProblem:
-    """The one failure every prompt source raises when it is too big."""
+def _oversized_prompt(source: str, size: int, *, exact: bool = True) -> UsageProblem:
+    """The one failure every prompt source raises when it is too big.
+
+    A stream is read one character past the limit and no further, so what it
+    yields is a floor on the real size rather than a measurement of it.  The
+    message says which of the two the number is, because a caller that trims
+    to fit would otherwise trim against a size acpc never took.
+    """
+    measured = f"{size} bytes" if exact else f"at least {size} bytes"
     return UsageProblem(
-        f"prompt from {source} is {size} bytes; the limit is "
+        f"prompt from {source} is {measured}; the limit is "
         f"{vocab.MAX_PROMPT_BYTES} bytes ({vocab.MAX_PROMPT_LABEL})"
     )
 
 
-def _checked_prompt(text: str, source: str) -> str:
+def _checked_prompt(text: str, source: str, *, exact: bool = True) -> str:
     """Return the prompt, or refuse it before anything has been created."""
     size = len(text.encode("utf-8"))
     if size > vocab.MAX_PROMPT_BYTES:
-        raise _oversized_prompt(source, size)
+        raise _oversized_prompt(source, size, exact=exact)
     return text
 
 
@@ -458,7 +465,7 @@ def _read_stdin_prompt() -> str:
     that is already over — either way the refusal is exact and the process
     never holds an unbounded stream.
     """
-    return _checked_prompt(sys.stdin.read(vocab.MAX_PROMPT_BYTES + 1), "-")
+    return _checked_prompt(sys.stdin.read(vocab.MAX_PROMPT_BYTES + 1), "-", exact=False)
 
 
 def _prompt_file_problem(prompt_file: str, error: OSError) -> AcpcError:
@@ -475,7 +482,14 @@ def _prompt_file_problem(prompt_file: str, error: OSError) -> AcpcError:
 
 
 def _read_prompt_file(prompt_file: str) -> str:
-    """Read the prompt file, refusing an oversized one without reading it."""
+    """Read the prompt file without buffering more than the limit.
+
+    `stat` stays as the cheap refusal that never opens the file, but it can
+    only be trusted when it says "too big": a FIFO, a character device and a
+    `/proc` entry all report zero bytes and would hand an unbounded stream to
+    an unbounded read.  So the read is capped exactly the way stdin's is, and
+    `--prompt-file <(...)` costs no more memory than the limit allows.
+    """
     path = Path(prompt_file).expanduser()
     try:
         size = path.stat().st_size
@@ -484,10 +498,11 @@ def _read_prompt_file(prompt_file: str) -> str:
     if size > vocab.MAX_PROMPT_BYTES:
         raise _oversized_prompt("--prompt-file", size)
     try:
-        text = path.read_text(encoding="utf-8")
+        with path.open(encoding="utf-8") as stream:
+            text = stream.read(vocab.MAX_PROMPT_BYTES + 1)
     except OSError as error:
         raise _prompt_file_problem(prompt_file, error) from None
-    return _checked_prompt(text, "--prompt-file")
+    return _checked_prompt(text, "--prompt-file", exact=False)
 
 
 def _read_prompt(prompt_text: str | None, prompt_file: str | None) -> str:
@@ -1566,6 +1581,23 @@ def probe_command(entry: str, discover: bool, json_mode: bool) -> None:
         _write_stdout(report.text())
 
 
+def _agent_entry_path(name: str) -> Path:
+    """Map one entry name to its file, refusing anything that leaves the directory.
+
+    Two layers, because neither alone is enough: the character check rejects a
+    name that is really a path (``../config``, an absolute path, which
+    ``Path.__truediv__`` would happily follow), and the resolved-parent check
+    rejects what survives it — a symbolic link planted inside ``agents``.
+    """
+    if not name or "/" in name or "\\" in name or name in {".", ".."}:
+        raise UsageProblem(f"invalid agent name '{name}'")
+    agents_dir = paths.agents_dir()
+    target = agents_dir / f"{name}.toml"
+    if target.resolve().parent != agents_dir.resolve():
+        raise UsageProblem(f"invalid agent name '{name}': it resolves outside {agents_dir}")
+    return target
+
+
 @effects.non_idempotent
 @agents_group.command(name="init")
 @click.argument("name")
@@ -1616,9 +1648,7 @@ def agents_init_command(
             registry.resolve_call(parent, model=model, effort=effort)
     except RegistryError as error:
         raise _registry_problem(error) from None
-    if not name or "/" in name or "\\" in name or name in {".", ".."}:
-        raise UsageProblem(f"invalid agent name '{name}'")
-    target = paths.agents_dir() / f"{name}.toml"
+    target = _agent_entry_path(name)
     if target.exists():
         # A strict create whose target already exists: nothing is malformed,
         # the name is simply taken.
@@ -1678,23 +1708,25 @@ def agents_delete_command(name: str, json_mode: bool) -> None:
     """Delete one entry this machine owns, under ``$ACPC_HOME/agents``.
 
     The counterpart to ``agents init``: it takes back exactly what that wrote,
-    which is why creating an entry needs no confirmation. Adapters acpc ships
-    are not this machine's to delete, so naming one is refused.
+    which is why creating an entry needs no confirmation — including the entry
+    that overrides an adapter acpc ships. The shipped adapter itself is not
+    this machine's, so a name with no file under ``agents`` is refused.
 
     Example: ``acpc agents delete work``
     """
-    target = paths.agents_dir() / f"{name}.toml"
+    target = _agent_entry_path(name)
     try:
         shipped = name in AgentRegistry().shipped_names
     except RegistryError as error:
         raise _registry_problem(error) from None
-    if shipped:
-        raise UsageProblem(
-            f"'{name}' is an adapter acpc ships, not an entry in {paths.agents_dir()} — "
-            "only entries created on this machine can be deleted"
-            + (f"; {target} only overrides it" if target.exists() else "")
-        )
     if not target.exists():
+        if shipped:
+            raise _not_found(
+                f"'{name}' is an adapter acpc ships and nothing under "
+                f"{paths.agents_dir()} overrides it — only entries created on this "
+                "machine can be deleted",
+                hint="Run: acpc agents",
+            )
         raise _not_found(f"unknown agent entry '{name}'", hint="Run: acpc agents")
     try:
         target.unlink()
@@ -2060,7 +2092,9 @@ async def _collect_preparing_sessions(targets: Sequence[str]) -> set[str]:
     """Read the daemon's in-memory preparation register without starting it."""
     preparing: set[str] = set()
     for target in set(targets):
-        daemon = await daemon_client.connect(target)
+        # Observe, never greet: `status` is read-only and a greeting from a
+        # different build would stand the daemon down.
+        daemon = await daemon_client.observe(target)
         if daemon is None:
             continue
         try:
@@ -2697,6 +2731,9 @@ def run_command(
 
     Example: ``acpc run codex "Fix the failing test" --permissions execute``
     """
+    # The limit above is spelled out because Click renders this docstring
+    # verbatim; `vocab.MAX_PROMPT_BYTES` is where it actually lives, and that
+    # constant carries the pointer back here.
     permissions = _normalize_permission(permissions)
     tty = interaction.stdout_is_tty()
 
@@ -3510,7 +3547,9 @@ async def _collect_daemon_status(
     session_metas = sessions.list_sessions(clock=lambda: now)
     entries: list[dict[str, Any]] = []
     for target in runner.daemon_targets_for(agent) if agent else runner.all_daemon_targets():
-        daemon = await daemon_client.connect(target)
+        # Observe, never greet: greeting stands a daemon of another build down,
+        # which is a change of state this command promises not to make.
+        daemon = await daemon_client.observe(target)
         if daemon is None:
             continue
         try:
@@ -3564,7 +3603,13 @@ def daemon_stop_command(
             message="daemon stop: stopping every daemon on this machine needs confirmation",
             hint="Run: acpc daemon stop --dry-run to see them, then repeat with --yes",
         )
-    stopped = asyncio.run(_stop_daemons(targets, dry_run=dry_run))
+    if dry_run:
+        # The preview talks to nothing. The lock files already name every
+        # daemon the mutating call would address, and greeting one is itself
+        # an effect: a daemon of another version stands down on contact.
+        stopped = list(targets)
+    else:
+        stopped = asyncio.run(_stop_daemons(targets))
     payload = {"targets": stopped, "changed": bool(stopped) and not dry_run}
     if json_mode:
         _maintenance_json(payload)
@@ -3598,21 +3643,14 @@ def _refuse_stop_over_active_sessions(agent: str | None, targets: Sequence[str])
     )
 
 
-async def _stop_daemons(targets: Sequence[str], *, dry_run: bool = False) -> list[str]:
-    """Stop the addressed daemons, returning the ones this call reached.
-
-    A preview reaches the same daemons and stops none, so the two calls report
-    the same targets.
-    """
+async def _stop_daemons(targets: Sequence[str]) -> list[str]:
+    """Stop the addressed daemons, returning the ones this call reached."""
     reached: list[str] = []
     for target in targets:
         daemon = await daemon_client.connect(target)
         if daemon is None:
             continue
         try:
-            if dry_run:
-                reached.append(target)
-                continue
             reply = await daemon.stop()
         finally:
             await daemon.close()

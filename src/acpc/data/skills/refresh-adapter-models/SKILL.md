@@ -23,8 +23,9 @@ only target. Investigate first; write only after step 5 yes.
 The advertised list is whatever `command` currently speaks. A stale
 binary cannot grow new ids. Update that process **before** `--check`.
 
-- Entry has `install_command` → propose `acpc install $NAME` (same
-  trusted one-liner). Ask, then run it.
+- Entry has `install_command` → propose `acpc install $NAME --yes` (same
+  trusted one-liner; `--yes` is what carries your ask into a call that
+  cannot ask again). Ask, then run it.
 - No `install_command` → vendor's own upgrade from `install_docs` (grok:
   the `grok` CLI). Ask; do not invent `curl | bash`.
 - Binary missing → same path, still ask. Do not silently install.

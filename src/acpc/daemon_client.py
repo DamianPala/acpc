@@ -143,6 +143,26 @@ async def connect(target: str) -> _SocketDaemon | None:
     return daemon
 
 
+async def observe(target: str) -> _SocketDaemon | None:
+    """Open a connection that only looks, or return None.
+
+    `connect` greets with this build's version, and a daemon of another build
+    stands down on hearing it — taking its sessions with it. That is the right
+    answer for a caller about to run a turn and the wrong one for a caller
+    that only reports, so an observer skips the greeting. `status` needs none:
+    it answers on its own and its reply carries the daemon's version, which
+    lets a report show the skew instead of resolving it.
+    """
+    transport = ipc.UnixSocketTransport(target)
+    try:
+        conn = await transport.connect()
+    except (ConnectionError, OSError, ValueError):
+        with contextlib.suppress(Exception):
+            await transport.cleanup()
+        return None
+    return _SocketDaemon(target, transport, conn)
+
+
 async def ensure_daemon(target: str) -> DaemonConnection | DaemonUnavailable:
     """Connect to the daemon serving `target`, starting it if needed.
 
