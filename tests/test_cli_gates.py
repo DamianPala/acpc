@@ -224,8 +224,16 @@ def test_prune_preview_and_mutation_share_one_shape_and_differ_in_changed(
     preview = json.loads(invoke(cli, "prune", "--older-than", "0d", "--dry-run", "--json").stdout)
     real = json.loads(invoke(cli, "prune", "--older-than", "0d", "--yes", "--json").stdout)
 
-    assert preview == {"targets": [session_id], "changed": False}
-    assert real == {"targets": [session_id], "changed": True}
+    assert preview == {
+        "targets": [session_id],
+        "changed": False,
+        "requires_confirmation": True,
+    }
+    assert real == {
+        "targets": [session_id],
+        "changed": True,
+        "requires_confirmation": True,
+    }
     assert not sessions.session_dir(session_id).exists()
 
 
@@ -244,7 +252,11 @@ def test_prune_that_selects_nothing_reports_no_change(cli: CliRunner) -> None:
 
     result = invoke(cli, "prune", "--older-than", "100d", "--yes", "--json")
 
-    assert json.loads(result.stdout) == {"targets": [], "changed": False}
+    assert json.loads(result.stdout) == {
+        "targets": [],
+        "changed": False,
+        "requires_confirmation": True,
+    }
 
 
 # --- daemon stop ------------------------------------------------------------
@@ -262,14 +274,22 @@ def test_a_named_daemon_stop_needs_no_confirmation(cli: CliRunner) -> None:
     result = invoke(cli, "daemon", "stop", "mock", "--json")
 
     assert result.exit_code == vocab.EXIT_OK
-    assert json.loads(result.stdout) == {"targets": [], "changed": False}
+    assert json.loads(result.stdout) == {
+        "targets": [],
+        "changed": False,
+        "requires_confirmation": False,
+    }
 
 
 def test_bare_daemon_stop_dry_run_needs_no_yes(cli: CliRunner) -> None:
     result = invoke(cli, "daemon", "stop", "--dry-run", "--json")
 
     assert result.exit_code == vocab.EXIT_OK
-    assert json.loads(result.stdout) == {"targets": [], "changed": False}
+    assert json.loads(result.stdout) == {
+        "targets": [],
+        "changed": False,
+        "requires_confirmation": True,
+    }
 
 
 def _known_daemon_target(state_root: Path, name: str = "mock") -> str:
@@ -294,7 +314,11 @@ def test_a_daemon_stop_preview_opens_no_connection(
     result = invoke(cli, "daemon", "stop", "--dry-run", "--json")
 
     assert result.exit_code == vocab.EXIT_OK
-    assert json.loads(result.stdout) == {"targets": [target], "changed": False}
+    assert json.loads(result.stdout) == {
+        "targets": [target],
+        "changed": False,
+        "requires_confirmation": True,
+    }
 
 
 def test_daemon_stop_preview_and_call_share_one_shape(cli: CliRunner, state_root: Path) -> None:
@@ -304,7 +328,11 @@ def test_daemon_stop_preview_and_call_share_one_shape(cli: CliRunner, state_root
     real = json.loads(invoke(cli, "daemon", "stop", "--yes", "--json").stdout)
 
     assert preview.keys() == real.keys()
-    assert preview == {"targets": [target], "changed": False}
+    assert preview == {
+        "targets": [target],
+        "changed": False,
+        "requires_confirmation": True,
+    }
     # Nothing answers on that socket, so the call reached nothing and changed
     # nothing — the preview still had to name what it would have addressed.
     assert real["changed"] is False

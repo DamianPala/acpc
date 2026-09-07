@@ -76,6 +76,7 @@ def result_envelope(
     *,
     truncated: bool = False,
     background: bool = False,
+    changed: bool | None = None,
 ) -> dict[str, Any]:
     """Build the pinned JSON shape for an answer-printing command."""
     if background:
@@ -90,6 +91,8 @@ def result_envelope(
         }
         if resume := _resume_status(meta):
             envelope["resume"] = resume
+        if changed is not None:
+            envelope["changed"] = changed
         return envelope
 
     envelope: dict[str, Any] = {
@@ -108,6 +111,8 @@ def result_envelope(
         envelope["resume"] = resume
     if truncated:
         envelope["output_file"] = str(sessions.answer_path(meta.session_id))
+    if changed is not None:
+        envelope["changed"] = changed
     return envelope
 
 
@@ -121,15 +126,16 @@ def _json_answer(
     *,
     max_output: int,
     answer_path: Path | str,
+    changed: bool | None,
 ) -> OutputResult:
-    complete = _json_text(result_envelope(meta, answer))
+    complete = _json_text(result_envelope(meta, answer, changed=changed))
     if max_output == 0 or len(complete.encode("utf-8")) <= max_output:
         return OutputResult(complete, False, len(complete.encode("utf-8")))
 
     marker = _marker(answer_path, kind="answer")
 
     def candidate(prefix: str) -> str:
-        return _json_text(result_envelope(meta, prefix + marker, truncated=True))
+        return _json_text(result_envelope(meta, prefix + marker, truncated=True, changed=changed))
 
     # JSON escaping adds a fixed envelope overhead and escapes the marker's
     # line breaks.  Binary-search the largest code-point prefix that keeps the
@@ -163,6 +169,7 @@ def render_result(
     json_mode: bool = False,
     background: bool = False,
     max_output: int = DEFAULT_MAX_OUTPUT,
+    changed: bool | None = None,
 ) -> OutputResult:
     """Render one answer command's stdout payload without writing it."""
     _validate_max_output(max_output)
@@ -170,7 +177,7 @@ def render_result(
 
     if background:
         if json_mode:
-            text = _json_text(result_envelope(meta, "", background=True))
+            text = _json_text(result_envelope(meta, "", background=True, changed=changed))
         else:
             text = f"{meta.session_id}\n{sessions.session_dir(meta.session_id)}\n"
         return OutputResult(text, False, len(text.encode("utf-8")))
@@ -181,6 +188,7 @@ def render_result(
             answer,
             max_output=max_output,
             answer_path=answer_path,
+            changed=changed,
         )
     return truncate_answer(answer, max_output=max_output, answer_path=answer_path)
 
@@ -193,6 +201,7 @@ def emit_result(
     json_mode: bool = False,
     background: bool = False,
     max_output: int = DEFAULT_MAX_OUTPUT,
+    changed: bool | None = None,
 ) -> OutputResult:
     """Render and write one stdout payload; return its truncation metadata."""
     result = render_result(
@@ -201,6 +210,7 @@ def emit_result(
         json_mode=json_mode,
         background=background,
         max_output=max_output,
+        changed=changed,
     )
     (sys.stdout if stream is None else stream).write(result.text)
     return result

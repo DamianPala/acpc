@@ -615,7 +615,11 @@ def test_prune_json_is_one_object_on_stdout(cli: CliRunner, state_root: Path) ->
     result = invoke(cli, "prune", "--older-than", "100d", "--dry-run", "--json")
 
     assert result.exit_code == vocab.EXIT_OK
-    assert json.loads(result.stdout) == {"targets": [session_id], "changed": False}
+    assert json.loads(result.stdout) == {
+        "targets": [session_id],
+        "changed": False,
+        "requires_confirmation": True,
+    }
     assert result.stderr.startswith("-- prune ")
 
 

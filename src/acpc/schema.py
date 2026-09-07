@@ -19,11 +19,12 @@ command or touching a session directory.
 """
 
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from copy import deepcopy
 from typing import Any
 
 import click
 
-from acpc import __version__, effects, vocab
+from acpc import __version__, effects, transcript, vocab
 
 # Introspection format version.  It changes when a required field is added, a
 # field is removed, or a field's type or meaning changes — not when an
@@ -40,6 +41,393 @@ STANDARD_VERSION = "0.1.0-draft.5"
 # Default output format per context.  acpc renders text in both today; a
 # command that has a machine shape offers it behind its own `--json`.
 FORMAT_DEFAULTS: dict[str, str] = {"tty": "text", "non_tty": "json"}
+
+
+def _object(properties: dict[str, Any], required: Sequence[str]) -> dict[str, Any]:
+    return {"type": "object", "properties": properties, "required": list(required)}
+
+
+def _array(items: dict[str, Any]) -> dict[str, Any]:
+    return {"type": "array", "items": items}
+
+
+_STRING = {"type": "string"}
+_INTEGER = {"type": "integer"}
+_NUMBER = {"type": "number"}
+_BOOLEAN = {"type": "boolean"}
+_NULLABLE_STRING = {"type": ["string", "null"]}
+_NULLABLE_NUMBER = {"type": ["number", "null"]}
+_NULLABLE_INTEGER = {"type": ["integer", "null"]}
+_SESSION_STATUS = {"type": "string", "enum": list(vocab.SESSION_STATES)}
+_NULLABLE_OBJECT = {"type": ["object", "null"], "properties": {}, "required": []}
+
+_PATHS = _object(
+    {name: _STRING for name in ("dir", "prompt", "transcript", "answer")},
+    ("dir", "prompt", "transcript", "answer"),
+)
+_DENIAL = _object(
+    {
+        "category": _STRING,
+        "count": _INTEGER,
+        "minimum_policy": _STRING,
+        "remedy": _STRING,
+        "target": _STRING,
+    },
+    ("category", "count", "minimum_policy", "remedy"),
+)
+_PERMISSIONS_CLAMP = _object(
+    {name: _STRING for name in ("requested", "ceiling", "effective")},
+    ("requested", "ceiling", "effective"),
+)
+
+_SESSION_RESULT_PROPERTIES = {
+    "session_id": _STRING,
+    "status": _SESSION_STATUS,
+    "stop_reason": _NULLABLE_STRING,
+    "paths": _PATHS,
+    "cost": _NULLABLE_NUMBER,
+    "answer": _STRING,
+    "truncated": _BOOLEAN,
+    "output_file": _STRING,
+    "denied": _array(_DENIAL),
+    "permissions_clamp": {
+        "type": ["object", "null"],
+        "properties": _PERMISSIONS_CLAMP["properties"],
+        "required": _PERMISSIONS_CLAMP["required"],
+    },
+    "next": _array(_STRING),
+    "resume": _STRING,
+    "changed": _BOOLEAN,
+}
+
+
+def _session_result_schema(*, changed: bool, foreground_only: bool = False) -> dict[str, Any]:
+    properties = dict(_SESSION_RESULT_PROPERTIES)
+    if not changed:
+        properties.pop("changed")
+    required = [
+        "status",
+        "session_id",
+        "paths",
+        "truncated",
+        "denied",
+        "permissions_clamp",
+    ]
+    if foreground_only:
+        required[2:2] = ["stop_reason", "cost", "answer"]
+    if changed:
+        required.append("changed")
+    return _object(properties, required)
+
+
+_AGENT_ITEM = _object(
+    {
+        "name": _STRING,
+        "kind": {"type": "string", "enum": ["adapter", "variant"]},
+        "display_name": _STRING,
+        "status": _STRING,
+        "base_adapter": _STRING,
+        "model": _NULLABLE_STRING,
+        "effort": _NULLABLE_STRING,
+        "permissions": _NULLABLE_STRING,
+        "home": _NULLABLE_STRING,
+        "description": _NULLABLE_STRING,
+    },
+    ("name", "kind", "description"),
+)
+_AGENTS_LIST = _object(
+    {"items": _array(_AGENT_ITEM), "has_more": _BOOLEAN},
+    ("items", "has_more"),
+)
+_CHECK_ITEM = _object(
+    {
+        "agent": _STRING,
+        "ok": _BOOLEAN,
+        "models": _INTEGER,
+        "error": _STRING,
+    },
+    ("agent", "ok"),
+)
+_AGENTS_CHECK = _object(
+    {"items": _array(_CHECK_ITEM), "has_more": _BOOLEAN},
+    ("items", "has_more"),
+)
+_RESOLVED_FIELD = _object({"value": _NULLABLE_STRING, "source": _STRING}, ("value", "source"))
+_AGENTS_GET = _object(
+    {
+        "agent": _STRING,
+        "base_adapter": _STRING,
+        "description": _NULLABLE_STRING,
+        "resolved": _object(
+            {name: _RESOLVED_FIELD for name in ("model", "effort", "mode", "permissions", "home")},
+            ("model", "effort", "mode", "permissions", "home"),
+        ),
+        "env": {},
+        "env_passthrough": _array(_STRING),
+        "advertised": _object(
+            {
+                "modes": _array(_STRING),
+                "mode_specs": {},
+                "models": _array(_STRING),
+                "commands": _array({}),
+            },
+            ("modes", "mode_specs", "models", "commands"),
+        ),
+        "presets": {},
+        "models": _array(_STRING),
+        "commands": _array(
+            _object(
+                {"name": _STRING, "description": _NULLABLE_STRING},
+                ("name", "description"),
+            )
+        ),
+    },
+    ("agent",),
+)
+_DAEMON_ITEM = _object(
+    {
+        "target": _STRING,
+        "version": _STRING,
+        "pid": _INTEGER,
+        "uptime_seconds": _NUMBER,
+        "log": _STRING,
+        "sessions": _array(_STRING),
+        "preparing": _array(_STRING),
+        "restoring": _array(_STRING),
+        "max_concurrent": _INTEGER,
+        "idle_seconds": _NULLABLE_NUMBER,
+    },
+    (
+        "target",
+        "version",
+        "pid",
+        "uptime_seconds",
+        "log",
+        "sessions",
+        "preparing",
+        "restoring",
+        "max_concurrent",
+        "idle_seconds",
+    ),
+)
+_DAEMON_STATUS = _object(
+    {"items": _array(_DAEMON_ITEM), "has_more": _BOOLEAN},
+    ("items", "has_more"),
+)
+_TARGET_MUTATION = _object(
+    {
+        "targets": _array(_STRING),
+        "changed": _BOOLEAN,
+        "requires_confirmation": _BOOLEAN,
+    },
+    ("targets", "changed", "requires_confirmation"),
+)
+_STATUS_LIST_ITEM = _object(
+    {
+        "session_id": _STRING,
+        "entry": _STRING,
+        "model": _NULLABLE_STRING,
+        "status": _SESSION_STATUS,
+        "name": _NULLABLE_STRING,
+        "prompt_snippet": _STRING,
+        "runtime_seconds": _NUMBER,
+        "idle_seconds": _NULLABLE_NUMBER,
+        "created_at": _NULLABLE_STRING,
+        "started_at": _NULLABLE_STRING,
+        "finished_at": _NULLABLE_STRING,
+    },
+    (
+        "session_id",
+        "entry",
+        "model",
+        "status",
+        "name",
+        "prompt_snippet",
+        "runtime_seconds",
+        "idle_seconds",
+        "created_at",
+        "started_at",
+        "finished_at",
+    ),
+)
+_STATUS_DETAIL = _object(
+    {
+        "session_id": _STRING,
+        "status": _SESSION_STATUS,
+        "pid": _NULLABLE_INTEGER,
+        "turns": _INTEGER,
+        "entry": _STRING,
+        "base_adapter": _STRING,
+        "model": _NULLABLE_STRING,
+        "name": _NULLABLE_STRING,
+        "runtime_seconds": _NUMBER,
+        "idle_seconds": _NULLABLE_NUMBER,
+        "tokens": _INTEGER,
+        "cost": _NULLABLE_NUMBER,
+        "exit_code": _NULLABLE_INTEGER,
+        "stop_reason": _NULLABLE_STRING,
+        "failure": _NULLABLE_STRING,
+        "paths": _PATHS,
+        "created_at": _NULLABLE_STRING,
+        "started_at": _NULLABLE_STRING,
+        "finished_at": _NULLABLE_STRING,
+    },
+    (
+        "session_id",
+        "status",
+        "pid",
+        "turns",
+        "entry",
+        "base_adapter",
+        "model",
+        "name",
+        "runtime_seconds",
+        "idle_seconds",
+        "tokens",
+        "cost",
+        "exit_code",
+        "stop_reason",
+        "failure",
+        "paths",
+        "created_at",
+        "started_at",
+        "finished_at",
+    ),
+)
+_STATUS = _object(
+    {
+        "items": _array(_STATUS_LIST_ITEM),
+        "has_more": _BOOLEAN,
+        **_STATUS_DETAIL["properties"],
+    },
+    (),
+)
+_LOG_EVENT = _object(
+    {
+        "i": _INTEGER,
+        "ts": _STRING,
+        "type": {"type": "string", "enum": sorted(transcript.EVENT_TYPES)},
+        "text": _STRING,
+        "name": _STRING,
+        "args_summary": _STRING,
+        "status": _STRING,
+        "duration_ms": _INTEGER,
+        "kind": _STRING,
+        "decision": _STRING,
+        "auto": _BOOLEAN,
+        "message": _STRING,
+        "from": _STRING,
+        "to": _STRING,
+        "tokens": _INTEGER,
+        "cost": _NULLABLE_NUMBER,
+    },
+    ("i", "ts", "type"),
+)
+_PROBE = _object(
+    {
+        "entry": _STRING,
+        "base_adapter": _STRING,
+        "discover_only": _BOOLEAN,
+        "turns": _INTEGER,
+        "current_mode": _NULLABLE_STRING,
+        "advertised_modes": _array(
+            _object(
+                {"id": _STRING, "name": _STRING, "description": _NULLABLE_STRING},
+                ("id", "name", "description"),
+            )
+        ),
+        "mode_reports": {},
+        "verdicts": {},
+        "refusal_violations": _array({}),
+        "implied_modes": {},
+        "unmeasured": _array({}),
+        "current_modes": {},
+        "diff": _array(
+            _object(
+                {
+                    "mode": _STRING,
+                    "status": {"type": "string", "enum": ["advertised-missing", "entry-missing"]},
+                    "description": _NULLABLE_STRING,
+                    "current": _NULLABLE_OBJECT,
+                    "proposed": _NULLABLE_OBJECT,
+                },
+                ("mode", "status", "description", "current", "proposed"),
+            )
+        ),
+    },
+    (
+        "entry",
+        "base_adapter",
+        "discover_only",
+        "turns",
+        "current_mode",
+        "advertised_modes",
+        "mode_reports",
+        "verdicts",
+        "refusal_violations",
+        "implied_modes",
+        "unmeasured",
+        "current_modes",
+        "diff",
+    ),
+)
+
+_OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
+    "agents check": _AGENTS_CHECK,
+    "agents create": _object(
+        {"name": _STRING, "extends": _STRING, "path": _STRING, "changed": _BOOLEAN},
+        ("name", "extends", "path", "changed"),
+    ),
+    "agents delete": _object(
+        {"name": _STRING, "path": _STRING, "changed": _BOOLEAN},
+        ("name", "path", "changed"),
+    ),
+    "agents get": _AGENTS_GET,
+    "agents list": _AGENTS_LIST,
+    "cancel": _object(
+        {
+            "session_id": _STRING,
+            "status": _SESSION_STATUS,
+            "stop_reason": _NULLABLE_STRING,
+            "changed": _BOOLEAN,
+        },
+        ("session_id", "status", "stop_reason", "changed"),
+    ),
+    "continue": _session_result_schema(changed=True),
+    "daemon status": _DAEMON_STATUS,
+    "daemon stop": _TARGET_MUTATION,
+    "delete": _object(
+        {"session_id": _STRING, "removed": _BOOLEAN, "changed": _BOOLEAN, "paths": _PATHS},
+        ("session_id", "removed", "changed", "paths"),
+    ),
+    "install": _object(
+        {"agent": _STRING, "ok": _BOOLEAN, "returncode": _INTEGER, "changed": _BOOLEAN},
+        ("agent", "ok", "returncode", "changed"),
+    ),
+    "log": _LOG_EVENT,
+    "probe": _PROBE,
+    "prune": _TARGET_MUTATION,
+    "run": _session_result_schema(changed=True),
+    "skills get": _object(
+        {"name": _STRING, "description": _STRING, "path": _STRING, "body": _STRING},
+        ("name", "description", "path", "body"),
+    ),
+    "skills list": _object(
+        {
+            "items": _array(
+                _object(
+                    {"name": _STRING, "description": _STRING, "path": _STRING},
+                    ("name", "description", "path"),
+                )
+            ),
+            "has_more": _BOOLEAN,
+        },
+        ("items", "has_more"),
+    ),
+    "status": _STATUS,
+    "steer": _session_result_schema(changed=True),
+    "wait": _session_result_schema(changed=False, foreground_only=True),
+}
 
 # Flags accepted by *every* command entry, and therefore not repeated in any
 # D8 document.  A flag belongs here if and only if it is in the intersection
@@ -83,6 +471,13 @@ _DISPATCHES_WITHOUT_COMMAND = "_acpc_schema_dispatches_without_command"
 
 class SchemaError(Exception):
     """A command cannot be published: a parameter has no declared contract."""
+
+
+def _output_schema(name: str) -> dict[str, Any]:
+    try:
+        return deepcopy(_OUTPUT_SCHEMAS[name])
+    except KeyError:
+        raise SchemaError(f"{name}: no output schema") from None
 
 
 def _parameter_names(command: click.Command) -> set[str]:
@@ -338,9 +733,8 @@ def commands(root: click.Group) -> dict[str, click.Command]:
 def detail(name: str, command: click.Command) -> dict[str, Any]:
     """The D8 document for one command.
 
-    `output` is not published yet: the JSON success shapes have not been
-    settled, and a schema that guessed them would be the drift this module
-    exists to prevent.
+    The parser supplies invocation details; the command's success schema is a
+    declared contract because Click has no way to infer it.
     """
     document: dict[str, Any] = {
         "name": name,
@@ -350,6 +744,7 @@ def detail(name: str, command: click.Command) -> dict[str, Any]:
         "effects": _effects_of(command),
         "confirm": _accepts_confirmation(command),
         "interactive": INTERACTIVE,
+        "output": _output_schema(name),
     }
     if getattr(command, _STREAM, False):
         document["stream"] = True

@@ -1808,7 +1808,7 @@ def _agents_check(
             "has_more": len(results) < len(_check_entries(registry, None)),
         }
     else:
-        payload = results[0]
+        payload = {"items": results, "has_more": False}
     if selected_format == "json":
         _emit_json(payload)
     elif selected_format == "plain":
@@ -1884,6 +1884,7 @@ def agents_check_command(
     With NAME, check one registered entry, including one whose adapter is not
     installed. Without NAME, check every registered adapter and variant.
     NAME cannot be combined with ``--limit`` or ``--plain``.
+    JSON output is always a collection; with NAME it contains one item.
     """
     selected_format = _select_format(format_name, json_mode, plain=plain)
     if name is not None:
@@ -2612,7 +2613,11 @@ def prune_command(
         raise UsageProblem(str(error)) from None
 
     session_ids = [meta.session_id for meta in candidates]
-    payload = {"targets": session_ids, "changed": bool(session_ids) and not dry_run}
+    payload = {
+        "targets": session_ids,
+        "changed": bool(session_ids) and not dry_run,
+        "requires_confirmation": True,
+    }
     if selected_format == "json":
         _maintenance_json(payload)
     elif session_ids:
@@ -3390,6 +3395,7 @@ def _run_foreground(
         outcome.answer,
         json_mode=selected_format == "json",
         max_output=max_output,
+        changed=True,
     )
     _emit_turn_result(
         result,
@@ -3781,6 +3787,7 @@ def _dispatch_background(
         json_mode=json_mode,
         background=True,
         max_output=max_output,
+        changed=True,
     )
     if not _write_rendered_file(output_file, result):
         _write_stdout(result.text)
@@ -4069,6 +4076,7 @@ def _dispatch_follow_up(
         outcome.answer,
         json_mode=json_mode,
         max_output=max_output,
+        changed=True,
     )
     _emit_turn_result(
         result,
@@ -4537,7 +4545,11 @@ def daemon_stop_command(
         stopped = list(targets)
     else:
         stopped = asyncio.run(_stop_daemons(targets))
-    payload = {"targets": stopped, "changed": bool(stopped) and not dry_run}
+    payload = {
+        "targets": stopped,
+        "changed": bool(stopped) and not dry_run,
+        "requires_confirmation": agent is None,
+    }
     if selected_format == "json":
         _maintenance_json(payload)
     click.echo(

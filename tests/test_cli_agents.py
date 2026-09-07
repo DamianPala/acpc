@@ -126,6 +126,7 @@ def test_agents_check_help_explains_name_and_default_scope(cli: CliRunner) -> No
     help_text = " ".join(result.stdout.split())
     assert "With NAME, check one registered entry" in help_text
     assert "Without NAME, check every registered adapter and variant" in help_text
+    assert "JSON output is always a collection" in help_text
     assert "only valid without NAME" in help_text
 
 
@@ -604,8 +605,10 @@ def test_check_reports_a_missing_named_adapter_as_check_data(cli: CliRunner) -> 
 
     assert result.exit_code == vocab.EXIT_OK
     payload = json.loads(result.stdout)
-    assert payload["agent"] == "phantom"
-    assert payload["ok"] is False
+    assert payload["has_more"] is False
+    assert payload["items"][0]["agent"] == "phantom"
+    assert payload["items"][0]["ok"] is False
+    assert payload["items"][0]["error"]
     assert "1 check failed" in result.stderr
 
 
@@ -623,9 +626,10 @@ def test_check_applies_the_resolved_options_so_a_bad_config_fails_it(
 
     assert result.exit_code == vocab.EXIT_OK
     payload = json.loads(result.stdout)
-    assert payload["agent"] == "brokenfx"
-    assert payload["ok"] is False
-    assert "Unknown config option: bogus_effort_id" in payload["error"]
+    assert payload["has_more"] is False
+    assert payload["items"][0]["agent"] == "brokenfx"
+    assert payload["items"][0]["ok"] is False
+    assert "Unknown config option: bogus_effort_id" in payload["items"][0]["error"]
     assert "1 check failed" in result.stderr
 
 
@@ -642,9 +646,10 @@ def test_check_spawns_the_resolved_cli_effort_argv(cli: CliRunner, state_root: P
 
     assert result.exit_code == vocab.EXIT_OK
     payload = json.loads(result.stdout)
-    assert payload["agent"] == "brokenargv"
-    assert payload["ok"] is False
-    assert "live probe failed" in payload["error"]
+    assert payload["has_more"] is False
+    assert payload["items"][0]["agent"] == "brokenargv"
+    assert payload["items"][0]["ok"] is False
+    assert "live probe failed" in payload["items"][0]["error"]
     assert "1 check failed" in result.stderr
 
 

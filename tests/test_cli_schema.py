@@ -164,9 +164,7 @@ def test_every_indexed_command_has_detail(runner: CliRunner) -> None:
         # Every acpc command is non-interactive: the prompts it may raise ask
         # for one missing input, they do not start a session.
         assert detail["interactive"] is False
-        # `output` is slice 3b's; publishing a guess would be the drift the
-        # generator exists to prevent.
-        assert "output" not in detail
+        assert isinstance(detail["output"], dict)
 
 
 def test_only_log_declares_a_record_stream(runner: CliRunner) -> None:
