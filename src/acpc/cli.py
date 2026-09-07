@@ -32,6 +32,7 @@ from acpc import (
     proc,
     render,
     runner,
+    schema,
     sessions,
     skills,
     transcript,
@@ -49,6 +50,31 @@ from acpc.registry import (
     InstallNotSupported,
     RegistryError,
     ResolvedEntry,
+)
+
+# How every command that addresses one session names it.  One sentence,
+# published on each of them, because a caller reading one command's schema
+# should not have to find the rule somewhere else.
+_SELECTOR_HELP = (
+    "Session id, the `--name` alias given at dispatch, or `last` for the most recent "
+    "session; `last` resolves only at a terminal, so a script must name the session."
+)
+
+# The prompt argument's contract, shared by the verbs that take one: one
+# source only, `-` for stdin, and the size acpc refuses beyond.
+_PROMPT_HELP = (
+    "The prompt, or `-` to read it from stdin; --prompt-file is the third source and "
+    f"exactly one of the three may be given. At most {vocab.MAX_PROMPT_LABEL} of UTF-8, "
+    "refused before anything is created."
+)
+
+# Values `TimeoutParamType` accepts, stated wherever one is taken: the type
+# name alone ("duration") does not tell a caller what to write.
+_DURATION_SYNTAX = "seconds, such as 90, or a suffixed value such as 90s, 5m, 1h30m"
+
+_OUTPUT_FILE_HELP = (
+    "Write the answer to a file; a relative path resolves against the directory acpc was "
+    "invoked from, and the file is overwritten."
 )
 
 _PERMISSION_CHOICES = (*vocab.PERMISSION_VALUES, *vocab.PERMISSION_ALIASES)
@@ -242,6 +268,13 @@ Common commands:
   probe, stop, rm, prune, install
   Use `acpc <command> --help` for the command's full reference.
 
+Machine-readable interface:
+  acpc schema           the whole command surface as JSON: every command with
+                        its description and effects
+  acpc schema run       one command's arguments, flags, effects and gates
+                        (path segments are separate words: acpc schema agents init)
+  --json on a command emits that command's own result as JSON.
+
 Flag → ACP
   --mode         → session/set_mode
   --permissions  → session/set_mode + request_permission
@@ -421,7 +454,7 @@ def _friendly_usage_message(message: str, *, command_path: str | None = None) ->
     invoke_without_command=True,
     context_settings={"show_default": True},
 )
-@click.version_option(__version__, "-V", "--version", message="acpc %(version)s")
+@click.version_option(__version__, "-V", "--version", message="%(version)s")
 @click.help_option("-h", "--help")
 @click.pass_context
 def main(ctx: click.Context) -> None:
@@ -432,6 +465,45 @@ def main(ctx: click.Context) -> None:
     _stdout_line_open = False
     if ctx.invoked_subcommand is None:
         click.echo(ctx.get_help())
+
+
+@effects.read_only
+@schema.describes(
+    path="Command path to describe, one word per segment; empty for the index.",
+)
+@main.command(name="schema")
+@click.argument("path", nargs=-1)
+@click.help_option("-h", "--help")
+def schema_command(path: tuple[str, ...]) -> None:
+    """Print the command surface as JSON: the index, or one command's detail.
+
+    Bare, it lists every command with its description and effects. Followed by
+    a command path it prints that command's arguments, flags, effects and
+    confirmation gate. Path segments are separate words: ``acpc schema agents
+    init``.
+
+    It reads no configuration, contacts nothing and starts nothing, so it
+    answers the same way on a machine acpc has never run on.
+
+    Example: ``acpc schema run``
+    """
+    try:
+        document = schema.document(main, path)
+    except KeyError:
+        known = schema.commands(main)
+        joined = " ".join(path)
+        if joined in known:
+            # The path exists; it was quoted into one word. Saying so beats
+            # listing seventeen paths the caller can already see.
+            raise UsageProblem(
+                f"unknown schema path {joined!r} — pass each segment as its own "
+                f"argument: acpc schema {joined}"
+            ) from None
+        nearest = schema.nearest(known, path)
+        raise UsageProblem(
+            f"unknown schema path {joined!r} — nearest: {', '.join(repr(name) for name in nearest)}"
+        ) from None
+    _write_stdout(json.dumps(document, ensure_ascii=False, indent=2) + "\n")
 
 
 def _oversized_prompt(source: str, size: int, *, exact: bool = True) -> UsageProblem:
@@ -1484,6 +1556,7 @@ def agents_group(
 
 
 @effects.read_only
+@schema.describes(name="Adapter or variant to render, as listed by bare `acpc agents`.")
 @click.command(name="agent-view")
 @click.argument("name")
 @click.option("--models", is_flag=True, help="Show full advertised presets and models.")
@@ -1542,6 +1615,7 @@ def _agents_check(registry: AgentRegistry, name: str | None, *, json_mode: bool)
 
 
 @effects.read_only
+@schema.describes(entry="Adapter or variant whose advertised modes are read.")
 @main.command(name="probe")
 @click.argument("entry")
 @click.option(
@@ -1599,6 +1673,7 @@ def _agent_entry_path(name: str) -> Path:
 
 
 @effects.non_idempotent
+@schema.describes(name="Name of the variant entry to create; an existing name is a conflict.")
 @agents_group.command(name="init")
 @click.argument("name")
 @click.option(
@@ -1700,6 +1775,7 @@ def agents_init_command(
 
 
 @effects.non_idempotent
+@schema.describes(name="Entry under $ACPC_HOME/agents to delete; entries acpc ships are refused.")
 @agents_group.command(name="delete")
 @click.argument("name")
 @_json_option("Emit the deleted entry as JSON.")
@@ -1783,6 +1859,7 @@ def skills_group(ctx: click.Context, json_mode: bool) -> None:
 
 
 @effects.read_only
+@schema.describes(name="Bundled skill to render, as listed by bare `acpc skills`.")
 @click.command(name="skill-view")
 @click.argument("name")
 @_json_option("Emit this view as JSON.")
@@ -1796,6 +1873,7 @@ def _skill_view_command(name: str, json_mode: bool) -> None:
 
 
 @effects.non_idempotent
+@schema.describes(agent="Registry entry whose adapter is installed; resolved as `run` resolves it.")
 @main.command(name="install")
 @click.argument("agent")
 @click.option("--yes", "-y", "assume_yes", is_flag=True, help="Install without being asked.")
@@ -1941,6 +2019,7 @@ def _maintenance_json(payload: Mapping[str, Any]) -> None:
 
 
 @effects.idempotent
+@schema.describes(selector=_SELECTOR_HELP)
 @main.command(name="stop")
 @click.argument("selector")
 @_json_option("Emit the result as JSON.")
@@ -1976,6 +2055,7 @@ def stop_command(selector: str, json_mode: bool) -> None:
 
 
 @effects.non_idempotent
+@schema.describes(selector=_SELECTOR_HELP)
 @main.command(name="rm")
 @click.argument("selector")
 @click.option("--yes", "-y", "assume_yes", is_flag=True, help="Delete without being asked.")
@@ -2023,7 +2103,15 @@ def rm_command(selector: str, assume_yes: bool, json_mode: bool) -> None:
 
 @effects.non_idempotent
 @main.command(name="prune")
-@click.option("--older-than", default=None, metavar="D", help="Age threshold, such as 7d.")
+@click.option(
+    "--older-than",
+    default=None,
+    metavar="D",
+    help=(
+        "Delete finished sessions older than this age, as a duration such as 7d or 24h; "
+        "absent, the configured retention window applies."
+    ),
+)
 @click.option("--dry-run", is_flag=True, help="List candidates without deleting them.")
 @click.option("--yes", "-y", "assume_yes", is_flag=True, help="Delete without being asked.")
 @_json_option("Emit the result as JSON.")
@@ -2186,6 +2274,9 @@ def _latest_failure_message(session_id: str) -> str | None:
 
 
 @effects.read_only
+@schema.describes(
+    selector=f"{_SELECTOR_HELP} Absent, it reports the whole list instead of one session."
+)
 @main.command(name="status")
 @click.argument("selector", required=False)
 @click.option(
@@ -2238,6 +2329,8 @@ def status_command(selector: str | None, all_sessions: bool, json_mode: bool) ->
 
 
 @effects.read_only
+@schema.emits_record_stream
+@schema.describes(selector=_SELECTOR_HELP)
 @main.command(name="log")
 @click.argument("selector")
 @click.option(
@@ -2276,7 +2369,8 @@ def status_command(selector: str | None, all_sessions: bool, json_mode: bool) ->
     default=None,
     metavar="S",
     help=(
-        "Give up waiting after this duration (exit 124); absent, it blocks indefinitely; "
+        f"Give up waiting after this duration ({_DURATION_SYNTAX}, or 0) and exit 124; "
+        "absent, it blocks indefinitely; "
         "requires --wait-new or --follow."
     ),
 )
@@ -2644,6 +2738,11 @@ def _still_running_note(session_id: str, timeout: float | None) -> str:
 
 
 @effects.non_idempotent
+@schema.reads_stdin("prompt_text")
+@schema.describes(
+    agent="Registry entry to dispatch: an adapter or a variant, as `acpc agents` lists them.",
+    prompt_text=_PROMPT_HELP,
+)
 @main.command(name="run")
 @click.argument("agent")
 @click.argument("prompt_text", required=False)
@@ -2651,11 +2750,31 @@ def _still_running_note(session_id: str, timeout: float | None) -> str:
     "--prompt-file",
     "prompt_file",
     metavar="FILE",
-    help=f"Read the prompt from a file; at most {vocab.MAX_PROMPT_LABEL}.",
+    help=(
+        f"Read the prompt from a file; at most {vocab.MAX_PROMPT_LABEL}. One of three "
+        "prompt sources with the argument and `-`, exactly one of which must be given."
+    ),
 )
-@click.option("--cwd", metavar="DIR", help="Working directory of the callee.")
-@click.option("--model", metavar="M", help="Model tier (fast/standard/max) or a raw model ID.")
-@click.option("--effort", metavar="E", help="Reasoning effort level.")
+@click.option(
+    "--cwd",
+    metavar="DIR",
+    help=(
+        "Working directory of the callee; absent, the directory acpc was invoked from. "
+        "A relative path resolves against that directory."
+    ),
+)
+@click.option(
+    "--model",
+    metavar="M",
+    help=(
+        "Model tier (fast/standard/max) or a raw model ID; absent, the entry's configured model."
+    ),
+)
+@click.option(
+    "--effort",
+    metavar="E",
+    help="Reasoning effort level; absent, the entry's configured effort.",
+)
 @click.option(
     "--permissions",
     type=click.Choice(_PERMISSION_CHOICES),
@@ -2675,17 +2794,33 @@ def _still_running_note(session_id: str, timeout: float | None) -> str:
         "Refused when it grants more than the policy; values from agents <name>."
     ),
 )
-@click.option("--home", metavar="DIR", help="Vendor home override.")
-@click.option("-o", "--output", "output_file", metavar="FILE", help="Write the answer to a file.")
+@click.option(
+    "--home", metavar="DIR", help="Vendor home override; absent, the entry's configured home."
+)
+@click.option("-o", "--output", "output_file", metavar="FILE", help=_OUTPUT_FILE_HELP)
 @click.option(
     "--timeout",
     type=TimeoutParamType(),
     metavar="S",
-    help="Cancel the session after this duration; absent, no wall-clock limit (the callee runs until it is done).",
+    help=(
+        f"Cancel the session after this duration ({_DURATION_SYNTAX}); absent, no wall-clock "
+        "limit (the callee runs until it is done)."
+    ),
 )
-@click.option("--name", "alias", metavar="ALIAS", help="Human-typeable handle for this session.")
 @click.option(
-    "--resolve", "resolve", is_flag=True, help="Print what this call resolves to, then exit."
+    "--name",
+    "alias",
+    metavar="ALIAS",
+    help="Human-typeable handle for this session; `last` is reserved as a selector.",
+)
+@click.option(
+    "--resolve",
+    "resolve",
+    is_flag=True,
+    help=(
+        "Print what this call resolves to, then exit; nothing is dispatched, so the prompt "
+        "is not read and --bg has no effect."
+    ),
 )
 @click.option(
     "--max-output",
@@ -2997,6 +3132,8 @@ def _dispatch_background(session_id: str, request: runner.TurnRequest, *, json_m
 
 
 @effects.non_idempotent
+@schema.reads_stdin("prompt_text")
+@schema.describes(selector=_SELECTOR_HELP, prompt_text=_PROMPT_HELP)
 @main.command(name="continue")
 @click.argument("selector")
 @click.argument("prompt_text", required=False)
@@ -3004,9 +3141,12 @@ def _dispatch_background(session_id: str, request: runner.TurnRequest, *, json_m
     "--prompt-file",
     "prompt_file",
     metavar="FILE",
-    help=f"Read the prompt from a file; at most {vocab.MAX_PROMPT_LABEL}.",
+    help=(
+        f"Read the prompt from a file; at most {vocab.MAX_PROMPT_LABEL}. One of three "
+        "prompt sources with the argument and `-`, exactly one of which must be given."
+    ),
 )
-@click.option("-o", "--output", "output_file", metavar="FILE", help="Write the answer to a file.")
+@click.option("-o", "--output", "output_file", metavar="FILE", help=_OUTPUT_FILE_HELP)
 @click.option(
     "--permissions",
     type=click.Choice(_PERMISSION_CHOICES),
@@ -3024,7 +3164,10 @@ def _dispatch_background(session_id: str, request: runner.TurnRequest, *, json_m
     "--timeout",
     type=TimeoutParamType(),
     metavar="S",
-    help="Cancel the session after this duration; absent, no wall-clock limit (the callee runs until it is done).",
+    help=(
+        f"Cancel the session after this duration ({_DURATION_SYNTAX}); absent, no wall-clock "
+        "limit (the callee runs until it is done)."
+    ),
 )
 @click.option(
     "--max-output",
@@ -3306,6 +3449,15 @@ def _steer_prompt(instruction: str) -> str:
 
 
 @effects.non_idempotent
+@schema.reads_stdin("instruction_text")
+@schema.describes(
+    selector=_SELECTOR_HELP,
+    instruction_text=(
+        "The redirect, or `-` to read it from stdin; --prompt-file is the third source and "
+        f"exactly one of the three may be given. At most {vocab.MAX_PROMPT_LABEL} of UTF-8. "
+        "An interrupted turn receives it under a fixed preamble."
+    ),
+)
 @main.command(name="steer")
 @click.argument("selector")
 @click.argument("instruction_text", required=False)
@@ -3313,15 +3465,21 @@ def _steer_prompt(instruction: str) -> str:
     "--prompt-file",
     "prompt_file",
     metavar="FILE",
-    help=f"Read the instruction from a file; at most {vocab.MAX_PROMPT_LABEL}.",
+    help=(
+        f"Read the instruction from a file; at most {vocab.MAX_PROMPT_LABEL}. One of three "
+        "sources with the argument and `-`, exactly one of which must be given."
+    ),
 )
-@click.option("-o", "--output", "output_file", metavar="FILE", help="Write the answer to a file.")
+@click.option("-o", "--output", "output_file", metavar="FILE", help=_OUTPUT_FILE_HELP)
 @click.option("--bg", "background", is_flag=True, help="Dispatch and return the session id.")
 @click.option(
     "--timeout",
     type=TimeoutParamType(),
     metavar="S",
-    help="Cancel the redirected turn after this duration; absent, no wall-clock limit (the callee runs until it is done).",
+    help=(
+        f"Cancel the redirected turn after this duration ({_DURATION_SYNTAX}); absent, no "
+        "wall-clock limit (the callee runs until it is done)."
+    ),
 )
 @click.option(
     "--max-output",
@@ -3398,6 +3556,7 @@ def steer_command(
 
 
 @effects.read_only
+@schema.describes(selector=_SELECTOR_HELP)
 @main.command(name="wait")
 @click.argument("selector")
 @click.option(
@@ -3405,9 +3564,12 @@ def steer_command(
     type=TimeoutParamType(allow_zero=True),
     default=None,
     metavar="S",
-    help="Stop waiting after this duration (exit 124; the session keeps running); absent, it blocks indefinitely.",
+    help=(
+        f"Stop waiting after this duration ({_DURATION_SYNTAX}, or 0) and exit 124; the "
+        "session keeps running; absent, it blocks indefinitely."
+    ),
 )
-@click.option("-o", "--output", "output_file", metavar="FILE", help="Write the answer to a file.")
+@click.option("-o", "--output", "output_file", metavar="FILE", help=_OUTPUT_FILE_HELP)
 @click.option(
     "--max-output",
     type=click.IntRange(min=0),
@@ -3504,6 +3666,9 @@ def daemon_group() -> None:
 
 
 @effects.read_only
+@schema.describes(
+    agent="Registry entry whose daemons are reported; absent, every daemon on this machine."
+)
 @daemon_group.command(name="status")
 @click.argument("agent", required=False)
 @_json_option("Emit the status as JSON.")
@@ -3564,6 +3729,12 @@ async def _collect_daemon_status(
 
 
 @effects.idempotent
+@schema.describes(
+    agent=(
+        "Registry entry whose daemon is stopped; absent, every daemon on this machine, "
+        "which is the call that needs --yes."
+    )
+)
 @daemon_group.command(name="stop")
 @click.argument("agent", required=False)
 @click.option(

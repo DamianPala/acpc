@@ -9,7 +9,7 @@ import click
 import pytest
 from click.testing import CliRunner
 
-from acpc import interaction, vocab
+from acpc import __version__, interaction, vocab
 from acpc.cli import main
 
 MOCK_AGENT_SCRIPT = str(Path(__file__).with_name("mock_agent.py"))
@@ -185,10 +185,7 @@ def test_help_explains_session_lifecycle_and_retention(runner: CliRunner) -> Non
         "With no id and no ``--all``: every running session plus the 5 most recent finished ones."
         in status_help
     )
-    assert (
-        "Stop waiting after this duration (exit 124; the session keeps running); absent, it blocks indefinitely."
-        in wait_help
-    )
+    assert "and exit 124; the session keeps running" in wait_help
     assert "The exit code mirrors the session result." in wait_help
     assert "the free way to reprint an answer." in wait_help
     assert "editing an entry never changes a session mid-conversation." in continue_help
@@ -359,7 +356,9 @@ def test_short_version_matches_long_version(runner: CliRunner) -> None:
     long_version = invoke(runner, "--version")
 
     assert short_version.stdout == long_version.stdout
-    assert "acpc" in short_version.stdout
+    # The version string alone: a caller that reads it should not have to
+    # strip a tool name off the front of it.
+    assert short_version.stdout.strip() == __version__
 
 
 def test_background_prompt_policy_is_rejected_on_a_tty(

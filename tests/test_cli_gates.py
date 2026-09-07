@@ -123,6 +123,7 @@ DECLARED_EFFECTS = {
     "prune": effects.NON_IDEMPOTENT,
     "rm": effects.NON_IDEMPOTENT,
     "run": effects.NON_IDEMPOTENT,
+    "schema": effects.READ_ONLY,
     "skills": effects.READ_ONLY,
     "status": effects.READ_ONLY,
     "steer": effects.NON_IDEMPOTENT,
