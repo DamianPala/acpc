@@ -117,7 +117,7 @@ def test_list_has_header_alignment_sorting_and_bounded_rendered_description(
         "---\na\n",
     )
 
-    result = invoke(cli, "skills")
+    result = invoke(cli, "skills", "--format", "text")
 
     assert result.exit_code == vocab.EXIT_OK
     lines = result.stdout.splitlines()
@@ -129,8 +129,8 @@ def test_list_has_header_alignment_sorting_and_bounded_rendered_description(
     header = lines[0]
     alpha = lines[1]
     assert alpha.index("A long") == header.index("DESCRIPTION")
-    assert alpha.endswith("...")
-    assert len(alpha.split("  ", 1)[1]) <= 80
+    assert "..." in alpha
+    assert "full: acpc skills alpha-name-longer-than-header" in alpha
     assert "repeated whitespace and" in alpha
 
 
@@ -141,7 +141,7 @@ def test_detail_preserves_body_and_places_directory_metadata_on_stderr(
     body = "# Exact body\n\nUnicode: café\nwithout final newline"
     directory = _write_skill(root, "exact", f"---\ndescription: x\n---\n{body}")
 
-    result = invoke(cli, "skills", "exact")
+    result = invoke(cli, "skills", "exact", "--format", "text")
 
     assert result.exit_code == vocab.EXIT_OK
     assert result.stdout == body

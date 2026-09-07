@@ -103,18 +103,28 @@ def _format_error(path: Path, detail: str) -> TranscriptError:
 
 
 def _format_timestamp(value: float) -> str:
-    return (
-        datetime.fromtimestamp(value, tz=UTC)
-        .isoformat(timespec="microseconds")
-        .replace("+00:00", "Z")
-    )
+    try:
+        timestamp = datetime.fromtimestamp(value, tz=UTC)
+    except (OverflowError, OSError, ValueError) as error:
+        raise ValueError("timestamp is outside the supported range") from error
+    return timestamp.isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 def _timestamp_seconds(value: Any, path: Path, *, what: str) -> float:
     if isinstance(value, bool):
         raise _format_error(path, f"{what} is not RFC 3339")
     if isinstance(value, (int, float)):
-        return float(value)
+        try:
+            timestamp = float(value)
+        except (OverflowError, ValueError) as error:
+            raise _format_error(path, f"{what} is outside the supported range") from error
+        if not math.isfinite(timestamp):
+            raise _format_error(path, f"{what} is not finite")
+        try:
+            datetime.fromtimestamp(timestamp, tz=UTC)
+        except (OverflowError, OSError, ValueError) as error:
+            raise _format_error(path, f"{what} is outside the supported range") from error
+        return timestamp
     if not isinstance(value, str):
         raise _format_error(path, f"{what} is not RFC 3339")
     if _RFC3339_TIMESTAMP.fullmatch(value) is None:

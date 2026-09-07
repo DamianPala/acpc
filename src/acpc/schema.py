@@ -58,20 +58,12 @@ GLOBAL_FLAGS: list[dict[str, Any]] = [
         "default": False,
     },
     {
-        "name": "format",
-        "description": (
-            "Select the command's human or machine representation; accepted values depend on "
-            "the command, and --json is its machine alias."
-        ),
-        "type": "string",
-        "required": False,
-    },
-    {
         "name": "color",
         "description": "Color policy for human output: auto, always or never.",
         "type": "string",
         "required": False,
         "default": "auto",
+        "enum": ["auto", "always", "never"],
     },
 ]
 

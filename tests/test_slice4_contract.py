@@ -2,6 +2,8 @@
 
 import json
 import os
+import pty
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -10,6 +12,7 @@ from typing import Any
 import pytest
 from click.testing import CliRunner
 
+from acpc import cli as cli_module
 from acpc import sessions, transcript, vocab
 from acpc.cli import main
 
@@ -25,8 +28,6 @@ home_env = "MOCK_HOME"
 default = {{ grants = "read", delegates = true }}
 '''
 
-# Keep this reference before the shared compatibility fixture wraps Click for
-# older human-view assertions. These tests intentionally exercise defaults.
 RAW_INVOKE = CliRunner.invoke
 
 
@@ -57,7 +58,11 @@ def create_finished(prompt: str = "finished") -> sessions.SessionMeta:
 def test_non_tty_defaults_match_schema_and_explicit_text_is_available(cli: CliRunner) -> None:
     index = json.loads(invoke(cli, "schema").stdout)
     assert index["format_defaults"] == {"tty": "text", "non_tty": "json"}
-    assert json.loads(invoke(cli, "status").stdout) == {"items": [], "has_more": False}
+    status_schema = json.loads(invoke(cli, "schema", "status").stdout)
+    status_format = next(flag for flag in status_schema["flags"] if flag["name"] == "format")
+    assert index["format_defaults"]["non_tty"] in status_format["enum"]
+    status_default = invoke(cli, "status")
+    assert json.loads(status_default.stdout) == {"items": [], "has_more": False}
     assert isinstance(json.loads(invoke(cli, "agents").stdout)["items"], list)
     assert isinstance(json.loads(invoke(cli, "skills").stdout)["items"], list)
     assert json.loads(invoke(cli, "daemon", "status").stdout) == {
@@ -68,7 +73,35 @@ def test_non_tty_defaults_match_schema_and_explicit_text_is_available(cli: CliRu
     log_detail = json.loads(invoke(cli, "schema", "log").stdout)
     assert log_detail["format_defaults"] == {"tty": "text", "non_tty": "text"}
     text = invoke(cli, "status", "--format", "text")
-    assert text.stdout.endswith("-- 0 z 0\n")
+    assert text.stdout.endswith("-- 0 of 0\n")
+
+
+def test_tty_uses_the_schema_tty_default(tmp_path: Path) -> None:
+    master, slave = pty.openpty()
+    environment = os.environ.copy()
+    environment["ACPC_HOME"] = str(tmp_path / "state")
+    process = subprocess.Popen(
+        [sys.executable, "-c", "from acpc.cli import main; main()", "status"],
+        stdin=subprocess.DEVNULL,
+        stdout=slave,
+        stderr=subprocess.PIPE,
+        env=environment,
+        text=False,
+    )
+    os.close(slave)
+    chunks: list[bytes] = []
+    while True:
+        try:
+            chunk = os.read(master, 4096)
+        except OSError:
+            break
+        if not chunk:
+            break
+        chunks.append(chunk)
+    os.close(master)
+    _, stderr = process.communicate(timeout=10)
+    assert process.returncode == vocab.EXIT_OK, stderr.decode()
+    assert b"ID" in b"".join(chunks)
 
 
 def test_empty_collection_and_bounded_collection_have_the_pinned_shape(cli: CliRunner) -> None:
@@ -82,7 +115,7 @@ def test_empty_collection_and_bounded_collection_have_the_pinned_shape(cli: CliR
     assert bounded["has_more"] is True
 
     human = invoke(cli, "status", "--format", "text")
-    assert "-- 20 z 21 — --limit żeby zmienić" in human.stdout
+    assert "-- 20 of 21 — use --limit to change" in human.stdout
 
 
 def test_plain_requires_an_explicit_limit_and_emits_one_identifier_per_line(
@@ -102,6 +135,43 @@ def test_plain_requires_an_explicit_limit_and_emits_one_identifier_per_line(
     assert result.stdout.count("\n") == 1
     assert result.stdout.strip() in identifiers
     assert "--" not in result.stdout
+
+
+def test_named_agent_views_reject_collection_only_flags(cli: CliRunner) -> None:
+    for view, flag in (("--models", "--limit"), ("--commands", "--plain"), ("--check", "--limit")):
+        arguments = ("agents", view, flag)
+        if flag == "--limit":
+            arguments += ("1",)
+        result = invoke(cli, *arguments)
+        assert result.exit_code == vocab.EXIT_USAGE
+        assert flag in result.stderr
+        assert view in result.stderr
+
+
+def test_schema_publishes_closed_format_choices_locally_and_color_globally(
+    cli: CliRunner,
+) -> None:
+    index = json.loads(invoke(cli, "schema").stdout)
+    globals_by_name = {flag["name"]: flag for flag in index["global_flags"]}
+    assert "format" not in globals_by_name
+    assert globals_by_name["color"]["enum"] == ["auto", "always", "never"]
+
+    status = json.loads(invoke(cli, "schema", "status").stdout)
+    log = json.loads(invoke(cli, "schema", "log").stdout)
+    status_format = next(flag for flag in status["flags"] if flag["name"] == "format")
+    log_format = next(flag for flag in log["flags"] if flag["name"] == "format")
+    assert status_format["enum"] == ["text", "json", "plain"]
+    assert log_format["enum"] == ["text", "ndjson"]
+
+
+def test_help_states_the_applicable_format_default(cli: CliRunner) -> None:
+    collection_help = invoke(cli, "status", "--help").stdout
+    native_help = invoke(cli, "run", "--help").stdout
+    stream_help = invoke(cli, "log", "--help").stdout
+
+    assert "absent, text on a TTY and JSON on non-TTY" in " ".join(collection_help.split())
+    assert "absent, text on both TTY and non-TTY" in " ".join(native_help.split())
+    assert "absent, text on both TTY and non-TTY" in " ".join(stream_help.split())
 
 
 def _assert_truncated(payload: dict[str, Any], session_id: str) -> None:
@@ -194,6 +264,77 @@ def test_json_output_file_is_exact_stdout_payload_and_stdout_stays_empty(
     assert payload["truncated"] is False
 
 
+def test_output_file_mirrors_text_and_json_wait_output_byte_for_byte(
+    cli: CliRunner, tmp_path: Path
+) -> None:
+    seed = invoke(cli, "run", "mock", "echo:stable answer", "--quiet", "--json")
+    session_id = json.loads(seed.stdout)["session_id"]
+
+    direct_text = invoke(cli, "wait", session_id, "--quiet", "--format", "text")
+    text_file = tmp_path / "answer.txt"
+    stored_text = invoke(
+        cli,
+        "wait",
+        session_id,
+        "--quiet",
+        "--format",
+        "text",
+        "--output-file",
+        str(text_file),
+    )
+    assert stored_text.stdout == ""
+    assert text_file.read_bytes() == direct_text.stdout.encode()
+
+    direct_json = invoke(cli, "wait", session_id, "--quiet", "--json")
+    json_file = tmp_path / "answer.json"
+    stored_json = invoke(
+        cli,
+        "wait",
+        session_id,
+        "--quiet",
+        "--json",
+        "--output-file",
+        str(json_file),
+    )
+    assert stored_json.stdout == ""
+    assert json_file.read_bytes() == direct_json.stdout.encode()
+
+
+def test_failed_turn_output_file_is_created_and_mirrors_selected_stream(
+    cli: CliRunner, tmp_path: Path
+) -> None:
+    text_file = tmp_path / "failed.txt"
+    text = invoke(
+        cli,
+        "run",
+        "mock",
+        "fail this turn",
+        "--quiet",
+        "--format",
+        "text",
+        "--output-file",
+        str(text_file),
+    )
+    assert text.exit_code == vocab.EXIT_AGENT_ERROR
+    assert text.stdout == ""
+    assert "Unable to complete" in text_file.read_text(encoding="utf-8")
+
+    json_file = tmp_path / "failed.json"
+    machine = invoke(
+        cli,
+        "run",
+        "mock",
+        "fail this turn",
+        "--quiet",
+        "--json",
+        "--output-file",
+        str(json_file),
+    )
+    assert machine.exit_code == vocab.EXIT_AGENT_ERROR
+    assert machine.stdout == ""
+    assert json_file.read_bytes() == b""
+
+
 def test_meta_status_and_transcript_timestamps_are_rfc3339(cli: CliRunner) -> None:
     meta = create_finished("timestamp check")
     transcript_file = transcript.Transcript(sessions.transcript_path(meta.session_id))
@@ -218,6 +359,64 @@ def test_legacy_transcript_error_names_the_rejected_version() -> None:
 
     with pytest.raises(transcript.TranscriptError, match=r"acpc\.transcript/1"):
         transcript.Transcript(path).read()
+
+
+def test_daemon_limit_zero_reports_truncation_instead_of_no_daemons(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def fake_status(agent: str | None) -> list[dict[str, Any]]:
+        del agent
+        return [{"target": "mock~target", "version": "1", "pid": 1, "uptime_seconds": 0}]
+
+    monkeypatch.setattr(cli_module, "_collect_daemon_status", fake_status)
+    result = invoke(cli, "daemon", "status", "--limit", "0", "--format", "text")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert result.stdout == "-- 0 of 1 — use --limit to change\n"
+    assert "no daemons running" not in result.stderr
+
+
+def test_timestamp_guards_turn_corrupt_metadata_into_one_named_failure(
+    cli: CliRunner,
+) -> None:
+    meta = create_finished("bad timestamp")
+    path = sessions.meta_path(meta.session_id)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["created_at"] = 10**1000
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = invoke(cli, "status", meta.session_id, "--format", "text")
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    assert "meta.json" in result.stderr
+    assert "Traceback" not in result.stderr
+    with pytest.raises(ValueError, match="supported range"):
+        sessions.format_timestamp(10**1000)
+
+    transcript_path = sessions.transcript_path(meta.session_id)
+    transcript_path.write_text(
+        '{"schema": "acpc.transcript/2"}\n{"i": 1, "ts": 1e300, "type": "msg", "text": "x"}\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(transcript.TranscriptError, match="outside the supported range"):
+        transcript.Transcript(transcript_path).read()
+
+
+def test_continue_classifies_legacy_transcript_as_corrupt_state_with_recovery(
+    cli: CliRunner,
+) -> None:
+    seed = invoke(cli, "run", "mock", "seed", "--quiet", "--json")
+    meta = sessions.read_meta(json.loads(seed.stdout)["session_id"])
+    path = sessions.transcript_path(meta.session_id)
+    path.write_text('{"schema": "acpc.transcript/1"}\n', encoding="utf-8")
+
+    result = invoke(cli, "continue", meta.session_id, "next", "--json")
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    error = json.loads(result.stderr.splitlines()[-1])["error"]
+    assert error["kind"] == "corrupt_state"
+    assert "acpc.transcript/1" in error["message"]
+    assert "acpc rm" in error["hint"]
 
 
 def test_log_limit_ends_follow_after_the_requested_number_of_records(cli: CliRunner) -> None:
@@ -246,13 +445,31 @@ def test_log_limit_ends_follow_after_the_requested_number_of_records(cli: CliRun
     ]
 
 
+def test_log_json_is_the_ndjson_alias(cli: CliRunner) -> None:
+    meta = create_finished()
+    transcript_file = transcript.Transcript(sessions.transcript_path(meta.session_id))
+    transcript_file.append("msg", text="alias event")
+
+    result = invoke(cli, "log", meta.session_id, "--json", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert json.loads(result.stdout)["text"] == "alias event"
+
+
+def test_equals_ndjson_format_keeps_machine_error_envelope(cli: CliRunner) -> None:
+    result = invoke(cli, "log", "missing", "--format=ndjson")
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    assert json.loads(result.stderr)["error"]["kind"] == "not_found"
+
+
 def test_human_output_escapes_ansi_in_session_and_agent_values(
     cli: CliRunner, state_root: Path
 ) -> None:
     meta = create_finished("prompt \x1b[31mred\x1b[0m")
-    sessions.update_meta(meta.session_id, name="name\x1b[2mhidden\x1b[0m")
+    sessions.update_meta(meta.session_id, name="name\x08\x07\x9b31mhidden\x1b[0m")
     status = invoke(cli, "status", meta.session_id, "--format", "text")
-    assert "\x1b" not in status.stdout
+    assert all(control not in status.stdout for control in ("\x08", "\x07", "\x9b", "\x1b"))
     assert "^[" in status.stdout
 
     description = 'description = "agent \\u001b[31mred\\u001b[0m"\n'
@@ -264,10 +481,17 @@ def test_human_output_escapes_ansi_in_session_and_agent_values(
     assert "\x1b" not in agents.stdout
 
 
-def test_no_color_and_dumb_terminal_do_not_change_machine_output(
+def test_color_policy_obeys_explicit_and_environment_precedence(
     cli: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    baseline = invoke(cli, "status", "--json").stdout
+    monkeypatch.setattr(cli_module, "_COLOR_POLICY", None)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("TERM", "xterm")
+    assert cli_module.color_policy(stdout_tty=True) == "always"
     monkeypatch.setenv("NO_COLOR", "1")
+    assert cli_module.color_policy(stdout_tty=True) == "never"
     monkeypatch.setenv("TERM", "dumb")
-    assert invoke(cli, "status", "--json").stdout == baseline
+    assert cli_module.color_policy(stdout_tty=True) == "never"
+    result = invoke(cli, "status", "--format", "text", "--color", "always")
+    assert result.exit_code == vocab.EXIT_OK
+    assert cli_module.color_policy(stdout_tty=False) == "always"

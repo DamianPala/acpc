@@ -99,12 +99,17 @@ def _single_line(value: object) -> str:
 
 def safe_text(value: object) -> str:
     """Make caller-controlled terminal text visible without control bytes."""
-    return _single_line(value).replace("\x1b", "^[")
-
-
-def _safe_text(value: object) -> str:
-    """Backward-compatible private name for the status renderer."""
-    return safe_text(value)
+    text = _single_line(value)
+    escaped: list[str] = []
+    for character in text:
+        codepoint = ord(character)
+        if codepoint == 0x1B:
+            escaped.append("^[")
+        elif codepoint < 0x20 or 0x7F <= codepoint <= 0x9F:
+            escaped.append(f"\\u{codepoint:04x}")
+        else:
+            escaped.append(character)
+    return "".join(escaped)
 
 
 def snippet(text: str, *, limit: int = 200) -> str:
@@ -462,10 +467,8 @@ def _status_active(meta: sessions.SessionMeta) -> bool:
 
 
 def _status_selection(
-    sessions_in: Sequence[sessions.SessionMeta], *, all_sessions: bool, limit: int
+    sessions_in: Sequence[sessions.SessionMeta], *, limit: int
 ) -> list[sessions.SessionMeta]:
-    if all_sessions:
-        return list(sessions_in)
     active = [meta for meta in sessions_in if _status_active(meta)]
     # SPEC `status`: the 5 most recent *finished*. The incoming order is by
     # start time, under which a long run that finished last is cut while a
@@ -486,7 +489,7 @@ def status_items(
     sessions_in: Sequence[sessions.SessionMeta], *, limit: int = DEFAULT_STATUS_LIMIT
 ) -> list[sessions.SessionMeta]:
     """Return the bounded status collection in its documented order."""
-    return _status_selection(sessions_in, all_sessions=False, limit=limit)
+    return _status_selection(sessions_in, limit=limit)
 
 
 def _status_row(meta: sessions.SessionMeta, *, clock: Clock | None) -> tuple[str, ...]:
@@ -494,7 +497,7 @@ def _status_row(meta: sessions.SessionMeta, *, clock: Clock | None) -> tuple[str
     runtime = format_duration(runtime_seconds)
     idle_seconds = _idle_seconds(meta, now=now)
     idle = f"idle {format_duration(idle_seconds)}" if idle_seconds is not None else "·"
-    name = _safe_text(meta.name) if meta.name else "·"
+    name = safe_text(meta.name) if meta.name else "·"
     model = meta.resolved_model or "·"
     snippet = json.dumps(meta.prompt_snippet, ensure_ascii=False)
     return (
@@ -544,24 +547,19 @@ def daemon_idle_seconds(
 def render_status_list(
     sessions_in: Sequence[sessions.SessionMeta],
     *,
-    all_sessions: bool = False,
     limit: int = DEFAULT_STATUS_LIMIT,
     clock: Clock | None = None,
 ) -> str:
     """Render the status list and its in-view summary footer."""
-    selected = _status_selection(sessions_in, all_sessions=all_sessions, limit=limit)
+    selected = _status_selection(sessions_in, limit=limit)
     lines = format_table(
         [_status_row(meta, clock=clock) for meta in selected],
         header=("id", "entry", "model", "status", "runtime", "idle", "name", "prompt"),
         separator="  ",
     )
-    running_count = sum(_status_active(meta) for meta in sessions_in)
-    if all_sessions:
-        footer = f"-- {running_count} running · {len(sessions_in)} sessions"
-    else:
-        footer = f"-- {len(selected)} z {len(sessions_in)}"
-        if len(selected) < len(sessions_in):
-            footer += " — --limit żeby zmienić"
+    footer = f"-- {len(selected)} of {len(sessions_in)}"
+    if len(selected) < len(sessions_in):
+        footer += " — use --limit to change"
     lines.append(footer)
     return "\n".join(lines) + "\n"
 
@@ -587,7 +585,7 @@ def render_status_detail(
     idle = f" · idle {format_duration(idle_seconds)}" if idle_seconds is not None else ""
     exit_text = f"exit {meta.exit_code}" if meta.exit_code is not None else "exit ·"
     tokens = format_tokens(meta.tokens)
-    name = _safe_text(meta.name) if meta.name else "·"
+    name = safe_text(meta.name) if meta.name else "·"
     directory = _display_path(sessions.session_dir(meta.session_id))
     model = meta.resolved_model or "·"
     lines = [
@@ -608,12 +606,11 @@ def render_status_detail(
 def status_list_json(
     sessions_in: Sequence[sessions.SessionMeta],
     *,
-    all_sessions: bool = False,
     limit: int = DEFAULT_STATUS_LIMIT,
     clock: Clock | None = None,
 ) -> dict[str, Any]:
     """Build the JSON shape for ``status`` without an id."""
-    selected = _status_selection(sessions_in, all_sessions=all_sessions, limit=limit)
+    selected = _status_selection(sessions_in, limit=limit)
     rows = []
     for meta in selected:
         runtime_seconds, now = _status_timing(meta, clock=clock)

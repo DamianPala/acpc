@@ -74,7 +74,7 @@ def invoke(cli: CliRunner, *args: str):
 
 
 def test_agents_list_shows_variant_delta(cli: CliRunner) -> None:
-    result = invoke(cli, "agents")
+    result = invoke(cli, "agents", "--format", "text")
 
     assert result.exit_code == vocab.EXIT_OK
     assert "  builder" in result.stdout
@@ -97,7 +97,7 @@ home = "~/.home-longer-than-the-old-column"
         encoding="utf-8",
     )
 
-    result = invoke(cli, "agents")
+    result = invoke(cli, "agents", "--format", "text")
     assert result.exit_code == vocab.EXIT_OK
     lines = result.stdout.splitlines()
     header = next(line for line in lines if line.startswith("  ENTRY"))
@@ -113,7 +113,7 @@ home = "~/.home-longer-than-the-old-column"
 
 
 def test_agents_views_render_present_and_absent_descriptions(cli: CliRunner) -> None:
-    listed = invoke(cli, "agents")
+    listed = invoke(cli, "agents", "--format", "text")
 
     assert listed.exit_code == vocab.EXIT_OK
     builder_row = next(line for line in listed.stdout.splitlines() if line.startswith("  builder"))
@@ -122,10 +122,10 @@ def test_agents_views_render_present_and_absent_descriptions(cli: CliRunner) -> 
     assert mock_row.endswith("installed")
     assert "description" not in mock_row
 
-    builder_detail = invoke(cli, "agents", "builder")
+    builder_detail = invoke(cli, "agents", "builder", "--format", "text")
     assert "description  Implements a task against a plan." in builder_detail.stdout
 
-    mock_detail = invoke(cli, "agents", "mock")
+    mock_detail = invoke(cli, "agents", "mock", "--format", "text")
     assert "description  " not in mock_detail.stdout
 
     list_json = json.loads(invoke(cli, "agents", "--json").stdout)
@@ -164,20 +164,22 @@ def test_agents_list_truncates_but_detail_and_json_keep_full_description(
         encoding="utf-8",
     )
 
-    listed = invoke(cli, "agents")
+    listed = invoke(cli, "agents", "--format", "text")
     builder_row = next(line for line in listed.stdout.splitlines() if line.startswith("  builder"))
     mock_row = next(line for line in listed.stdout.splitlines() if line.startswith("mock"))
     builder_snippet = (
         "A deliberately long description with repeated whitespace and enough words to..."
     )
     mock_snippet = "An adapter description with enough words to exercise the same list-only..."
-    assert builder_row.endswith(builder_snippet)
-    assert mock_row.endswith(mock_snippet)
+    assert builder_snippet in builder_row
+    assert mock_snippet in mock_row
+    assert "full: acpc agents builder" in builder_row
+    assert "full: acpc agents mock" in mock_row
     assert full_description not in listed.stdout
     assert len(builder_snippet) <= 80
     assert len(mock_snippet) <= 80
 
-    detail = invoke(cli, "agents", "builder")
+    detail = invoke(cli, "agents", "builder", "--format", "text")
     collapsed_description = " ".join(full_description.split())
     assert f"description  {collapsed_description}" in detail.stdout
 
@@ -191,7 +193,7 @@ def test_agents_list_truncates_but_detail_and_json_keep_full_description(
 
 
 def test_agents_list_shows_missing_install_hint(cli: CliRunner) -> None:
-    result = invoke(cli, "agents")
+    result = invoke(cli, "agents", "--format", "text")
 
     assert result.exit_code == vocab.EXIT_OK
     assert "missing → acpc install phantom" in result.stdout
@@ -206,7 +208,7 @@ def test_agents_list_shows_vendor_docs_when_entry_has_no_install_command(
         encoding="utf-8",
     )
 
-    result = invoke(cli, "agents")
+    result = invoke(cli, "agents", "--format", "text")
 
     assert result.exit_code == vocab.EXIT_OK
     assert "missing → https://example.test/cli" in result.stdout
@@ -214,21 +216,21 @@ def test_agents_list_shows_vendor_docs_when_entry_has_no_install_command(
 
 
 def test_agents_list_has_no_cache_footer(cli: CliRunner) -> None:
-    result = invoke(cli, "agents")
+    result = invoke(cli, "agents", "--format", "text")
 
     assert result.exit_code == vocab.EXIT_OK
     assert "cached" not in result.stdout
 
 
 def test_variant_detail_shows_provenance(cli: CliRunner) -> None:
-    result = invoke(cli, "agents", "builder")
+    result = invoke(cli, "agents", "builder", "--format", "text")
 
     assert result.exit_code == vocab.EXIT_OK
     assert "model        mock-opus-5 (entry)" in result.stdout
 
 
 def test_agents_detail_shows_mode_and_its_source(cli: CliRunner) -> None:
-    result = invoke(cli, "agents", "builder")
+    result = invoke(cli, "agents", "builder", "--format", "text")
 
     assert result.exit_code == vocab.EXIT_OK
     assert "effort       xhigh (entry)" in result.stdout
@@ -251,7 +253,7 @@ def test_entry_permission_alias_resolves_canonically_and_warns_on_run(
 
 
 def test_resolve_renders_and_serializes_mode_escalation(cli: CliRunner) -> None:
-    text_result = invoke(cli, "run", "builder", "probe", "--resolve")
+    text_result = invoke(cli, "run", "builder", "probe", "--resolve", "--format", "text")
 
     assert text_result.exit_code == vocab.EXIT_OK
     mode_line = next(
@@ -263,7 +265,17 @@ def test_resolve_renders_and_serializes_mode_escalation(cli: CliRunner) -> None:
     # The false case has to be pinned on the text view too: an unconditional
     # marker would claim in-vendor escalation for every mode and stay green.
     plain_text = invoke(
-        cli, "run", "mock", "probe", "--mode", "default", "--permissions", "read", "--resolve"
+        cli,
+        "run",
+        "mock",
+        "probe",
+        "--mode",
+        "default",
+        "--permissions",
+        "read",
+        "--resolve",
+        "--format",
+        "text",
     )
     plain_mode_line = next(
         line for line in plain_text.stdout.splitlines() if line.startswith("mode         ")
@@ -292,7 +304,7 @@ def test_resolve_renders_and_serializes_mode_escalation(cli: CliRunner) -> None:
 
 
 def test_agents_detail_renders_an_unset_mode_with_its_source(cli: CliRunner) -> None:
-    result = invoke(cli, "agents", "mock")
+    result = invoke(cli, "agents", "mock", "--format", "text")
 
     assert result.exit_code == vocab.EXIT_OK
     assert "mode         · (unset)" in result.stdout
@@ -301,7 +313,7 @@ def test_agents_detail_renders_an_unset_mode_with_its_source(cli: CliRunner) -> 
 
 
 def test_variant_detail_points_to_parent_catalog(cli: CliRunner) -> None:
-    result = invoke(cli, "agents", "builder")
+    result = invoke(cli, "agents", "builder", "--format", "text")
 
     assert result.exit_code == vocab.EXIT_OK
     assert "modes/models/commands: acpc agents mock" in result.stdout
@@ -315,7 +327,7 @@ def test_agents_list_abbreviates_variant_home(cli: CliRunner, state_root: Path) 
         encoding="utf-8",
     )
 
-    result = invoke(cli, "agents")
+    result = invoke(cli, "agents", "--format", "text")
 
     assert result.exit_code == vocab.EXIT_OK
     assert str(Path("~") / variant_home.relative_to(Path.home())) in result.stdout
@@ -323,7 +335,7 @@ def test_agents_list_abbreviates_variant_home(cli: CliRunner, state_root: Path) 
 
 
 def test_adapter_detail_probes_on_a_cache_miss(cli: CliRunner, state_root: Path) -> None:
-    result = invoke(cli, "agents", "mock")
+    result = invoke(cli, "agents", "mock", "--format", "text")
 
     assert result.exit_code == vocab.EXIT_OK
     assert "yolo" in result.stdout
@@ -332,14 +344,14 @@ def test_adapter_detail_probes_on_a_cache_miss(cli: CliRunner, state_root: Path)
 
 
 def test_named_models_view_prints_full_presets(cli: CliRunner) -> None:
-    result = invoke(cli, "agents", "mock", "--models")
+    result = invoke(cli, "agents", "mock", "--models", "--format", "text")
 
     assert result.exit_code == vocab.EXIT_OK
     assert "fast" in result.stdout and "mock-haiku-4-5" in result.stdout
 
 
 def test_named_models_view_labels_and_aligns_the_preset_table(cli: CliRunner) -> None:
-    result = invoke(cli, "agents", "mock", "--models")
+    result = invoke(cli, "agents", "mock", "--models", "--format", "text")
 
     assert result.exit_code == vocab.EXIT_OK
     lines = result.stdout.splitlines()
@@ -370,8 +382,8 @@ def test_a_preset_without_an_effort_renders_as_absent_in_both_model_views(
         encoding="utf-8",
     )
 
-    named = invoke(cli, "agents", "noeffort", "--models")
-    overview = invoke(cli, "agents", "--models")
+    named = invoke(cli, "agents", "noeffort", "--models", "--format", "text")
+    overview = invoke(cli, "agents", "--models", "--format", "text")
 
     assert named.exit_code == vocab.EXIT_OK
     assert overview.exit_code == vocab.EXIT_OK
@@ -388,7 +400,7 @@ def test_a_preset_without_an_effort_renders_as_absent_in_both_model_views(
 
 
 def test_models_overview_lists_variants(cli: CliRunner) -> None:
-    result = invoke(cli, "agents", "--models")
+    result = invoke(cli, "agents", "--models", "--format", "text")
 
     assert result.exit_code == vocab.EXIT_OK
     assert "mock" in result.stdout and "builder" in result.stdout
@@ -408,7 +420,7 @@ effort = "xhigh"
         encoding="utf-8",
     )
 
-    result = invoke(cli, "agents", "--models")
+    result = invoke(cli, "agents", "--models", "--format", "text")
 
     assert result.exit_code == vocab.EXIT_OK
     lines = result.stdout.splitlines()
@@ -431,7 +443,7 @@ effort = "xhigh"
 def test_variant_models_view_delegates_to_parent_catalog(cli: CliRunner) -> None:
     cache.refresh_advertised("mock", {"models": ["parent-model"]}, clock=lambda: 100.0)
 
-    result = invoke(cli, "agents", "builder", "--models")
+    result = invoke(cli, "agents", "builder", "--models", "--format", "text")
 
     assert result.exit_code == vocab.EXIT_OK
     assert "parent-model" in result.stdout
@@ -444,7 +456,7 @@ def test_variant_commands_view_reads_parent_cache(cli: CliRunner) -> None:
         clock=lambda: 100.0,
     )
 
-    result = invoke(cli, "agents", "builder", "--commands")
+    result = invoke(cli, "agents", "builder", "--commands", "--format", "text")
 
     assert result.exit_code == vocab.EXIT_OK
     assert "/parent-command" in result.stdout
@@ -466,7 +478,7 @@ def test_adapter_detail_caps_models_and_commands_but_never_modes(cli: CliRunner)
         clock=lambda: 100.0,
     )
 
-    result = invoke(cli, "agents", "mock")
+    result = invoke(cli, "agents", "mock", "--format", "text")
 
     assert result.exit_code == vocab.EXIT_OK
     assert (
@@ -494,7 +506,7 @@ def test_adapter_detail_caps_models_and_commands_but_never_modes(cli: CliRunner)
 
 
 def test_named_models_view_accepts_options_before_the_name(cli: CliRunner) -> None:
-    result = invoke(cli, "agents", "--models", "mock")
+    result = invoke(cli, "agents", "--models", "mock", "--format", "text")
 
     assert result.exit_code == vocab.EXIT_OK
     assert "mock-haiku-4-5" in result.stdout
@@ -502,7 +514,7 @@ def test_named_models_view_accepts_options_before_the_name(cli: CliRunner) -> No
 
 def test_commands_view_truncates_sentences(cli: CliRunner) -> None:
     invoke(cli, "agents", "mock")
-    result = invoke(cli, "agents", "mock", "--commands")
+    result = invoke(cli, "agents", "mock", "--commands", "--format", "text")
 
     assert result.exit_code == vocab.EXIT_OK
     assert "/plan" in result.stdout
@@ -522,7 +534,7 @@ def test_commands_view_aligns_descriptions_past_the_longest_name(cli: CliRunner)
         clock=lambda: 100.0,
     )
 
-    result = invoke(cli, "agents", "mock", "--commands")
+    result = invoke(cli, "agents", "mock", "--commands", "--format", "text")
 
     assert result.exit_code == vocab.EXIT_OK
     lines = result.stdout.splitlines()
@@ -533,19 +545,21 @@ def test_commands_view_aligns_descriptions_past_the_longest_name(cli: CliRunner)
 
 
 def test_commands_view_names_full_cache_file(cli: CliRunner) -> None:
-    invoke(cli, "agents", "mock")
-    result = invoke(cli, "agents", "mock", "--commands")
+    invoke(cli, "agents", "mock", "--format", "text")
+    result = invoke(cli, "agents", "mock", "--commands", "--format", "text")
 
     assert result.exit_code == vocab.EXIT_OK
     assert "commands.md" in result.stdout
 
 
-def test_check_reports_a_missing_named_adapter_with_exit_one(cli: CliRunner) -> None:
+def test_check_reports_a_missing_named_adapter_as_check_data(cli: CliRunner) -> None:
     result = invoke(cli, "agents", "phantom", "--check")
 
-    assert result.exit_code == vocab.EXIT_AGENT_ERROR
-    assert "phantom" in result.stdout
-    assert "failed" in result.stdout
+    assert result.exit_code == vocab.EXIT_OK
+    payload = json.loads(result.stdout)
+    assert payload["checks"][0]["agent"] == "phantom"
+    assert payload["checks"][0]["ok"] is False
+    assert "1 check failed" in result.stderr
 
 
 def test_check_applies_the_resolved_options_so_a_bad_config_fails_it(
@@ -560,9 +574,12 @@ def test_check_applies_the_resolved_options_so_a_bad_config_fails_it(
 
     result = invoke(cli, "agents", "brokenfx", "--check")
 
-    assert result.exit_code == vocab.EXIT_AGENT_ERROR
-    assert "brokenfx failed" in result.stdout
-    assert "Unknown config option: bogus_effort_id" in result.stdout
+    assert result.exit_code == vocab.EXIT_OK
+    payload = json.loads(result.stdout)
+    assert payload["checks"][0]["agent"] == "brokenfx"
+    assert payload["checks"][0]["ok"] is False
+    assert "Unknown config option: bogus_effort_id" in payload["checks"][0]["error"]
+    assert "1 check failed" in result.stderr
 
 
 def test_check_spawns_the_resolved_cli_effort_argv(cli: CliRunner, state_root: Path) -> None:
@@ -576,9 +593,12 @@ def test_check_spawns_the_resolved_cli_effort_argv(cli: CliRunner, state_root: P
 
     result = invoke(cli, "agents", "brokenargv", "--check")
 
-    assert result.exit_code == vocab.EXIT_AGENT_ERROR
-    assert "brokenargv failed" in result.stdout
-    assert "live probe failed" in result.stdout
+    assert result.exit_code == vocab.EXIT_OK
+    payload = json.loads(result.stdout)
+    assert payload["checks"][0]["agent"] == "brokenargv"
+    assert payload["checks"][0]["ok"] is False
+    assert "live probe failed" in payload["checks"][0]["error"]
+    assert "1 check failed" in result.stderr
 
 
 def test_agents_init_validates_effort_against_the_requested_model(
@@ -733,7 +753,7 @@ def test_agents_models_warns_when_resolved_model_has_no_row(
         encoding="utf-8",
     )
 
-    result = invoke(cli, "agents", "mock", "--models")
+    result = invoke(cli, "agents", "mock", "--models", "--format", "text")
 
     assert result.exit_code == vocab.EXIT_OK
     assert "mock-sonnet-5 has no [effort_by_model] row" in result.stderr
@@ -748,7 +768,7 @@ def test_agents_check_warns_when_resolved_model_has_no_row(
         encoding="utf-8",
     )
 
-    result = invoke(cli, "agents", "mock", "--check")
+    result = invoke(cli, "agents", "mock", "--check", "--format", "text")
 
     assert result.exit_code == vocab.EXIT_OK
     assert "mock-sonnet-5 has no [effort_by_model] row" in result.stderr
@@ -762,7 +782,7 @@ def test_agents_models_does_not_warn_when_resolved_model_has_a_row(
         encoding="utf-8",
     )
 
-    result = invoke(cli, "agents", "mock", "--models")
+    result = invoke(cli, "agents", "mock", "--models", "--format", "text")
 
     assert result.exit_code == vocab.EXIT_OK
     assert "has no [effort_by_model] row" not in result.stderr

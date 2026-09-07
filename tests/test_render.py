@@ -388,7 +388,7 @@ def test_status_list_limits_finished_sessions_and_json_preserves_fields() -> Non
 
     assert "active prompt" in text
     assert text.count("finished") == 5
-    assert "-- 6 z 7 — --limit żeby zmienić" in text
+    assert "-- 6 of 7 — use --limit to change" in text
     assert len(payload["items"]) == 6
     assert payload["items"][0]["prompt_snippet"] == "active prompt"
 
@@ -453,7 +453,7 @@ def test_status_list_has_one_lowercase_header_and_aligns_long_columns() -> None:
         },
     )
 
-    text = render.render_status_list([short, long], all_sessions=True, clock=lambda: 120.0)
+    text = render.render_status_list([short, long], limit=2, clock=lambda: 120.0)
     lines = text.splitlines()
     header = lines[0]
     headings = ("ID", "ENTRY", "MODEL", "STATUS", "RUNTIME", "IDLE", "NAME", "PROMPT")
@@ -500,7 +500,7 @@ def test_status_list_computes_widths_down_for_short_values() -> None:
         resolution={"resolved": {"model": {"value": "tiny-model", "source": "entry"}}},
     )
 
-    text = render.render_status_list([meta], all_sessions=True, clock=lambda: 120.0)
+    text = render.render_status_list([meta], limit=1, clock=lambda: 120.0)
     lines = text.splitlines()
     header = lines[0]
     row = status_line(text, meta)
@@ -562,7 +562,7 @@ def test_two_entries_on_one_model_are_distinguishable_only_by_the_model_column()
         resolution={"resolved": {"model": {"value": "gpt-5.6-terra", "source": "entry"}}},
     )
 
-    text = render.render_status_list([builder, reviewer], clock=lambda: 120.0, all_sessions=True)
+    text = render.render_status_list([builder, reviewer], clock=lambda: 120.0, limit=2)
 
     assert "gpt-5.6-luna" in status_line(text, builder)
     assert "gpt-5.6-terra" in status_line(text, reviewer)
@@ -579,7 +579,7 @@ def test_status_list_renders_idle_age_for_active_and_dot_for_finished() -> None:
     )
     add_transcript_event(finished, 105.0)
 
-    text = render.render_status_list([active, finished], clock=lambda: 120.0, all_sessions=True)
+    text = render.render_status_list([active, finished], clock=lambda: 120.0, limit=2)
 
     active_row = status_line(text, active)
     finished_row = status_line(text, finished)
@@ -612,9 +612,9 @@ def test_status_ages_distinguish_fresh_and_stale_activity_and_grow_with_time() -
     add_transcript_event(fresh, 119.0)
     add_transcript_event(stale, 105.0)
 
-    text = render.render_status_list([fresh, stale], clock=lambda: 120.0, all_sessions=True)
-    initial = render.status_list_json([fresh, stale], all_sessions=True, clock=lambda: 120.0)
-    later = render.status_list_json([fresh, stale], all_sessions=True, clock=lambda: 130.0)
+    text = render.render_status_list([fresh, stale], clock=lambda: 120.0, limit=2)
+    initial = render.status_list_json([fresh, stale], clock=lambda: 120.0, limit=2)
+    later = render.status_list_json([fresh, stale], clock=lambda: 130.0, limit=2)
     initial_rows = {row["session_id"]: row for row in initial["items"]}
     later_rows = {row["session_id"]: row for row in later["items"]}
 
@@ -641,13 +641,11 @@ def test_status_json_idle_seconds_match_text_and_finished_sessions_are_null() ->
     )
     add_transcript_event(finished, 105.0)
 
-    list_payload = render.status_list_json(
-        [active, finished], all_sessions=True, clock=lambda: 120.0
-    )
+    list_payload = render.status_list_json([active, finished], clock=lambda: 120.0, limit=2)
     list_rows = {row["session_id"]: row for row in list_payload["items"]}
     active_idle = list_rows[active.session_id]["idle_seconds"]
     finished_idle = list_rows[finished.session_id]["idle_seconds"]
-    text = render.render_status_list([active, finished], all_sessions=True, clock=lambda: 120.0)
+    text = render.render_status_list([active, finished], clock=lambda: 120.0, limit=2)
 
     assert isinstance(active_idle, float)
     assert finished_idle is None
@@ -663,8 +661,8 @@ def test_status_json_idle_seconds_match_text_and_finished_sessions_are_null() ->
 def test_status_without_a_transcript_shows_dot_and_null() -> None:
     active = make_session()
 
-    text = render.render_status_list([active], all_sessions=True, clock=lambda: 120.0)
-    payload = render.status_list_json([active], all_sessions=True, clock=lambda: 120.0)
+    text = render.render_status_list([active], clock=lambda: 120.0, limit=1)
+    payload = render.status_list_json([active], clock=lambda: 120.0, limit=1)
 
     assert "·" in status_line(text, active)
     assert "idle " not in status_line(text, active)

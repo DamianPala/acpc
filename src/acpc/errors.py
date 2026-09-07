@@ -196,7 +196,7 @@ def reset(args: Sequence[str]) -> None:
     for index, arg in enumerate(args):
         if arg == "--":
             break
-        if arg == "--format=json" or (
+        if arg in {"--format=json", "--format=ndjson"} or (
             arg == "--format" and index + 1 < len(args) and args[index + 1] in {"json", "ndjson"}
         ):
             _machine_format = True

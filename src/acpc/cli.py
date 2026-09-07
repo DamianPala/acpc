@@ -76,8 +76,11 @@ _DURATION_SYNTAX = (
 )
 
 _OUTPUT_FILE_HELP = (
-    "Write the answer to a file; a relative path resolves against the directory acpc was "
-    "invoked from, and the file is overwritten."
+    "Write exactly what stdout would receive to a file; on success stdout stays empty, and "
+    "a failed machine-format turn writes an empty file. A relative path resolves against the "
+    "directory acpc was invoked from, and the file is overwritten. The session's full "
+    "answer.md lives in its session directory and follows its retention and prune policy "
+    "(90 days by default)."
 )
 
 # The same file, said in full for the schema: `--help` has no room for it.
@@ -86,9 +89,30 @@ _OUTPUT_FILE_DESCRIPTION = (
     "directory is created."
 )
 
+_FORMAT_OUTPUT_HELP = "Select text or JSON output; absent, text on a TTY and JSON on non-TTY."
+_FORMAT_COLLECTION_HELP = (
+    "Select text, JSON, or one-item-per-line output; absent, text on a TTY and JSON on non-TTY."
+)
+_FORMAT_NATIVE_HELP = "Select text or JSON output; absent, text on both TTY and non-TTY."
+_FORMAT_STREAM_HELP = "Select text or NDJSON output; absent, text on both TTY and non-TTY."
+
 _PERMISSION_CHOICES = (*vocab.PERMISSION_VALUES, *vocab.PERMISSION_ALIASES)
 _WARNED_PERMISSION_ALIASES: set[str] = set()
 _json_option = errors.json_option
+_COLOR_POLICY: str | None = None
+
+
+def _record_color_policy(
+    ctx: click.Context, parameter: click.Parameter, value: str | None
+) -> str | None:
+    del parameter
+    global _COLOR_POLICY
+    if (
+        value is not None
+        and ctx.get_parameter_source("color") is click.core.ParameterSource.COMMANDLINE
+    ):
+        _COLOR_POLICY = value
+    return value
 
 
 def _color_option() -> Any:
@@ -98,6 +122,7 @@ def _color_option() -> Any:
         type=click.Choice(("auto", "always", "never")),
         default="auto",
         expose_value=False,
+        callback=_record_color_policy,
         help="Color policy for human output; NO_COLOR and TERM=dumb disable color.",
     )
 
@@ -107,6 +132,18 @@ def _stdout_is_tty() -> bool:
         return sys.stdout.isatty()
     except (AttributeError, ValueError):
         return False
+
+
+def color_policy(*, stdout_tty: bool | None = None) -> str:
+    """Resolve color policy in the standard's explicit-to-context order."""
+    if _COLOR_POLICY is not None:
+        return _COLOR_POLICY
+    if os.environ.get("NO_COLOR"):
+        return "never"
+    if os.environ.get("TERM") == "dumb":
+        return "never"
+    is_tty = _stdout_is_tty() if stdout_tty is None else stdout_tty
+    return "always" if is_tty else "never"
 
 
 def _select_format(
@@ -123,6 +160,8 @@ def _select_format(
         raise UsageProblem("--json and --format select different output formats")
     if plain and (json_mode or format_name not in (None, "plain")):
         raise UsageProblem("--plain cannot be combined with another output format")
+    # Explicit format wins over the stream-derived default; native text is a
+    # command contract, not a hidden override for a caller's --format choice.
     selected = "plain" if plain else format_name
     if selected is None:
         selected = "text" if native_text or _stdout_is_tty() else machine_name
@@ -137,6 +176,23 @@ def _write_rendered_file(path: str | None, result: output.OutputResult) -> bool:
         return False
     output.write_output_file(path, result.text)
     return True
+
+
+def _emit_turn_result(
+    result: output.OutputResult,
+    *,
+    output_file: str | None,
+    json_mode: bool,
+    success: bool,
+) -> None:
+    # A failed machine-format document must leave stdout empty; still create
+    # the requested mirror file so callers can read it after every exit code.
+    if output_file is not None:
+        file_result = result if success or not json_mode else output.OutputResult("", False, 0)
+        _write_rendered_file(output_file, file_result)
+        return
+    if success or not json_mode:
+        _write_stdout(result.text)
 
 
 def _not_found(message: str, *, hint: str) -> AcpcError:
@@ -225,6 +281,12 @@ def _follow_up_problem(error: Exception, session_id: str) -> AcpcError:
     """
     if isinstance(error, AcpcError):
         problem = error
+    elif isinstance(error, transcript.TranscriptError):
+        problem = AcpcError(
+            str(error),
+            kind=errors.CORRUPT_STATE,
+            hint=f"Run: acpc rm {session_id} --yes to remove the incompatible session state.",
+        )
     elif isinstance(error, sessions.SessionError):
         problem = _session_problem(error)
     elif isinstance(error, runner.RunnerError):
@@ -518,8 +580,9 @@ def main(ctx: click.Context) -> None:
     """acpc — dispatch coding agents over ACP."""
     # Fresh per invocation: in-process callers (tests) would otherwise inherit
     # the previous command's unterminated-stdout state.
-    global _stdout_line_open
+    global _stdout_line_open, _COLOR_POLICY
     _stdout_line_open = False
+    _COLOR_POLICY = None
     if ctx.invoked_subcommand is None:
         click.echo(ctx.get_help())
 
@@ -1135,11 +1198,7 @@ _ROSTER_DESCRIPTION_LIMIT = 80
 
 def _agent_row(entry: ResolvedEntry) -> tuple[str, ...]:
     status = entry.roster_install_status()
-    description = (
-        render.snippet(render.safe_text(entry.description), limit=_ROSTER_DESCRIPTION_LIMIT)
-        if entry.description is not None
-        else ""
-    )
+    description = _roster_description(entry.description, full_command=f"acpc agents {entry.entry}")
     return (entry.entry, entry.name, status, description)
 
 
@@ -1148,11 +1207,7 @@ def _variant_row(entry: ResolvedEntry) -> tuple[str, ...]:
         field: _local_variant_value(entry, field)
         for field in ("model", "effort", "permissions", "home")
     }
-    description = (
-        render.snippet(render.safe_text(entry.description), limit=_ROSTER_DESCRIPTION_LIMIT)
-        if entry.description is not None
-        else ""
-    )
+    description = _roster_description(entry.description, full_command=f"acpc agents {entry.entry}")
     return (
         entry.entry,
         values["model"] or "·",
@@ -1164,12 +1219,18 @@ def _variant_row(entry: ResolvedEntry) -> tuple[str, ...]:
 
 
 def _skill_row(skill: skills.Skill) -> tuple[str, ...]:
-    description = (
-        render.snippet(render.safe_text(skill.description), limit=_ROSTER_DESCRIPTION_LIMIT)
-        if skill.description is not None
-        else ""
-    )
+    description = _roster_description(skill.description, full_command=f"acpc skills {skill.name}")
     return (skill.name, description)
+
+
+def _roster_description(value: str | None, *, full_command: str) -> str:
+    if value is None:
+        return ""
+    safe = render.safe_text(value)
+    preview = render.snippet(safe, limit=_ROSTER_DESCRIPTION_LIMIT)
+    if preview != safe:
+        return f"{preview} (full: {full_command})"
+    return preview
 
 
 def _skill_payload(skill: skills.Skill, *, include_body: bool) -> dict[str, Any]:
@@ -1601,61 +1662,42 @@ def _run_agents_view(
             elif selected_format == "plain":
                 _write_stdout("".join(f"{item['name']}\n" for item in items))
             else:
-                if len(items) == len(all_items):
-                    variants = {
-                        adapter.entry: [
-                            item for item in registry.variants if item.base_adapter == adapter.entry
-                        ]
-                        for adapter in registry.adapters
-                    }
-                    adapter_items = list(registry.adapters)
-                    adapter_lines = render.format_table(
-                        [_agent_row(adapter) for adapter in adapter_items], separator="  "
-                    )
-                    adapter_lines_by_entry = {
-                        adapter.entry: adapter_lines[index]
-                        for index, adapter in enumerate(adapter_items)
-                    }
-                    variant_items = [
-                        item for adapter in registry.adapters for item in variants[adapter.entry]
-                    ]
-                    variant_lines = render.format_table(
-                        [_variant_row(item) for item in variant_items],
-                        header=("entry", "model", "effort", "permissions", "home", "description"),
+                # Apply the limit to entries before feeding the same grouped
+                # renderer used for a complete roster, so pagination cannot
+                # silently change the human table's grammar.
+                selected_names = {str(item["name"]) for item in items}
+                adapter_items = [
+                    adapter for adapter in registry.adapters if adapter.entry in selected_names
+                ]
+                variant_items = [
+                    variant for variant in registry.variants if variant.entry in selected_names
+                ]
+                adapter_lines = render.format_table(
+                    [_agent_row(adapter) for adapter in adapter_items], separator="  "
+                )
+                variant_lines = (
+                    render.format_table(
+                        [_variant_row(variant) for variant in variant_items],
+                        header=(
+                            "entry",
+                            "model",
+                            "effort",
+                            "permissions",
+                            "home",
+                            "description",
+                        ),
                         prefix="  ",
                         separator="  ",
                     )
-                    variant_lines_by_entry = {
-                        item.entry: variant_lines[index + 1]
-                        for index, item in enumerate(variant_items)
-                    }
-                    lines: list[str] = []
-                    variant_header_added = False
-                    for adapter in adapter_items:
-                        lines.append(adapter_lines_by_entry[adapter.entry])
-                        if variants[adapter.entry] and not variant_header_added:
-                            lines.append(variant_lines[0])
-                            variant_header_added = True
-                        lines.extend(
-                            variant_lines_by_entry[item.entry] for item in variants[adapter.entry]
-                        )
-                else:
-                    rows = [
-                        (
-                            str(item["name"]),
-                            str(item.get("display_name", item.get("base_adapter", "variant"))),
-                            str(item.get("status", "variant")),
-                            render.snippet(
-                                render.safe_text(str(item.get("description") or "")),
-                                limit=_ROSTER_DESCRIPTION_LIMIT,
-                            ),
-                        )
-                        for item in items
-                    ]
-                    lines = render.format_table(rows, separator="  ")
+                    if variant_items
+                    else []
+                )
+                lines = [*adapter_lines]
+                if variant_lines:
+                    lines.extend(variant_lines)
                 _write_stdout("\n".join(lines) + ("\n" if lines else ""))
                 if len(items) < len(all_items):
-                    _echo_metadata(f"-- {len(items)} z {len(all_items)} — --limit żeby zmienić")
+                    _write_stdout(f"-- {len(items)} of {len(all_items)} — use --limit to change\n")
         else:
             entry = registry.resolve(name)
             if entry.is_variant:
@@ -1704,7 +1746,7 @@ def _run_agents_view(
     "--format",
     "format_name",
     type=click.Choice(("text", "json", "plain")),
-    help="Select text, JSON, or one-item-per-line output.",
+    help=_FORMAT_COLLECTION_HELP,
 )
 @_color_option()
 @_json_option("Emit this view as JSON.")
@@ -1726,6 +1768,17 @@ def agents_group(
     """
     if ctx.invoked_subcommand is None:
         selected_format = _select_format(format_name, json_mode, plain=plain)
+        views = [(models, "--models"), (commands, "--commands"), (check_live, "--check")]
+        selected_view = next((flag for enabled, flag in views if enabled), None)
+        if selected_view is not None:
+            if ctx.get_parameter_source("limit") is click.core.ParameterSource.COMMANDLINE:
+                raise UsageProblem(
+                    f"--limit is only supported by the agents collection, not {selected_view}"
+                )
+            if plain:
+                raise UsageProblem(
+                    f"--plain is only supported by the agents collection, not {selected_view}"
+                )
         if (
             selected_format == "plain"
             and ctx.get_parameter_source("limit") is not click.core.ParameterSource.COMMANDLINE
@@ -1765,7 +1818,7 @@ def agents_group(
     "--format",
     "format_name",
     type=click.Choice(("text", "json")),
-    help="Select text or JSON output.",
+    help=_FORMAT_OUTPUT_HELP,
 )
 @_color_option()
 @_json_option("Emit this view as JSON.")
@@ -1810,15 +1863,10 @@ def _agents_check(registry: AgentRegistry, name: str | None, *, json_mode: bool)
                 _write_stdout(f"{result['agent']} ok\n")
             else:
                 _write_stdout(f"{result['agent']} failed: {result['error']}\n")
-    # The report is a successful survey in which an entry may say `ok: false`,
-    # so it stays on stdout; the envelope says the command as a whole failed.
     failed = [str(result["agent"]) for result in results if not result["ok"]]
     if failed:
-        raise AgentProblem(
-            f"live check failed for {', '.join(failed)}",
-            kind=errors.UNAVAILABLE,
-            context={"agents": failed},
-        )
+        noun = "check" if len(failed) == 1 else "checks"
+        click.echo(f"-- {len(failed)} {noun} failed: {', '.join(failed)}", err=True)
 
 
 @effects.read_only
@@ -1834,7 +1882,7 @@ def _agents_check(registry: AgentRegistry, name: str | None, *, json_mode: bool)
     "--format",
     "format_name",
     type=click.Choice(("text", "json")),
-    help="Select text or JSON output.",
+    help=_FORMAT_OUTPUT_HELP,
 )
 @_color_option()
 @_json_option("Emit the report as JSON.")
@@ -1933,7 +1981,7 @@ def _agent_entry_path(name: str) -> Path:
     "--format",
     "format_name",
     type=click.Choice(("text", "json")),
-    help="Select text or JSON output.",
+    help=_FORMAT_OUTPUT_HELP,
 )
 @_json_option("Emit the created entry as JSON.")
 @_color_option()
@@ -2037,7 +2085,7 @@ def agents_init_command(
     "--format",
     "format_name",
     type=click.Choice(("text", "json")),
-    help="Select text or JSON output.",
+    help=_FORMAT_OUTPUT_HELP,
 )
 @_json_option("Emit the deleted entry as JSON.")
 @_color_option()
@@ -2106,7 +2154,7 @@ def _run_skills_view(
         )
         _write_stdout("\n".join(rows) + "\n")
         if len(items) < len(bundled):
-            _echo_metadata(f"-- {len(items)} z {len(bundled)} — --limit żeby zmienić")
+            _write_stdout(f"-- {len(items)} of {len(bundled)} — use --limit to change\n")
         return
 
     try:
@@ -2137,7 +2185,7 @@ def _run_skills_view(
     "--format",
     "format_name",
     type=click.Choice(("text", "json", "plain")),
-    help="Select text, JSON, or one-item-per-line output.",
+    help=_FORMAT_COLLECTION_HELP,
 )
 @_color_option()
 @_json_option("Emit this view as JSON.")
@@ -2183,7 +2231,7 @@ def skills_group(
     "--format",
     "format_name",
     type=click.Choice(("text", "json")),
-    help="Select text or JSON output.",
+    help=_FORMAT_OUTPUT_HELP,
 )
 @_color_option()
 @_json_option("Emit this view as JSON.")
@@ -2193,7 +2241,7 @@ def _skill_view_command(name: str, format_name: str | None, json_mode: bool) -> 
 
     Example: ``acpc skills provider-bringup``
     """
-    selected_format = _select_format(format_name, json_mode, native_text=True)
+    selected_format = _select_format(format_name, json_mode)
     _run_skills_view(name, json_mode=json_mode, selected_format=selected_format)
 
 
@@ -2206,7 +2254,7 @@ def _skill_view_command(name: str, format_name: str | None, json_mode: bool) -> 
     "--format",
     "format_name",
     type=click.Choice(("text", "json")),
-    help="Select text or JSON output.",
+    help=_FORMAT_OUTPUT_HELP,
 )
 @_json_option("Emit the install result as JSON.")
 @_color_option()
@@ -2359,7 +2407,7 @@ def _maintenance_json(payload: Mapping[str, Any]) -> None:
     "--format",
     "format_name",
     type=click.Choice(("text", "json")),
-    help="Select text or JSON output.",
+    help=_FORMAT_OUTPUT_HELP,
 )
 @_json_option("Emit the result as JSON.")
 @_color_option()
@@ -2406,7 +2454,7 @@ def stop_command(selector: str, format_name: str | None, json_mode: bool) -> Non
     "--format",
     "format_name",
     type=click.Choice(("text", "json")),
-    help="Select text or JSON output.",
+    help=_FORMAT_OUTPUT_HELP,
 )
 @_json_option("Emit the result as JSON.")
 @_color_option()
@@ -2469,7 +2517,7 @@ def rm_command(selector: str, assume_yes: bool, format_name: str | None, json_mo
     "--format",
     "format_name",
     type=click.Choice(("text", "json")),
-    help="Select text or JSON output.",
+    help=_FORMAT_OUTPUT_HELP,
 )
 @_json_option("Emit the result as JSON.")
 @_color_option()
@@ -2662,7 +2710,7 @@ def _latest_failure_message(session_id: str) -> str | None:
     "--format",
     "format_name",
     type=click.Choice(("text", "json", "plain")),
-    help="Select text, JSON, or one-item-per-line output.",
+    help=_FORMAT_COLLECTION_HELP,
 )
 @_color_option()
 @_json_option("Emit a JSON status object.")
@@ -2689,10 +2737,10 @@ def status_command(
     """
     selected_format = _select_format(format_name, json_mode, plain=plain)
     explicit_limit = ctx.get_parameter_source("limit") is click.core.ParameterSource.COMMANDLINE
-    if selected_format == "plain" and not explicit_limit:
-        raise UsageProblem("--plain requires an explicit --limit")
     if selector is not None and selected_format == "plain":
         raise UsageProblem("--plain is available only for the status collection")
+    if selected_format == "plain" and not explicit_limit:
+        raise UsageProblem("--plain requires an explicit --limit")
 
     if selector is not None:
         meta = _load_view_session(selector)
@@ -2756,7 +2804,7 @@ def status_command(
     "--format",
     "format_name",
     type=click.Choice(("text", "ndjson")),
-    help="Select text or NDJSON output; --json is the NDJSON spelling.",
+    help=_FORMAT_STREAM_HELP,
 )
 @_color_option()
 @click.option(
@@ -3234,7 +3282,7 @@ def _still_running_note(session_id: str, timeout: float | None) -> str:
     "--format",
     "format_name",
     type=click.Choice(("text", "json")),
-    help="Select text or JSON output; absent, the default follows stdout's TTY state.",
+    help=_FORMAT_NATIVE_HELP,
 )
 @click.option(
     "--timeout",
@@ -3446,11 +3494,12 @@ def run_command(
         json_mode=selected_format == "json",
         max_output=max_output,
     )
-    if outcome.exit_code == vocab.EXIT_OK:
-        if not _write_rendered_file(output_file, result):
-            _write_stdout(result.text)
-    elif selected_format == "text" and output_file is None:
-        _write_stdout(result.text)
+    _emit_turn_result(
+        result,
+        output_file=output_file,
+        json_mode=selected_format == "json",
+        success=outcome.exit_code == vocab.EXIT_OK,
+    )
 
     if outcome.state == "detached":
         # SPEC *Output contract*: the session outlives this client, so the way
@@ -3600,6 +3649,8 @@ def _dispatch_background(
     if problem is not None:
         # The session exists by now: the caller has to be able to reach it
         # even though the dispatch that would have run it failed (R7a).
+        if output_file is not None:
+            output.write_output_file(output_file, "")
         raise AgentProblem(problem, context={"session_id": session_id})
     meta = sessions.read_meta(session_id)
     result = output.render_result(
@@ -3637,7 +3688,7 @@ def _dispatch_background(
     "--format",
     "format_name",
     type=click.Choice(("text", "json")),
-    help="Select text or JSON output; absent, the default is text.",
+    help=_FORMAT_NATIVE_HELP,
 )
 @click.option(
     "--permissions",
@@ -3811,7 +3862,8 @@ def _follow_up_request(
     try:
         current = sessions.read_meta(session_id)
         stored_policy = _stored_permission_policy(current)
-    except sessions.SessionError as error:
+        transcript.Transcript(sessions.transcript_path(session_id)).read()
+    except (sessions.SessionError, transcript.TranscriptError) as error:
         raise _follow_up_problem(error, session_id) from None
     policy = permissions if permissions is not None else stored_policy
     policy, permissions_clamp = _clamp_inherited_ceiling(policy)
@@ -3865,7 +3917,13 @@ def _follow_up_request(
             defer_rotation=True,
             rotation_resolution=updated_resolution,
         )
-    except (AcpcError, sessions.SessionError, runner.RunnerError, OSError) as error:
+    except (
+        AcpcError,
+        sessions.SessionError,
+        transcript.TranscriptError,
+        runner.RunnerError,
+        OSError,
+    ) as error:
         raise _follow_up_problem(error, session_id) from None
     return current, request
 
@@ -3932,11 +3990,12 @@ def _dispatch_follow_up(
         json_mode=json_mode,
         max_output=max_output,
     )
-    if outcome.exit_code == vocab.EXIT_OK:
-        if not _write_rendered_file(output_file, result):
-            _write_stdout(result.text)
-    elif not json_mode and output_file is None:
-        _write_stdout(result.text)
+    _emit_turn_result(
+        result,
+        output_file=output_file,
+        json_mode=json_mode,
+        success=outcome.exit_code == vocab.EXIT_OK,
+    )
     if outcome.state == "detached":
         _echo_metadata(
             f"-- detached, still RUNNING: {meta.session_id}"
@@ -3988,7 +4047,7 @@ def _steer_prompt(instruction: str) -> str:
     "--format",
     "format_name",
     type=click.Choice(("text", "json")),
-    help="Select text or JSON output; absent, the default is text.",
+    help=_FORMAT_NATIVE_HELP,
 )
 @click.option("--bg", "background", is_flag=True, help="Dispatch and return the session id.")
 @click.option(
@@ -4098,7 +4157,7 @@ def steer_command(
     "--format",
     "format_name",
     type=click.Choice(("text", "json")),
-    help="Select text or JSON output; absent, the default is text.",
+    help=_FORMAT_NATIVE_HELP,
 )
 @click.option(
     "--max-output",
@@ -4156,11 +4215,12 @@ def wait_command(
         max_output=max_output,
     )
     exit_code = runner.exit_code_for(final.state, final.stop_reason)
-    if exit_code == vocab.EXIT_OK:
-        if not _write_rendered_file(output_file, result):
-            _write_stdout(result.text)
-    elif selected_format == "text" and output_file is None:
-        _write_stdout(result.text)
+    _emit_turn_result(
+        result,
+        output_file=output_file,
+        json_mode=selected_format == "json",
+        success=exit_code == vocab.EXIT_OK,
+    )
     if not quiet:
         summary = output.format_summary(final)
         if final.state == "failed" and (
@@ -4220,7 +4280,7 @@ def daemon_group() -> None:
     "--format",
     "format_name",
     type=click.Choice(("text", "json", "plain")),
-    help="Select text, JSON, or one-item-per-line output.",
+    help=_FORMAT_COLLECTION_HELP,
 )
 @_json_option("Emit the status as JSON.")
 @_color_option()
@@ -4262,8 +4322,11 @@ def daemon_status_command(
     if selected_format == "plain":
         _write_stdout("".join(f"{item['target']}\n" for item in entries))
         return
-    if not entries:
+    if not all_entries:
         click.echo("-- no daemons running", err=True)
+        return
+    if not entries:
+        _write_stdout(f"-- 0 of {len(all_entries)} — use --limit to change\n")
         return
     rows = [
         (
@@ -4280,7 +4343,7 @@ def daemon_status_command(
     lines = render.format_table(rows, separator="  ")
     _write_stdout("\n".join(lines) + "\n")
     if len(entries) < len(all_entries):
-        _echo_metadata(f"-- {len(entries)} z {len(all_entries)} — --limit żeby zmienić")
+        _write_stdout(f"-- {len(entries)} of {len(all_entries)} — use --limit to change\n")
 
 
 async def _collect_daemon_status(
@@ -4326,7 +4389,7 @@ async def _collect_daemon_status(
     "--format",
     "format_name",
     type=click.Choice(("text", "json")),
-    help="Select text or JSON output.",
+    help=_FORMAT_OUTPUT_HELP,
 )
 @_json_option("Emit the result as JSON.")
 @_color_option()

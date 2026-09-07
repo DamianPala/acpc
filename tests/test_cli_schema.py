@@ -221,15 +221,28 @@ def test_flag_descriptors_match_the_parser(runner: CliRunner) -> None:
 
 
 def test_global_flags_are_exactly_the_flags_every_command_accepts(runner: CliRunner) -> None:
-    """D7a's quantifier, checked: the intersection over `commands`, nothing else."""
+    """Global flags have one descriptor; command-specific choices stay local."""
     index = read_index(runner)
-    per_command = [
-        {expected_flag(parameter)["name"] for parameter in accepted_options(entry["name"])}
+    per_command = {
+        entry["name"]: {
+            expected_flag(parameter)["name"]: expected_flag(parameter)
+            for parameter in accepted_options(entry["name"])
+        }
         for entry in index["commands"]
-    ]
-    assert per_command
-    intersection = set.intersection(*per_command)
-    assert {flag["name"] for flag in index["global_flags"]} == intersection
+    }
+    common = set.intersection(*(set(flags) for flags in per_command.values()))
+    uniform = {
+        name
+        for name in common
+        if len(
+            {
+                tuple((key, repr(value)) for key, value in sorted(flags[name].items()))
+                for flags in per_command.values()
+            }
+        )
+        == 1
+    }
+    assert {flag["name"] for flag in index["global_flags"]} == uniform
     for flag in index["global_flags"]:
         assert set(flag) >= {"name", "description", "type", "required"}
         assert flag["description"].strip()

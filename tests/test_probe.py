@@ -98,7 +98,7 @@ def test_discover_reads_catalogue_and_sends_zero_turns(state_root: Path) -> None
         },
         "proposed": None,
     }
-    text_result = _invoke("probe", "mock", "--discover")
+    text_result = _invoke("probe", "mock", "--discover", "--format", "text")
     assert "+ plan — Mock planning mode" in text_result.stdout
     assert "- legacy" in text_result.stdout
     assert "Background task failed" not in result.stderr
@@ -136,7 +136,7 @@ def test_discover_text_and_json_report_the_same_catalogue(state_root: Path) -> N
     _install(state_root, _modes())
 
     json_result = _invoke("probe", "mock", "--discover", "--json")
-    text_result = _invoke("probe", "mock", "--discover")
+    text_result = _invoke("probe", "mock", "--discover", "--format", "text")
 
     payload = json.loads(json_result.stdout)
     for mode in payload["advertised_modes"]:

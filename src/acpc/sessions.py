@@ -23,6 +23,7 @@ retention ages without sleeping.
 import contextlib
 import errno
 import json
+import math
 import os
 import random
 import re
@@ -76,11 +77,11 @@ _RFC3339_TIMESTAMP = re.compile(
 
 def format_timestamp(value: float) -> str:
     """Render one timestamp precision everywhere acpc publishes time."""
-    return (
-        datetime.fromtimestamp(value, tz=UTC)
-        .isoformat(timespec="microseconds")
-        .replace("+00:00", "Z")
-    )
+    try:
+        timestamp = datetime.fromtimestamp(value, tz=UTC)
+    except (OverflowError, OSError, ValueError) as error:
+        raise ValueError("timestamp is outside the supported range") from error
+    return timestamp.isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 def parse_timestamp(value: Any, key: str, path: Path) -> float | None:
@@ -90,7 +91,17 @@ def parse_timestamp(value: Any, key: str, path: Path) -> float | None:
     if isinstance(value, bool):
         raise CorruptSessionError(f"{path}: {key} is not a timestamp")
     if isinstance(value, (int, float)):
-        return float(value)
+        try:
+            timestamp = float(value)
+        except (OverflowError, ValueError) as error:
+            raise CorruptSessionError(f"{path}: {key} is outside the supported range") from error
+        if not math.isfinite(timestamp):
+            raise CorruptSessionError(f"{path}: {key} is not finite")
+        try:
+            datetime.fromtimestamp(timestamp, tz=UTC)
+        except (OverflowError, OSError, ValueError) as error:
+            raise CorruptSessionError(f"{path}: {key} is outside the supported range") from error
+        return timestamp
     if not isinstance(value, str):
         raise CorruptSessionError(f"{path}: {key} is not a timestamp")
     if _RFC3339_TIMESTAMP.fullmatch(value) is None:
@@ -102,7 +113,10 @@ def parse_timestamp(value: Any, key: str, path: Path) -> float | None:
         raise CorruptSessionError(f"{path}: {key} is not RFC 3339") from error
     if parsed.tzinfo is None:
         raise CorruptSessionError(f"{path}: {key} has no timezone")
-    return parsed.timestamp()
+    try:
+        return parsed.timestamp()
+    except (OverflowError, OSError, ValueError) as error:
+        raise CorruptSessionError(f"{path}: {key} is outside the supported range") from error
 
 
 class SessionError(Exception):

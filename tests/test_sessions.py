@@ -126,21 +126,27 @@ class TestCreateSession:
         assert on_disk["started_at"] is None
         assert on_disk["name"] == "researcher"
 
-    def test_legacy_meta_is_read_and_rewritten_with_canonical_fields(self) -> None:
+    @pytest.mark.parametrize(
+        ("legacy_state", "canonical_state"),
+        [("done", "succeeded"), ("cancelled", "canceled")],
+    )
+    def test_legacy_meta_is_read_and_rewritten_with_canonical_fields(
+        self, legacy_state: str, canonical_state: str
+    ) -> None:
         meta = make_session()
         path = sessions.meta_path(meta.session_id)
         payload = json.loads(path.read_text())
-        payload["state"] = "done"
+        payload["state"] = legacy_state
         payload.pop("status")
         payload["created_at"] = BASE_TIME
         path.write_text(json.dumps(payload))
 
         loaded = sessions.read_meta(meta.session_id)
-        assert loaded.state == "succeeded"
+        assert loaded.state == canonical_state
 
         sessions.update_meta(meta.session_id, name="rewritten")
         rewritten = json.loads(path.read_text())
-        assert rewritten["status"] == "succeeded"
+        assert rewritten["status"] == canonical_state
         assert "state" not in rewritten
         assert rewritten["created_at"] == "2025-10-09T08:53:20.000000Z"
 

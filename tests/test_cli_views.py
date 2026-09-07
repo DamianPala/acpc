@@ -166,7 +166,7 @@ def test_status_reports_the_model_a_real_dispatch_resolved(cli: CliRunner) -> No
     """End to end: the column reads the resolution the dispatch actually stored."""
     session_id = run_mock(cli, "echo:which model")
 
-    text = invoke(cli, "status", session_id).stdout
+    text = invoke(cli, "status", session_id, "--format", "text").stdout
     detail = json.loads(invoke(cli, "status", session_id, "--json").stdout)
     row = json.loads(invoke(cli, "status", "--json").stdout)["items"][0]
 
@@ -187,7 +187,7 @@ def test_status_detail_surfaces_current_failure_and_json(cli: CliRunner) -> None
     stored = json.loads(sessions.meta_path(session_id).read_text(encoding="utf-8"))
     assert stored["failure"] == meta.failure
 
-    text_result = invoke(cli, "status", session_id)
+    text_result = invoke(cli, "status", session_id, "--format", "text")
     json_result = invoke(cli, "status", session_id, "--json")
 
     assert f"failure  {meta.failure} · continue: acpc continue {session_id}" in text_result.stdout
@@ -197,7 +197,7 @@ def test_status_detail_surfaces_current_failure_and_json(cli: CliRunner) -> None
 def test_status_detail_omits_failure_for_successful_turn(cli: CliRunner) -> None:
     session_id = run_mock(cli)
 
-    text_result = invoke(cli, "status", session_id)
+    text_result = invoke(cli, "status", session_id, "--format", "text")
     json_result = invoke(cli, "status", session_id, "--json")
 
     assert "failure  " not in text_result.stdout

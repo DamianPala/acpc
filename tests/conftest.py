@@ -10,10 +10,8 @@ through and stops what they started.
 import asyncio
 import os
 from collections.abc import Iterator
-from typing import Any
 
 import pytest
-from click.testing import CliRunner
 
 from acpc import daemon_client, runner
 
@@ -28,51 +26,6 @@ def no_daemon(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -
         return daemon_client.DaemonUnavailable(f"no daemon in this test ({target})")
 
     monkeypatch.setattr(daemon_client, "ensure_daemon", unavailable)
-
-
-@pytest.fixture(autouse=True)
-def legacy_human_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep pre-slice view assertions explicit while default tests opt in to JSON."""
-    original_invoke = CliRunner.invoke
-    text_commands = {
-        "agents",
-        "continue",
-        "daemon",
-        "install",
-        "log",
-        "probe",
-        "prune",
-        "rm",
-        "run",
-        "skills",
-        "status",
-        "steer",
-        "stop",
-        "wait",
-    }
-
-    def invoke(
-        runner: Any,
-        cli: Any,
-        args: list[str] | tuple[str, ...] | None = None,
-        **kwargs: Any,
-    ) -> Any:
-        values = list(args or ())
-        command = values[0] if values else None
-        has_explicit_format = any(
-            value in {"--json", "--plain"} or value == "--format" or value.startswith("--format=")
-            for value in values
-        )
-        if (
-            command in text_commands
-            and not has_explicit_format
-            and "--help" not in values
-            and "-h" not in values
-        ):
-            values.extend(("--format", "text"))
-        return original_invoke(runner, cli, values, **kwargs)
-
-    monkeypatch.setattr(CliRunner, "invoke", invoke)
 
 
 @pytest.fixture

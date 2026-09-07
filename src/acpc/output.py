@@ -86,7 +86,7 @@ def result_envelope(
             "truncated": False,
             "denied": _denial_payload(meta),
             "permissions_clamp": _permissions_clamp(meta),
-            "next": [f"acpc wait {meta.session_id}"],
+            "next": ["acpc", "wait", meta.session_id],
         }
         if resume := _resume_status(meta):
             envelope["resume"] = resume
@@ -102,7 +102,7 @@ def result_envelope(
         "truncated": truncated,
         "denied": _denial_payload(meta),
         "permissions_clamp": _permissions_clamp(meta),
-        "next": [f"acpc continue {meta.session_id}"],
+        "next": ["acpc", "continue", meta.session_id],
     }
     if resume := _resume_status(meta):
         envelope["resume"] = resume
@@ -162,7 +162,6 @@ def render_result(
     *,
     json_mode: bool = False,
     background: bool = False,
-    output_file: Path | str | None = None,
     max_output: int = DEFAULT_MAX_OUTPUT,
 ) -> OutputResult:
     """Render one answer command's stdout payload without writing it."""
@@ -193,7 +192,6 @@ def emit_result(
     stream: TextIO | None = None,
     json_mode: bool = False,
     background: bool = False,
-    output_file: Path | str | None = None,
     max_output: int = DEFAULT_MAX_OUTPUT,
 ) -> OutputResult:
     """Render and write one stdout payload; return its truncation metadata."""
@@ -202,7 +200,6 @@ def emit_result(
         answer,
         json_mode=json_mode,
         background=background,
-        output_file=output_file,
         max_output=max_output,
     )
     (sys.stdout if stream is None else stream).write(result.text)

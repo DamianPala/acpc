@@ -151,7 +151,7 @@ def test_stop_unknown_session_is_not_found(cli: CliRunner) -> None:
 def test_daemon_status_with_no_daemons_is_a_successful_empty_report(cli: CliRunner) -> None:
     """No daemons is a normal state, not a failure — scripted cleanliness
     checks (`acpc daemon status && …`) depend on the zero exit."""
-    result = invoke(cli, "daemon", "status")
+    result = invoke(cli, "daemon", "status", "--format", "text")
 
     assert result.exit_code == vocab.EXIT_OK
     assert result.stdout == ""
@@ -186,8 +186,8 @@ def test_daemon_status_idle_age_grows_between_clock_reads(
     original_time = cli_module.time
     cli_module.time = monkey_time
     try:
-        first = invoke(cli, "daemon", "status", "mock")
-        second = invoke(cli, "daemon", "status", "mock")
+        first = invoke(cli, "daemon", "status", "mock", "--format", "text")
+        second = invoke(cli, "daemon", "status", "mock", "--format", "text")
     finally:
         cli_module.time = original_time
 
@@ -199,7 +199,7 @@ def test_daemon_status_renders_the_acpc_version(cli: CliRunner, live_daemon: Non
     target = _target()
     _start_daemon(target)
 
-    text_result = invoke(cli, "daemon", "status", "mock")
+    text_result = invoke(cli, "daemon", "status", "mock", "--format", "text")
     json_result = invoke(cli, "daemon", "status", "mock", "--json")
     row = _daemon_status_line(text_result, target)
     entry = json.loads(json_result.stdout)["items"][0]
@@ -222,7 +222,7 @@ def test_daemon_status_aligns_rows_without_a_header(
     _start_daemon(short_target)
     _start_daemon(long_target)
 
-    result = invoke(cli, "daemon", "status")
+    result = invoke(cli, "daemon", "status", "--format", "text")
     assert result.exit_code == vocab.EXIT_OK
     rows = [_daemon_status_line(result, target) for target in (short_target, long_target)]
     assert result.stdout.splitlines()[0].split()[0] != "target"
@@ -235,7 +235,7 @@ def test_daemon_status_running_target_renders_dot_and_json_null(
 ) -> None:
     _start_slow_session(cli, "slow:5 daemon status running")
 
-    text_result = invoke(cli, "daemon", "status", "mock")
+    text_result = invoke(cli, "daemon", "status", "mock", "--format", "text")
     json_result = invoke(cli, "daemon", "status", "mock", "--json")
     target = _target()
     row = _daemon_status_line(text_result, target)
@@ -256,7 +256,7 @@ def test_daemon_status_starting_target_renders_dot_and_json_null(
         entry="mock", base_adapter="mock", prompt="daemon status starting", target=target
     )
 
-    text_result = invoke(cli, "daemon", "status", "mock")
+    text_result = invoke(cli, "daemon", "status", "mock", "--format", "text")
     json_result = invoke(cli, "daemon", "status", "mock", "--json")
     row = _daemon_status_line(text_result, target)
     entry = json.loads(json_result.stdout)["items"][0]
@@ -273,7 +273,7 @@ def test_daemon_status_json_idle_age_matches_text(cli: CliRunner, live_daemon: N
     original_time = cli_module.time
     cli_module.time = SimpleNamespace(time=lambda: 120.0)
     try:
-        text_result = invoke(cli, "daemon", "status", "mock")
+        text_result = invoke(cli, "daemon", "status", "mock", "--format", "text")
         json_result = invoke(cli, "daemon", "status", "mock", "--json")
     finally:
         cli_module.time = original_time
@@ -292,7 +292,7 @@ def test_daemon_status_never_served_target_has_no_idle_age(
     target = _target()
     _start_daemon(target)
 
-    text_result = invoke(cli, "daemon", "status", "mock")
+    text_result = invoke(cli, "daemon", "status", "mock", "--format", "text")
     json_result = invoke(cli, "daemon", "status", "mock", "--json")
     row = _daemon_status_line(text_result, target)
     entry = json.loads(json_result.stdout)["items"][0]
@@ -318,7 +318,7 @@ def test_daemon_stop_refuses_a_running_session_and_leaves_daemon_alive(
 ) -> None:
     session_id = _start_slow_session(cli)
 
-    result = invoke(cli, "daemon", "stop", "mock")
+    result = invoke(cli, "daemon", "stop", "mock", "--json")
 
     assert result.exit_code == vocab.EXIT_AGENT_ERROR
     assert result.stdout == ""
@@ -356,7 +356,7 @@ def test_daemon_stop_force_fails_active_sessions_with_the_existing_reason(
     result = invoke(cli, "daemon", "stop", "mock", "--force")
 
     assert result.exit_code == vocab.EXIT_OK
-    assert result.stdout == ""
+    assert json.loads(result.stdout)["targets"] == ["mock~4ac109c6ee44d1e7"]
     assert result.stderr == "-- stopped 1 daemon(s)\n"
     _wait_until_state(session_id, "failed")
     meta = sessions.read_meta(session_id)
@@ -370,7 +370,7 @@ def test_idle_daemon_stop_keeps_its_existing_output(cli: CliRunner, live_daemon:
     result = invoke(cli, "daemon", "stop", "mock")
 
     assert result.exit_code == vocab.EXIT_OK
-    assert result.stdout == ""
+    assert json.loads(result.stdout)["targets"] == [_target()]
     assert result.stderr == "-- stopped 1 daemon(s)\n"
 
 

@@ -78,10 +78,8 @@ def test_background_and_output_file_shapes_are_separate(tmp_path: Path) -> None:
     output_file = tmp_path / "answer.md"
 
     background = json.loads(output.render_result(meta, json_mode=True, background=True).text)
-    written = output.render_result(meta, answer, output_file=output_file)
-    written_json = json.loads(
-        output.render_result(meta, answer, json_mode=True, output_file=output_file).text
-    )
+    written = output.render_result(meta, answer)
+    written_json = json.loads(output.render_result(meta, answer, json_mode=True).text)
 
     assert set(background) == {
         "session_id",
@@ -94,7 +92,9 @@ def test_background_and_output_file_shapes_are_separate(tmp_path: Path) -> None:
     }
     assert background["denied"] == []
     assert background["permissions_clamp"] is None
+    assert background["next"] == ["acpc", "wait", meta.session_id]
     assert written_json["answer"] == answer
+    assert written_json["next"] == ["acpc", "continue", meta.session_id]
     assert "output_file" not in written_json
     assert written.text == answer
 

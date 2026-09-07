@@ -125,7 +125,7 @@ def test_json_forces_the_envelope_even_when_stderr_is_a_terminal(
 def test_a_person_at_a_terminal_gets_the_line_and_its_hint_instead(
     cli: CliRunner, terminal_stderr: None
 ) -> None:
-    result = invoke(cli, "status", "does-not-exist")
+    result = invoke(cli, "status", "does-not-exist", "--format", "text")
 
     assert result.exit_code == vocab.EXIT_AGENT_ERROR
     assert result.stderr.splitlines() == [

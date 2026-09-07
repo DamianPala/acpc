@@ -469,7 +469,7 @@ def test_last_resolves_in_an_interactive_context(
     session_id = start_session(cli)
     streams(monkeypatch, stdin=True, stdout=True)
 
-    result = invoke(cli, "status", "last")
+    result = invoke(cli, "status", "last", "--format", "text")
 
     assert result.exit_code == vocab.EXIT_OK
     assert session_id in result.stdout
@@ -480,7 +480,7 @@ def test_last_survives_a_redirected_stdout(cli: CliRunner, monkeypatch: pytest.M
     session_id = start_session(cli)
     streams(monkeypatch, stdin=True, stdout=False)
 
-    result = invoke(cli, "status", "last")
+    result = invoke(cli, "status", "last", "--format", "text")
 
     assert result.exit_code == vocab.EXIT_OK
     assert session_id in result.stdout
