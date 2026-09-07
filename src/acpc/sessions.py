@@ -8,7 +8,7 @@ Two invariants drive the shape of this module:
 
 - **No torn reads.** `meta.json` is replaced atomically (frozen `paths`), and
   every mutation runs under a per-session file lock, so `run`, `continue` and
-  `stop` on one session never interleave.
+  `cancel` on one session never interleave.
 - **State is verified, not trusted.** A stored `running` means nothing on its
   own: `load` re-checks the host process through the frozen `proc` identity
   token and persists `orphaned` when it is gone, so every reader agrees
@@ -1006,7 +1006,7 @@ def claim_name(name: str, *, clock: Clock | None = None) -> str | None:
     if holder.is_active:
         raise SessionNameTaken(
             f"name {name!r} belongs to session {holder.session_id}, still {holder.state} — "
-            f"stop it first or pick another name"
+            f"cancel it first or pick another name"
         )
     return f"name {name!r} was bound to session {holder.session_id}; rebinding it to the new one"
 
@@ -1028,7 +1028,7 @@ def _remove_tree(directory: Path) -> None:
 def ensure_deletable(meta: SessionMeta) -> None:
     """Refuse an active session, so a caller can check before it commits.
 
-    SPEC.md `rm`: errors on `starting`/`running` — `stop` it first. Split out
+    SPEC.md `delete`: errors on `starting`/`running` — `cancel` it first. Split out
     so the CLI can run this check before it asks for confirmation: a running
     session is a conflict, not something a confirmation would resolve.
     """

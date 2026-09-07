@@ -111,7 +111,7 @@ def walk(command: click.Command, path: str = "") -> Iterator[tuple[str, click.Co
 DECLARED_EFFECTS = {
     "": effects.READ_ONLY,
     "agents": effects.READ_ONLY,
-    "agents check": effects.NON_IDEMPOTENT,
+    "agents check": effects.READ_ONLY,
     "agents create": effects.NON_IDEMPOTENT,
     "agents delete": effects.NON_IDEMPOTENT,
     "agents get": effects.READ_ONLY,

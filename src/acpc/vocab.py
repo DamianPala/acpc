@@ -32,7 +32,7 @@ SESSION_STATES = (
     "orphaned",
 )
 
-# States that count as finished: `continue` accepts them, `rm`/`prune` delete
+# States that count as finished: `continue` accepts them, `delete`/`prune` delete
 # them, `wait` returns immediately. `orphaned` is finished by definition.
 FINISHED_STATES = frozenset({"succeeded", "failed", "canceled", "timeout", "orphaned"})
 ACTIVE_STATES = frozenset({"starting", "running"})

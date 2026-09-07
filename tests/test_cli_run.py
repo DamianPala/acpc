@@ -4,6 +4,9 @@ import json
 import os
 import pty
 import queue
+import re
+import select
+import signal
 import subprocess
 import sys
 import threading
@@ -925,6 +928,20 @@ def test_timeout_cannot_be_combined_with_background(cli: CliRunner) -> None:
     assert "--cancel-after" in result.stderr
 
 
+@pytest.mark.parametrize("deadline_flag", ["--timeout", "--cancel-after"])
+def test_resolve_rejects_deadlines_before_creating_a_session(
+    cli: CliRunner, state_root: Path, deadline_flag: str
+) -> None:
+    result = invoke(cli, "run", "mock", "probe", "--resolve", deadline_flag, "1", "--json")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    envelope = error_envelope(result)
+    assert envelope["kind"] == "invalid_input"
+    assert "--resolve" in envelope["message"]
+    assert deadline_flag in envelope["message"]
+    assert not (state_root / "sessions").exists()
+
+
 def test_timeout_only_stops_waiting_and_reports_observed_state(
     cli: CliRunner, live_daemon: None
 ) -> None:
@@ -950,6 +967,68 @@ def test_timeout_direct_fallback_keeps_the_session_alive(cli: CliRunner) -> None
     while sessions.load(session_id).is_active and time.monotonic() < deadline:
         time.sleep(0.05)
     assert sessions.load(session_id).state == "succeeded"
+
+
+@pytest.mark.filterwarnings(
+    "ignore:This process .* is multi-threaded, use of forkpty\\(\\) may lead to deadlocks.*:DeprecationWarning"
+)
+def test_timeout_direct_worker_survives_closing_the_client_pty(state_root: Path) -> None:
+    # A file at the daemon directory makes the real subprocess take the
+    # direct fallback, without changing the production routing code.
+    (state_root / "daemon").write_text("direct fallback", encoding="utf-8")
+    argv = [
+        sys.executable,
+        "-c",
+        "from acpc.cli import main; main()",
+        "run",
+        "mock",
+        "slow:2 pty direct timeout",
+        "--permissions",
+        "read",
+        "--timeout",
+        "0.1",
+        "--quiet",
+        "--json",
+    ]
+    child_pid, master_fd = pty.fork()
+    if child_pid == 0:
+        signal.signal(signal.SIGHUP, signal.SIG_DFL)
+        os.environ["ACPC_HOME"] = str(state_root)
+        os.execve(sys.executable, argv, os.environ.copy())
+
+    output = bytearray()
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([master_fd], [], [], 0.2)
+            if not ready:
+                continue
+            try:
+                output.extend(os.read(master_fd, 4096))
+            except OSError:
+                break
+            if b'"kind": "timeout"' in output or b'"kind":"timeout"' in output:
+                break
+        rendered = output.decode(errors="replace")
+        match = re.search(r'"session_id"\s*:\s*"([a-z0-9]{4})"', rendered)
+        assert match is not None, rendered
+        session_id = match.group(1)
+        os.close(master_fd)
+        master_fd = -1
+
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            if sessions.load(session_id).state == "succeeded":
+                break
+            time.sleep(0.05)
+        assert sessions.load(session_id).state == "succeeded"
+    finally:
+        if master_fd >= 0:
+            os.close(master_fd)
+        waited_pid, _ = os.waitpid(child_pid, os.WNOHANG)
+        if waited_pid == 0:
+            os.kill(child_pid, signal.SIGKILL)
+            os.waitpid(child_pid, 0)
 
 
 def test_timeout_direct_fallback_can_still_be_canceled(cli: CliRunner) -> None:

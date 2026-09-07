@@ -301,17 +301,41 @@ def test_group_prefixes_have_no_command_detail(runner: CliRunner) -> None:
         assert name in result.stderr
 
 
-def test_help_only_group_is_not_a_command_entry() -> None:
-    @click.group()
-    def root() -> None:
-        pass
-
-    @root.group(invoke_without_command=True)
+def test_help_only_group_is_not_a_command_entry(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    @main.group(name="help-only", invoke_without_command=True)
     @click.pass_context
     def help_only(ctx: click.Context) -> None:
         click.echo(ctx.get_help())
 
-    assert "help-only" not in schema.commands(root)
+    main.commands.pop("help-only")
+    monkeypatch.setitem(main.commands, "help-only", help_only)
+    names = {entry["name"] for entry in read_index(runner)["commands"]}
+
+    assert "help-only" not in names
+
+
+def test_public_schema_includes_a_group_that_dispatches_without_a_subcommand(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    @effects.read_only
+    @schema.dispatches_without_command
+    @main.group(name="useful", invoke_without_command=True)
+    @click.pass_context
+    def useful(ctx: click.Context) -> None:
+        """Run useful work when no subcommand is given."""
+        if ctx.invoked_subcommand is None:
+            click.echo("useful result")
+
+    main.commands.pop("useful")
+    monkeypatch.setitem(main.commands, "useful", useful)
+    result = invoke(runner, "schema")
+
+    assert result.exit_code == 0, result.output
+    names = {entry["name"] for entry in json.loads(result.stdout)["commands"]}
+    assert "useful" in names
+    assert invoke(runner, "useful").stdout == "useful result\n"
 
 
 def test_background_alias_and_timeout_contract_are_published(runner: CliRunner) -> None:
@@ -320,6 +344,22 @@ def test_background_alias_and_timeout_contract_are_published(runner: CliRunner) 
     assert flags["background"]["aliases"] == ["bg"]
     assert "the session keeps running" in flags["timeout"]["description"]
     assert "changes the work itself" in flags["cancel-after"]["description"]
+    assert "Cannot be combined with --resolve" in flags["timeout"]["description"]
+    assert "Cannot be combined with --resolve" in flags["cancel-after"]["description"]
+    assert "block by default" in read_detail(runner, "run")["description"]
+    assert "--background" in read_detail(runner, "run")["description"]
+
+
+def test_agents_check_publishes_its_scope_and_conflicts(runner: CliRunner) -> None:
+    detail = read_detail(runner, "agents check")
+    argument = detail["args"][0]["description"]
+    flags = {flag["name"]: flag for flag in detail["flags"]}
+
+    assert detail["effects"] == "read_only"
+    assert "every registered adapter and variant" in argument
+    assert "adapter is unavailable" in argument
+    assert "only valid without NAME" in flags["limit"]["description"]
+    assert "only valid without NAME" in flags["plain"]["description"]
 
 
 def test_descriptors_are_well_formed(runner: CliRunner) -> None:

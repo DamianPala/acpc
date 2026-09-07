@@ -374,7 +374,7 @@ Checking on a run:
   acpc log <id>                    # the default: instant snapshot, condensed
   Need only the result? wait <id>. Don't block on a run you won't act on.
 
-Supervising a risky run you intend to steer/stop mid-flight — the one
+Supervising a risky run you intend to steer/cancel mid-flight — the one
 case for --follow (a bounded digest, not a live view):
   acpc log <id> --follow --timeout 60 --max-output 16384
   Ends at session end (exit 0), the timeout (124) or the cap (4); resume
@@ -548,9 +548,16 @@ def _no_such_command(message: str, spelling: str) -> bool:
     return f"No such command '{spelling}'" in message or f'No such command "{spelling}"' in message
 
 
-def _friendly_usage_message(message: str, *, command_path: str | None = None) -> str:
-    """Replace known neighboring-tool spellings with their acpc equivalents."""
-    command_parts = (command_path or "").split()
+def _matching_option_hint(message: str, hints: Mapping[str, str]) -> str | None:
+    if "No such option" not in message:
+        return None
+    for spelling, replacement in hints.items():
+        if _no_such_option(message, spelling):
+            return replacement
+    return None
+
+
+def _friendly_option_hint(message: str, command_parts: list[str]) -> str | None:
     follow_hint = (
         "--follow is not a flag on this command — following a session is: "
         "acpc log <id> --follow [--timeout S]"
@@ -559,6 +566,44 @@ def _friendly_usage_message(message: str, *, command_path: str | None = None) ->
         "--detach is not an acpc flag — background dispatch is: "
         'acpc run <agent> "<prompt>" --background'
     )
+    if command_parts[-1:] == ["agents"]:
+        hint = _matching_option_hint(
+            message,
+            {
+                "--json": "--json belongs to: acpc agents list --json",
+                "--check": "--check moved to: acpc agents check [<name>]",
+                "--models": "--models belongs to: acpc agents get <name> --models",
+                "--commands": "--commands belongs to: acpc agents get <name> --commands",
+                "--limit": "--limit belongs to: acpc agents list --limit N",
+                "--plain": "--plain belongs to: acpc agents list --plain --limit N",
+            },
+        )
+        if hint is not None:
+            return hint
+    if command_parts[-1:] == ["skills"]:
+        hint = _matching_option_hint(
+            message, {"--json": "--json belongs to: acpc skills list --json"}
+        )
+        if hint is not None:
+            return hint
+    if command_parts[-1:] == ["continue"]:
+        hint = _matching_option_hint(
+            message,
+            {
+                flag: f"{flag} is a run-only flag — use acpc run; continue reuses stored settings"
+                for flag in (
+                    "--model",
+                    "--effort",
+                    "--mode",
+                    "--cwd",
+                    "--home",
+                    "--name",
+                    "--resolve",
+                )
+            },
+        )
+        if hint is not None:
+            return hint
     aliases = {
         "--follow": follow_hint,
         "-f": follow_hint,
@@ -569,28 +614,13 @@ def _friendly_usage_message(message: str, *, command_path: str | None = None) ->
         "-o": "-o was renamed to --output-file — use --output-file FILE",
         "--output": "--output was renamed to --output-file — use --output-file FILE",
     }
-    if command_parts[-1:] == ["agents"] and "No such option" in message:
-        replacements = {
-            "--check": "--check moved to: acpc agents check [<name>]",
-            "--models": "--models belongs to: acpc agents get <name> --models",
-            "--commands": "--commands belongs to: acpc agents get <name> --commands",
-            "--limit": "--limit belongs to: acpc agents list --limit N",
-            "--plain": "--plain belongs to: acpc agents list --plain --limit N",
-        }
-        for spelling, replacement in replacements.items():
-            if _no_such_option(message, spelling):
-                return replacement
-    if command_parts[-1:] == ["continue"] and "No such option" in message:
-        for flag in ("--model", "--effort", "--mode", "--cwd", "--home", "--name", "--resolve"):
-            if _no_such_option(message, flag):
-                return f"{flag} is a run-only flag — use acpc run; continue reuses stored settings"
-    if "No such option" in message:
-        for spelling, replacement in aliases.items():
-            if _no_such_option(message, spelling):
-                return replacement
+    return _matching_option_hint(message, aliases)
+
+
+def _daemon_command_hint(message: str, command_parts: list[str]) -> str | None:
     daemon_group = command_parts[-1:] == ["daemon"]
     daemon_stop = command_parts[-2:] == ["daemon", "stop"]
-    if daemon_stop and "No such option" in message and _no_such_option(message, "--all"):
+    if daemon_stop and _no_such_option(message, "--all"):
         return "--all is not a daemon flag — bare acpc daemon stop already addresses every daemon"
     if daemon_group and "No such command" in message:
         for spelling in ("list", "ls", "ps"):
@@ -602,12 +632,20 @@ def _friendly_usage_message(message: str, *, command_path: str | None = None) ->
                     f"no such command '{spelling}' — daemons start on first use; acpc daemon "
                     "stop <agent> and the next run is the restart"
                 )
+    return None
+
+
+def _group_command_hint(message: str, command_parts: list[str]) -> str | None:
     if command_parts[-1:] == ["agents"] and "No such command" in message:
         if any(_no_such_command(message, spelling) for spelling in ("init", "new")):
             return "agents create is the variant-creation command"
         return "agents needs a subcommand; use `acpc agents list` or `acpc agents get <name>`"
     if command_parts[-1:] == ["skills"] and "No such command" in message:
         return "skills needs a subcommand; use `acpc skills list` or `acpc skills get <name>`"
+    return None
+
+
+def _legacy_command_hint(message: str, command_parts: list[str]) -> str | None:
     if len(command_parts) == 1 and "No such command" in message:
         old_commands = {
             "rm": "delete",
@@ -618,7 +656,25 @@ def _friendly_usage_message(message: str, *, command_path: str | None = None) ->
                 return f"no such command '{old}' — use acpc {new}"
     if "No such command" in message and (_no_such_command(message, "logs")):
         return "no such command 'logs' — the viewing command is: acpc log <id>"
-    return message
+    return None
+
+
+def _friendly_command_hint(message: str, command_parts: list[str]) -> str | None:
+    for hint_function in (_daemon_command_hint, _group_command_hint, _legacy_command_hint):
+        hint = hint_function(message, command_parts)
+        if hint is not None:
+            return hint
+    return None
+
+
+def _friendly_usage_message(message: str, *, command_path: str | None = None) -> str:
+    """Replace known neighboring-tool spellings with their acpc equivalents."""
+    command_parts = (command_path or "").split()
+    return (
+        _friendly_option_hint(message, command_parts)
+        or _friendly_command_hint(message, command_parts)
+        or message
+    )
 
 
 @effects.read_only
@@ -955,7 +1011,7 @@ def _resolve_permissions(
     policy, clamp = _clamp_inherited_ceiling(policy)
     if policy == "ask":
         cause = (
-            "cannot be used with --bg, which returns before a request could be answered"
+            "cannot be used with --bg/--background, which returns before a request could be answered"
             if background
             else interaction.why_not_interactive()
         )
@@ -994,7 +1050,7 @@ def _ask_background_policy() -> tuple[str, str | None]:
     default = "read"
     try:
         chosen = interaction.ask_choice(
-            "acpc: --bg detaches this session, so nothing can answer a permission request.\n"
+            "acpc: --bg/--background detaches this session, so nothing can answer a permission request.\n"
             f"acpc: policy for this session [{', '.join(choices)}] ({default}): ",
             choices=choices,
             default=default,
@@ -1003,7 +1059,7 @@ def _ask_background_policy() -> tuple[str, str | None]:
         return default, None
     if chosen is None:
         raise UsageProblem(
-            "--bg needs a permission policy chosen before it detaches; "
+            "--bg/--background needs a permission policy chosen before it detaches; "
             "pass --permissions none, read, edit, execute or all"
         )
     return chosen, PERMISSIONS_ANSWERED
@@ -1638,6 +1694,45 @@ def agents_list_command(
     _run_agents_list(selected_format, limit, plain)
 
 
+def _emit_agent_models(registry: AgentRegistry, entry: ResolvedEntry, selected_format: str) -> None:
+    _warn_unlisted_effort_model(registry.resolve_call(entry.entry))
+    record = _ensure_cache(entry)
+    text, payload = _render_models(entry, record)
+    if selected_format == "json":
+        _emit_json(payload)
+        click.echo(_cache_footer(record), err=True)
+    else:
+        _write_stdout(text)
+
+
+def _emit_agent_commands(entry: ResolvedEntry, selected_format: str) -> None:
+    record = _ensure_cache(entry)
+    text, payload = _render_commands(entry, record)
+    if selected_format == "json":
+        _emit_json(payload)
+        click.echo(
+            _commands_footer(entry.base_adapter, list(payload["commands"]), record),
+            err=True,
+        )
+    else:
+        _write_stdout(text)
+
+
+def _emit_agent_detail(registry: AgentRegistry, entry: ResolvedEntry, selected_format: str) -> None:
+    text, payload, _ = _render_entry_detail(registry, entry)
+    if not entry.is_variant:
+        record = _ensure_cache(entry)
+        advertised_text, advertised_payload = _render_advertised_detail(entry, record)
+        payload.update(advertised_payload)
+        text += advertised_text
+        if selected_format == "json":
+            click.echo(_cache_footer(record), err=True)
+    if selected_format == "json":
+        _emit_json(payload)
+    else:
+        _write_stdout(text)
+
+
 @effects.read_only
 @schema.describes(name="Adapter or variant to render, as listed by `acpc agents list`.")
 @agents_group.command(name="get")
@@ -1664,39 +1759,12 @@ def agents_get_command(
         registry = AgentRegistry()
         entry = registry.resolve(name)
         if models:
-            _warn_unlisted_effort_model(registry.resolve_call(name))
-            record = _ensure_cache(entry)
-            text, payload = _render_models(entry, record)
-            if selected_format == "json":
-                _emit_json(payload)
-                click.echo(_cache_footer(record), err=True)
-            else:
-                _write_stdout(text)
+            _emit_agent_models(registry, entry, selected_format)
             return
         if commands:
-            record = _ensure_cache(entry)
-            text, payload = _render_commands(entry, record)
-            if selected_format == "json":
-                _emit_json(payload)
-                click.echo(
-                    _commands_footer(entry.base_adapter, list(payload["commands"]), record),
-                    err=True,
-                )
-            else:
-                _write_stdout(text)
+            _emit_agent_commands(entry, selected_format)
             return
-        text, payload, _ = _render_entry_detail(registry, entry)
-        if not entry.is_variant:
-            record = _ensure_cache(entry)
-            advertised_text, advertised_payload = _render_advertised_detail(entry, record)
-            payload.update(advertised_payload)
-            text += advertised_text
-            if selected_format == "json":
-                click.echo(_cache_footer(record), err=True)
-        if selected_format == "json":
-            _emit_json(payload)
-        else:
-            _write_stdout(text)
+        _emit_agent_detail(registry, entry, selected_format)
     except cache.ProbeError as error:
         raise _probe_problem(error) from None
     except RegistryError as error:
@@ -1760,9 +1828,12 @@ def _agents_check(
 _CHECK_TIMEOUT_DEFAULT = "30s"
 
 
-@effects.non_idempotent
+@effects.read_only
 @schema.describes(
-    name="Optional adapter or variant to check; absent, all installed adapters are checked.",
+    name=(
+        "Optional adapter or variant to check; absent, every registered adapter and variant is "
+        "checked, including entries whose adapter is unavailable."
+    ),
 )
 @agents_group.command(name="check")
 @click.argument("name", required=False)
@@ -1771,10 +1842,15 @@ _CHECK_TIMEOUT_DEFAULT = "30s"
     type=click.IntRange(min=0),
     default=render.DEFAULT_STATUS_LIMIT,
     show_default=True,
-    help="Return at most N check results; default 20.",
+    help="Return at most N check results; default 20; only valid without NAME.",
 )
 @click.option(
-    "--plain", is_flag=True, help="Print one checked agent name per line; requires --limit."
+    "--plain",
+    is_flag=True,
+    help=(
+        "Print one checked agent name per line; only valid without NAME and requires an "
+        "explicit --limit."
+    ),
 )
 @click.option(
     "--timeout",
@@ -1803,7 +1879,12 @@ def agents_check_command(
     format_name: str | None,
     json_mode: bool,
 ) -> None:
-    """Launch and authenticate an adapter, then report its advertised data."""
+    """Check registered adapters and variants, then report advertised data.
+
+    With NAME, check one registered entry, including one whose adapter is not
+    installed. Without NAME, check every registered adapter and variant.
+    NAME cannot be combined with ``--limit`` or ``--plain``.
+    """
     selected_format = _select_format(format_name, json_mode, plain=plain)
     if name is not None:
         if ctx.get_parameter_source("limit") is click.core.ParameterSource.COMMANDLINE:
@@ -2282,7 +2363,7 @@ def install_command(agent: str, assume_yes: bool, format_name: str | None, json_
 
 
 async def _cancel_with_daemon(target: str, session_id: str) -> bool | None:
-    """Request cancellation without allowing a dead daemon to hang ``stop``."""
+    """Request cancellation without allowing a dead daemon to hang ``cancel``."""
     try:
         return await asyncio.wait_for(
             daemon_client.cancel_turn(target, session_id),
@@ -2294,7 +2375,7 @@ async def _cancel_with_daemon(target: str, session_id: str) -> bool | None:
         return False
 
 
-def _wait_for_stop(session_id: str) -> sessions.SessionMeta:
+def _wait_for_cancel(session_id: str) -> sessions.SessionMeta:
     """Give a daemon's cancellation time to finalize the session on disk."""
     deadline = time.monotonic() + runner.CANCEL_ACK_TIMEOUT
     while True:
@@ -2304,21 +2385,7 @@ def _wait_for_stop(session_id: str) -> sessions.SessionMeta:
         time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
 
 
-def _cancel_session(meta: sessions.SessionMeta) -> sessions.SessionMeta:
-    """Cancel an active session and return the state it settled into.
-
-    SPEC `stop`: graceful `session/cancel` with a bounded wait for the ack,
-    torn down anyway if the callee will not wind down in time. `steer` puts
-    the same cancel in front of a follow-up turn, so it lives here rather
-    than inside `stop`.
-    """
-    cancelled = False
-    if meta.target is not None:
-        cancelled = asyncio.run(_cancel_with_daemon(meta.target, meta.session_id))
-    if cancelled is True:
-        return _wait_for_stop(meta.session_id)
-    if cancelled is None:
-        return sessions.load(meta.session_id)
+def _cancel_local_session(meta: sessions.SessionMeta) -> sessions.SessionMeta:
     if meta.pid is None:
         return sessions.transition(
             meta.session_id,
@@ -2338,17 +2405,35 @@ def _cancel_session(meta: sessions.SessionMeta) -> sessions.SessionMeta:
                 kind=errors.UNAVAILABLE,
                 context={"session_id": meta.session_id},
             ) from None
-        return _wait_for_stop(meta.session_id)
+        return _wait_for_cancel(meta.session_id)
     result = proc.kill_process_tree(meta.pid, meta.process_start_time)
     if result == "refused":
         # The process is there and would not take the signal, so acpc did not
-        # observe the stop it was asked for and must not report one.
+        # observe the cancellation it was asked for and must not report one.
         raise AcpcError(
-            f"could not stop session {meta.session_id}: refused to signal it",
+            f"could not cancel session {meta.session_id}: refused to signal it",
             kind=errors.UNAVAILABLE,
             context={"session_id": meta.session_id},
         )
-    return _wait_for_stop(meta.session_id)
+    return _wait_for_cancel(meta.session_id)
+
+
+def _cancel_session(meta: sessions.SessionMeta) -> sessions.SessionMeta:
+    """Cancel an active session and return the state it settled into.
+
+    SPEC `cancel`: graceful `session/cancel` with a bounded wait for the ack,
+    torn down anyway if the callee will not wind down in time. `steer` puts
+    the same cancel in front of a follow-up turn, so it lives here rather
+    than inside `cancel`.
+    """
+    cancelled = False
+    if meta.target is not None:
+        cancelled = asyncio.run(_cancel_with_daemon(meta.target, meta.session_id))
+    if cancelled is True:
+        return _wait_for_cancel(meta.session_id)
+    if cancelled is None:
+        return sessions.load(meta.session_id)
+    return _cancel_local_session(meta)
 
 
 def _maintenance_json(payload: Mapping[str, Any]) -> None:
@@ -2420,7 +2505,7 @@ def delete_command(
 ) -> None:
     """Delete a finished session's on-disk state.
 
-    Errors on a starting or running session — stop it first. The transcript,
+    Errors on a starting or running session — cancel it first. The transcript,
     the prompt and the answer go with it and acpc cannot bring them back, so
     the call needs ``--yes``. Prints the removed session id; ``--json`` also
     lists the deleted paths.
@@ -3373,8 +3458,8 @@ def _run_foreground(
         "\b\n"
         "Permission scale: none, read, edit, execute, all or ask; absent, ask when acpc "
         "could put the question — stdin and stdout both terminals, no --json, NO_INPUT "
-        "unset — and read in every other case, and --bg asks which policy to detach with. "
-        "ask itself needs a terminal on stdin and refuses under --json, --bg or a set "
+        "unset — and read in every other case, and --background asks which policy to detach with. "
+        "ask itself needs a terminal on stdin and refuses under --json, --background or a set "
         "NO_INPUT. execute permits read, edit and execute; write and prompt are "
         "deprecated aliases for execute and ask."
     ),
@@ -3403,7 +3488,7 @@ def _run_foreground(
     metavar="S",
     help=(
         f"Stop waiting after this duration ({_DURATION_SYNTAX}); the session keeps running. "
-        "Use --cancel-after to cancel the session."
+        "Cannot be combined with --resolve; use --cancel-after to cancel the session."
     ),
 )
 @click.option(
@@ -3412,7 +3497,7 @@ def _run_foreground(
     metavar="S",
     help=(
         f"Cancel the session after this duration ({_DURATION_SYNTAX}); unlike --timeout, "
-        "this changes the work itself."
+        "this changes the work itself. Cannot be combined with --resolve."
     ),
 )
 @click.option(
@@ -3427,7 +3512,7 @@ def _run_foreground(
     is_flag=True,
     help=(
         "Print what this call resolves to, then exit; nothing is dispatched, so the prompt "
-        "is not read and no question is put to anyone. Under --bg without --permissions the "
+        "is not read and no question is put to anyone. Under --background without --permissions the "
         "policy and the mode it selects print unresolved, sourced 'asked at dispatch'."
     ),
 )
@@ -3473,7 +3558,7 @@ def run_command(
     quiet: bool,
     json_mode: bool,
 ) -> None:
-    """Dispatch one agent and print its answer, or preview it with ``--resolve``.
+    """Dispatch one agent; block by default, use ``--background`` or ``--bg`` to detach, or preview it with ``--resolve``.
 
     One prompt source is required, and prompts over 1 MiB are rejected before
     session creation. Permission defaults follow the TTY and output format.
@@ -3483,6 +3568,10 @@ def run_command(
     selected_format = _select_format(format_name, json_mode, native_text=True)
     if background and timeout is not None:
         raise UsageProblem("--timeout only bounds waiting; use --cancel-after with --background")
+    if resolve and timeout is not None:
+        raise UsageProblem("--resolve cannot be combined with --timeout")
+    if resolve and cancel_after is not None:
+        raise UsageProblem("--resolve cannot be combined with --cancel-after")
     permissions = _normalize_permission(permissions)
     resolution = _resolve_run_call(
         agent,
@@ -3790,7 +3879,7 @@ def continue_command(
     json_mode: bool,
     permissions: str | None,
 ) -> None:
-    """Continue a finished session; block and print the answer unless ``--bg``.
+    """Continue a finished session; block and print the answer unless ``--background``.
 
     Model, effort, mode, permissions and home come from the session, not from
     re-resolving the agent entry — editing an entry never changes a session
@@ -4089,7 +4178,7 @@ def steer_command(
     quiet: bool,
     json_mode: bool,
 ) -> None:
-    """Redirect the running turn; block and print the answer unless ``--bg``.
+    """Redirect the running turn; block and print the answer unless ``--background``.
 
     Interrupts the running turn and redirects the session in one verb: cancels
     the turn in flight (ACP session/cancel), waits for the ack, then

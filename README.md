@@ -8,7 +8,7 @@ acpc is built for a specific primary user: **another agent calling it through a 
 
 ## The whole mental model
 
-*`run` blocks and prints the answer; `--bg` returns an ID; `status`/`log`/`wait`/`continue`/`steer`/`stop` operate on that ID; everything is on disk under a predictable path.*
+*`run` blocks and prints the answer; `--background` (alias `--bg`) returns an ID; `status`/`log`/`wait`/`continue`/`steer`/`cancel` operate on that ID; everything is on disk under a predictable path.*
 
 `status` is a lightweight pulse: active sessions show `idle <age>` since their newest transcript event, while finished sessions show `·`. The JSON view exposes the same value as `idle_seconds` (`null` when unavailable or finished). Every row also names the model the session resolved to, because entry names hide it — two variants that both `extend` the same parent run the same model, and only the column says so.
 
@@ -18,8 +18,8 @@ A failed run is not lost: `acpc status <id>` names the failure on its `failure` 
 # 90% of usage is this:
 acpc run codex "fix the failing test in tests/test_auth.py" --cwd ~/repo --permissions execute
 
-# Background + collect later. --bg prints the session id, then its dir:
-acpc run codex "run the full suite and summarize" --bg
+# Background + collect later. --background prints the session id, then its dir:
+acpc run codex "run the full suite and summarize" --background
 acpc wait x7k2
 
 # Follow up in the same session, context preserved:
@@ -31,7 +31,7 @@ Review the implementation against SPEC.md and make the required edits.
 PROMPT
 ```
 
-An agent caller reads the session id straight from the `--bg` output — shell variables don't survive across its tool calls anyway. A script that really chains in one shell uses `--bg --json` and takes `jq -r .session_id`.
+An agent caller reads the session id straight from the `--background` output — shell variables don't survive across its tool calls anyway. A script that really chains in one shell uses `--background --json` and takes `jq -r .session_id`.
 
 ## Command surface
 
@@ -40,14 +40,14 @@ run <agent> (prompt | - | --prompt-file) [options]   # default: block, stdout = 
 continue <id> (prompt | - | --prompt-file)           # follow-up in the same session context
 steer <id> (instruction | - | --prompt-file)         # interrupt the running turn and redirect it
 status [id]                # no id: active + recent; with id: one session's vitals
-log <id> [--since CURSOR] [--tail N] [--prose] [--wait-new | --follow]   # incremental transcript access
+log <id> [--since CURSOR] [--limit N] [--prose] [--wait-new | --follow]   # incremental transcript access
 wait <id> [--timeout S]    # block until done, print the answer
-stop <id>
-rm <id> | prune [--older-than D] [--dry-run]
-agents [name] [--models|--commands|--check]   # adapters + variants; resolved definitions
-agents init <name> --extends <agent>          # scaffold a variant
+cancel <id>
+delete <id> | prune [--older-than D] [--dry-run]
+agents list|get|check|create|delete          # adapters + variants
+agents create <name> --extends <agent>       # scaffold a variant
 probe <entry> --discover [--json]             # read the adapter's advertised modes; report only
-skills [name] [--json]                        # bundled how-to skills; with name: body + dir on stderr
+skills list|get                               # bundled how-to skills; get prints body + dir on stderr
 install <agent>
 daemon status|stop [target] [--force]   # plumbing escape hatch — never needed in the happy path
 ```
@@ -57,7 +57,7 @@ daemon status|stop [target] [--force]   # plumbing escape hatch — never needed
 ## Bundled skills
 
 Recipes that would go stale in `AGENTS.md` live as package skills. List them
-with `acpc skills`; print one body with `acpc skills <name>` (the skill
+with `acpc skills list`; print one body with `acpc skills get <name>` (the skill
 directory path is on stderr — that is how you find `references/`).
 
 | Skill | For | Source |
@@ -67,21 +67,21 @@ directory path is on stderr — that is how you find `references/`).
 | `refresh-adapter-models` | Vendor shipped new model ids: upgrade the adapter binary first, then overlay `$ACPC_HOME/agents/<name>.toml` presets and `[effort_by_model]` | [`src/acpc/data/skills/refresh-adapter-models/SKILL.md`](src/acpc/data/skills/refresh-adapter-models/SKILL.md) |
 
 ```bash
-acpc skills
-acpc skills adapter-bringup
-acpc skills provider-bringup
-acpc skills refresh-adapter-models
+acpc skills list
+acpc skills get adapter-bringup
+acpc skills get provider-bringup
+acpc skills get refresh-adapter-models
 ```
 
 `acpc probe <entry> --discover` opens a session, reads the modes the adapter advertises, releases it, and prints that catalogue alongside a two-sided diff against the entry's recorded `[modes]`: modes the adapter advertises that the entry does not list, and entry modes the adapter no longer advertises. It costs zero turns and never edits the registry — applying anything it reports is a separate, explicit act. Measuring what a mode actually *permits* is not in this release, so `--discover` is required and a bare `probe` says so rather than answering a question you did not ask. Probe refuses to run on Windows because its commands are POSIX shell commands and would measure the shell rather than the sandbox.
 
-`steer <id> "…"` interrupts the turn in flight and redirects the session in one call — `stop` plus `continue` without the race in the middle. During daemon-owned `continue` preparation, nothing has reached the callee yet: acpc cancels that preparation, reports that nothing was interrupted, and sends the instruction plainly without the interruption preamble. Once a prompt is in flight, the instruction reaches the callee under the fixed preamble naming the interruption, and the interrupted turn's partial answer is kept as that turn's answer file.
+`steer <id> "…"` interrupts the turn in flight and redirects the session in one call — `cancel` plus `continue` without the race in the middle. During daemon-owned `continue` preparation, nothing has reached the callee yet: acpc cancels that preparation, reports that nothing was interrupted, and sends the instruction plainly without the interruption preamble. Once a prompt is in flight, the instruction reaches the callee under the fixed preamble naming the interruption, and the interrupted turn's partial answer is kept as that turn's answer file.
 
-`status` reports that daemon-owned window as `preparing`. `stop` and Ctrl-C finish a cancelled preparation with a no-prompt placeholder, releasing the session reservation and the adapter binding. What acpc cannot do is unsend a restore already in flight — ACP defines no cancellation for `session/load` or `session/resume` — so the promise is about what a turn runs against rather than about what the adapter does: the next `continue` waits for that restore to settle before preparing its own, and no turn ever runs against a half-restored session.
+`status` reports that daemon-owned window as `preparing`. `cancel` and Ctrl-C finish a cancelled preparation with a no-prompt placeholder, releasing the session reservation and the adapter binding. What acpc cannot do is unsend a restore already in flight — ACP defines no cancellation for `session/load` or `session/resume` — so the promise is about what a turn runs against rather than about what the adapter does: the next `continue` waits for that restore to settle before preparing its own, and no turn ever runs against a half-restored session.
 
 ## Reading a run
 
-- **stdout carries exactly one thing**: the answer (default), a confirmation (`-o`), a JSON envelope (`--json`), or id + session dir (`--bg`). Never spinners, logs, or diagnostics.
+- **stdout carries exactly one thing**: the answer (default), a confirmation (`--output-file`), a JSON envelope (`--json`), or id + session dir (`--background`). Never spinners, logs, or diagnostics.
 - **stderr carries acpc's own metadata**, every line prefixed `--`: the end-of-run summary (duration, tokens, exit, session id, dir) and `log`/`status` footers. Harnesses that merge streams can still separate the two mechanically.
 - **`log <id>`** is the progress view — condensed one-liners, tool calls and prose interleaved. **`log <id> --prose`** is the content view — clean markdown of what the agent wrote. `--since CURSOR` never re-emits events, so polling is cheap and stateless.
 
@@ -100,20 +100,20 @@ $ acpc log x7k2 --since 42
 | 1 | agent error — crash, refusal, missing auth |
 | 2 | usage error — bad flags, unknown session, rejected mode/permissions combination |
 | 4 | output budget exhausted — `log --follow` stopped because `--max-output` ran out before the session ended |
-| 124 | timeout (`run`: session cancelled; `wait`/`log --wait-new`/`log --follow`: gave up waiting, session runs on) |
-| 130 | cancelled — SIGINT or `stop` |
+| 124 | timeout (`run`: gave up waiting, session runs on; `wait`/`log --wait-new`/`log --follow`: same) |
+| 130 | cancelled — SIGINT or `cancel` |
 | 141 / 143 | SIGPIPE / SIGTERM |
 
-**Client death ≠ session death.** SIGINT cancels the session. SIGTERM — a harness killing the tool call on its own timeout, the normal case for an agent caller — *detaches*: the session keeps running under the daemon, the client's last stderr line names the id and its options (`wait` for the answer, `stop` to cancel), and `wait <id>` collects the answer later.
+**Client death ≠ session death.** SIGINT cancels the session. SIGTERM — a harness killing the tool call on its own timeout, the normal case for an agent caller — *detaches*: the session keeps running under the daemon, the client's last stderr line names the id and its options (`wait` for the answer, `cancel` to cancel), and `wait <id>` collects the answer later.
 
 ## Permissions
 
-`--permissions none|read|edit|execute|all|ask` names a ceiling for ACP permission requests, classified by tool-call kind. `ask` is off the scale: reads are allowed and other categories ask on `/dev/tty`. Default: `ask` on a TTY, `read` otherwise (`--bg` counts as non-TTY). `write` and `prompt` remain accepted as deprecated aliases for `execute` and `ask`.
+`--permissions none|read|edit|execute|all|ask` names a ceiling for ACP permission requests, classified by tool-call kind. `ask` is off the scale: reads are allowed and other categories ask on `/dev/tty`. Default: `ask` on a TTY, `read` otherwise (`--background` counts as non-TTY). `write` and `prompt` remain accepted as deprecated aliases for `execute` and `ask`.
 
 Three edges worth internalizing:
 
 - **The non-TTY default is a silent read-only trap.** A caller that passes no `--permissions` gets a read-only callee — write requests are denied without an error and the turn exits 0. Pass `edit` for file changes, or `execute` when the task must also run commands.
-- **The policy selects the vendor mode.** Adapter `[modes]` tables measure each mode's `grants`, whether it `delegates`, and whether it `escalates` — the last being informational, a flag that an in-vendor auto-approver can raise that mode's ceiling unasked, so its `grants` is a measurement rather than a bound. acpc always sends `session/set_mode`, and refuses a mode that grants more than the policy. An advertised mode missing from `[modes]` is admitted only under `all`. `--mode` is normally unnecessary, but an explicit value is checked by the same ceiling and comes from `acpc agents <name>`.
+- **The policy selects the vendor mode.** Adapter `[modes]` tables measure each mode's `grants`, whether it `delegates`, and whether it `escalates` — the last being informational, a flag that an in-vendor auto-approver can raise that mode's ceiling unasked, so its `grants` is a measurement rather than a bound. acpc always sends `session/set_mode`, and refuses a mode that grants more than the policy. An advertised mode missing from `[modes]` is admitted only under `all`. `--mode` is normally unnecessary, but an explicit value is checked by the same ceiling and comes from `acpc agents get <name>`.
 - **This is an approval policy, not a sandbox.** It answers the requests the adapter emits; a delegating mode can still classify some work as safe and emit no request. A real boundary means confining the adapter itself: a container, a dedicated user, or the vendor's own sandbox.
 
 ## Agent variants
@@ -121,7 +121,7 @@ Three edges worth internalizing:
 A named TOML entry bundles model, effort, permissions, an optional mode override, home and environment, so `run builder "task"` replaces five flags:
 
 ```toml
-# ~/.acpc/agents/builder.toml — hand-editable; `agents init` scaffolds this
+# ~/.acpc/agents/builder.toml — hand-editable; `agents create` scaffolds this
 extends = "codex"
 model = "gpt-5.6-luna"
 effort = "xhigh"
@@ -133,9 +133,9 @@ env_passthrough = ["OPENROUTER_API_KEY"]   # names read from the caller's env, n
 MODEL_PROVIDER = "openrouter"
 ```
 
-The `home` field is the provider switch: OpenAI vs OpenRouter vs a local endpoint is just a different vendor home. Resolution stays fully inspectable — `acpc agents builder` shows what the entry resolves to with per-field provenance, `run --dry-run` shows one concrete call.
+The `home` field is the provider switch: OpenAI vs OpenRouter vs a local endpoint is just a different vendor home. Resolution stays fully inspectable — `acpc agents get builder` shows what the entry resolves to with per-field provenance, `run --resolve` shows one concrete call.
 
-`--model fast|standard|max` resolves through the adapter's preset table (overridable per adapter in `agents/`). When the vendor advertises new model ids, upgrade that adapter's binary first, then `acpc skills refresh-adapter-models` — it writes only the operator overlay, after a confirm. The adapter's environment is **constructed, not inherited**: a base system set, capability variables (ssh agent, proxies, CA bundles), and the entry's declared env — the rest of your ambient environment never reaches the adapter.
+`--model fast|standard|max` resolves through the adapter's preset table (overridable per adapter in `agents/`). When the vendor advertises new model ids, upgrade that adapter's binary first, then `acpc skills get refresh-adapter-models` — it writes only the operator overlay, after a confirm. The adapter's environment is **constructed, not inherited**: a base system set, capability variables (ssh agent, proxies, CA bundles), and the entry's declared env — the rest of your ambient environment never reaches the adapter.
 
 ## Teaching agents about acpc
 

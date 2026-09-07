@@ -81,6 +81,8 @@ def invoke(cli: CliRunner, *args: str):
         (("agents", "mock"), "acpc agents get"),
         (("skills", "provider-bringup"), "acpc skills get"),
         (("agents", "--check"), "acpc agents check"),
+        (("agents", "--json"), "acpc agents list --json"),
+        (("skills", "--json"), "acpc skills list --json"),
         (("agents", "init", "variant", "--extends", "mock"), "agents create"),
         (("rm", "abcd"), "acpc delete"),
         (("stop", "abcd"), "acpc cancel"),
@@ -106,6 +108,25 @@ def test_agents_check_without_name_is_a_bounded_collection(cli: CliRunner) -> No
     assert set(payload) == {"items", "has_more"}
     assert len(payload["items"]) <= 1
     assert isinstance(payload["has_more"], bool)
+
+
+@pytest.mark.parametrize("flag", ["--limit", "--plain"])
+def test_agents_check_rejects_collection_flags_with_a_name(cli: CliRunner, flag: str) -> None:
+    extra = (flag, "1") if flag == "--limit" else (flag,)
+    result = invoke(cli, "agents", "check", "mock", *extra)
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert "only supported when checking all agents" in result.stderr
+
+
+def test_agents_check_help_explains_name_and_default_scope(cli: CliRunner) -> None:
+    result = invoke(cli, "agents", "check", "--help")
+
+    assert result.exit_code == vocab.EXIT_OK
+    help_text = " ".join(result.stdout.split())
+    assert "With NAME, check one registered entry" in help_text
+    assert "Without NAME, check every registered adapter and variant" in help_text
+    assert "only valid without NAME" in help_text
 
 
 def test_agents_list_shows_variant_delta(cli: CliRunner) -> None:

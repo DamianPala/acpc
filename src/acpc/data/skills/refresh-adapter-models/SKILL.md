@@ -21,7 +21,7 @@ only target. Investigate first; write only after step 5 yes.
 ## 1. Update the adapter
 
 The advertised list is whatever `command` currently speaks. A stale
-binary cannot grow new ids. Update that process **before** `--check`.
+binary cannot grow new ids. Update that process **before** `agents check`.
 
 - Entry has `install_command` → propose `acpc install $NAME --yes` (same
   trusted one-liner; `--yes` is what carries your ask into a call that
@@ -30,15 +30,15 @@ binary cannot grow new ids. Update that process **before** `--check`.
   the `grok` CLI). Ask; do not invent `curl | bash`.
 - Binary missing → same path, still ask. Do not silently install.
 
-Then `acpc agents --check "$NAME"`. If check still fails, stop — the
+Then `acpc agents check "$NAME"`. If check still fails, stop — the
 catalogue is not trustworthy.
 
 ## 2. Which entry
 
 ```bash
 NAME=<adapter>          # stem: acpc run $NAME
-acpc agents             # roster
-acpc agents "$NAME"     # resolved entry + base_adapter
+acpc agents list         # roster
+acpc agents get "$NAME"  # resolved entry + base_adapter
 OVERLAY="${ACPC_HOME:-$HOME/.acpc}/agents/${NAME}.toml"
 ```
 
@@ -54,15 +54,15 @@ into the package later.
 
 ## 3. Catalogue
 
-Read, do not edit: `acpc agents "$NAME"`, `$OVERLAY` if it exists. Record
+Read, do not edit: `acpc agents get "$NAME"`, `$OVERLAY` if it exists. Record
 current `fast` / `standard` / `max` and every `[effort_by_model]` key. Do
 not copy rows from another adapter's TOML.
 
 Stale cache is yesterday's list:
 
 ```bash
-acpc agents --check "$NAME"      # live probe; refreshes cache
-acpc agents "$NAME" --models     # advertised ids + current presets
+acpc agents check "$NAME"        # live probe; refreshes cache
+acpc agents get "$NAME" --models # advertised ids + current presets
 acpc run "$NAME" "x" --resolve   # today's default (no --model)
 ```
 
@@ -178,7 +178,7 @@ key and comment. Date the catalogue comment.
 ## 6. Prove the overlay
 
 ```bash
-acpc agents "$NAME"
+acpc agents get "$NAME"
 acpc run "$NAME" "x" --resolve
 acpc run "$NAME" --model fast --resolve
 acpc run "$NAME" --model standard --resolve
@@ -194,7 +194,7 @@ Report `$OVERLAY` and the diff.
 
 | Symptom | Actually means |
 |---|---|
-| `--models` without `--check` | Yesterday's catalogue. |
+| `agents get --models` without `agents check` | Yesterday's catalogue. |
 | Edit `src/acpc/data/agents/` | Wrong tree. Overlay only. |
 | Live turn exit 0, docs omit the level | Silent fallback. Do not write that level. |
 | First row on an empty map | Unlisted models leave the global scale. Name it. |

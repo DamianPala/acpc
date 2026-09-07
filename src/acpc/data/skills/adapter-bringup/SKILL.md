@@ -36,7 +36,7 @@ keyed by **filename**:
 | `<name>.toml` with `command`, no `extends` | **this** skill: new base adapter |
 | same name as a shipped adapter | field overrides; catalogue refresh is `refresh-adapter-models` |
 
-Read a shipped TOML only as a **field catalogue** (`acpc agents claude`), never
+Read a shipped TOML only as a **field catalogue** (`acpc agents get claude`), never
 as a modes or presets table to copy.
 
 ## Ladder
@@ -111,7 +111,7 @@ env_passthrough = [
 ```
 
 ```bash
-acpc agents "$NAME"
+acpc agents get "$NAME"
 acpc run "$NAME" "x" --resolve   # must refuse: empty [modes] — that is correct
 acpc probe "$NAME" --discover    # works without [modes]; never edits the entry
 ```
@@ -200,7 +200,7 @@ When that fails (Method not found / unknown option), use entry overrides:
 ### 6. Dry-run, then a trivial turn
 
 ```bash
-acpc agents "$NAME"
+acpc agents get "$NAME"
 acpc run "$NAME" "x" --resolve
 acpc run "$NAME" "Reply with exactly: OK" --timeout 180
 ```
@@ -212,8 +212,8 @@ name login / missing passthrough — fix env, do not widen permissions.
 
 ```bash
 acpc daemon status "$NAME"    # own target when home/env differ
-acpc agents --check "$NAME"   # live apply of resolved options; zero turns
-# (skip --check model/effort asserts if those options are unsupported)
+acpc agents check "$NAME"      # live apply of resolved options; zero turns
+# (skip model/effort assertions if those options are unsupported)
 ```
 
 - Own `home` ⇒ own daemon target.
@@ -273,7 +273,7 @@ Shape references (not values to copy): package `data/agents/claude.toml`,
 ## When you are done
 
 ```bash
-acpc agents "$NAME"
+acpc agents get "$NAME"
 acpc probe "$NAME" --discover
 acpc run "$NAME" "Reply with exactly: OK" --timeout 180
 ```

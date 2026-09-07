@@ -41,7 +41,7 @@ and 5**, nothing else: the plumbing is proven, the model is not.
 
 **On a miss**, climb all seven rungs. `references/openrouter.md`, in this skill's
 directory, carries both pairs anonymized plus what differs between the two
-harnesses; `acpc skills <name>` prints that directory on stderr.
+harnesses; `acpc skills get <name>` prints that directory on stderr.
 
 Keep the convention when you add a combination: the next agent should find
 comments in your entry, not a longer version of this table.
@@ -125,7 +125,7 @@ variant (`extends`); a base adapter with `command` and no `extends` is
 `adapter-bringup` (empty `[modes]`, discovery, first mode table).
 
 ```bash
-acpc agents <name>              # what the entry resolves to, with provenance
+acpc agents get <name>          # what the entry resolves to, with provenance
 acpc run <name> "x" --resolve   # what this call resolves to, incl. env
 acpc run <name> "Reply with exactly: OK" --timeout 180
 ```

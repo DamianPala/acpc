@@ -26,6 +26,7 @@ import os
 import re
 import shutil
 import signal
+import subprocess
 import sys
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from copy import deepcopy
@@ -47,10 +48,11 @@ from acpc import (
 )
 from acpc.client import AcpcClient
 from acpc.permissions import PermissionLevel
+from acpc.proc import process_group_kwargs
 from acpc.registry import AgentRegistry, CallResolution, ModeSpec, RegistryError, ResolvedEntry
 from acpc.spawn import spawn_adapter
 
-# SPEC.md `stop`: graceful cancel with a bounded wait for the ack (10s) — if
+# SPEC.md `cancel`: graceful cancellation with a bounded wait for the ack (10s) — if
 # the callee does not wind down in time, the connection is torn down anyway.
 CANCEL_ACK_TIMEOUT = 10.0
 
@@ -1223,27 +1225,22 @@ def _write_direct_request(session_id: str, request: TurnRequest) -> None:
 def start_direct_worker(session_id: str, request: TurnRequest) -> int:
     """Start a detached direct worker and return its process id.
 
-    POSIX uses ``posix_spawn`` so the worker is not joined when the observing
-    client exits. Windows uses ``spawnve``; the worker redirects its standard
-    streams before reading the private request file.
+    The worker gets a new process session or group and no terminal streams, so
+    closing the observing client's terminal cannot signal the accepted turn.
     """
     _write_direct_request(session_id, request)
     argv = (sys.executable, "-m", "acpc.direct_worker", session_id)
     env = dict(os.environ)
     env[_DIRECT_WORKER_ENV] = "1"
-    if os.name == "posix":
-        devnull = os.open(os.devnull, os.O_RDWR)
-        actions = [
-            (os.POSIX_SPAWN_DUP2, devnull, 0),
-            (os.POSIX_SPAWN_DUP2, devnull, 1),
-            (os.POSIX_SPAWN_DUP2, devnull, 2),
-            (os.POSIX_SPAWN_CLOSE, devnull),
-        ]
-        try:
-            return os.posix_spawn(sys.executable, argv, env, file_actions=actions)
-        finally:
-            os.close(devnull)
-    return os.spawnve(os.P_NOWAIT, sys.executable, argv, env)
+    process = subprocess.Popen(
+        argv,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        **process_group_kwargs(),
+    )
+    return process.pid
 
 
 async def _execute_direct_with_wait_timeout(

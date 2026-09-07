@@ -78,6 +78,7 @@ _DESCRIPTIONS = "_acpc_schema_descriptions"
 _STDIN = "_acpc_schema_stdin"
 _STREAM = "_acpc_schema_stream"
 _FORMAT_DEFAULTS = "_acpc_schema_format_defaults"
+_DISPATCHES_WITHOUT_COMMAND = "_acpc_schema_dispatches_without_command"
 
 
 class SchemaError(Exception):
@@ -123,6 +124,17 @@ def reads_stdin[C: click.Command](*names: str) -> Callable[[C], C]:
 def emits_record_stream[C: click.Command](command: C) -> C:
     """Mark a command whose success is a stream of records, not one document."""
     setattr(command, _STREAM, True)
+    return command
+
+
+def dispatches_without_command[C: click.Group](command: C) -> C:
+    """Mark a group whose callback performs useful work without a subcommand.
+
+    Apply this to a Click group only when invoking that group without a
+    subcommand executes its operation. Groups that only print help or explain
+    a missing subcommand remain unmarked and are published as prefixes.
+    """
+    setattr(command, _DISPATCHES_WITHOUT_COMMAND, True)
     return command
 
 
@@ -311,7 +323,7 @@ def _walk(group: click.Group, prefix: tuple[str, ...] = ()) -> Iterator[tuple[st
             # A group may use ``invoke_without_command`` to produce a usage
             # error or help.  Only a group explicitly marked as doing useful
             # work without a subcommand is itself a dispatchable command.
-            if getattr(command, "_acpc_dispatches_without_command", False):
+            if getattr(command, _DISPATCHES_WITHOUT_COMMAND, False):
                 yield " ".join(path), command
             yield from _walk(command, path)
         else:
