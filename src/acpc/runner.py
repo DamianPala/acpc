@@ -1607,8 +1607,15 @@ def auto_prune(retention_seconds: float) -> None:
         sessions.prune_sessions(older_than=retention_seconds)
 
 
-def resolution_payload(resolution: CallResolution, *, cwd: str | None) -> dict[str, Any]:
-    """The `--resolve` view: every resolved value and where it came from."""
+def resolution_payload(
+    resolution: CallResolution, *, cwd: str | None, permissions_source: str | None = None
+) -> dict[str, Any]:
+    """The `--resolve` view: every resolved value and where it came from.
+
+    `permissions_source` names an origin provenance cannot see, because the
+    policy did not come from the entry, a flag or acpc's own default — it was
+    typed at a prompt, or it will be, once this call is really dispatched.
+    """
     entry = resolution.entry
     provenance: Mapping[str, Any] = resolution.provenance
     fields: dict[str, Any] = {
@@ -1625,6 +1632,8 @@ def resolution_payload(resolution: CallResolution, *, cwd: str | None) -> dict[s
         }
         for name, value in fields.items()
     }
+    if permissions_source is not None:
+        resolved["permissions"]["source"] = permissions_source
     if resolution.permissions_clamp is not None:
         requested, ceiling = resolution.permissions_clamp
         permissions = resolved["permissions"]

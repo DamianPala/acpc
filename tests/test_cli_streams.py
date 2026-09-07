@@ -9,7 +9,6 @@ import json
 import os
 import pty
 import sys
-from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
@@ -208,62 +207,110 @@ def test_explicit_ask_with_bg_names_bg(cli: CliRunner, monkeypatch: pytest.Monke
     assert "--bg" in result.stderr
 
 
+def test_the_published_default_rule_is_the_rule_acpc_applies(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One assertion over both halves: the sentence acpc publishes, and the code.
+
+    Two terminals are not enough on their own, and a descriptor that said so
+    would send a person to `--json` expecting to approve edits and get a run
+    that denied them without asking.
+    """
+    described = json.loads(invoke(cli, "schema", "run").stdout)
+    permissions = next(flag for flag in described["flags"] if flag["name"] == "permissions")
+    assert (
+        "stdin and stdout both terminals, no --json, NO_INPUT unset" in permissions["description"]
+    )
+
+    streams(monkeypatch, stdin=True, stdout=True)
+    machine = invoke(cli, "run", "mock", "probe", "--resolve", "--json")
+    assert json.loads(machine.stdout)["resolved"]["permissions"]["value"] == "read"
+
+    monkeypatch.setenv("NO_INPUT", "1")
+    assert resolved_policy(cli) == "read"
+
+
 # --- one stream never reclassifies another -----------------------------------
 
 
 def test_a_terminal_on_stdin_does_not_change_the_output_format(
     cli: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """No `--json` here: with it, the flag and not the classification decides."""
     streams(monkeypatch, stdin=True, stdout=False)
+    with_a_terminal = invoke(cli, "run", "mock", "probe", "--resolve")
 
-    result = invoke(cli, "run", "mock", "probe", "--resolve", "--json")
+    streams(monkeypatch, stdin=False, stdout=False)
+    without_one = invoke(cli, "run", "mock", "probe", "--resolve")
 
-    assert result.exit_code == vocab.EXIT_OK
-    assert json.loads(result.stdout)["entry"] == "mock"
+    assert with_a_terminal.exit_code == vocab.EXIT_OK
+    assert without_one.exit_code == vocab.EXIT_OK
+    assert with_a_terminal.stdout.startswith("entry")
+    assert without_one.stdout.startswith("entry")
 
 
 # --- `--bg` asks for a policy instead of lowering one -------------------------
 
 
-def answer_policy_prompt(monkeypatch: pytest.MonkeyPatch, answer: str | None) -> list[str]:
-    """Stand in for the terminal and record what it was offered."""
+def answer_on_the_terminal(monkeypatch: pytest.MonkeyPatch, reply: str | None) -> list[str]:
+    """Stand in for `/dev/tty` itself; `None` is end of input, not an answer.
+
+    Substituted at the boundary, so `ask_choice` stays under test: what it
+    does with an answer outside the offered set, or with a bare Enter, is part
+    of what these tests are checking.
+    """
     seen: list[str] = []
 
-    def ask(question: str, *, choices: Sequence[str], default: str) -> str | None:
+    def ask(question: str) -> str | None:
         seen.append(question)
-        assert "ask" not in choices
-        assert default == "read"
-        return answer
+        return reply
 
-    monkeypatch.setattr(interaction, "ask_choice", ask)
+    monkeypatch.setattr(interaction, "_ask_on_tty", ask)
     return seen
 
 
-def test_bg_at_a_terminal_asks_which_policy_to_detach_with(
-    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    streams(monkeypatch, stdin=True, stdout=True)
-    asked = answer_policy_prompt(monkeypatch, "edit")
+def no_terminal_to_ask_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A platform with no `/dev/tty` to open — every Windows console."""
 
-    assert resolved_policy(cli, "--bg") == "edit"
+    def unavailable(question: str) -> str | None:
+        raise interaction.TerminalUnavailable("no controlling terminal")
+
+    monkeypatch.setattr(interaction, "_ask_on_tty", unavailable)
+
+
+def dispatched_policy(cli: CliRunner, *args: str) -> tuple[str, str | None]:
+    """Dispatch for real and read back the policy and its source from `meta.json`.
+
+    `--bg` is what is under test, so the answer has to come out of the session
+    it detached, not out of a preview that no longer resolves one.
+    """
+    result = invoke(cli, "run", "mock", "write-file:background.md", "--bg", "--name", "det", *args)
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    stored = sessions.read_meta(sessions.resolve_selector("det")).resolution
+    return stored["resolved"]["permissions"]["value"], stored.get("permissions_source")
+
+
+def test_bg_at_a_terminal_asks_which_policy_to_detach_with(
+    cli: CliRunner, live_daemon: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # No `--json`: it would revoke the interactive context and with it the
+    # prompt, so the session is found by the name it was dispatched under.
+    streams(monkeypatch, stdin=True, stdout=True)
+    asked = answer_on_the_terminal(monkeypatch, "edit")
+
+    assert dispatched_policy(cli)[0] == "edit"
     assert len(asked) == 1
     assert "--bg" in asked[0]
 
 
-def test_the_policy_chosen_for_bg_reaches_the_session(
+def test_a_policy_typed_at_the_prompt_is_not_recorded_as_a_default(
     cli: CliRunner, live_daemon: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """`default` would claim acpc picked it; a person did."""
     streams(monkeypatch, stdin=True, stdout=True)
-    answer_policy_prompt(monkeypatch, "edit")
+    answer_on_the_terminal(monkeypatch, "edit")
 
-    # No `--json` here: it would revoke the interactive context and with it
-    # the prompt, so the session is found by the name it was dispatched under.
-    result = invoke(cli, "run", "mock", "write-file:background.md", "--bg", "--name", "detached")
-
-    assert result.exit_code == vocab.EXIT_OK
-    session_id = sessions.resolve_selector("detached")
-    stored = sessions.read_meta(session_id).resolution["resolved"]["permissions"]["value"]
-    assert stored == "edit"
+    assert dispatched_policy(cli)[1] == "answered"
 
 
 def test_bg_without_a_terminal_asks_nothing_and_defaults_to_read(
@@ -275,16 +322,96 @@ def test_bg_without_a_terminal_asks_nothing_and_defaults_to_read(
     assert resolved_policy(cli, "--bg") == "read"
 
 
+def test_bg_falls_back_to_read_when_no_terminal_can_be_opened(
+    cli: CliRunner, live_daemon: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both streams look like terminals, but the platform has none to open.
+
+    The question was never put, so there is no silence to read as consent and
+    nothing to refuse the call over: the policy takes its floor, and says so.
+    """
+    streams(monkeypatch, stdin=True, stdout=True)
+    no_terminal_to_ask_on(monkeypatch)
+
+    assert dispatched_policy(cli) == ("read", "default")
+
+
 def test_an_unanswered_policy_prompt_fails_instead_of_defaulting(
     cli: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The terminal opened and said nothing — that is a refusal, not `read`."""
     streams(monkeypatch, stdin=True, stdout=True)
-    answer_policy_prompt(monkeypatch, None)
+    answer_on_the_terminal(monkeypatch, None)
 
-    result = invoke(cli, "run", "mock", "probe", "--bg", "--resolve")
+    result = invoke(cli, "run", "mock", "probe", "--bg")
 
     assert result.exit_code == vocab.EXIT_USAGE
     assert "--permissions" in result.stderr
+
+
+def test_ask_is_not_on_offer_at_the_policy_prompt(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nobody stays attached to answer, so `ask` is not a choice `--bg` accepts."""
+    streams(monkeypatch, stdin=True, stdout=True)
+    asked = answer_on_the_terminal(monkeypatch, "ask")
+
+    result = invoke(cli, "run", "mock", "probe", "--bg")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert "ask" not in asked[0].split("[", 1)[1].split("]", 1)[0]
+
+
+def test_bg_with_an_explicit_policy_asks_nothing(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    streams(monkeypatch, stdin=True, stdout=True)
+    forbid_prompt(monkeypatch)
+
+    assert resolved_policy(cli, "--bg", "--permissions", "execute") == "execute"
+
+
+# --- `--resolve` previews the call and asks nobody anything -------------------
+
+
+def test_resolve_under_bg_asks_nothing_and_reports_the_policy_as_unresolved(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A preview starts nothing, so it has no business holding a terminal."""
+    streams(monkeypatch, stdin=True, stdout=True)
+    forbid_prompt(monkeypatch)
+
+    result = invoke(cli, "run", "mock", "probe", "--bg", "--resolve")
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    assert "permissions  · (asked at dispatch)" in result.stdout
+
+
+def test_two_previews_of_the_same_bg_call_agree(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A preview that asked would report whatever it was told, twice over."""
+    streams(monkeypatch, stdin=True, stdout=True)
+    answer_on_the_terminal(monkeypatch, "edit")
+
+    first = invoke(cli, "run", "mock", "probe", "--bg", "--resolve")
+    second = invoke(cli, "run", "mock", "probe", "--bg", "--resolve")
+
+    assert first.exit_code == vocab.EXIT_OK
+    assert first.stdout == second.stdout
+
+
+def test_a_refused_call_is_refused_before_anyone_is_asked(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No point spending an answer on a call that cannot be dispatched."""
+    streams(monkeypatch, stdin=True, stdout=True)
+    forbid_prompt(monkeypatch)
+
+    result = invoke(cli, "run", "mock", "--prompt-file", "no-such-file.md", "--bg")
+
+    assert result.exit_code != vocab.EXIT_OK
+    assert "no-such-file.md" in result.stderr
 
 
 def _choose_under_a_pty(answer: str) -> tuple[str, str]:

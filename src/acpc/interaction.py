@@ -1,6 +1,6 @@
 """What acpc may ask the caller, and the gate in front of a mutation.
 
-Two rules live here, and they are deliberately not one.
+Two rules live here, and they answer two different questions.
 
 `interactive_context` answers *may acpc ask at all*: stdin is a terminal, the
 selected stdout format is readable by a person, and `NO_INPUT` is empty or
@@ -21,6 +21,12 @@ purpose — a test replaces one and gets the whole tool's answer, rather than
 patching whichever module it happened to reach.  This module deliberately
 knows nothing about `cli`: the question "may acpc ask?" belongs below the
 command layer, where the session store and the runner can also ask it.
+
+Silence and an absent terminal are also two different answers.  A caller that
+was asked and said nothing agreed to nothing, and every form of that arrives
+as `None`.  A caller that could not be asked at all — no controlling terminal,
+which is every Windows console, where `/dev/tty` does not exist — was not
+consulted, and `TerminalUnavailable` says so instead of passing for silence.
 """
 
 import os
@@ -32,6 +38,16 @@ from acpc.errors import AcpcError
 
 # The caller says nothing may be asked of it, whatever the terminals suggest.
 NO_INPUT = "NO_INPUT"
+
+
+class TerminalUnavailable(Exception):
+    """No terminal could be opened, so the question was never put.
+
+    Distinct from an unanswered question on purpose: a caller that stayed
+    silent refused, while a caller that was never reachable did nothing at
+    all.  Each command decides for itself what an unasked question means —
+    a confirmation stays unconfirmed, a policy falls back to its floor.
+    """
 
 
 def stdin_is_tty() -> bool:
@@ -77,18 +93,24 @@ def ask_by_default() -> bool:
 def why_not_interactive() -> str | None:
     """Why acpc may not ask, as a clause; `None` when it may.
 
-    Three different situations hide behind "not interactive", and a caller
-    told the wrong one goes looking for the wrong fix — someone sitting at a
-    terminal does not need to be told to find one.  The caller's own
-    instructions come first, because those are what it can take back.
+    Every reason that holds is named, not just the first.  Reporting one of
+    several sends the caller round the loop for each: it withdraws `--json`,
+    calls again and meets the missing terminal that was there all along.  The
+    reasons it cannot take back come first, because those decide the answer
+    however the rest are changed.
     """
-    if no_input():
-        return "cannot be used while NO_INPUT is set, which forbids every prompt"
-    if errors.machine_format_selected():
-        return "cannot be used with --json, which forces a non-interactive context"
+    reasons = []
     if not stdin_is_tty():
-        return "needs a terminal to ask on"
-    return None
+        reasons.append("needs a terminal to ask on")
+    if errors.machine_format_selected():
+        reasons.append("cannot be used with --json, which forces a non-interactive context")
+    if no_input():
+        reasons.append("cannot be used while NO_INPUT is set, which forbids every prompt")
+    if not reasons:
+        return None
+    if len(reasons) == 1:
+        return reasons[0]
+    return f"{', '.join(reasons[:-1])} and {reasons[-1]}"
 
 
 def _ask_on_tty(question: str) -> str | None:
@@ -102,6 +124,10 @@ def _ask_on_tty(question: str) -> str | None:
     End of input is not an answer.  A closed terminal, a killed reader, a
     heredoc that ran out — none of them agreed to anything, and each arrives
     here as `None` so no caller can mistake it for a choice.
+
+    A terminal that will not open at all is `TerminalUnavailable`, which is a
+    different fact: there was nobody to ask, rather than somebody who declined
+    to answer.
     """
     try:
         with (
@@ -111,8 +137,8 @@ def _ask_on_tty(question: str) -> str | None:
             ask.write(question)
             ask.flush()
             line = answer.readline()
-    except OSError:
-        return None
+    except OSError as error:
+        raise TerminalUnavailable(str(error)) from error
     if line == "":
         return None
     return line.strip()
@@ -122,8 +148,13 @@ def ask_yes_no(question: str, *, default: bool) -> bool:
     """Ask a yes/no question; anything but a yes is a no.
 
     `default` only covers a bare Enter — silence is a no regardless of it.
+    An unreachable terminal is a no for the same reason: a confirmation that
+    was never given cannot be read as one, whatever stopped it being asked.
     """
-    reply = _ask_on_tty(question)
+    try:
+        reply = _ask_on_tty(question)
+    except TerminalUnavailable:
+        return False
     if reply is None:
         return False
     if not reply:
@@ -137,6 +168,9 @@ def ask_choice(question: str, *, choices: Sequence[str], default: str) -> str | 
     Silence and an answer outside `choices` are both `None`: neither is a
     selection, and guessing which one a typo meant would hand out a policy
     nobody named.  A bare Enter takes `default`, which the question shows.
+
+    `TerminalUnavailable` propagates: what an unasked question means depends
+    on what was being chosen, and only the caller knows that.
     """
     reply = _ask_on_tty(question)
     if reply is None:

@@ -749,12 +749,20 @@ def _updated_session_resolution(
     return payload
 
 
+# The source of a policy a person typed at the `--bg` prompt: neither `unset`
+# (somebody did set it) nor `default` (acpc did not pick it).
+PERMISSIONS_ANSWERED = "answered"
+# What a `--resolve` preview reports instead of putting that question itself.
+PERMISSIONS_ASKED_AT_DISPATCH = "asked at dispatch"
+
+
 def _resolve_permissions(
     explicit: str | None,
     resolution: CallResolution,
     *,
     background: bool = False,
-) -> tuple[str, tuple[str, str] | None]:
+    preview: bool = False,
+) -> tuple[str | None, tuple[str, str] | None, str | None]:
     """Settle the permission policy against the streams this call was given.
 
     Two separate questions (see `interaction`): whether acpc may ask at all,
@@ -764,13 +772,21 @@ def _resolve_permissions(
 
     `--bg` is the one case that neither answers.  Accepting the work instead
     of waiting for it may change only how long the command waits, never what
-    the callee may do, so `--bg` no longer quietly drops the default to
-    `read`: it asks for the policy up front and carries the answer into the
-    session.
+    the callee may do, so it asks for the policy up front and carries the
+    answer into the session rather than quietly lowering the default.
+
+    Returns the policy, any inherited-ceiling clamp, and a source label when
+    the policy came from somewhere provenance cannot name.  Under `preview`
+    the policy is `None` whenever it would have to be asked for: a preview
+    dispatches nothing, so it reports that the value is chosen later instead
+    of producing an answer the real call would go on to ask for again.
     """
     policy = explicit if explicit is not None else resolution.permissions
+    source: str | None = None
     if policy is None:
-        policy = _default_policy(background=background)
+        policy, source = _default_policy(background=background, preview=preview)
+    if policy is None:
+        return None, None, source
     policy, clamp = _clamp_inherited_ceiling(policy)
     if policy == "ask":
         cause = (
@@ -782,40 +798,50 @@ def _resolve_permissions(
             raise UsageProblem(
                 f"--permissions ask {cause}; pass --permissions none, read, edit, execute or all"
             )
-    return policy, clamp
+    return policy, clamp, source
 
 
-def _default_policy(*, background: bool) -> str:
-    """The policy for a caller that named none."""
+def _default_policy(*, background: bool, preview: bool) -> tuple[str | None, str | None]:
+    """The policy for a caller that named none, and where it came from."""
     if not interaction.ask_by_default():
-        return "read"
+        return "read", None
     if not background:
-        return "ask"
+        return "ask", None
+    if preview:
+        return None, PERMISSIONS_ASKED_AT_DISPATCH
     return _ask_background_policy()
 
 
-def _ask_background_policy() -> str:
+def _ask_background_policy() -> tuple[str, str | None]:
     """Ask once, before dispatch, which policy the detached session runs under.
 
     `ask` is not on offer: nobody will be attached to answer, so accepting it
     here would promise a dialogue that can never happen.  Silence is not
     consent — an unanswered question fails the call by name rather than
     settling on `read` behind the caller's back.
+
+    A terminal that will not open is the other case.  There the question was
+    never put, so there is no silence to read as consent and nothing to fail
+    for: the policy drops to the floor every caller without a terminal gets,
+    and is reported as acpc's own default rather than as an answer.
     """
     choices = list(vocab.PERMISSION_VALUES[:-1])
     default = "read"
-    chosen = interaction.ask_choice(
-        "acpc: --bg detaches this session, so nothing can answer a permission request.\n"
-        f"acpc: policy for this session [{', '.join(choices)}] ({default}): ",
-        choices=choices,
-        default=default,
-    )
+    try:
+        chosen = interaction.ask_choice(
+            "acpc: --bg detaches this session, so nothing can answer a permission request.\n"
+            f"acpc: policy for this session [{', '.join(choices)}] ({default}): ",
+            choices=choices,
+            default=default,
+        )
+    except interaction.TerminalUnavailable:
+        return default, None
     if chosen is None:
         raise UsageProblem(
             "--bg needs a permission policy chosen before it detaches; "
             "pass --permissions none, read, edit, execute or all"
         )
-    return chosen
+    return chosen, PERMISSIONS_ANSWERED
 
 
 def _clamp_inherited_ceiling(policy: str) -> tuple[str, tuple[str, str] | None]:
@@ -2891,10 +2917,11 @@ def _still_running_note(session_id: str, timeout: float | None) -> str:
     metavar="P",
     help=(
         "\b\n"
-        "Permission scale: none, read, edit, execute, all or ask; absent, ask when stdin "
-        "and stdout are both terminals and read otherwise, and --bg asks which policy to "
-        "detach with. ask itself needs a terminal on stdin and refuses under --json, --bg "
-        "or a set NO_INPUT. execute permits read, edit and execute; write and prompt are "
+        "Permission scale: none, read, edit, execute, all or ask; absent, ask when acpc "
+        "could put the question — stdin and stdout both terminals, no --json, NO_INPUT "
+        "unset — and read in every other case, and --bg asks which policy to detach with. "
+        "ask itself needs a terminal on stdin and refuses under --json, --bg or a set "
+        "NO_INPUT. execute permits read, edit and execute; write and prompt are "
         "deprecated aliases for execute and ask."
     ),
 )
@@ -2931,7 +2958,8 @@ def _still_running_note(session_id: str, timeout: float | None) -> str:
     is_flag=True,
     help=(
         "Print what this call resolves to, then exit; nothing is dispatched, so the prompt "
-        "is not read and --bg has no effect."
+        "is not read and no question is put to anyone. Under --bg without --permissions the "
+        "policy and the mode it selects print unresolved, sourced 'asked at dispatch'."
     ),
 )
 @click.option(
@@ -2941,7 +2969,15 @@ def _still_running_note(session_id: str, timeout: float | None) -> str:
     metavar="BYTES",
     help="Cap on stdout bytes; 0 disables the cap.",
 )
-@click.option("--bg", "background", is_flag=True, help="Dispatch and return the session id.")
+@click.option(
+    "--bg",
+    "background",
+    is_flag=True,
+    help=(
+        "Dispatch and return the session id; without --permissions it first asks at the "
+        "terminal which policy to detach with, and it refuses --permissions ask."
+    ),
+)
 @click.option("--quiet", is_flag=True, help="Suppress the stderr summary line.")
 @_json_option("Emit this command's output as JSON.")
 @click.help_option("-h", "--help")
@@ -2966,10 +3002,11 @@ def run_command(
 ) -> None:
     """Dispatch one agent; block and print the final answer.
 
-    The default permission policy is ``ask`` when stdin and stdout are both
-    terminals, and ``read`` otherwise.  ``--bg`` cannot answer a request once
-    it has detached, so it asks for the policy before dispatching instead of
-    lowering it silently.
+    The default permission policy is ``ask`` when acpc could put the question
+    — stdin and stdout both terminals, no ``--json``, ``NO_INPUT`` unset — and
+    ``read`` in every other case.  ``--bg`` cannot answer a request once it has
+    detached, so it asks for the policy before dispatching instead of lowering
+    it silently.
 
     The prompt comes from one source: the argument, ``-`` for stdin, or
     ``--prompt-file``. Whichever it is, acpc reads at most 1 MiB (1048576
@@ -3002,12 +3039,6 @@ def run_command(
         raise _registry_problem(error) from None
 
     defaulted_permissions = permissions is None and resolution.permissions is None
-    policy, permissions_clamp = _resolve_permissions(permissions, resolution, background=background)
-    # The stream-resolved policy is part of the resolved invocation: meta.json
-    # stores everything --resolve shows, and `continue` reuses it verbatim.
-    resolution = _select_resolution(
-        replace(resolution, permissions=policy, permissions_clamp=permissions_clamp)
-    )
     # Resolved to an absolute path here, at the caller: the adapter receives
     # cwd over session/new, so a relative path would be resolved against
     # whatever process hosts the adapter — the daemon's directory, not the
@@ -3016,8 +3047,18 @@ def run_command(
 
     if resolve:
         # A preview of the resolution, not of a mutation: nothing below this
-        # line runs, so no session directory and no daemon come into being.
-        payload = runner.resolution_payload(resolution, cwd=resolved_cwd)
+        # line runs, so no session directory and no daemon come into being,
+        # and nothing is asked of anybody.  A policy the dispatch would ask
+        # for stays unresolved here, along with the mode that policy selects.
+        policy, permissions_clamp, permissions_source = _resolve_permissions(
+            permissions, resolution, background=background, preview=True
+        )
+        previewed = replace(resolution, permissions=policy, permissions_clamp=permissions_clamp)
+        if policy is not None:
+            previewed = _select_resolution(previewed)
+        payload = runner.resolution_payload(
+            previewed, cwd=resolved_cwd, permissions_source=permissions_source
+        )
         _emit_resolution(payload, json_mode=json_mode)
         return
 
@@ -3037,6 +3078,17 @@ def run_command(
         if warning:
             click.echo(f"-- {warning}", err=True)
 
+    # Asked only once the call is known to be dispatchable: a question about a
+    # call acpc is about to refuse spends the caller's attention on nothing.
+    policy, permissions_clamp, permissions_source = _resolve_permissions(
+        permissions, resolution, background=background
+    )
+    # The stream-resolved policy is part of the resolved invocation: meta.json
+    # stores everything --resolve shows, and `continue` reuses it verbatim.
+    resolution = _select_resolution(
+        replace(resolution, permissions=policy, permissions_clamp=permissions_clamp)
+    )
+
     settings = config.load_config()
     runner.auto_prune(settings.retention_seconds)
 
@@ -3048,7 +3100,8 @@ def run_command(
             resolution=runner.session_resolution(
                 resolution,
                 cwd=resolved_cwd,
-                permissions_source="default" if defaulted_permissions else None,
+                permissions_source=permissions_source
+                or ("default" if defaulted_permissions else None),
             ),
             target=runner.call_target(resolution),
             name=alias,
@@ -3268,13 +3321,22 @@ def _dispatch_background(session_id: str, request: runner.TurnRequest, *, json_m
     metavar="P",
     help=(
         "Permission scale for this and later turns: none, read, edit, execute, all or ask; "
-        "the run default is ask when stdin and stdout are both terminals and read otherwise. "
+        "the run default is ask when acpc could put the question — stdin and stdout both "
+        "terminals, no --json, NO_INPUT unset — and read in every other case. "
         "Without this flag, continue reuses its stored policy. write and prompt are "
         "deprecated aliases for execute and ask; --permissions re-runs mode selection against "
         "the adapter's current [modes]."
     ),
 )
-@click.option("--bg", "background", is_flag=True, help="Dispatch and return the session id.")
+@click.option(
+    "--bg",
+    "background",
+    is_flag=True,
+    help=(
+        "Dispatch and return the session id; refused while the policy in effect is ask, "
+        "which needs someone still attached to answer."
+    ),
+)
 @click.option(
     "--timeout",
     type=TimeoutParamType(),

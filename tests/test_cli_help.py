@@ -161,7 +161,10 @@ def test_help_names_behavioral_defaults_and_global_output_default(runner: CliRun
     assert "absent, it blocks indefinitely" in wait_help
     assert "absent, it blocks indefinitely" in log_help
     assert "without --since or --tail, show the last 20 events" in log_help
-    assert "absent, ask when stdin and stdout are both terminals and read otherwise" in run_help
+    assert (
+        "absent, ask when acpc could put the question — stdin and stdout both terminals, "
+        "no --json, NO_INPUT unset — and read in every other case"
+    ) in run_help
     assert "[default: 131072" in run_help
     assert "[default: 131072" in wait_help
     assert "[default: 131072" in log_help
