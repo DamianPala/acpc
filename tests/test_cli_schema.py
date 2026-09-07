@@ -39,6 +39,16 @@ DESCRIPTOR_TYPES = {
     "boolean": bool,
 }
 
+# What each Click type name has to be published as. Anything absent here is a
+# string whose accepted syntax belongs in the description.
+CLICK_TYPES = {
+    "integer": "integer",
+    "integer range": "integer",
+    "float": "number",
+    "float range": "number",
+    "boolean": "boolean",
+}
+
 
 @pytest.fixture(autouse=True)
 def state_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
@@ -156,21 +166,73 @@ def test_only_log_declares_a_record_stream(runner: CliRunner) -> None:
     assert streaming == {"log"}
 
 
-def test_flag_descriptors_cover_every_accepted_flag(runner: CliRunner) -> None:
-    """Including the ones `--help` hides: D8 wants every flag the parser takes."""
+def expected_flag(parameter: click.Option) -> dict[str, Any]:
+    """What a descriptor for this option has to say, read off the parser itself."""
+    spellings = [*parameter.opts, *parameter.secondary_opts]
+    longs = [item for item in spellings if item.startswith("--")]
+    canonical = longs[0] if longs else spellings[0]
+    expected: dict[str, Any] = {
+        "name": canonical.lstrip("-"),
+        "type": "boolean" if parameter.is_flag else CLICK_TYPES.get(parameter.type.name, "string"),
+        "required": parameter.required,
+    }
+    aliases = [item.lstrip("-") for item in spellings if item != canonical]
+    if aliases:
+        expected["aliases"] = aliases
+    if isinstance(parameter.type, click.Choice):
+        expected["enum"] = [str(choice) for choice in parameter.type.choices]
+    if parameter.multiple:
+        expected["repeatable"] = True
+    return expected
+
+
+def accepted_options(name: str) -> list[click.Option]:
+    """Every flag the parser takes for a path, including the hidden ones."""
+    return [
+        parameter
+        for parameter in click_command(name).params
+        if isinstance(parameter, click.Option) and parameter.name != "help"
+    ]
+
+
+def test_flag_descriptors_match_the_parser(runner: CliRunner) -> None:
+    """Every flag the parser takes, published with the contract the parser has.
+
+    A count and a name are not enough: a flag published with the wrong type,
+    the wrong `required`, a stale `enum` or a missing alias is exactly the
+    drift a caller cannot see and the generator exists to prevent.
+    """
+    global_names = {flag["name"] for flag in read_index(runner)["global_flags"]}
     for entry in read_index(runner)["commands"]:
-        command = click_command(entry["name"])
-        accepted = [
-            parameter
-            for parameter in command.params
-            if isinstance(parameter, click.Option) and parameter.name != "help"
-        ]
-        detail = read_detail(runner, entry["name"])
-        assert len(detail["flags"]) == len(accepted), entry["name"]
-        published = {flag["name"] for flag in detail["flags"]}
+        accepted = accepted_options(entry["name"])
+        published = {flag["name"]: flag for flag in read_detail(runner, entry["name"])["flags"]}
+        assert len(published) == len(accepted) - len(global_names), entry["name"]
         for parameter in accepted:
-            spellings = {item.lstrip("-") for item in parameter.opts}
-            assert spellings & published, (entry["name"], parameter.opts)
+            expected = expected_flag(parameter)
+            where = (entry["name"], expected["name"])
+            if expected["name"] in global_names:
+                # D7a: a global flag is published once, in the index.
+                assert expected["name"] not in published, where
+                continue
+            descriptor = published.get(expected["name"])
+            assert descriptor is not None, where
+            for field, value in expected.items():
+                assert descriptor.get(field) == value, (where, field)
+
+
+def test_global_flags_are_exactly_the_flags_every_command_accepts(runner: CliRunner) -> None:
+    """D7a's quantifier, checked: the intersection over `commands`, nothing else."""
+    index = read_index(runner)
+    per_command = [
+        {expected_flag(parameter)["name"] for parameter in accepted_options(entry["name"])}
+        for entry in index["commands"]
+    ]
+    assert per_command
+    intersection = set.intersection(*per_command)
+    assert {flag["name"] for flag in index["global_flags"]} == intersection
+    for flag in index["global_flags"]:
+        assert set(flag) >= {"name", "description", "type", "required"}
+        assert flag["description"].strip()
 
 
 def test_hidden_flags_are_published(runner: CliRunner) -> None:
@@ -187,14 +249,42 @@ def test_hidden_flags_are_published(runner: CliRunner) -> None:
 def test_argument_descriptors_cover_every_accepted_argument(runner: CliRunner) -> None:
     for entry in read_index(runner)["commands"]:
         command = click_command(entry["name"])
-        # `agents <name>` and `skills <name>` are parsed by the view command
-        # the group hands an unrecognized first word to.
-        source = getattr(command, "view_command", command)
+        if isinstance(command, click.Group):
+            # A group's positional argument is parsed elsewhere; that its
+            # descriptor is honoured is what the next test settles.
+            continue
         accepted = [
-            parameter.name for parameter in source.params if isinstance(parameter, click.Argument)
+            parameter.name for parameter in command.params if isinstance(parameter, click.Argument)
         ]
         detail = read_detail(runner, entry["name"])
         assert [arg["name"] for arg in detail["args"]] == accepted, entry["name"]
+
+
+@pytest.mark.parametrize(
+    ("group", "renders"),
+    [
+        ("agents", "Render one named adapter or variant."),
+        ("skills", "Render one named bundled skill."),
+    ],
+)
+def test_every_listed_name_reaches_the_published_argument(
+    runner: CliRunner, group: str, renders: str
+) -> None:
+    """`<group> <name>` takes every name the bare listing shows.
+
+    The descriptor promises a name "as listed by bare `acpc <group>`", so a
+    listed name the parser routes somewhere else makes the published contract
+    false — which is what a name colliding with a subcommand used to do. The
+    help of the call says where it went, and asking for it starts nothing.
+    """
+    assert [arg["name"] for arg in read_detail(runner, group)["args"]] == ["name"]
+    listed = json.loads(invoke(runner, group, "--json").stdout)[group]
+    names = [item["name"] for item in listed]
+    assert names
+    for name in names:
+        result = invoke(runner, group, name, "--help")
+        assert result.exit_code == 0, (name, result.output)
+        assert renders in result.stdout, (name, result.stdout)
 
 
 def test_named_view_arguments_are_optional(runner: CliRunner) -> None:
@@ -225,7 +315,9 @@ def test_no_descriptor_publishes_a_sentinel_default(runner: CliRunner) -> None:
             value = descriptor["default"]
             assert value is not None, where
             assert not descriptor["required"], where
-            assert isinstance(value, DESCRIPTOR_TYPES[descriptor["type"]] | int), where
+            # `bool` and not `int`: a boolean is an int in Python, but a
+            # `type: "string"` descriptor carrying `default: 5` is a lie.
+            assert isinstance(value, DESCRIPTOR_TYPES[descriptor["type"]] | bool), where
 
 
 def test_run_time_resolved_values_are_not_published_as_defaults(runner: CliRunner) -> None:
@@ -283,6 +375,15 @@ def test_unknown_path_names_the_nearest_valid_paths(runner: CliRunner) -> None:
     assert "wait" not in message
 
 
+def test_a_group_prefix_names_the_paths_under_it(runner: CliRunner) -> None:
+    """`schema daemon` is the natural next move after reading `daemon status`."""
+    result = invoke(runner, "schema", "daemon")
+    assert result.exit_code == vocab.EXIT_USAGE
+    message = json.loads(result.stderr.strip().splitlines()[-1])["error"]["message"]
+    assert "daemon status" in message and "daemon stop" in message
+    assert "run" not in message
+
+
 def test_unknown_first_word_names_every_path(runner: CliRunner) -> None:
     result = invoke(runner, "schema", "nope")
     assert result.exit_code == vocab.EXIT_USAGE
@@ -297,6 +398,9 @@ def test_a_quoted_path_is_not_a_path(runner: CliRunner) -> None:
     assert result.exit_code == vocab.EXIT_USAGE
     message = json.loads(result.stderr.strip().splitlines()[-1])["error"]["message"]
     assert "acpc schema agents init" in message
+    # The shell ate the quotes, so the message has to name the difference
+    # rather than repeat the string the caller can already see.
+    assert "one argument" in message and "pass 2 arguments" in message
 
 
 def test_root_help_names_the_introspection_command(runner: CliRunner) -> None:

@@ -19,7 +19,7 @@ command or touching a session directory.
 """
 
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from typing import Any, TypeVar
+from typing import Any
 
 import click
 
@@ -41,10 +41,25 @@ STANDARD_VERSION = "0.1.0-draft.5"
 # command that has a machine shape offers it behind its own `--json`.
 FORMAT_DEFAULTS: dict[str, str] = {"tty": "text", "non_tty": "text"}
 
-# Flags accepted by *every* command.  acpc has none: `--json` is declared per
-# command, because only a command that has a machine-readable result offers
-# it, and `--help` and `--version` are excluded by definition.
-GLOBAL_FLAGS: list[dict[str, Any]] = []
+# Flags accepted by *every* command entry, and therefore not repeated in any
+# D8 document.  A flag belongs here if and only if it is in the intersection
+# of the flags of every entry in `commands` — not because it reads as general
+# purpose.  `--help` and `--version` are excluded by definition; `schema` and
+# the group prefixes are not entries, so they do not narrow the intersection.
+GLOBAL_FLAGS: list[dict[str, Any]] = [
+    {
+        "name": "json",
+        "description": (
+            "Emit this command's result as JSON on stdout instead of text; failures answer "
+            "in the machine envelope either way."
+        ),
+        "type": "boolean",
+        "required": False,
+        "default": False,
+    }
+]
+
+_GLOBAL_FLAG_NAMES = frozenset(flag["name"] for flag in GLOBAL_FLAGS)
 
 # No acpc command starts an interactive session: a permission prompt, the
 # `install` prompt and the `--bg` policy question all ask for one missing
@@ -55,8 +70,6 @@ _DESCRIPTIONS = "_acpc_schema_descriptions"
 _STDIN = "_acpc_schema_stdin"
 _STREAM = "_acpc_schema_stream"
 
-_C = TypeVar("_C", bound=click.Command)
-
 
 class SchemaError(Exception):
     """A command cannot be published: a parameter has no declared contract."""
@@ -66,7 +79,7 @@ def _parameter_names(command: click.Command) -> set[str]:
     return {parameter.name for parameter in command.params if parameter.name}
 
 
-def describes(**descriptions: str) -> Callable[[_C], _C]:
+def describes[C: click.Command](**descriptions: str) -> Callable[[C], C]:
     """Give parameters of the decorated command their one-line contract.
 
     Positional arguments have no other place to carry one, and a flag whose
@@ -74,7 +87,7 @@ def describes(**descriptions: str) -> Callable[[_C], _C]:
     here instead of stretching the help line.
     """
 
-    def apply(command: _C) -> _C:
+    def apply(command: C) -> C:
         unknown = set(descriptions) - _parameter_names(command)
         if unknown:
             raise SchemaError(f"{command.name}: no such parameter: {', '.join(sorted(unknown))}")
@@ -85,10 +98,10 @@ def describes(**descriptions: str) -> Callable[[_C], _C]:
     return apply
 
 
-def reads_stdin(*names: str) -> Callable[[_C], _C]:
+def reads_stdin[C: click.Command](*names: str) -> Callable[[C], C]:
     """Mark the parameters on which `-` selects stdin instead of a file."""
 
-    def apply(command: _C) -> _C:
+    def apply(command: C) -> C:
         unknown = set(names) - _parameter_names(command)
         if unknown:
             raise SchemaError(f"{command.name}: no such parameter: {', '.join(sorted(unknown))}")
@@ -246,9 +259,11 @@ def _args(command: click.Command) -> list[dict[str, Any]]:
 
 
 def _flags(command: click.Command) -> list[dict[str, Any]]:
-    return [
+    """The command's own flags: D8 must not repeat the global ones."""
+    descriptors = (
         _descriptor(parameter, command) for parameter in command.params if _is_own_flag(parameter)
-    ]
+    )
+    return [flag for flag in descriptors if flag["name"] not in _GLOBAL_FLAG_NAMES]
 
 
 def _short_description(command: click.Command) -> str:
@@ -350,7 +365,7 @@ def nearest(known: Mapping[str, click.Command], path: Sequence[str]) -> list[str
     shares.  With no shared prefix at all, every path is equally near, which
     is the whole list — the answer a caller who mistyped the first word needs.
     """
-    for length in range(len(path) - 1, -1, -1):
+    for length in range(len(path), -1, -1):
         prefix = list(path[:length])
         matches = [name for name in known if name.split(" ")[:length] == prefix]
         if matches:

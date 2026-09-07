@@ -663,6 +663,18 @@ def test_agents_init_writes_the_requested_variant_fields(cli: CliRunner, state_r
     assert AgentRegistry(state_root / "agents").resolve("smoke-variant").mode == "plan"
 
 
+@pytest.mark.parametrize("name", ["init", "delete"])
+def test_agents_init_refuses_a_name_that_is_a_subcommand(
+    cli: CliRunner, state_root: Path, name: str
+) -> None:
+    """An entry named after a subcommand would be listed and never reachable."""
+    result = invoke(cli, "agents", "init", name, "--extends", "mock")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert name in result.stderr and "subcommand" in result.stderr
+    assert not (state_root / "agents" / f"{name}.toml").exists()
+
+
 def test_install_returns_one_for_a_failed_definition_command(cli: CliRunner) -> None:
     result = invoke(cli, "install", "phantom", "--yes")
 

@@ -71,11 +71,19 @@ _PROMPT_HELP = (
 
 # Values `TimeoutParamType` accepts, stated wherever one is taken: the type
 # name alone ("duration") does not tell a caller what to write.
-_DURATION_SYNTAX = "seconds, such as 90, or a suffixed value such as 90s, 5m, 1h30m"
+_DURATION_SYNTAX = (
+    "seconds, such as 90, or a value suffixed s, m, h, d or w, such as 90s, 5m, 1h30m"
+)
 
 _OUTPUT_FILE_HELP = (
     "Write the answer to a file; a relative path resolves against the directory acpc was "
     "invoked from, and the file is overwritten."
+)
+
+# The same file, said in full for the schema: `--help` has no room for it.
+_OUTPUT_FILE_DESCRIPTION = (
+    f"{_OUTPUT_FILE_HELP.rstrip('.')}. A leading `~` is expanded, and a missing parent "
+    "directory is created."
 )
 
 _PERMISSION_CHOICES = (*vocab.PERMISSION_VALUES, *vocab.PERMISSION_ALIASES)
@@ -494,16 +502,21 @@ def schema_command(path: tuple[str, ...]) -> None:
         known = schema.commands(main)
         joined = " ".join(path)
         if joined in known:
-            # The path exists; it was quoted into one word. Saying so beats
-            # listing seventeen paths the caller can already see.
+            # The path exists; it was quoted into one word. The shell strips
+            # the quotes before acpc sees them, so the caller is shown the
+            # difference the message is about: one argument, not two.
+            words = len(joined.split(" "))
             raise UsageProblem(
-                f"unknown schema path {joined!r} — pass each segment as its own "
-                f"argument: acpc schema {joined}"
+                f"unknown schema path {joined!r} — that is one argument containing a space; "
+                f"pass {words} arguments: acpc schema {joined}"
             ) from None
-        nearest = schema.nearest(known, path)
-        raise UsageProblem(
-            f"unknown schema path {joined!r} — nearest: {', '.join(repr(name) for name in nearest)}"
-        ) from None
+        listed = ", ".join(repr(name) for name in schema.nearest(known, path))
+        raise UsageProblem(f"unknown schema path {joined!r} — nearest: {listed}") from None
+    except schema.SchemaError as error:
+        # A command was added without the contract the generator needs; the
+        # exception text is the only thing that says which one and what is
+        # missing, so it is the message.
+        raise AcpcError(str(error), kind=errors.OPERATION_FAILED) from None
     _write_stdout(json.dumps(document, ensure_ascii=False, indent=2) + "\n")
 
 
@@ -1595,7 +1608,13 @@ def agents_group(
 
 
 @effects.read_only
-@schema.describes(name="Adapter or variant to render, as listed by bare `acpc agents`.")
+@schema.describes(
+    name=(
+        "Adapter or variant to render, as listed by bare `acpc agents`. A name that is also an "
+        "`acpc agents` subcommand would be parsed as that subcommand, so `acpc agents init` "
+        "refuses to create one."
+    )
+)
 @click.command(name="agent-view")
 @click.argument("name")
 @click.option("--models", is_flag=True, help="Show full advertised presets and models.")
@@ -1712,7 +1731,25 @@ def _agent_entry_path(name: str) -> Path:
 
 
 @effects.non_idempotent
-@schema.describes(name="Name of the variant entry to create; an existing name is a conflict.")
+@schema.describes(
+    name=(
+        "Name of the variant entry to create; an existing name is a conflict. One file name "
+        "under `agents`: it may not be empty, contain `/` or `\\`, be `.` or `..`, or resolve "
+        "outside that directory, and it may not be a subcommand of `acpc agents` (`init`, "
+        "`delete`) — such an entry would be unreachable."
+    ),
+    model="Default model or preset for the variant; absent, the field is left out and the "
+    "entry under --extends decides at run time.",
+    effort="Default reasoning effort for the variant; absent, the field is left out and the "
+    "entry under --extends decides at run time.",
+    mode="Default operating mode for the variant; absent, the field is left out and the "
+    "entry under --extends decides at run time.",
+    permissions="Default permission policy for the variant: none, read, edit, execute, all "
+    "or ask; write and prompt are deprecated aliases. Absent, the field is left out and the "
+    "entry under --extends decides at run time.",
+    home="Vendor home override for the variant; absent, the field is left out and the entry "
+    "under --extends decides at run time.",
+)
 @agents_group.command(name="init")
 @click.argument("name")
 @click.option(
@@ -1754,6 +1791,13 @@ def agents_init_command(
 
     Example: ``acpc agents init work --extends mock --permissions execute``
     """
+    if name in agents_group.commands:
+        # `acpc agents <name>` would dispatch the subcommand, so the entry
+        # would be listed and never reachable. Refuse the name instead.
+        raise UsageProblem(
+            f"invalid agent name '{name}': it is an acpc agents subcommand, so the entry "
+            f"would be unreachable — acpc agents {name} runs the subcommand"
+        )
     permissions = _normalize_permission(permissions)
     try:
         registry = AgentRegistry()
@@ -1814,7 +1858,13 @@ def agents_init_command(
 
 
 @effects.non_idempotent
-@schema.describes(name="Entry under $ACPC_HOME/agents to delete; entries acpc ships are refused.")
+@schema.describes(
+    name=(
+        "Entry under $ACPC_HOME/agents to delete; entries acpc ships are refused. One file name "
+        "under `agents`: it may not be empty, contain `/` or `\\`, be `.` or `..`, or resolve "
+        "outside that directory."
+    )
+)
 @agents_group.command(name="delete")
 @click.argument("name")
 @_json_option("Emit the deleted entry as JSON.")
@@ -1898,7 +1948,12 @@ def skills_group(ctx: click.Context, json_mode: bool) -> None:
 
 
 @effects.read_only
-@schema.describes(name="Bundled skill to render, as listed by bare `acpc skills`.")
+@schema.describes(
+    name=(
+        "Bundled skill to render, as listed by bare `acpc skills`. A name that is also an "
+        "`acpc skills` subcommand would be parsed as that subcommand; no bundled skill is."
+    )
+)
 @click.command(name="skill-view")
 @click.argument("name")
 @_json_option("Emit this view as JSON.")
@@ -2374,7 +2429,17 @@ def status_command(selector: str | None, all_sessions: bool, json_mode: bool) ->
 
 @effects.read_only
 @schema.emits_record_stream
-@schema.describes(selector=_SELECTOR_HELP)
+@schema.describes(
+    selector=_SELECTOR_HELP,
+    since=(
+        "Show only events after this cursor; 0 or greater. Without --since or --tail, "
+        "the last 20 events."
+    ),
+    tail=(
+        "Show only the last N selected events; 0 or greater, and 0 selects none. Without "
+        "--since or --tail, the last 20 events."
+    ),
+)
 @main.command(name="log")
 @click.argument("selector")
 @click.option(
@@ -2786,6 +2851,7 @@ def _still_running_note(session_id: str, timeout: float | None) -> str:
 @schema.describes(
     agent="Registry entry to dispatch: an adapter or a variant, as `acpc agents` lists them.",
     prompt_text=_PROMPT_HELP,
+    output_file=_OUTPUT_FILE_DESCRIPTION,
 )
 @main.command(name="run")
 @click.argument("agent")
@@ -3178,7 +3244,11 @@ def _dispatch_background(session_id: str, request: runner.TurnRequest, *, json_m
 
 @effects.non_idempotent
 @schema.reads_stdin("prompt_text")
-@schema.describes(selector=_SELECTOR_HELP, prompt_text=_PROMPT_HELP)
+@schema.describes(
+    selector=_SELECTOR_HELP,
+    prompt_text=_PROMPT_HELP,
+    output_file=_OUTPUT_FILE_DESCRIPTION,
+)
 @main.command(name="continue")
 @click.argument("selector")
 @click.argument("prompt_text", required=False)
@@ -3287,7 +3357,7 @@ def continue_command(
     alias: str | None,
     resolve: bool,
 ) -> None:
-    """Continue a finished session using its stored adapter resolution.
+    """Continue a finished session; block and print the answer unless ``--bg``.
 
     Model, effort, mode, permissions and home come from the session, not from
     re-resolving the agent entry — editing an entry never changes a session
@@ -3502,6 +3572,7 @@ def _steer_prompt(instruction: str) -> str:
         f"exactly one of the three may be given. At most {vocab.MAX_PROMPT_LABEL} of UTF-8. "
         "An interrupted turn receives it under a fixed preamble."
     ),
+    output_file=_OUTPUT_FILE_DESCRIPTION,
 )
 @main.command(name="steer")
 @click.argument("selector")
@@ -3547,9 +3618,10 @@ def steer_command(
     quiet: bool,
     json_mode: bool,
 ) -> None:
-    """Interrupt the running turn and redirect the session in one verb.
+    """Redirect the running turn; block and print the answer unless ``--bg``.
 
-    Cancels the turn in flight (ACP session/cancel), waits for the ack, then
+    Interrupts the running turn and redirects the session in one verb: cancels
+    the turn in flight (ACP session/cancel), waits for the ack, then
     starts the next turn with the instruction under a fixed preamble. If a
     daemon-owned ``continue`` is still preparing, no prompt has happened: acpc
     cancels that preparation, reports that nothing was interrupted, and sends
@@ -3601,7 +3673,7 @@ def steer_command(
 
 
 @effects.read_only
-@schema.describes(selector=_SELECTOR_HELP)
+@schema.describes(selector=_SELECTOR_HELP, output_file=_OUTPUT_FILE_DESCRIPTION)
 @main.command(name="wait")
 @click.argument("selector")
 @click.option(
