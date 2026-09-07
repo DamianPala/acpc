@@ -84,7 +84,7 @@ def test_root_help_is_a_compact_cheat_sheet(runner: CliRunner) -> None:
         in result.stdout
     )
     assert (
-        "stop <id>         stop a running session; it stays resumable with continue"
+        "cancel <id>       cancel a running session; it stays resumable with continue"
         in result.stdout
     )
 
@@ -139,10 +139,10 @@ def test_every_registered_command_has_helpful_options_and_both_help_spellings(
 
 @pytest.mark.parametrize("spelling", ["-h", "--help"])
 def test_named_agents_view_accepts_both_help_spellings(runner: CliRunner, spelling: str) -> None:
-    result = invoke(runner, "agents", "mock", spelling)
+    result = invoke(runner, "agents", "get", "mock", spelling)
 
     assert result.exit_code == vocab.EXIT_OK
-    assert "Render one named adapter or variant." in result.stdout
+    assert "Show one adapter or variant" in result.stdout
 
 
 def test_help_names_behavioral_defaults_and_global_output_default(runner: CliRunner) -> None:
@@ -155,9 +155,12 @@ def test_help_names_behavioral_defaults_and_global_output_default(runner: CliRun
     wait_help = normalized(invoke(runner, "wait", "--help").stdout)
     log_help = normalized(invoke(runner, "log", "--help").stdout)
 
-    assert "absent, no wall-clock limit (the callee runs until it is done)" in run_help
-    assert "absent, no wall-clock limit (the callee runs until it is done)" in continue_help
-    assert "absent, no wall-clock limit (the callee runs until it is done)" in steer_help
+    assert "the session keeps running" in run_help
+    assert "the session keeps running" in continue_help
+    assert "the session keeps running" in steer_help
+    assert "--cancel-after" in run_help
+    assert "--cancel-after" in continue_help
+    assert "--cancel-after" in steer_help
     assert "absent, it blocks indefinitely" in wait_help
     assert "absent, it blocks indefinitely" in log_help
     assert "without --since or --limit, show the last 20 events" in log_help
@@ -174,14 +177,14 @@ def test_help_explains_session_lifecycle_and_retention(runner: CliRunner) -> Non
     def normalized(text: str) -> str:
         return " ".join(text.split()).replace("mid- conversation", "mid-conversation")
 
-    stop_help = normalized(invoke(runner, "stop", "--help").stdout)
+    stop_help = normalized(invoke(runner, "cancel", "--help").stdout)
     status_help = normalized(invoke(runner, "status", "--help").stdout)
     wait_help = normalized(invoke(runner, "wait", "--help").stdout)
     continue_help = normalized(invoke(runner, "continue", "--help").stdout)
     steer_help = normalized(invoke(runner, "steer", "--help").stdout)
     prune_help = normalized(invoke(runner, "prune", "--help").stdout)
 
-    assert "Stop a running session; it stays resumable with ``acpc continue``." in stop_help
+    assert "Cancel a running session; it stays usable with ``acpc continue``." in stop_help
     assert "Cancels the turn in flight (ACP ``session/cancel``)" in stop_help
     assert "With no id: a bounded collection of sessions." in status_help
     assert "Return at most N sessions" in status_help
@@ -229,7 +232,7 @@ def test_log_help_documents_activity_waiting(runner: CliRunner) -> None:
     assert "Example" in result.stdout
 
 
-@pytest.mark.parametrize("verb", ["stop", "rm", "install"])
+@pytest.mark.parametrize("verb", ["cancel", "delete", "install"])
 def test_short_verbs_have_real_help_pages(runner: CliRunner, verb: str) -> None:
     root_help = invoke(runner, "--help")
     command_help = invoke(runner, verb, "--help")
@@ -247,7 +250,7 @@ def test_no_command_redirects_to_root_help_and_root_keeps_verb_one_liners(
     ]
 
     assert redirected == []
-    for name in ("stop", "rm", "prune", "install"):
+    for name in ("cancel", "delete", "prune", "install"):
         described = [
             line
             for line in root_help.splitlines()
@@ -277,14 +280,14 @@ def test_no_command_redirects_to_root_help_and_root_keeps_verb_one_liners(
             ("status", "--detach"),
             (
                 "Error: --detach is not an acpc flag — background dispatch is: acpc run "
-                '<agent> "<prompt>" --bg'
+                '<agent> "<prompt>" --background'
             ),
         ),
         (
             ("-d",),
             (
                 "Error: --detach is not an acpc flag — background dispatch is: acpc run "
-                '<agent> "<prompt>" --bg'
+                '<agent> "<prompt>" --background'
             ),
         ),
         (

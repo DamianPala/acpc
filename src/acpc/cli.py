@@ -8,6 +8,7 @@ delegates everything else to the layer that owns it.
 import asyncio
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -65,9 +66,12 @@ _SELECTOR_HELP = (
 # source only, `-` for stdin, and the size acpc refuses beyond.
 _PROMPT_HELP = (
     "The prompt, or `-` to read it from stdin; --prompt-file is the third source and "
-    f"exactly one of the three may be given. At most {vocab.MAX_PROMPT_LABEL} of UTF-8, "
+    f"exactly one of the three may be given. At most {vocab.MAX_PROMPT_BYTES} bytes "
+    f"({vocab.MAX_PROMPT_LABEL}) of UTF-8, "
     "refused before anything is created."
 )
+
+_PROMPT_LIMIT_HELP = f"{vocab.MAX_PROMPT_BYTES} bytes ({vocab.MAX_PROMPT_LABEL})"
 
 # Values `TimeoutParamType` accepts, stated wherever one is taken: the type
 # name alone ("duration") does not tell a caller what to write.
@@ -195,6 +199,30 @@ def _emit_turn_result(
         _write_stdout(result.text)
 
 
+def _raise_wait_timeout(session_id: str, output_file: str | None) -> NoReturn:
+    """Fail after a wait deadline without changing the accepted session."""
+    if output_file is not None:
+        output.write_output_file(output_file, "")
+    try:
+        observed = sessions.read_meta(session_id)
+    except (sessions.SessionError, OSError):
+        raise AcpcError(
+            f"session {session_id} timed out and its state could not be observed",
+            kind=errors.OUTCOME_UNKNOWN,
+            retryable=False,
+            context={"session_id": session_id, "status": None},
+            exit_code=vocab.EXIT_AGENT_ERROR,
+        ) from None
+    raise AcpcError(
+        f"session {session_id} timed out while still {observed.state}",
+        kind=errors.TIMEOUT,
+        retryable=True,
+        hint=f"Run: acpc wait {session_id}",
+        context={"session_id": session_id, "status": observed.state},
+        exit_code=vocab.EXIT_TIMEOUT,
+    )
+
+
 def _not_found(message: str, *, hint: str) -> AcpcError:
     """A named target does not exist: exit 1, because the call was well formed.
 
@@ -208,7 +236,7 @@ def _not_found(message: str, *, hint: str) -> AcpcError:
 def _registry_problem(error: RegistryError) -> AcpcError:
     """Classify a registry failure: a missing entry is not a bad flag."""
     if isinstance(error, AgentNotFound):
-        return _not_found(str(error), hint="Run: acpc agents")
+        return _not_found(str(error), hint="Run: acpc agents list")
     if isinstance(error, CorruptEntry):
         # A file acpc reads, not a flag the caller typed: no rewriting of the
         # call fixes it, and the message already names the file to repair.
@@ -285,7 +313,7 @@ def _follow_up_problem(error: Exception, session_id: str) -> AcpcError:
         problem = AcpcError(
             str(error),
             kind=errors.CORRUPT_STATE,
-            hint=f"Run: acpc rm {session_id} --yes to remove the incompatible session state.",
+            hint=f"Run: acpc delete {session_id} --yes to remove the incompatible session state.",
         )
     elif isinstance(error, sessions.SessionError):
         problem = _session_problem(error)
@@ -334,10 +362,10 @@ Short task (fits your tool-call window — blocks, answer on stdout):
   acpc run <agent> "Implement the fix" --permissions execute
   execute permits read, edit and execute; edit permits read and edit only
   Dispatch prints `-- session <id> | dir <path>` on stderr right away:
-  the id works mid-run with log / stop / steer.
+  the id works mid-run with log / cancel / steer.
 
 Long or uncertain task (background):
-  acpc run <agent> "Run the tests" --bg --json    # {"session_id": ..., "paths": ...}
+  acpc run <agent> "Run the tests" --background --json  # {"session_id": ..., "paths": ...}
   acpc wait <id> --quiet                          # block until done, prints the answer
   Truncated or huge answer? Read <dir>/answer.md selectively — always complete.
   In a shell that can background calls, `wait` becomes a completion push.
@@ -373,25 +401,25 @@ Context care (agent callers):
 
 Maintenance and setup:
   status            running + the 20 most recent sessions (--limit N to change)
-  stop <id>         stop a running session; it stays resumable with continue
-  rm <id> --yes     delete a finished session's on-disk state
+  cancel <id>       cancel a running session; it stays resumable with continue
+  delete <id> --yes delete a finished session's on-disk state
   prune --yes       delete finished sessions older than retention (--older-than D)
   install <agent>   install the agent's adapter (--yes unless you are at a terminal)
-  skills            list bundled how-to skills; skills <name> prints the body
-  Killing acpc does not stop the session — acpc stop does.
-  Deleting needs --yes; --dry-run previews prune and bare daemon stop and
+  skills list       list bundled how-to skills; skills get <name> prints the body
+  Killing acpc does not cancel the session — acpc cancel does.
+  Deleting needs --yes; --dry-run previews prune and bare daemon stop, and
   never needs it. --force is separate: it overrides a documented refusal.
 
 Common commands:
   run, continue, steer, wait, status, log, agents, skills, daemon,
-  probe, stop, rm, prune, install
+  probe, cancel, delete, prune, install
   Use `acpc <command> --help` for the command's full reference.
 
 Machine-readable interface:
   acpc schema           the whole command surface as JSON: every command with
                         its description and effects
   acpc schema run       one command's arguments, flags, effects and gates
-                        (path segments are separate words: acpc schema agents init)
+                        (path segments are separate words: acpc schema agents create)
   --json on a command emits that command's own result as JSON.
 
 Flag → ACP
@@ -505,14 +533,31 @@ def _fail(error: AcpcError) -> NoReturn:
     raise SystemExit(error.exit_status) from None
 
 
+def _no_such_option(message: str, spelling: str) -> bool:
+    return any(
+        marker in message
+        for marker in (
+            f"No such option: {spelling}",
+            f"No such option '{spelling}'",
+            f'No such option "{spelling}"',
+        )
+    )
+
+
+def _no_such_command(message: str, spelling: str) -> bool:
+    return f"No such command '{spelling}'" in message or f'No such command "{spelling}"' in message
+
+
 def _friendly_usage_message(message: str, *, command_path: str | None = None) -> str:
     """Replace known neighboring-tool spellings with their acpc equivalents."""
+    command_parts = (command_path or "").split()
     follow_hint = (
         "--follow is not a flag on this command — following a session is: "
         "acpc log <id> --follow [--timeout S]"
     )
     detach_hint = (
-        '--detach is not an acpc flag — background dispatch is: acpc run <agent> "<prompt>" --bg'
+        "--detach is not an acpc flag — background dispatch is: "
+        'acpc run <agent> "<prompt>" --background'
     )
     aliases = {
         "--follow": follow_hint,
@@ -520,49 +565,58 @@ def _friendly_usage_message(message: str, *, command_path: str | None = None) ->
         "--detach": detach_hint,
         "-d": detach_hint,
         "-C": "-C is not an acpc flag — the working-directory flag is --cwd DIR",
+        "--tail": "--tail was renamed to --limit — use acpc log <id> --limit N",
+        "-o": "-o was renamed to --output-file — use --output-file FILE",
+        "--output": "--output was renamed to --output-file — use --output-file FILE",
     }
+    if command_parts[-1:] == ["agents"] and "No such option" in message:
+        replacements = {
+            "--check": "--check moved to: acpc agents check [<name>]",
+            "--models": "--models belongs to: acpc agents get <name> --models",
+            "--commands": "--commands belongs to: acpc agents get <name> --commands",
+            "--limit": "--limit belongs to: acpc agents list --limit N",
+            "--plain": "--plain belongs to: acpc agents list --plain --limit N",
+        }
+        for spelling, replacement in replacements.items():
+            if _no_such_option(message, spelling):
+                return replacement
+    if command_parts[-1:] == ["continue"] and "No such option" in message:
+        for flag in ("--model", "--effort", "--mode", "--cwd", "--home", "--name", "--resolve"):
+            if _no_such_option(message, flag):
+                return f"{flag} is a run-only flag — use acpc run; continue reuses stored settings"
     if "No such option" in message:
         for spelling, replacement in aliases.items():
-            markers = (
-                f"No such option: {spelling}",
-                f"No such option '{spelling}'",
-                f'No such option "{spelling}"',
-            )
-            if any(marker in message for marker in markers):
+            if _no_such_option(message, spelling):
                 return replacement
-    command_parts = (command_path or "").split()
     daemon_group = command_parts[-1:] == ["daemon"]
     daemon_stop = command_parts[-2:] == ["daemon", "stop"]
-    if daemon_stop and "No such option" in message:
-        for marker in (
-            "No such option: --all",
-            "No such option '--all'",
-            'No such option "--all"',
-        ):
-            if marker in message:
-                return (
-                    "--all is not a daemon flag — bare acpc daemon stop already addresses every "
-                    "daemon"
-                )
+    if daemon_stop and "No such option" in message and _no_such_option(message, "--all"):
+        return "--all is not a daemon flag — bare acpc daemon stop already addresses every daemon"
     if daemon_group and "No such command" in message:
         for spelling in ("list", "ls", "ps"):
-            if (
-                f"No such command '{spelling}'" in message
-                or f'No such command "{spelling}"' in message
-            ):
+            if _no_such_command(message, spelling):
                 return f"no such command '{spelling}' — the daemon view is: acpc daemon status"
         for spelling in ("start", "restart"):
-            if (
-                f"No such command '{spelling}'" in message
-                or f'No such command "{spelling}"' in message
-            ):
+            if _no_such_command(message, spelling):
                 return (
                     f"no such command '{spelling}' — daemons start on first use; acpc daemon "
                     "stop <agent> and the next run is the restart"
                 )
-    if "No such command" in message and (
-        "No such command 'logs'" in message or 'No such command "logs"' in message
-    ):
+    if command_parts[-1:] == ["agents"] and "No such command" in message:
+        if any(_no_such_command(message, spelling) for spelling in ("init", "new")):
+            return "agents create is the variant-creation command"
+        return "agents needs a subcommand; use `acpc agents list` or `acpc agents get <name>`"
+    if command_parts[-1:] == ["skills"] and "No such command" in message:
+        return "skills needs a subcommand; use `acpc skills list` or `acpc skills get <name>`"
+    if len(command_parts) == 1 and "No such command" in message:
+        old_commands = {
+            "rm": "delete",
+            "stop": "cancel",
+        }
+        for old, new in old_commands.items():
+            if _no_such_command(message, old):
+                return f"no such command '{old}' — use acpc {new}"
+    if "No such command" in message and (_no_such_command(message, "logs")):
         return "no such command 'logs' — the viewing command is: acpc log <id>"
     return message
 
@@ -1198,7 +1252,9 @@ _ROSTER_DESCRIPTION_LIMIT = 80
 
 def _agent_row(entry: ResolvedEntry) -> tuple[str, ...]:
     status = entry.roster_install_status()
-    description = _roster_description(entry.description, full_command=f"acpc agents {entry.entry}")
+    description = _roster_description(
+        entry.description, full_command=f"acpc agents get {entry.entry}"
+    )
     return (entry.entry, entry.name, status, description)
 
 
@@ -1207,7 +1263,9 @@ def _variant_row(entry: ResolvedEntry) -> tuple[str, ...]:
         field: _local_variant_value(entry, field)
         for field in ("model", "effort", "permissions", "home")
     }
-    description = _roster_description(entry.description, full_command=f"acpc agents {entry.entry}")
+    description = _roster_description(
+        entry.description, full_command=f"acpc agents get {entry.entry}"
+    )
     return (
         entry.entry,
         values["model"] or "·",
@@ -1219,7 +1277,9 @@ def _variant_row(entry: ResolvedEntry) -> tuple[str, ...]:
 
 
 def _skill_row(skill: skills.Skill) -> tuple[str, ...]:
-    description = _roster_description(skill.description, full_command=f"acpc skills {skill.name}")
+    description = _roster_description(
+        skill.description, full_command=f"acpc skills get {skill.name}"
+    )
     return (skill.name, description)
 
 
@@ -1428,7 +1488,7 @@ def _render_entry_detail(
         "env_passthrough": list(entry.env_passthrough),
     }
     if entry.is_variant:
-        lines.append(f"-- modes/models/commands: acpc agents {entry.base_adapter}")
+        lines.append(f"-- modes/models/commands: acpc agents get {entry.base_adapter}")
         return "\n".join(lines) + "\n", payload, None
     return "\n".join(lines) + "\n", payload, entry.base_adapter
 
@@ -1486,236 +1546,46 @@ def _render_commands(
     }
 
 
-class _NamedViewGroup(click.Group):
-    """Treat an unknown first word as the optional named-view argument.
-
-    Subclasses name the command that renders one item; group-level flags the
-    caller already typed are forwarded to it, so `--json <name>` and
-    `<name> --json` are the same call.
-    """
-
-    @property
-    def view_command(self) -> click.Command:
-        """The command that renders one named item."""
-        raise NotImplementedError
-
-    def resolve_command(
-        self, ctx: click.Context, args: list[str]
-    ) -> tuple[str | None, click.Command | None, list[str]]:
-        if args and not args[0].startswith("-") and args[0] not in self.commands:
-            forwarded = list(args)
-            for parameter in self.params:
-                if not isinstance(parameter, click.Option) or not parameter.is_flag:
-                    continue
-                if parameter.name is None or not ctx.params.get(parameter.name):
-                    continue
-                flag = next((option for option in parameter.opts if option.startswith("--")), None)
-                if flag is not None:
-                    forwarded.append(flag)
-            return args[0], self.view_command, forwarded
-        return super().resolve_command(ctx, args)
-
-
-class _AgentsGroup(_NamedViewGroup):
-    """Treat an unknown first word as the optional agent view name."""
-
-    @property
-    def view_command(self) -> click.Command:
-        return _agent_view_command
-
-
-class _SkillsGroup(_NamedViewGroup):
-    """Treat an unknown first word as the optional skill view name."""
-
-    @property
-    def view_command(self) -> click.Command:
-        return _skill_view_command
-
-
-def _models_overview(registry: AgentRegistry) -> tuple[str, dict[str, Any], list[str]]:
-    lines: list[str] = []
-    payload: dict[str, Any] = {"agents": []}
-    footer_agents: list[str] = []
-    for entry in registry.adapters:
-        record = cache.read_advertised(entry.entry)
-        advertised = _advertised_payload(record)
-        models = [str(item) for item in advertised.get("models", [])]
-        lines.append(entry.entry)
-        lines.extend(
-            render.format_table(
-                [
-                    (tier, preset.model, preset.effort or "·")
-                    for tier, preset in entry.presets.items()
-                ],
-                header=("tier", "model", "effort"),
-                prefix="  presets   ",
-                continuation_prefix=" " * 12,
-            )
-        )
-        lines.append("  models    " + (" · ".join(models) if models else "·"))
-        variants = [item for item in registry.variants if item.base_adapter == entry.entry]
-        if variants:
-            lines.extend(
-                render.format_table(
-                    [
-                        (
-                            variant.entry,
-                            _local_variant_value(variant, "model") or "·",
-                            _local_variant_value(variant, "effort") or "·",
-                        )
-                        for variant in variants
-                    ],
-                    header=("entry", "model", "effort"),
-                    prefix="  variants  ",
-                    continuation_prefix=" " * 12,
-                )
-            )
-        payload["agents"].append(
-            {
-                "name": entry.entry,
-                "presets": {
-                    tier: {"model": item.model, "effort": item.effort}
-                    for tier, item in entry.presets.items()
-                },
-                "models": models,
-                "variants": [
-                    {
-                        "name": variant.entry,
-                        "model": _local_variant_value(variant, "model"),
-                        "effort": _local_variant_value(variant, "effort"),
-                    }
-                    for variant in variants
-                ],
-            }
-        )
-        if record is not None:
-            footer_agents.append(
-                f"{entry.entry} {cache.cache_age(record.cached_at)}"
-                if cache.cache_age(record.cached_at) == "now"
-                else f"{entry.entry} {cache.cache_age(record.cached_at)} ago"
-            )
-    lines.append("-- cached: " + " · ".join(footer_agents))
-    return "\n".join(lines) + "\n", payload, footer_agents
-
-
 def _emit_json(payload: Mapping[str, Any]) -> None:
     _write_stdout(json.dumps(dict(payload), ensure_ascii=False) + "\n")
 
 
-def _run_agents_view(
-    name: str | None,
-    models: bool,
-    commands: bool,
-    check_live: bool,
-    json_mode: bool,
-    selected_format: str = "text",
-    limit: int = render.DEFAULT_STATUS_LIMIT,
-    plain: bool = False,
-) -> None:
-    """List adapters and variants, or inspect advertised adapter data."""
-    json_mode = selected_format == "json"
-    if models and commands:
-        raise UsageProblem("--models and --commands are mutually exclusive views")
+def _render_agent_roster(registry: AgentRegistry, items: list[dict[str, Any]], total: int) -> str:
+    selected_names = {str(item["name"]) for item in items}
+    adapter_lines = render.format_table(
+        [_agent_row(adapter) for adapter in registry.adapters if adapter.entry in selected_names],
+        separator="  ",
+    )
+    variants = [variant for variant in registry.variants if variant.entry in selected_names]
+    variant_lines = (
+        render.format_table(
+            [_variant_row(variant) for variant in variants],
+            header=("entry", "model", "effort", "permissions", "home", "description"),
+            prefix="  ",
+            separator="  ",
+        )
+        if variants
+        else []
+    )
+    lines = [*adapter_lines, *variant_lines]
+    if len(items) < total:
+        lines.append(f"-- {len(items)} of {total} — use --limit to change")
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def _run_agents_list(selected_format: str, limit: int, plain: bool) -> None:
+    """Render the bounded adapter and variant collection."""
     try:
         registry = AgentRegistry()
-        if check_live:
-            _agents_check(registry, name, json_mode=json_mode)
-        elif models:
-            if name is None:
-                text, payload, footer = _models_overview(registry)
-                if json_mode:
-                    _emit_json(payload)
-                    click.echo("-- cached: " + " · ".join(footer), err=True)
-                else:
-                    _write_stdout(text)
-            else:
-                entry = registry.resolve(name)
-                _warn_unlisted_effort_model(registry.resolve_call(name))
-                record = _ensure_cache(entry)
-                text, payload = _render_models(entry, record)
-                if json_mode:
-                    _emit_json(payload)
-                    click.echo(_cache_footer(record), err=True)
-                else:
-                    _write_stdout(text)
-        elif commands:
-            if name is None:
-                raise UsageProblem("--commands requires an agent name")
-            entry = registry.resolve(name)
-            record = _ensure_cache(entry)
-            text, payload = _render_commands(entry, record)
-            if json_mode:
-                _emit_json(payload)
-                click.echo(
-                    _commands_footer(entry.base_adapter, list(payload["commands"]), record),
-                    err=True,
-                )
-            else:
-                _write_stdout(text)
-        elif name is None:
-            payload = _agent_list_payload(registry)
-            all_items = list(payload["items"])
-            items = all_items[:limit]
-            payload = {"items": items, "has_more": len(items) < len(all_items)}
-            if selected_format == "json":
-                _emit_json(payload)
-            elif selected_format == "plain":
-                _write_stdout("".join(f"{item['name']}\n" for item in items))
-            else:
-                # Apply the limit to entries before feeding the same grouped
-                # renderer used for a complete roster, so pagination cannot
-                # silently change the human table's grammar.
-                selected_names = {str(item["name"]) for item in items}
-                adapter_items = [
-                    adapter for adapter in registry.adapters if adapter.entry in selected_names
-                ]
-                variant_items = [
-                    variant for variant in registry.variants if variant.entry in selected_names
-                ]
-                adapter_lines = render.format_table(
-                    [_agent_row(adapter) for adapter in adapter_items], separator="  "
-                )
-                variant_lines = (
-                    render.format_table(
-                        [_variant_row(variant) for variant in variant_items],
-                        header=(
-                            "entry",
-                            "model",
-                            "effort",
-                            "permissions",
-                            "home",
-                            "description",
-                        ),
-                        prefix="  ",
-                        separator="  ",
-                    )
-                    if variant_items
-                    else []
-                )
-                lines = [*adapter_lines]
-                if variant_lines:
-                    lines.extend(variant_lines)
-                _write_stdout("\n".join(lines) + ("\n" if lines else ""))
-                if len(items) < len(all_items):
-                    _write_stdout(f"-- {len(items)} of {len(all_items)} — use --limit to change\n")
+        all_items = list(_agent_list_payload(registry)["items"])
+        items = all_items[:limit]
+        payload = {"items": items, "has_more": len(items) < len(all_items)}
+        if selected_format == "json":
+            _emit_json(payload)
+        elif selected_format == "plain":
+            _write_stdout("".join(f"{item['name']}\n" for item in items))
         else:
-            entry = registry.resolve(name)
-            if entry.is_variant:
-                text, payload, _ = _render_entry_detail(registry, entry)
-                if json_mode:
-                    _emit_json(payload)
-                else:
-                    _write_stdout(text)
-            else:
-                text, payload, _ = _render_entry_detail(registry, entry)
-                record = _ensure_cache(entry)
-                advertised_text, advertised_payload = _render_advertised_detail(entry, record)
-                payload.update(advertised_payload)
-                if json_mode:
-                    _emit_json(payload)
-                    click.echo(_cache_footer(record), err=True)
-                else:
-                    _write_stdout(text + advertised_text)
+            _write_stdout(_render_agent_roster(registry, items, len(all_items)))
     except cache.ProbeError as error:
         raise _probe_problem(error) from None
     except RegistryError as error:
@@ -1723,21 +1593,24 @@ def _run_agents_view(
 
 
 @effects.read_only
-@main.group(name="agents", cls=_AgentsGroup, invoke_without_command=True)
-@click.option("--models", is_flag=True, help="Show full advertised presets and models.")
-@click.option("--commands", is_flag=True, help="Show advertised slash commands.")
-@click.option(
-    "--check",
-    "check_live",
-    is_flag=True,
-    help="Launch, authenticate and apply the resolved options.",
-)
+@main.group(name="agents", invoke_without_command=True)
+@click.help_option("-h", "--help")
+@click.pass_context
+def agents_group(ctx: click.Context) -> None:
+    """Manage adapter and variant entries with explicit list/get verbs."""
+    if ctx.invoked_subcommand is None:
+        raise UsageProblem("agents needs a subcommand; use `acpc agents list`")
+
+
+@effects.read_only
+@schema.describes()
+@agents_group.command(name="list")
 @click.option(
     "--limit",
     type=click.IntRange(min=0),
     default=render.DEFAULT_STATUS_LIMIT,
     show_default=True,
-    help="Return at most N agents in the collection view.",
+    help="Return at most N agents in the collection; default 20.",
 )
 @click.option(
     "--plain", is_flag=True, help="Print one agent name per line; requires explicit --limit."
@@ -1749,71 +1622,28 @@ def _run_agents_view(
     help=_FORMAT_COLLECTION_HELP,
 )
 @_color_option()
-@_json_option("Emit this view as JSON.")
+@_json_option("Emit this collection as JSON.")
 @click.help_option("-h", "--help")
 @click.pass_context
-def agents_group(
-    ctx: click.Context,
-    models: bool,
-    commands: bool,
-    check_live: bool,
-    json_mode: bool,
-    limit: int,
-    plain: bool,
-    format_name: str | None,
+def agents_list_command(
+    ctx: click.Context, limit: int, plain: bool, format_name: str | None, json_mode: bool
 ) -> None:
-    """List adapters and variants, or inspect advertised adapter data.
-
-    Example: ``acpc agents mock --models``
-    """
-    if ctx.invoked_subcommand is None:
-        selected_format = _select_format(format_name, json_mode, plain=plain)
-        views = [(models, "--models"), (commands, "--commands"), (check_live, "--check")]
-        selected_view = next((flag for enabled, flag in views if enabled), None)
-        if selected_view is not None:
-            if ctx.get_parameter_source("limit") is click.core.ParameterSource.COMMANDLINE:
-                raise UsageProblem(
-                    f"--limit is only supported by the agents collection, not {selected_view}"
-                )
-            if plain:
-                raise UsageProblem(
-                    f"--plain is only supported by the agents collection, not {selected_view}"
-                )
-        if (
-            selected_format == "plain"
-            and ctx.get_parameter_source("limit") is not click.core.ParameterSource.COMMANDLINE
-        ):
-            raise UsageProblem("--plain requires an explicit --limit")
-        _run_agents_view(
-            None,
-            models,
-            commands,
-            check_live,
-            json_mode,
-            selected_format=selected_format,
-            limit=limit,
-            plain=plain,
-        )
+    """List adapters and variants; default is 20 entries."""
+    selected_format = _select_format(format_name, json_mode, plain=plain)
+    if (
+        selected_format == "plain"
+        and ctx.get_parameter_source("limit") is not click.core.ParameterSource.COMMANDLINE
+    ):
+        raise UsageProblem("--plain requires an explicit --limit")
+    _run_agents_list(selected_format, limit, plain)
 
 
 @effects.read_only
-@schema.describes(
-    name=(
-        "Adapter or variant to render, as listed by bare `acpc agents`. A name that is also an "
-        "`acpc agents` subcommand would be parsed as that subcommand, so `acpc agents init` "
-        "refuses to create one."
-    )
-)
-@click.command(name="agent-view")
+@schema.describes(name="Adapter or variant to render, as listed by `acpc agents list`.")
+@agents_group.command(name="get")
 @click.argument("name")
 @click.option("--models", is_flag=True, help="Show full advertised presets and models.")
 @click.option("--commands", is_flag=True, help="Show advertised slash commands.")
-@click.option(
-    "--check",
-    "check_live",
-    is_flag=True,
-    help="Launch, authenticate and apply the resolved options.",
-)
 @click.option(
     "--format",
     "format_name",
@@ -1821,42 +1651,100 @@ def agents_group(
     help=_FORMAT_OUTPUT_HELP,
 )
 @_color_option()
-@_json_option("Emit this view as JSON.")
+@_json_option("Emit this agent view as JSON.")
 @click.help_option("-h", "--help")
-def _agent_view_command(
-    name: str,
-    models: bool,
-    commands: bool,
-    check_live: bool,
-    format_name: str | None,
-    json_mode: bool,
+def agents_get_command(
+    name: str, models: bool, commands: bool, format_name: str | None, json_mode: bool
 ) -> None:
-    """Render one named adapter or variant.
-
-    Example: ``acpc agents mock --commands``
-    """
+    """Show one adapter or variant, optionally with models or commands."""
+    if models and commands:
+        raise UsageProblem("--models and --commands are mutually exclusive")
     selected_format = _select_format(format_name, json_mode)
-    _run_agents_view(name, models, commands, check_live, json_mode, selected_format=selected_format)
+    try:
+        registry = AgentRegistry()
+        entry = registry.resolve(name)
+        if models:
+            _warn_unlisted_effort_model(registry.resolve_call(name))
+            record = _ensure_cache(entry)
+            text, payload = _render_models(entry, record)
+            if selected_format == "json":
+                _emit_json(payload)
+                click.echo(_cache_footer(record), err=True)
+            else:
+                _write_stdout(text)
+            return
+        if commands:
+            record = _ensure_cache(entry)
+            text, payload = _render_commands(entry, record)
+            if selected_format == "json":
+                _emit_json(payload)
+                click.echo(
+                    _commands_footer(entry.base_adapter, list(payload["commands"]), record),
+                    err=True,
+                )
+            else:
+                _write_stdout(text)
+            return
+        text, payload, _ = _render_entry_detail(registry, entry)
+        if not entry.is_variant:
+            record = _ensure_cache(entry)
+            advertised_text, advertised_payload = _render_advertised_detail(entry, record)
+            payload.update(advertised_payload)
+            text += advertised_text
+            if selected_format == "json":
+                click.echo(_cache_footer(record), err=True)
+        if selected_format == "json":
+            _emit_json(payload)
+        else:
+            _write_stdout(text)
+    except cache.ProbeError as error:
+        raise _probe_problem(error) from None
+    except RegistryError as error:
+        raise _registry_problem(error) from None
 
 
-def _agents_check(registry: AgentRegistry, name: str | None, *, json_mode: bool) -> None:
+def _check_entries(registry: AgentRegistry, name: str | None) -> list[ResolvedEntry]:
     if name is None:
-        entries = [entry for entry in registry.adapters if entry.installed]
-    else:
-        selected = registry.resolve(name)
-        entries = [registry.resolve(selected.base_adapter)]
+        return list(registry)
+    return [registry.resolve(name)]
+
+
+def _check_one(registry: AgentRegistry, entry: ResolvedEntry, timeout: float) -> dict[str, Any]:
+    try:
+        resolution = registry.resolve_call(entry.entry)
+        _warn_unlisted_effort_model(resolution)
+        advertised = asyncio.run(
+            asyncio.wait_for(cache.probe_advertised(resolution), timeout=timeout)
+        )
+        return {"agent": entry.entry, "ok": True, "models": len(advertised["models"])}
+    except (cache.ProbeError, TimeoutError) as error:
+        message = "check timed out" if isinstance(error, TimeoutError) else str(error)
+        return {"agent": entry.entry, "ok": False, "error": message}
+
+
+def _agents_check(
+    registry: AgentRegistry,
+    name: str | None,
+    *,
+    selected_format: str,
+    limit: int,
+    timeout: float,
+) -> None:
+    entries = _check_entries(registry, name)[:limit]
     results: list[dict[str, Any]] = []
     for entry in entries:
-        try:
-            resolution = registry.resolve_call(entry.entry)
-            _warn_unlisted_effort_model(resolution)
-            advertised = asyncio.run(cache.probe_advertised(resolution))
-            result = {"agent": entry.entry, "ok": True, "models": len(advertised["models"])}
-        except cache.ProbeError as error:
-            result = {"agent": entry.entry, "ok": False, "error": str(error)}
-        results.append(result)
-    if json_mode:
-        _emit_json({"checks": results})
+        results.append(_check_one(registry, entry, timeout))
+    if name is None:
+        payload: dict[str, Any] = {
+            "items": results,
+            "has_more": len(results) < len(_check_entries(registry, None)),
+        }
+    else:
+        payload = results[0]
+    if selected_format == "json":
+        _emit_json(payload)
+    elif selected_format == "plain":
+        _write_stdout("".join(f"{result['agent']}\n" for result in results))
     else:
         for result in results:
             if result["ok"]:
@@ -1867,6 +1755,79 @@ def _agents_check(registry: AgentRegistry, name: str | None, *, json_mode: bool)
     if failed:
         noun = "check" if len(failed) == 1 else "checks"
         click.echo(f"-- {len(failed)} {noun} failed: {', '.join(failed)}", err=True)
+
+
+_CHECK_TIMEOUT_DEFAULT = "30s"
+
+
+@effects.non_idempotent
+@schema.describes(
+    name="Optional adapter or variant to check; absent, all installed adapters are checked.",
+)
+@agents_group.command(name="check")
+@click.argument("name", required=False)
+@click.option(
+    "--limit",
+    type=click.IntRange(min=0),
+    default=render.DEFAULT_STATUS_LIMIT,
+    show_default=True,
+    help="Return at most N check results; default 20.",
+)
+@click.option(
+    "--plain", is_flag=True, help="Print one checked agent name per line; requires --limit."
+)
+@click.option(
+    "--timeout",
+    type=TimeoutParamType(),
+    default=_CHECK_TIMEOUT_DEFAULT,
+    show_default=True,
+    metavar="S",
+    help=f"Bound each adapter connection check; default {_CHECK_TIMEOUT_DEFAULT}.",
+)
+@click.option(
+    "--format",
+    "format_name",
+    type=click.Choice(("text", "json", "plain")),
+    help=_FORMAT_COLLECTION_HELP,
+)
+@_color_option()
+@_json_option("Emit check results as JSON.")
+@click.help_option("-h", "--help")
+@click.pass_context
+def agents_check_command(
+    ctx: click.Context,
+    name: str | None,
+    limit: int,
+    plain: bool,
+    timeout: float,
+    format_name: str | None,
+    json_mode: bool,
+) -> None:
+    """Launch and authenticate an adapter, then report its advertised data."""
+    selected_format = _select_format(format_name, json_mode, plain=plain)
+    if name is not None:
+        if ctx.get_parameter_source("limit") is click.core.ParameterSource.COMMANDLINE:
+            raise UsageProblem("--limit is only supported when checking all agents")
+        if plain:
+            raise UsageProblem("--plain is only supported when checking all agents")
+    elif (
+        selected_format == "plain"
+        and ctx.get_parameter_source("limit") is not click.core.ParameterSource.COMMANDLINE
+    ):
+        raise UsageProblem("--plain requires an explicit --limit")
+    try:
+        registry = AgentRegistry()
+        _agents_check(
+            registry,
+            name,
+            selected_format=selected_format,
+            limit=limit,
+            timeout=timeout,
+        )
+    except cache.ProbeError as error:
+        raise _probe_problem(error) from None
+    except RegistryError as error:
+        raise _registry_problem(error) from None
 
 
 @effects.read_only
@@ -1940,8 +1901,8 @@ def _agent_entry_path(name: str) -> Path:
     name=(
         "Name of the variant entry to create; an existing name is a conflict. One file name "
         "under `agents`: it may not be empty, contain `/` or `\\`, be `.` or `..`, or resolve "
-        "outside that directory, and it may not be a subcommand of `acpc agents` (`init`, "
-        "`delete`) — such an entry would be unreachable."
+        "outside that directory, and it may not be a subcommand of `acpc agents` (`list`, `get`, "
+        "`create`, `delete`, `check`) — such an entry would be unreachable."
     ),
     model="Default model or preset for the variant; absent, the field is left out and the "
     "entry under --extends decides at run time.",
@@ -1955,7 +1916,7 @@ def _agent_entry_path(name: str) -> Path:
     home="Vendor home override for the variant; absent, the field is left out and the entry "
     "under --extends decides at run time.",
 )
-@agents_group.command(name="init")
+@agents_group.command(name="create")
 @click.argument("name")
 @click.option(
     "--extends",
@@ -1986,7 +1947,7 @@ def _agent_entry_path(name: str) -> Path:
 @_json_option("Emit the created entry as JSON.")
 @_color_option()
 @click.help_option("-h", "--help")
-def agents_init_command(
+def agents_create_command(
     name: str,
     parent: str,
     model: str | None,
@@ -2002,11 +1963,11 @@ def agents_init_command(
     A strict create: an existing entry of that name is a conflict, never an
     overwrite. ``acpc agents delete`` removes what this wrote.
 
-    Example: ``acpc agents init work --extends mock --permissions execute``
+    Example: ``acpc agents create work --extends mock --permissions execute``
     """
     selected_format = _select_format(format_name, json_mode)
     if name in agents_group.commands:
-        # `acpc agents <name>` would dispatch the subcommand, so the entry
+        # `acpc agents get <name>` is the named-entry dispatch, so the entry
         # would be listed and never reachable. Refuse the name instead.
         raise UsageProblem(
             f"invalid agent name '{name}': it is an acpc agents subcommand, so the entry "
@@ -2093,7 +2054,7 @@ def agents_init_command(
 def agents_delete_command(name: str, format_name: str | None, json_mode: bool) -> None:
     """Delete one entry this machine owns, under ``$ACPC_HOME/agents``.
 
-    The counterpart to ``agents init``: it takes back exactly what that wrote,
+    The counterpart to ``agents create``: it takes back exactly what that wrote,
     which is why creating an entry needs no confirmation — including the entry
     that overrides an adapter acpc ships. The shipped adapter itself is not
     this machine's, so a name with no file under ``agents`` is refused.
@@ -2112,9 +2073,9 @@ def agents_delete_command(name: str, format_name: str | None, json_mode: bool) -
                 f"'{name}' is an adapter acpc ships and nothing under "
                 f"{paths.agents_dir()} overrides it — only entries created on this "
                 "machine can be deleted",
-                hint="Run: acpc agents",
+                hint="Run: acpc agents list",
             )
-        raise _not_found(f"unknown agent entry '{name}'", hint="Run: acpc agents")
+        raise _not_found(f"unknown agent entry '{name}'", hint="Run: acpc agents list")
     try:
         target.unlink()
     except OSError as error:
@@ -2129,39 +2090,31 @@ def agents_delete_command(name: str, format_name: str | None, json_mode: bool) -
         _write_stdout(f"deleted {target}\n")
 
 
-def _run_skills_view(
-    name: str | None,
-    *,
-    json_mode: bool,
-    selected_format: str = "text",
-    limit: int = render.DEFAULT_STATUS_LIMIT,
-    plain: bool = False,
-) -> None:
-    """List bundled skills or render one skill's body and directory."""
-    if name is None:
-        bundled = skills.list_skills()
-        items = [_skill_payload(skill, include_body=False) for skill in bundled]
-        items = items[:limit]
-        if selected_format == "json":
-            _emit_json({"items": items, "has_more": len(items) < len(bundled)})
-            return
-        if selected_format == "plain":
-            _write_stdout("".join(f"{item['name']}\n" for item in items))
-            return
+def _run_skills_list(selected_format: str, limit: int) -> None:
+    """Render the bounded bundled-skill collection."""
+    bundled = skills.list_skills()
+    items = [_skill_payload(skill, include_body=False) for skill in bundled[:limit]]
+    payload = {"items": items, "has_more": len(items) < len(bundled)}
+    if selected_format == "json":
+        _emit_json(payload)
+    elif selected_format == "plain":
+        _write_stdout("".join(f"{item['name']}\n" for item in items))
+    else:
         rows = render.format_table(
             [_skill_row(skill) for skill in bundled[:limit]],
             header=("name", "description"),
         )
-        _write_stdout("\n".join(rows) + "\n")
         if len(items) < len(bundled):
-            _write_stdout(f"-- {len(items)} of {len(bundled)} — use --limit to change\n")
-        return
+            rows.append(f"-- {len(items)} of {len(bundled)} — use --limit to change")
+        _write_stdout("\n".join(rows) + "\n")
 
+
+def _run_skill_get(name: str, selected_format: str) -> None:
+    """Render one bundled skill and identify its source directory."""
     try:
         skill = skills.get_skill(name)
     except skills.SkillNotFoundError:
-        raise _not_found(f"unknown skill {name!r}", hint="Run: acpc skills") from None
-
+        raise _not_found(f"unknown skill {name!r}", hint="Run: acpc skills list") from None
     if selected_format == "json":
         _emit_json(_skill_payload(skill, include_body=True))
     else:
@@ -2170,13 +2123,24 @@ def _run_skills_view(
 
 
 @effects.read_only
-@main.group(name="skills", cls=_SkillsGroup, invoke_without_command=True)
+@main.group(name="skills", invoke_without_command=True)
+@click.help_option("-h", "--help")
+@click.pass_context
+def skills_group(ctx: click.Context) -> None:
+    """Browse bundled skills with explicit list and get verbs."""
+    if ctx.invoked_subcommand is None:
+        raise UsageProblem("skills needs a subcommand; use `acpc skills list`")
+
+
+@effects.read_only
+@schema.describes()
+@skills_group.command(name="list")
 @click.option(
     "--limit",
     type=click.IntRange(min=0),
     default=render.DEFAULT_STATUS_LIMIT,
     show_default=True,
-    help="Return at most N skills in the collection view.",
+    help="Return at most N skills in the collection; default 20.",
 )
 @click.option(
     "--plain", is_flag=True, help="Print one skill name per line; requires explicit --limit."
@@ -2188,61 +2152,40 @@ def _run_skills_view(
     help=_FORMAT_COLLECTION_HELP,
 )
 @_color_option()
-@_json_option("Emit this view as JSON.")
+@_json_option("Emit this collection as JSON.")
 @click.help_option("-h", "--help")
 @click.pass_context
-def skills_group(
-    ctx: click.Context,
-    json_mode: bool,
-    limit: int,
-    plain: bool,
-    format_name: str | None,
+def skills_list_command(
+    ctx: click.Context, limit: int, plain: bool, format_name: str | None, json_mode: bool
 ) -> None:
-    """List bundled skills, or render one named skill.
-
-    Example: ``acpc skills provider-bringup``
-    """
-    if ctx.invoked_subcommand is None:
-        selected_format = _select_format(format_name, json_mode, plain=plain)
-        if (
-            selected_format == "plain"
-            and ctx.get_parameter_source("limit") is not click.core.ParameterSource.COMMANDLINE
-        ):
-            raise UsageProblem("--plain requires an explicit --limit")
-        _run_skills_view(
-            None,
-            json_mode=json_mode,
-            selected_format=selected_format,
-            limit=limit,
-            plain=plain,
-        )
+    """List bundled skills; default is 20 entries."""
+    selected_format = _select_format(format_name, json_mode, plain=plain)
+    if (
+        selected_format == "plain"
+        and ctx.get_parameter_source("limit") is not click.core.ParameterSource.COMMANDLINE
+    ):
+        raise UsageProblem("--plain requires an explicit --limit")
+    _run_skills_list(selected_format, limit)
 
 
 @effects.read_only
-@schema.describes(
-    name=(
-        "Bundled skill to render, as listed by bare `acpc skills`. A name that is also an "
-        "`acpc skills` subcommand would be parsed as that subcommand; no bundled skill is."
-    )
-)
-@click.command(name="skill-view")
+@schema.format_defaults(tty="text", non_tty="text")
+@schema.describes(name="Bundled skill to render, as listed by `acpc skills list`.")
+@skills_group.command(name="get")
 @click.argument("name")
 @click.option(
     "--format",
     "format_name",
     type=click.Choice(("text", "json")),
-    help=_FORMAT_OUTPUT_HELP,
+    help=_FORMAT_NATIVE_HELP,
 )
 @_color_option()
-@_json_option("Emit this view as JSON.")
+@_json_option("Emit this skill as JSON.")
 @click.help_option("-h", "--help")
-def _skill_view_command(name: str, format_name: str | None, json_mode: bool) -> None:
-    """Render one named bundled skill.
-
-    Example: ``acpc skills provider-bringup``
-    """
-    selected_format = _select_format(format_name, json_mode)
-    _run_skills_view(name, json_mode=json_mode, selected_format=selected_format)
+def skills_get_command(name: str, format_name: str | None, json_mode: bool) -> None:
+    """Print one bundled skill's body and source directory."""
+    selected_format = _select_format(format_name, json_mode, native_text=True)
+    _run_skill_get(name, selected_format)
 
 
 @effects.non_idempotent
@@ -2383,6 +2326,19 @@ def _cancel_session(meta: sessions.SessionMeta) -> sessions.SessionMeta:
             exit_code=vocab.EXIT_CANCELLED,
             stop_reason="stopped by user",
         )
+    command_line = proc.process_cmdline(meta.pid)
+    if command_line is not None and "acpc.direct_worker" in command_line:
+        try:
+            os.kill(meta.pid, signal.SIGINT)
+        except ProcessLookupError:
+            return sessions.load(meta.session_id)
+        except OSError as error:
+            raise AcpcError(
+                f"could not cancel session {meta.session_id}: {error}",
+                kind=errors.UNAVAILABLE,
+                context={"session_id": meta.session_id},
+            ) from None
+        return _wait_for_stop(meta.session_id)
     result = proc.kill_process_tree(meta.pid, meta.process_start_time)
     if result == "refused":
         # The process is there and would not take the signal, so acpc did not
@@ -2401,7 +2357,7 @@ def _maintenance_json(payload: Mapping[str, Any]) -> None:
 
 @effects.idempotent
 @schema.describes(selector=_SELECTOR_HELP)
-@main.command(name="stop")
+@main.command(name="cancel")
 @click.argument("selector")
 @click.option(
     "--format",
@@ -2412,8 +2368,8 @@ def _maintenance_json(payload: Mapping[str, Any]) -> None:
 @_json_option("Emit the result as JSON.")
 @_color_option()
 @click.help_option("-h", "--help")
-def stop_command(selector: str, format_name: str | None, json_mode: bool) -> None:
-    """Stop a running session; it stays resumable with ``acpc continue``.
+def cancel_command(selector: str, format_name: str | None, json_mode: bool) -> None:
+    """Cancel a running session; it stays usable with ``acpc continue``.
 
     Cancels the turn in flight (ACP ``session/cancel``) and waits up to 10s for the
     ack; past that the connection is torn down anyway. During a daemon-owned
@@ -2422,7 +2378,7 @@ def stop_command(selector: str, format_name: str | None, json_mode: bool) -> Non
     post-mortem. Stopping an already-finished session is a successful no-op that
     reports the state it found; an unknown id is a usage error.
 
-    Example: ``acpc stop q7x2``
+    Example: ``acpc cancel q7x2``
     """
     selected_format = _select_format(format_name, json_mode)
     meta = _load_view_session(selector)
@@ -2442,12 +2398,12 @@ def stop_command(selector: str, format_name: str | None, json_mode: bool) -> Non
         _maintenance_json(payload)
     else:
         _write_stdout(f"{meta.session_id} {meta.state}\n")
-    click.echo(f"-- stop {meta.session_id} · {meta.state}", err=True)
+    click.echo(f"-- canceled {meta.session_id} · {meta.state}", err=True)
 
 
 @effects.non_idempotent
 @schema.describes(selector=_SELECTOR_HELP)
-@main.command(name="rm")
+@main.command(name="delete")
 @click.argument("selector")
 @click.option("--yes", "-y", "assume_yes", is_flag=True, help="Delete without being asked.")
 @click.option(
@@ -2459,7 +2415,9 @@ def stop_command(selector: str, format_name: str | None, json_mode: bool) -> Non
 @_json_option("Emit the result as JSON.")
 @_color_option()
 @click.help_option("-h", "--help")
-def rm_command(selector: str, assume_yes: bool, format_name: str | None, json_mode: bool) -> None:
+def delete_command(
+    selector: str, assume_yes: bool, format_name: str | None, json_mode: bool
+) -> None:
     """Delete a finished session's on-disk state.
 
     Errors on a starting or running session — stop it first. The transcript,
@@ -2467,7 +2425,7 @@ def rm_command(selector: str, assume_yes: bool, format_name: str | None, json_mo
     the call needs ``--yes``. Prints the removed session id; ``--json`` also
     lists the deleted paths.
 
-    Example: ``acpc rm q7x2 --yes``
+    Example: ``acpc delete q7x2 --yes``
     """
     selected_format = _select_format(format_name, json_mode)
     meta = _load_view_session(selector)
@@ -2480,8 +2438,8 @@ def rm_command(selector: str, assume_yes: bool, format_name: str | None, json_mo
         raise _session_problem(error).with_context(session_id=meta.session_id) from None
     interaction.require_confirmation(
         assume_yes,
-        message=f"rm {meta.session_id}: deleting a session's state needs confirmation",
-        hint=f"Run: acpc rm {meta.session_id} --yes",
+        message=f"delete {meta.session_id}: deleting a session's state needs confirmation",
+        hint=f"Run: acpc delete {meta.session_id} --yes",
     )
     try:
         sessions.delete_session(meta.session_id)
@@ -2511,7 +2469,7 @@ def rm_command(selector: str, assume_yes: bool, format_name: str | None, json_mo
         "absent, the configured retention window applies."
     ),
 )
-@click.option("--dry-run", is_flag=True, help="List candidates without deleting them.")
+@click.option("--dry-run", "-n", is_flag=True, help="List candidates without deleting them.")
 @click.option("--yes", "-y", "assume_yes", is_flag=True, help="Delete without being asked.")
 @click.option(
     "--format",
@@ -2816,7 +2774,6 @@ def status_command(
 )
 @click.option("--wait-new", is_flag=True, help="Wait for new transcript events.")
 @click.option(
-    "-f",
     "--follow",
     is_flag=True,
     help="Collect events until the session ends; exit 124 on --timeout, 4 on --max-output.",
@@ -3151,6 +3108,36 @@ def _follow_log(
             break
         _sleep_until(deadline)
 
+    _finish_follow_log(
+        meta,
+        transcript_file,
+        cursor=cursor,
+        page_start=page_start,
+        page_end=page_end,
+        exhausted=exhausted,
+        timed_out=timed_out,
+        quiet=quiet,
+        since_note=since_note,
+        timeout=timeout,
+        max_output=max_output,
+    )
+
+
+def _finish_follow_log(
+    meta: sessions.SessionMeta,
+    transcript_file: transcript.Transcript,
+    *,
+    cursor: int,
+    page_start: int | None,
+    page_end: int | None,
+    exhausted: bool,
+    timed_out: bool,
+    quiet: bool,
+    since_note: str | None,
+    timeout: float | None,
+    max_output: int,
+) -> None:
+    """Render follow's current footer and raise its bounded-ending status."""
     # The follow outlived the state it started with; the footer is the caller's
     # termination signal, so it has to be current.
     meta = _load_view_session(meta.session_id)
@@ -3173,7 +3160,7 @@ def _follow_log(
         )
     if exhausted:
         # Not a failure: the caller asked for at most `--max-output` bytes and
-        # got them.  Reaching a read limit ends that read, it does not end the
+        # got them. Reaching a read limit ends that read, it does not end the
         # transcript, so the way out is the budget code and the footer's
         # cursor — no envelope, because nothing went wrong.
         raise SystemExit(vocab.EXIT_BUDGET)
@@ -3208,15 +3195,141 @@ def _still_running_note(session_id: str, timeout: float | None) -> str:
     waited = "" if timeout is None else f" after {timeout:g}s"
     return (
         f"-- still running (gave up waiting{waited}) — session continues; "
-        f"acpc stop {session_id} to cancel"
+        f"acpc cancel {session_id} to cancel"
     )
+
+
+def _resolve_run_call(
+    agent: str,
+    *,
+    model: str | None,
+    effort: str | None,
+    mode: str | None,
+    permissions: str | None,
+    home: str | None,
+) -> CallResolution:
+    try:
+        registry = AgentRegistry()
+        resolution = registry.resolve_call(
+            agent,
+            model=model,
+            effort=effort,
+            mode=mode,
+            permissions=permissions,
+            home=home,
+        )
+        if permissions is None:
+            _warn_permission_alias(registry.permission_alias(agent))
+        _warn_unlisted_effort_model(resolution)
+        return resolution
+    except RegistryError as error:
+        raise _registry_problem(error) from None
+
+
+def _run_preview(
+    resolution: CallResolution,
+    *,
+    permissions: str | None,
+    background: bool,
+    cwd: str,
+    selected_format: str,
+) -> None:
+    policy, permissions_clamp, permissions_source = _resolve_permissions(
+        permissions, resolution, background=background, preview=True
+    )
+    previewed = replace(resolution, permissions=policy, permissions_clamp=permissions_clamp)
+    if policy is not None:
+        previewed = _select_resolution(previewed)
+    payload = runner.resolution_payload(previewed, cwd=cwd, permissions_source=permissions_source)
+    _emit_resolution(payload, json_mode=selected_format == "json")
+
+
+def _claim_run_alias(alias: str | None) -> None:
+    if alias is None:
+        return
+    try:
+        warning = sessions.claim_name(alias)
+    except sessions.SessionNameError as error:
+        raise _session_problem(error) from None
+    if warning:
+        click.echo(f"-- {warning}", err=True)
+
+
+def _create_run_session(
+    resolution: CallResolution,
+    *,
+    prompt: str,
+    cwd: str,
+    alias: str | None,
+    permissions_source: str | None,
+) -> sessions.SessionMeta:
+    settings = config.load_config()
+    runner.auto_prune(settings.retention_seconds)
+    try:
+        return sessions.create_session(
+            entry=resolution.entry.entry,
+            base_adapter=resolution.entry.base_adapter,
+            prompt=prompt,
+            resolution=runner.session_resolution(
+                resolution,
+                cwd=cwd,
+                permissions_source=permissions_source,
+            ),
+            target=runner.call_target(resolution),
+            name=alias,
+        )
+    except sessions.SessionError as error:
+        raise _session_problem(error) from None
+
+
+def _run_foreground(
+    meta: sessions.SessionMeta,
+    request: runner.TurnRequest,
+    *,
+    output_file: str | None,
+    selected_format: str,
+    max_output: int,
+    quiet: bool,
+) -> None:
+    if not quiet:
+        _echo_metadata(output.format_session_line(meta))
+    try:
+        outcome = runner.execute_turn(meta.session_id, request)
+    except runner.RunnerError as error:
+        raise _runner_problem(error).with_context(session_id=meta.session_id) from None
+    if outcome.wait_timed_out:
+        _raise_wait_timeout(meta.session_id, output_file)
+    final = sessions.read_meta(meta.session_id)
+    result = output.render_result(
+        final,
+        outcome.answer,
+        json_mode=selected_format == "json",
+        max_output=max_output,
+    )
+    _emit_turn_result(
+        result,
+        output_file=output_file,
+        json_mode=selected_format == "json",
+        success=outcome.exit_code == vocab.EXIT_OK,
+    )
+    if outcome.state == "detached":
+        _echo_metadata(
+            f"-- detached, still RUNNING: {meta.session_id}"
+            f" — answer: acpc wait {meta.session_id} · cancel: acpc cancel {meta.session_id}"
+        )
+        _end_turn_for(meta.session_id, outcome)
+    if not quiet:
+        _echo_metadata(output.format_summary(final, route_note=_route_note(outcome)))
+    _end_turn_for(meta.session_id, outcome)
 
 
 @effects.non_idempotent
 @schema.format_defaults(tty="text", non_tty="text")
 @schema.reads_stdin("prompt_text")
 @schema.describes(
-    agent="Registry entry to dispatch: an adapter or a variant, as `acpc agents` lists them.",
+    agent=(
+        "Registry entry to dispatch: an adapter or a variant, as `acpc agents list` lists them."
+    ),
     prompt_text=_PROMPT_HELP,
     output_file=_OUTPUT_FILE_DESCRIPTION,
 )
@@ -3228,7 +3341,7 @@ def _still_running_note(session_id: str, timeout: float | None) -> str:
     "prompt_file",
     metavar="FILE",
     help=(
-        f"Read the prompt from a file; at most {vocab.MAX_PROMPT_LABEL}. One of three "
+        f"Read the prompt from a file; at most {_PROMPT_LIMIT_HELP}. One of three "
         "prompt sources with the argument and `-`, exactly one of which must be given."
     ),
 )
@@ -3271,7 +3384,7 @@ def _still_running_note(session_id: str, timeout: float | None) -> str:
     metavar="M",
     help=(
         "Vendor mode override; normally unnecessary because --permissions selects the mode. "
-        "Refused when it grants more than the policy; values from agents <name>."
+        "Refused when it grants more than the policy; values from agents get <name>."
     ),
 )
 @click.option(
@@ -3289,8 +3402,17 @@ def _still_running_note(session_id: str, timeout: float | None) -> str:
     type=TimeoutParamType(),
     metavar="S",
     help=(
-        f"Cancel the session after this duration ({_DURATION_SYNTAX}); absent, no wall-clock "
-        "limit (the callee runs until it is done)."
+        f"Stop waiting after this duration ({_DURATION_SYNTAX}); the session keeps running. "
+        "Use --cancel-after to cancel the session."
+    ),
+)
+@click.option(
+    "--cancel-after",
+    type=TimeoutParamType(),
+    metavar="S",
+    help=(
+        f"Cancel the session after this duration ({_DURATION_SYNTAX}); unlike --timeout, "
+        "this changes the work itself."
     ),
 )
 @click.option(
@@ -3317,6 +3439,7 @@ def _still_running_note(session_id: str, timeout: float | None) -> str:
     help="Cap on stdout bytes; 0 disables the cap.",
 )
 @click.option(
+    "--background",
     "--bg",
     "background",
     is_flag=True,
@@ -3342,6 +3465,7 @@ def run_command(
     output_file: str | None,
     format_name: str | None,
     timeout: float | None,
+    cancel_after: float | None,
     alias: str | None,
     resolve: bool,
     background: bool,
@@ -3349,122 +3473,61 @@ def run_command(
     quiet: bool,
     json_mode: bool,
 ) -> None:
-    """Dispatch one agent; block and print the final answer.
+    """Dispatch one agent and print its answer, or preview it with ``--resolve``.
 
-    The default permission policy is ``ask`` when acpc could put the question
-    — stdin and stdout both terminals, no ``--json``, ``NO_INPUT`` unset — and
-    ``read`` in every other case.  ``--bg`` cannot answer a request once it has
-    detached, so it asks for the policy before dispatching instead of lowering
-    it silently.
-
-    The prompt comes from one source: the argument, ``-`` for stdin, or
-    ``--prompt-file``. Whichever it is, acpc reads at most 1 MiB (1048576
-    bytes) and refuses a larger one before it creates anything.
-
-    ``--resolve`` prints what the call resolves to — entry, command, and every
-    resolved value with its source — and starts nothing.
+    One prompt source is required, and prompts over 1 MiB are rejected before
+    session creation. Permission defaults follow the TTY and output format.
 
     Example: ``acpc run codex "Fix the failing test" --permissions execute``
     """
     selected_format = _select_format(format_name, json_mode, native_text=True)
-
-    # The limit above is spelled out because Click renders this docstring
-    # verbatim; `vocab.MAX_PROMPT_BYTES` is where it actually lives, and that
-    # constant carries the pointer back here.
+    if background and timeout is not None:
+        raise UsageProblem("--timeout only bounds waiting; use --cancel-after with --background")
     permissions = _normalize_permission(permissions)
-
-    try:
-        registry = AgentRegistry()
-        resolution = registry.resolve_call(
-            agent,
-            model=model,
-            effort=effort,
-            mode=mode,
-            permissions=permissions,
-            home=home,
-        )
-        if permissions is None:
-            _warn_permission_alias(registry.permission_alias(agent))
-        _warn_unlisted_effort_model(resolution)
-    except RegistryError as error:
-        raise _registry_problem(error) from None
-
+    resolution = _resolve_run_call(
+        agent,
+        model=model,
+        effort=effort,
+        mode=mode,
+        permissions=permissions,
+        home=home,
+    )
     defaulted_permissions = permissions is None and resolution.permissions is None
-    # Resolved to an absolute path here, at the caller: the adapter receives
-    # cwd over session/new, so a relative path would be resolved against
-    # whatever process hosts the adapter — the daemon's directory, not the
-    # caller's — and vendors reject a literal ".".
     resolved_cwd = str(Path(cwd).expanduser().resolve()) if cwd else os.getcwd()
-
     if resolve:
-        # A preview of the resolution, not of a mutation: nothing below this
-        # line runs, so no session directory and no daemon come into being,
-        # and nothing is asked of anybody.  A policy the dispatch would ask
-        # for stays unresolved here, along with the mode that policy selects.
-        policy, permissions_clamp, permissions_source = _resolve_permissions(
-            permissions, resolution, background=background, preview=True
+        _run_preview(
+            resolution,
+            permissions=permissions,
+            background=background,
+            cwd=resolved_cwd,
+            selected_format=selected_format,
         )
-        previewed = replace(resolution, permissions=policy, permissions_clamp=permissions_clamp)
-        if policy is not None:
-            previewed = _select_resolution(previewed)
-        payload = runner.resolution_payload(
-            previewed, cwd=resolved_cwd, permissions_source=permissions_source
-        )
-        _emit_resolution(payload, json_mode=selected_format == "json")
         return
-
     prompt = _read_prompt(prompt_text, prompt_file)
-
     try:
-        command_head = runner.adapter_command(resolution)[0]
+        runner.adapter_command(resolution)
     except runner.RunnerError as error:
         raise _runner_problem(error) from None
-    del command_head
-
-    if alias is not None:
-        try:
-            warning = sessions.claim_name(alias)
-        except sessions.SessionNameError as error:
-            raise _session_problem(error) from None
-        if warning:
-            click.echo(f"-- {warning}", err=True)
-
-    # Asked only once the call is known to be dispatchable: a question about a
-    # call acpc is about to refuse spends the caller's attention on nothing.
+    _claim_run_alias(alias)
     policy, permissions_clamp, permissions_source = _resolve_permissions(
         permissions, resolution, background=background
     )
-    # The stream-resolved policy is part of the resolved invocation: meta.json
-    # stores everything --resolve shows, and `continue` reuses it verbatim.
     resolution = _select_resolution(
         replace(resolution, permissions=policy, permissions_clamp=permissions_clamp)
     )
-
-    settings = config.load_config()
-    runner.auto_prune(settings.retention_seconds)
-
-    try:
-        meta = sessions.create_session(
-            entry=resolution.entry.entry,
-            base_adapter=resolution.entry.base_adapter,
-            prompt=prompt,
-            resolution=runner.session_resolution(
-                resolution,
-                cwd=resolved_cwd,
-                permissions_source=permissions_source
-                or ("default" if defaulted_permissions else None),
-            ),
-            target=runner.call_target(resolution),
-            name=alias,
-        )
-    except sessions.SessionError as error:
-        raise _session_problem(error) from None
-
+    meta = _create_run_session(
+        resolution,
+        prompt=prompt,
+        cwd=resolved_cwd,
+        alias=alias,
+        permissions_source=permissions_source or ("default" if defaulted_permissions else None),
+    )
     request = runner.TurnRequest(
         resolution=resolution,
         prompt=prompt,
         cwd=resolved_cwd,
-        timeout=timeout,
+        wait_timeout=timeout,
+        cancel_after=cancel_after,
         permission_prompt=_tty_permission_prompt if policy == "ask" else None,
     )
 
@@ -3477,43 +3540,14 @@ def run_command(
             max_output=max_output,
         )
         return
-
-    if not quiet:
-        _echo_metadata(output.format_session_line(meta))
-
-    try:
-        outcome = runner.execute_turn(meta.session_id, request)
-    except runner.RunnerError as error:
-        raise _runner_problem(error).with_context(session_id=meta.session_id) from None
-
-    final = sessions.read_meta(meta.session_id)
-
-    result = output.render_result(
-        final,
-        outcome.answer,
-        json_mode=selected_format == "json",
-        max_output=max_output,
-    )
-    _emit_turn_result(
-        result,
+    _run_foreground(
+        meta,
+        request,
         output_file=output_file,
-        json_mode=selected_format == "json",
-        success=outcome.exit_code == vocab.EXIT_OK,
+        selected_format=selected_format,
+        max_output=max_output,
+        quiet=quiet,
     )
-
-    if outcome.state == "detached":
-        # SPEC *Output contract*: the session outlives this client, so the way
-        # out has to say which session the caller can still reach.
-        _echo_metadata(
-            f"-- detached, still RUNNING: {meta.session_id}"
-            f" — answer: acpc wait {meta.session_id} · cancel: acpc stop {meta.session_id}"
-        )
-        _end_turn_for(meta.session_id, outcome)
-
-    if not quiet:
-        _echo_metadata(output.format_summary(final, route_note=_route_note(outcome)))
-
-    _end_turn_for(meta.session_id, outcome)
 
 
 # What a finished turn means when it did not end in `done`.  The exit code
@@ -3679,7 +3713,7 @@ def _dispatch_background(
     "prompt_file",
     metavar="FILE",
     help=(
-        f"Read the prompt from a file; at most {vocab.MAX_PROMPT_LABEL}. One of three "
+        f"Read the prompt from a file; at most {_PROMPT_LIMIT_HELP}. One of three "
         "prompt sources with the argument and `-`, exactly one of which must be given."
     ),
 )
@@ -3704,6 +3738,7 @@ def _dispatch_background(
     ),
 )
 @click.option(
+    "--background",
     "--bg",
     "background",
     is_flag=True,
@@ -3717,8 +3752,17 @@ def _dispatch_background(
     type=TimeoutParamType(),
     metavar="S",
     help=(
-        f"Cancel the session after this duration ({_DURATION_SYNTAX}); absent, no wall-clock "
-        "limit (the callee runs until it is done)."
+        f"Stop waiting after this duration ({_DURATION_SYNTAX}); the session keeps running. "
+        "Use --cancel-after to cancel the session."
+    ),
+)
+@click.option(
+    "--cancel-after",
+    type=TimeoutParamType(),
+    metavar="S",
+    help=(
+        f"Cancel the session after this duration ({_DURATION_SYNTAX}); unlike --timeout, "
+        "this changes the work itself."
     ),
 )
 @click.option(
@@ -3731,50 +3775,6 @@ def _dispatch_background(
 @click.option("--quiet", is_flag=True, help="Suppress the stderr summary line.")
 @_json_option("Emit this command's output as JSON.")
 @_color_option()
-@click.option(
-    "--model",
-    metavar="M",
-    hidden=True,
-    help="Run-only model override; continue reuses the stored model.",
-)
-@click.option(
-    "--effort",
-    metavar="E",
-    hidden=True,
-    help="Run-only reasoning effort; continue reuses the stored effort.",
-)
-@click.option(
-    "--mode",
-    metavar="M",
-    hidden=True,
-    help=(
-        "Run-only vendor mode override; normally unnecessary because --permissions selects "
-        "the mode. On run, refused when it grants more than the policy; values from "
-        "agents <name>."
-    ),
-)
-@click.option(
-    "--cwd",
-    metavar="DIR",
-    hidden=True,
-    help="Run-only working directory; continue reuses the stored directory.",
-)
-@click.option(
-    "--home",
-    metavar="DIR",
-    hidden=True,
-    help="Run-only vendor home; continue reuses the stored home.",
-)
-@click.option(
-    "--name",
-    "alias",
-    metavar="ALIAS",
-    hidden=True,
-    help="Run-only session name; continue reuses the stored name.",
-)
-@click.option(
-    "--resolve", "resolve", is_flag=True, hidden=True, help="Run-only resolution preview."
-)
 @click.help_option("-h", "--help")
 def continue_command(
     selector: str,
@@ -3784,43 +3784,26 @@ def continue_command(
     format_name: str | None,
     background: bool,
     timeout: float | None,
+    cancel_after: float | None,
     max_output: int,
     quiet: bool,
     json_mode: bool,
     permissions: str | None,
-    model: str | None,
-    effort: str | None,
-    mode: str | None,
-    cwd: str | None,
-    home: str | None,
-    alias: str | None,
-    resolve: bool,
 ) -> None:
     """Continue a finished session; block and print the answer unless ``--bg``.
 
     Model, effort, mode, permissions and home come from the session, not from
     re-resolving the agent entry — editing an entry never changes a session
-    mid-conversation. A session cancelled by ``stop`` is the pause/resume path; its
-    adapter context is preserved. ``--permissions`` is the one ``run`` resolution
+    mid-conversation. A canceled session keeps its adapter context when the
+    adapter supports continuation. ``--permissions`` is the one ``run`` resolution
     flag ``continue`` accepts: it applies to this turn and every turn after it.
 
     Example: ``acpc continue <session-id> "Run the tests again"``
     """
     selected_format = _select_format(format_name, json_mode, native_text=True)
+    if background and timeout is not None:
+        raise UsageProblem("--timeout only bounds waiting; use --cancel-after with --background")
     permissions = _normalize_permission(permissions)
-    run_only = {
-        "--model": model,
-        "--effort": effort,
-        "--mode": mode,
-        "--cwd": cwd,
-        "--home": home,
-        "--name": alias,
-        "--resolve": resolve,
-    }
-    for flag, value in run_only.items():
-        if value not in (None, False):
-            rule = "continue reuses the session's stored settings"
-            raise UsageProblem(f"{rule} (run-only flag: {flag})")
 
     prompt = _read_prompt(prompt_text, prompt_file)
     meta = _load_view_session(selector)
@@ -3839,6 +3822,7 @@ def continue_command(
         permissions=permissions,
         background=background,
         timeout=timeout,
+        cancel_after=cancel_after,
         max_output=max_output,
         quiet=quiet,
         json_mode=selected_format == "json",
@@ -3852,6 +3836,7 @@ def _follow_up_request(
     permissions: str | None,
     background: bool,
     timeout: float | None,
+    cancel_after: float | None,
 ) -> tuple[sessions.SessionMeta, runner.TurnRequest]:
     """Build the next turn on a finished session from its stored resolution.
 
@@ -3911,7 +3896,8 @@ def _follow_up_request(
         request = runner.continue_request(
             current,
             prompt,
-            timeout=timeout,
+            wait_timeout=timeout,
+            cancel_after=cancel_after,
             permission_prompt=(_tty_permission_prompt if policy == "ask" and interactive else None),
             resolution=request_resolution,
             defer_rotation=True,
@@ -3936,6 +3922,7 @@ def _dispatch_follow_up(
     permissions: str | None,
     background: bool,
     timeout: float | None,
+    cancel_after: float | None,
     max_output: int,
     quiet: bool,
     json_mode: bool,
@@ -3951,6 +3938,7 @@ def _dispatch_follow_up(
         permissions=permissions,
         background=background,
         timeout=timeout,
+        cancel_after=cancel_after,
     )
 
     if background:
@@ -3982,6 +3970,9 @@ def _dispatch_follow_up(
     except runner.RunnerError as error:
         raise _runner_problem(error).with_context(session_id=meta.session_id) from None
 
+    if outcome.wait_timed_out:
+        _raise_wait_timeout(meta.session_id, output_file)
+
     final = sessions.read_meta(meta.session_id)
 
     result = output.render_result(
@@ -3999,7 +3990,7 @@ def _dispatch_follow_up(
     if outcome.state == "detached":
         _echo_metadata(
             f"-- detached, still RUNNING: {meta.session_id}"
-            f" — answer: acpc wait {meta.session_id} · cancel: acpc stop {meta.session_id}"
+            f" — answer: acpc wait {meta.session_id} · cancel: acpc cancel {meta.session_id}"
         )
         _end_turn_for(meta.session_id, outcome)
     if not quiet:
@@ -4025,7 +4016,7 @@ def _steer_prompt(instruction: str) -> str:
     selector=_SELECTOR_HELP,
     instruction_text=(
         "The redirect, or `-` to read it from stdin; --prompt-file is the third source and "
-        f"exactly one of the three may be given. At most {vocab.MAX_PROMPT_LABEL} of UTF-8. "
+        f"exactly one of the three may be given. At most {_PROMPT_LIMIT_HELP} of UTF-8. "
         "An interrupted turn receives it under a fixed preamble."
     ),
     output_file=_OUTPUT_FILE_DESCRIPTION,
@@ -4038,7 +4029,7 @@ def _steer_prompt(instruction: str) -> str:
     "prompt_file",
     metavar="FILE",
     help=(
-        f"Read the instruction from a file; at most {vocab.MAX_PROMPT_LABEL}. One of three "
+        f"Read the instruction from a file; at most {_PROMPT_LIMIT_HELP}. One of three "
         "sources with the argument and `-`, exactly one of which must be given."
     ),
 )
@@ -4049,14 +4040,29 @@ def _steer_prompt(instruction: str) -> str:
     type=click.Choice(("text", "json")),
     help=_FORMAT_NATIVE_HELP,
 )
-@click.option("--bg", "background", is_flag=True, help="Dispatch and return the session id.")
+@click.option(
+    "--background",
+    "--bg",
+    "background",
+    is_flag=True,
+    help="Dispatch and return the session id.",
+)
 @click.option(
     "--timeout",
     type=TimeoutParamType(),
     metavar="S",
     help=(
-        f"Cancel the redirected turn after this duration ({_DURATION_SYNTAX}); absent, no "
-        "wall-clock limit (the callee runs until it is done)."
+        f"Stop waiting after this duration ({_DURATION_SYNTAX}); the session keeps running. "
+        "Use --cancel-after to cancel the session."
+    ),
+)
+@click.option(
+    "--cancel-after",
+    type=TimeoutParamType(),
+    metavar="S",
+    help=(
+        f"Cancel the redirected turn after this duration ({_DURATION_SYNTAX}); unlike "
+        "--timeout, this changes the work itself."
     ),
 )
 @click.option(
@@ -4078,6 +4084,7 @@ def steer_command(
     format_name: str | None,
     background: bool,
     timeout: float | None,
+    cancel_after: float | None,
     max_output: int,
     quiet: bool,
     json_mode: bool,
@@ -4096,6 +4103,8 @@ def steer_command(
     Example: ``acpc steer x7k2 "Stop editing; diagnose only"``
     """
     selected_format = _select_format(format_name, json_mode, native_text=True)
+    if background and timeout is not None:
+        raise UsageProblem("--timeout only bounds waiting; use --cancel-after with --background")
     instruction = _read_prompt(instruction_text, prompt_file)
     meta = _load_view_session(selector)
     if not meta.is_active:
@@ -4131,6 +4140,7 @@ def steer_command(
         permissions=None,
         background=background,
         timeout=timeout,
+        cancel_after=cancel_after,
         max_output=max_output,
         quiet=quiet,
         json_mode=selected_format == "json",
@@ -4183,9 +4193,9 @@ def wait_command(
 
     The exit code mirrors the session result. On an already-finished session it
     returns immediately — the free way to reprint an answer. ``--timeout`` stops
-    the waiting only and exits 124: the session keeps running, unlike ``run --timeout``,
-    which cancels it. A session that failed adds a ``failure:`` segment to the stderr
-    summary, naming what acpc observed and the next step to take.
+    the waiting only and exits 124: the session keeps running. A session that failed
+    adds a ``failure:`` segment to the stderr summary, naming what acpc observed and
+    the next step to take.
 
     Example: ``acpc wait <session-id> --timeout 120``
     """
@@ -4380,10 +4390,13 @@ async def _collect_daemon_status(
 @click.argument("agent", required=False)
 @click.option(
     "--force",
+    "-f",
     is_flag=True,
     help="Stop even when the target has running or starting sessions; they are failed, not orphaned.",
 )
-@click.option("--dry-run", is_flag=True, help="List the daemons it would stop, and stop none.")
+@click.option(
+    "--dry-run", "-n", is_flag=True, help="List the daemons it would stop, and stop none."
+)
 @click.option("--yes", "-y", "assume_yes", is_flag=True, help="Stop them without being asked.")
 @click.option(
     "--format",

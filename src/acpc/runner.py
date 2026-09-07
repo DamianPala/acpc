@@ -8,16 +8,20 @@ resolved call and a finished session:
   visible, folded into the single `--` stderr summary line, never silent.
 - **Signals.** SIGINT is a human's Ctrl-C and cancels the session (ACP
   `session/cancel`, bounded wait for the ack) → exit 130. SIGTERM is a harness
-  killing the tool call; on the daemon path it detaches, but a direct child
-  cannot outlive its parent, so there it cancels too → exit 143.
-- **Timeout.** `--timeout` cancels the session the same way, but the state is
-  `timeout` and the exit code 124.
+  killing the tool call; on the daemon path it detaches, while an ordinary
+  direct child cancels too → exit 143. A direct wait-deadline worker is an
+  accepted, detached owner just for the `--timeout` wait-only path.
+- **Timeout.** `--timeout` bounds the client's wait without canceling work;
+  the daemon keeps the session running and the client exits 124.
+- **Cancel-after.** `--cancel-after` cancels the session, which is a failed
+  operation for a waiting caller and exits 1.
 - **Finalization.** Whatever the outcome, `answer.md` and `meta.json` are
   written before the process exits: a partial answer is still an answer.
 """
 
 import asyncio
 import contextlib
+import json
 import os
 import re
 import shutil
@@ -61,6 +65,12 @@ _ANSI_ESCAPE_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b\n]*(?:\x0
 # Bounds both the tail spliced into the one-line failure message and the
 # persisted failure observation in meta.json.
 MESSAGE_TAIL_CHARS = 300
+
+# A direct timeout worker owns the accepted turn after the observing client
+# exits.  The request is private session state and is removed after the worker
+# reads it; it is not part of the advertised session paths.
+_DIRECT_REQUEST_NAME = ".direct-request"
+_DIRECT_WORKER_ENV = "ACPC_DIRECT_WORKER"
 
 # ACP stop reasons that mean the turn failed rather than completed.
 _FAILURE_STOP_REASONS = frozenset({"refusal", "max_tokens", "max_turn_requests"})
@@ -462,7 +472,11 @@ class TurnRequest:
     resolution: CallResolution
     prompt: str
     cwd: str | None = None
-    timeout: float | None = None
+    # ``wait_timeout`` belongs to the client observing the turn.  It must not
+    # be sent to the adapter or cancel work that the daemon has accepted.
+    wait_timeout: float | None = None
+    # ``cancel_after`` is the deadline that intentionally cancels this turn.
+    cancel_after: float | None = None
     permission_prompt: Callable[[str, str], bool] | None = None
     resume_adapter_session: str | None = None
     defer_rotation: bool = False
@@ -495,6 +509,8 @@ class TurnOutcome:
     finalized_elsewhere: bool = False
     queued: bool = False
     turn_token: int | None = None
+    # The daemon continues the accepted turn after this client stops waiting.
+    wait_timed_out: bool = False
     # True when this process's own Ctrl-C ended the turn. A session that reads
     # `cancelled` says nothing about who cancelled it, and the two answers need
     # different failure kinds: the command was stopped, or it watched an
@@ -517,7 +533,7 @@ def exit_code_for(state: str, stop_reason: str | None = None) -> int:
     if state == "timeout":
         return vocab.EXIT_TIMEOUT
     if state == "canceled":
-        return vocab.EXIT_CANCELLED
+        return vocab.EXIT_AGENT_ERROR if stop_reason == "cancel_after" else vocab.EXIT_CANCELLED
     # Detached (daemon path) and terminated (direct path) are both "SIGTERM
     # ended this client"; they differ only in whether the session survives it.
     if state in {"detached", "terminated"}:
@@ -975,15 +991,17 @@ async def _await_prompt(
     try:
         done, _pending = await asyncio.wait(
             {prompt_task, waiter},
-            timeout=request.timeout,
+            timeout=request.cancel_after,
             return_when=asyncio.FIRST_COMPLETED,
         )
         if prompt_task in done:
             return _stop_reason_of(prompt_task, usage_client=usage_client)
 
-        # Either the timeout expired or a signal asked us to wind down.
+        # Either the cancellation deadline expired or a signal asked us to
+        # wind down.  A client-side wait deadline is handled by the daemon
+        # route, because direct children cannot outlive this process.
         if not cancel.requested.is_set():
-            cancel.request("timeout")
+            cancel.request("canceled", stop_reason="cancel_after")
         cancel.cancellation_dispatched.set()
         with contextlib.suppress(Exception):
             await conn.cancel(session_id=adapter_session_id)
@@ -1024,8 +1042,8 @@ def _install_signal_handlers(
 ) -> None:
     """Route SIGINT/SIGTERM into the turn's cancel path.
 
-    SIGTERM detaches only when the daemon owns the session; a direct child
-    dies with its parent, so there it cancels (SPEC.md *Output contract*).
+    SIGTERM detaches only when the daemon owns the session; an ordinary direct
+    child dies with its parent, so there it cancels (SPEC.md *Output contract*).
     """
     if sys.platform == "win32":
         return
@@ -1054,7 +1072,7 @@ def daemon_payload(request: TurnRequest) -> dict[str, Any]:
         "permissions": resolution.permissions,
         "home": resolution.home,
         "cwd": request.cwd,
-        "timeout": request.timeout,
+        "cancel_after": request.cancel_after,
         "prompt": request.prompt,
         "resume_adapter_session": request.resume_adapter_session,
         "defer_rotation": request.defer_rotation,
@@ -1072,6 +1090,8 @@ def routes_direct(request: TurnRequest) -> str | None:
     An `ask` policy needs a terminal to ask on and the daemon has none, so
     such a call stays a direct child even when a daemon is available.
     """
+    if os.environ.get(_DIRECT_WORKER_ENV) == "1":
+        return "the detached direct worker owns this session"
     if request.permission_prompt is not None or request.resolution.permissions == "ask":
         return "--permissions ask needs this terminal"
     return None
@@ -1124,6 +1144,13 @@ async def _execute_routed(
     if daemon is not None:
         target = daemon_target(request.resolution)
         return await _execute_via_daemon(session_id, request, daemon, cancel, target)
+
+    if request.wait_timeout is not None:
+        return await _execute_direct_with_wait_timeout(
+            session_id,
+            request,
+            route_note=route_note,
+        )
 
     if request.defer_rotation:
         try:
@@ -1180,6 +1207,88 @@ async def _execute_direct(
     return outcome
 
 
+def _direct_request_path(session_id: str) -> Path:
+    return sessions.session_dir(session_id) / _DIRECT_REQUEST_NAME
+
+
+def _write_direct_request(session_id: str, request: TurnRequest) -> None:
+    """Persist the direct worker's request before detaching it."""
+    worker_request = replace(request, wait_timeout=None)
+    paths.atomic_write(
+        _direct_request_path(session_id),
+        json.dumps(daemon_payload(worker_request), ensure_ascii=False),
+    )
+
+
+def start_direct_worker(session_id: str, request: TurnRequest) -> int:
+    """Start a detached direct worker and return its process id.
+
+    POSIX uses ``posix_spawn`` so the worker is not joined when the observing
+    client exits. Windows uses ``spawnve``; the worker redirects its standard
+    streams before reading the private request file.
+    """
+    _write_direct_request(session_id, request)
+    argv = (sys.executable, "-m", "acpc.direct_worker", session_id)
+    env = dict(os.environ)
+    env[_DIRECT_WORKER_ENV] = "1"
+    if os.name == "posix":
+        devnull = os.open(os.devnull, os.O_RDWR)
+        actions = [
+            (os.POSIX_SPAWN_DUP2, devnull, 0),
+            (os.POSIX_SPAWN_DUP2, devnull, 1),
+            (os.POSIX_SPAWN_DUP2, devnull, 2),
+            (os.POSIX_SPAWN_CLOSE, devnull),
+        ]
+        try:
+            return os.posix_spawn(sys.executable, argv, env, file_actions=actions)
+        finally:
+            os.close(devnull)
+    return os.spawnve(os.P_NOWAIT, sys.executable, argv, env)
+
+
+async def _execute_direct_with_wait_timeout(
+    session_id: str,
+    request: TurnRequest,
+    *,
+    route_note: str | None,
+) -> TurnOutcome:
+    """Observe a detached direct worker until it finishes or the wait expires."""
+    initial_turns = sessions.read_meta(session_id).turns
+    try:
+        start_direct_worker(session_id, request)
+    except OSError as error:
+        raise RunnerError(f"could not start the direct timeout worker: {error}") from None
+
+    wait_timeout = request.wait_timeout
+    if wait_timeout is None:
+        raise RunnerError("direct timeout worker started without a wait timeout")
+    deadline = asyncio.get_running_loop().time() + wait_timeout
+    while True:
+        current = sessions.load(session_id)
+        turn_started = not request.defer_rotation or current.turns > initial_turns
+        if turn_started and current.is_finished:
+            return TurnOutcome(
+                state=current.state,
+                stop_reason=current.stop_reason,
+                answer=_answer_on_disk(session_id),
+                tokens=current.tokens,
+                cost=current.cost,
+                finalized_elsewhere=True,
+                route_note=route_note,
+            )
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            return TurnOutcome(
+                state=current.state,
+                stop_reason=current.stop_reason,
+                answer="",
+                finalized_elsewhere=True,
+                wait_timed_out=True,
+                route_note=route_note,
+            )
+        await asyncio.sleep(min(0.02, remaining))
+
+
 async def _execute_via_daemon(
     session_id: str,
     request: TurnRequest,
@@ -1207,7 +1316,9 @@ async def _execute_via_daemon(
         waiting = asyncio.ensure_future(daemon.await_turn(session_id))
         signalled = asyncio.ensure_future(cancel.requested.wait())
         done, _pending = await asyncio.wait(
-            {waiting, signalled}, return_when=asyncio.FIRST_COMPLETED
+            {waiting, signalled},
+            timeout=request.wait_timeout,
+            return_when=asyncio.FIRST_COMPLETED,
         )
 
         if waiting not in done:
@@ -1220,6 +1331,18 @@ async def _execute_via_daemon(
                     answer="",
                     finalized_elsewhere=True,
                     queued=queued,
+                )
+            if not cancel.requested.is_set():
+                waiting.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await waiting
+                return TurnOutcome(
+                    state="running",
+                    stop_reason=None,
+                    answer="",
+                    finalized_elsewhere=True,
+                    queued=queued,
+                    wait_timed_out=True,
                 )
             await daemon_client.cancel_turn(target, session_id)
         signalled.cancel()
@@ -1266,16 +1389,16 @@ def _answer_on_disk(session_id: str) -> str:
 async def dispatch_background(session_id: str, request: TurnRequest) -> str | None:
     """Start a turn the caller will not wait for; None on success.
 
-    `--bg` needs an owner that outlives this process, which is exactly what the
+    `--background` needs an owner that outlives this process, which is exactly what the
     daemon is. Without one there is nobody to hand the session to, so this
     reports why instead of silently running a child that dies on exit.
     """
     forced = routes_direct(request)
     if forced is not None:
-        return f"--bg needs the daemon, and {forced}"
+        return f"--background needs the daemon, and {forced}"
     routed = await daemon_client.ensure_daemon(daemon_target(request.resolution))
     if isinstance(routed, daemon_client.DaemonUnavailable):
-        return f"--bg needs the daemon: {routed.reason}"
+        return f"--background needs the daemon: {routed.reason}"
     try:
         started = await routed.start_turn(session_id, daemon_payload(request))
         if not started.get("ok"):
@@ -1343,6 +1466,45 @@ def execute_turn(session_id: str, request: TurnRequest) -> TurnOutcome:
     if not outcome.finalized_elsewhere:
         _finalize(session_id, outcome, error=outcome.error, expected_turn=outcome.turn_token)
     return outcome
+
+
+def _direct_worker_request(session_id: str) -> TurnRequest:
+    """Read a detached direct request from its owner-only session file."""
+    request_path = _direct_request_path(session_id)
+    try:
+        payload = json.loads(request_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise TypeError("direct worker request has an invalid shape")
+        meta = sessions.read_meta(session_id)
+        request = TurnRequest(
+            resolution=resolution_from_session(meta),
+            prompt=payload.get("prompt", ""),
+            cwd=payload.get("cwd"),
+            cancel_after=payload.get("cancel_after"),
+            resume_adapter_session=payload.get("resume_adapter_session"),
+            defer_rotation=bool(payload.get("defer_rotation", False)),
+            rotation_resolution=payload.get("rotation_resolution"),
+            resume_prepared=bool(payload.get("resume_prepared", False)),
+            turn_token=payload.get("turn_token"),
+        )
+        return request
+    except (OSError, ValueError, TypeError, KeyError, RunnerError, sessions.SessionError) as error:
+        failure = RunnerError(f"cannot read the direct worker request: {error}")
+        _finalize(
+            session_id,
+            TurnOutcome(state="failed", stop_reason="error", answer=""),
+            error=failure,
+        )
+        raise failure from None
+    finally:
+        with contextlib.suppress(OSError):
+            request_path.unlink()
+
+
+def run_direct_worker(session_id: str, request: TurnRequest | None = None) -> None:
+    """Run a detached direct request from its owner-only session file."""
+    request = request or _direct_worker_request(session_id)
+    execute_turn(session_id, request)
 
 
 def _finalize(
@@ -1843,7 +2005,8 @@ def continue_request(
     meta: sessions.SessionMeta,
     prompt: str,
     *,
-    timeout: float | None = None,
+    wait_timeout: float | None = None,
+    cancel_after: float | None = None,
     permissions: str | None = None,
     permission_prompt: Callable[[str, str], bool] | None = None,
     resolution: CallResolution | None = None,
@@ -1866,7 +2029,8 @@ def continue_request(
         resolution=resolution,
         prompt=prompt,
         cwd=cwd,
-        timeout=timeout,
+        wait_timeout=wait_timeout,
+        cancel_after=cancel_after,
         permission_prompt=permission_prompt,
         resume_adapter_session=meta.adapter_session_id,
         defer_rotation=defer_rotation,
@@ -1876,7 +2040,7 @@ def continue_request(
 
 
 def _source_label(source: Any) -> str:
-    """Render a `FieldSource` the way `--resolve` and `agents <name>` show it."""
+    """Render a `FieldSource` the way `--resolve` and `agents get` show it."""
     if source is None:
         return "unset"
     kind = getattr(source, "kind", "unset")
@@ -1939,7 +2103,7 @@ async def _await_session(session_id: str, target: str | None, timeout: float | N
 def wait_for_session(session_id: str, *, timeout: float | None = None) -> str | None:
     """Block until a session finishes, returning its state or None on timeout.
 
-    SPEC.md `wait`: the timeout stops *waiting* only — unlike `run --timeout`,
+    SPEC.md `wait`: the timeout stops *waiting* only — as `run --timeout` does,
     the session is left running.
     """
     meta = sessions.load(session_id)

@@ -63,8 +63,8 @@ def test_non_tty_defaults_match_schema_and_explicit_text_is_available(cli: CliRu
     assert index["format_defaults"]["non_tty"] in status_format["enum"]
     status_default = invoke(cli, "status")
     assert json.loads(status_default.stdout) == {"items": [], "has_more": False}
-    assert isinstance(json.loads(invoke(cli, "agents").stdout)["items"], list)
-    assert isinstance(json.loads(invoke(cli, "skills").stdout)["items"], list)
+    assert isinstance(json.loads(invoke(cli, "agents", "list").stdout)["items"], list)
+    assert isinstance(json.loads(invoke(cli, "skills", "list").stdout)["items"], list)
     assert json.loads(invoke(cli, "daemon", "status").stdout) == {
         "items": [],
         "has_more": False,
@@ -138,14 +138,15 @@ def test_plain_requires_an_explicit_limit_and_emits_one_identifier_per_line(
 
 
 def test_named_agent_views_reject_collection_only_flags(cli: CliRunner) -> None:
-    for view, flag in (("--models", "--limit"), ("--commands", "--plain"), ("--check", "--limit")):
-        arguments = ("agents", view, flag)
-        if flag == "--limit":
-            arguments += ("1",)
+    calls = (
+        (("agents", "get", "mock", "--models", "--limit", "1"), "--limit"),
+        (("agents", "get", "mock", "--commands", "--plain"), "--plain"),
+        (("agents", "check", "mock", "--limit", "1"), "--limit"),
+    )
+    for arguments, flag in calls:
         result = invoke(cli, *arguments)
         assert result.exit_code == vocab.EXIT_USAGE
         assert flag in result.stderr
-        assert view in result.stderr
 
 
 def test_schema_publishes_closed_format_choices_locally_and_color_globally(
@@ -416,7 +417,7 @@ def test_continue_classifies_legacy_transcript_as_corrupt_state_with_recovery(
     error = json.loads(result.stderr.splitlines()[-1])["error"]
     assert error["kind"] == "corrupt_state"
     assert "acpc.transcript/1" in error["message"]
-    assert "acpc rm" in error["hint"]
+    assert "acpc delete" in error["hint"]
 
 
 def test_log_limit_ends_follow_after_the_requested_number_of_records(cli: CliRunner) -> None:
@@ -477,7 +478,7 @@ def test_human_output_escapes_ansi_in_session_and_agent_values(
         MOCK_ENTRY.replace('name = "Mock Agent"\n', 'name = "Mock Agent"\n' + description),
         encoding="utf-8",
     )
-    agents = invoke(cli, "agents", "--format", "text")
+    agents = invoke(cli, "agents", "list", "--format", "text")
     assert "\x1b" not in agents.stdout
 
 

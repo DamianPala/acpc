@@ -7,6 +7,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -238,7 +239,7 @@ def test_an_unknown_agent_is_not_found(cli: CliRunner) -> None:
     assert result.exit_code == vocab.EXIT_AGENT_ERROR
     envelope = json.loads(result.stderr)["error"]
     assert envelope["kind"] == "not_found"
-    assert envelope["hint"] == "Run: acpc agents"
+    assert envelope["hint"] == "Run: acpc agents list"
 
 
 def test_a_missing_adapter_binary_exits_1_and_names_the_install(cli: CliRunner) -> None:
@@ -905,19 +906,71 @@ def test_a_refusal_exits_1(cli: CliRunner) -> None:
     assert envelope["context"]["status"] == "failed"
 
 
-def test_a_timeout_exits_124(cli: CliRunner) -> None:
-    result = invoke(cli, "run", "mock", "slow:30 cli timeout probe", "--timeout", "1", "--quiet")
+def test_cancel_after_exits_1_and_cancels(cli: CliRunner) -> None:
+    result = invoke(
+        cli, "run", "mock", "slow:30 cli timeout probe", "--cancel-after", "1", "--quiet"
+    )
 
-    assert result.exit_code == vocab.EXIT_TIMEOUT
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    envelope = error_envelope(result)
+    assert envelope["kind"] == "operation_failed"
+    assert envelope["context"]["status"] == "canceled"
+    assert sessions.read_meta(envelope["context"]["session_id"]).state == "canceled"
+
+
+def test_timeout_cannot_be_combined_with_background(cli: CliRunner) -> None:
+    result = invoke(cli, "run", "mock", "hello", "--background", "--timeout", "1")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert "--cancel-after" in result.stderr
+
+
+def test_timeout_only_stops_waiting_and_reports_observed_state(
+    cli: CliRunner, live_daemon: None
+) -> None:
+    result = invoke(cli, "run", "mock", "slow:30 wait only", "--timeout", "1", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_TIMEOUT, result.stderr
     envelope = error_envelope(result)
     assert envelope["kind"] == "timeout"
-    assert sessions.read_meta(envelope["context"]["session_id"]).state == "timeout"
+    session_id = envelope["context"]["session_id"]
+    assert envelope["context"]["status"] in {"starting", "running"}
+    assert sessions.read_meta(session_id).state in {"starting", "running"}
+
+
+def test_timeout_direct_fallback_keeps_the_session_alive(cli: CliRunner) -> None:
+    result = invoke(cli, "run", "mock", "slow:2 direct wait only", "--timeout", "0.1", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_TIMEOUT, result.stderr
+    envelope = error_envelope(result)
+    session_id = envelope["context"]["session_id"]
+    assert sessions.load(session_id).state in {"starting", "running"}
+
+    deadline = time.monotonic() + 5
+    while sessions.load(session_id).is_active and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert sessions.load(session_id).state == "succeeded"
+
+
+def test_timeout_direct_fallback_can_still_be_canceled(cli: CliRunner) -> None:
+    result = invoke(cli, "run", "mock", "slow:30 cancel after wait", "--timeout", "0.1", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_TIMEOUT
+    session_id = error_envelope(result)["context"]["session_id"]
+    deadline = time.monotonic() + 5
+    while sessions.load(session_id).state == "starting" and time.monotonic() < deadline:
+        time.sleep(0.05)
+
+    canceled = invoke(cli, "cancel", session_id, "--json")
+
+    assert canceled.exit_code == vocab.EXIT_OK, canceled.stderr
+    assert json.loads(canceled.stdout)["status"] == "canceled"
 
 
 def test_a_bare_integer_timeout_is_seconds(cli: CliRunner) -> None:
-    result = invoke(cli, "run", "mock", "slow:2 bare seconds", "--timeout", "1", "--quiet")
+    result = invoke(cli, "run", "mock", "slow:2 bare seconds", "--cancel-after", "1", "--quiet")
 
-    assert result.exit_code == vocab.EXIT_TIMEOUT
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
 
 
 def test_a_five_minute_timeout_is_not_five_seconds(cli: CliRunner) -> None:

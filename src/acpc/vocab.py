@@ -77,9 +77,9 @@ EXIT_DESCRIPTIONS: dict[str, str] = {
     "exceeds the policy, or a policy no declared mode satisfies.",
     "4": "Output budget exhausted: `log --follow` stopped because `--max-output` ran out "
     "before the session ended; the footer's cursor covers what was printed.",
-    "124": "Timeout: `run` cancelled the session; `wait` and `log --wait-new` stopped waiting "
-    "and left it running.",
-    "130": "Cancelled by SIGINT or `acpc stop`. Answer-printing commands mirror the session "
+    "124": "Timeout: `run --timeout` stopped waiting and left the session running; `wait` "
+    "and `log --wait-new` do the same.",
+    "130": "Cancelled by SIGINT or `acpc cancel`. Answer-printing commands mirror the session "
     "result, so `wait` on a cancelled session also exits 130.",
     "141": "SIGPIPE: a downstream reader closed the pipe.",
     "143": "SIGTERM: the client detached from a daemon-owned session, or ended the turn.",

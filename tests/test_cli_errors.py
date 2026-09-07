@@ -180,7 +180,7 @@ def test_a_command_that_parses_json_itself_refines_the_argument_scan(
     assert result.exit_code == vocab.EXIT_AGENT_ERROR
     assert result.stderr.splitlines() == [
         "Error: unknown agent 'no-such-agent'",
-        "Run: acpc agents",
+        "Run: acpc agents list",
     ]
 
 
@@ -483,13 +483,13 @@ def test_an_unreadable_prompt_file_is_a_refusal_and_a_missing_one_is_not(
 def test_an_entry_directory_that_refuses_the_write_is_not_a_usage_error(
     cli: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`agents init` was spelled correctly; the filesystem said no."""
+    """`agents create` was spelled correctly; the filesystem said no."""
     locked = tmp_path / "locked"
     locked.mkdir()
     locked.chmod(0o555)
     monkeypatch.setenv("ACPC_HOME", str(locked))
     try:
-        result = invoke(cli, "agents", "init", "variant", "--extends", "codex")
+        result = invoke(cli, "agents", "create", "variant", "--extends", "codex")
     finally:
         locked.chmod(0o755)
 

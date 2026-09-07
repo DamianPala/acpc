@@ -111,8 +111,11 @@ def walk(command: click.Command, path: str = "") -> Iterator[tuple[str, click.Co
 DECLARED_EFFECTS = {
     "": effects.READ_ONLY,
     "agents": effects.READ_ONLY,
+    "agents check": effects.NON_IDEMPOTENT,
+    "agents create": effects.NON_IDEMPOTENT,
     "agents delete": effects.NON_IDEMPOTENT,
-    "agents init": effects.NON_IDEMPOTENT,
+    "agents get": effects.READ_ONLY,
+    "agents list": effects.READ_ONLY,
     "continue": effects.NON_IDEMPOTENT,
     "daemon": effects.READ_ONLY,
     "daemon status": effects.READ_ONLY,
@@ -121,13 +124,15 @@ DECLARED_EFFECTS = {
     "log": effects.READ_ONLY,
     "probe": effects.READ_ONLY,
     "prune": effects.NON_IDEMPOTENT,
-    "rm": effects.NON_IDEMPOTENT,
+    "delete": effects.NON_IDEMPOTENT,
     "run": effects.NON_IDEMPOTENT,
     "schema": effects.READ_ONLY,
     "skills": effects.READ_ONLY,
+    "skills get": effects.READ_ONLY,
+    "skills list": effects.READ_ONLY,
     "status": effects.READ_ONLY,
     "steer": effects.NON_IDEMPOTENT,
-    "stop": effects.IDEMPOTENT,
+    "cancel": effects.IDEMPOTENT,
     "wait": effects.READ_ONLY,
 }
 
@@ -138,22 +143,22 @@ def test_every_command_in_the_tree_declares_one_effects_value() -> None:
     assert undeclared == []
 
 
-def test_the_named_views_declare_their_effects() -> None:
-    assert effects.of(cli_module._agent_view_command) == effects.READ_ONLY
-    assert effects.of(cli_module._skill_view_command) == effects.READ_ONLY
+def test_agent_and_skill_subcommands_declare_their_effects() -> None:
+    assert effects.of(cli_module.agents_get_command) == effects.READ_ONLY
+    assert effects.of(cli_module.skills_get_command) == effects.READ_ONLY
 
 
 def test_each_command_declares_the_published_classification() -> None:
     assert {path: effects.of(command) for path, command in walk(main)} == DECLARED_EFFECTS
 
 
-# --- rm ---------------------------------------------------------------------
+# --- delete -----------------------------------------------------------------
 
 
-def test_rm_without_yes_stops_before_deleting_anything(cli: CliRunner) -> None:
+def test_delete_without_yes_stops_before_deleting_anything(cli: CliRunner) -> None:
     session_id = finished_session()
 
-    result = invoke(cli, "rm", session_id)
+    result = invoke(cli, "delete", session_id)
 
     assert result.exit_code != vocab.EXIT_OK
     assert envelope(result)["kind"] == "confirmation_required"
@@ -161,25 +166,25 @@ def test_rm_without_yes_stops_before_deleting_anything(cli: CliRunner) -> None:
     assert sessions.session_dir(session_id).exists()
 
 
-def test_rm_of_an_unknown_session_is_not_found_rather_than_a_gate(cli: CliRunner) -> None:
-    result = invoke(cli, "rm", "does-not-exist")
+def test_delete_of_an_unknown_session_is_not_found_rather_than_a_gate(cli: CliRunner) -> None:
+    result = invoke(cli, "delete", "does-not-exist")
 
     assert envelope(result)["kind"] == "not_found"
 
 
-def test_rm_of_a_running_session_is_a_conflict_rather_than_a_gate(cli: CliRunner) -> None:
+def test_delete_of_a_running_session_is_a_conflict_rather_than_a_gate(cli: CliRunner) -> None:
     session_id = running_session()
 
-    result = invoke(cli, "rm", session_id)
+    result = invoke(cli, "delete", session_id)
 
     assert envelope(result)["kind"] == "conflict"
     assert sessions.session_dir(session_id).exists()
 
 
-def test_rm_reports_that_it_changed_something(cli: CliRunner) -> None:
+def test_delete_reports_that_it_changed_something(cli: CliRunner) -> None:
     session_id = finished_session()
 
-    result = invoke(cli, "rm", session_id, "--yes", "--json")
+    result = invoke(cli, "delete", session_id, "--yes", "--json")
 
     assert result.exit_code == vocab.EXIT_OK
     assert json.loads(result.stdout)["changed"] is True
@@ -488,10 +493,10 @@ def test_a_bare_enter_takes_the_offered_default(installer: Path) -> None:
 # --- agents delete ----------------------------------------------------------
 
 
-def test_agents_delete_removes_the_entry_agents_init_wrote(
+def test_agents_delete_removes_the_entry_agents_create_wrote(
     cli: CliRunner, state_root: Path
 ) -> None:
-    invoke(cli, "agents", "init", "work", "--extends", "mock")
+    invoke(cli, "agents", "create", "work", "--extends", "mock")
     target = state_root / "agents" / "work.toml"
     assert target.exists()
 
@@ -516,7 +521,7 @@ def test_agents_delete_refuses_an_adapter_acpc_ships(cli: CliRunner) -> None:
 def test_agents_delete_takes_back_an_override_of_a_shipped_adapter(
     cli: CliRunner, state_root: Path
 ) -> None:
-    invoke(cli, "agents", "init", "codex", "--extends", "mock")
+    invoke(cli, "agents", "create", "codex", "--extends", "mock")
     target = state_root / "agents" / "codex.toml"
     assert target.exists()
 
@@ -565,10 +570,10 @@ def test_agents_delete_refuses_a_link_that_points_out_of_the_directory(
     assert victim.exists()
 
 
-def test_agents_init_refuses_a_name_that_climbs_out_of_the_agents_directory(
+def test_agents_create_refuses_a_name_that_climbs_out_of_the_agents_directory(
     cli: CliRunner, state_root: Path
 ) -> None:
-    result = invoke(cli, "agents", "init", "../escapee", "--extends", "mock")
+    result = invoke(cli, "agents", "create", "../escapee", "--extends", "mock")
 
     assert envelope(result)["kind"] == "invalid_input"
     assert not (state_root / "escapee.toml").exists()
@@ -580,16 +585,16 @@ def test_agents_delete_of_an_unknown_entry_is_not_found(cli: CliRunner) -> None:
     assert envelope(result)["kind"] == "not_found"
 
 
-def test_agents_init_onto_an_existing_entry_is_a_conflict(cli: CliRunner) -> None:
-    invoke(cli, "agents", "init", "work", "--extends", "mock")
+def test_agents_create_onto_an_existing_entry_is_a_conflict(cli: CliRunner) -> None:
+    invoke(cli, "agents", "create", "work", "--extends", "mock")
 
-    result = invoke(cli, "agents", "init", "work", "--extends", "mock")
+    result = invoke(cli, "agents", "create", "work", "--extends", "mock")
 
     assert envelope(result)["kind"] == "conflict"
 
 
-def test_agents_init_reports_that_it_changed_something(cli: CliRunner) -> None:
-    result = invoke(cli, "agents", "init", "work", "--extends", "mock", "--json")
+def test_agents_create_reports_that_it_changed_something(cli: CliRunner) -> None:
+    result = invoke(cli, "agents", "create", "work", "--extends", "mock", "--json")
 
     assert json.loads(result.stdout)["changed"] is True
 

@@ -570,18 +570,19 @@ def test_permission_denied_turn_does_not_record_a_failure() -> None:
     assert sessions.read_meta(session_id).failure is None
 
 
-def test_timeout_cancels_the_turn_and_exits_124() -> None:
-    session_id, outcome = start_turn("slow:30 timeout probe", timeout=1.0)
+def test_cancel_after_cancels_the_turn_and_exits_1() -> None:
+    session_id, outcome = start_turn("slow:30 timeout probe", cancel_after=1.0)
 
-    assert outcome.state == "timeout"
-    assert outcome.exit_code == vocab.EXIT_TIMEOUT
+    assert outcome.state == "canceled"
+    assert outcome.stop_reason == "cancel_after"
+    assert outcome.exit_code == vocab.EXIT_AGENT_ERROR
     meta = sessions.read_meta(session_id)
-    assert meta.state == "timeout"
-    assert meta.exit_code == vocab.EXIT_TIMEOUT
+    assert meta.state == "canceled"
+    assert meta.exit_code == vocab.EXIT_AGENT_ERROR
 
 
 def test_a_timed_out_turn_leaves_an_answer_file_behind() -> None:
-    session_id, _ = start_turn("slow:30 timeout probe", timeout=1.0)
+    session_id, _ = start_turn("slow:30 timeout probe", cancel_after=1.0)
 
     assert sessions.answer_path(session_id).exists()
 

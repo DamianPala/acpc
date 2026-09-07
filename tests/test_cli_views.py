@@ -641,7 +641,7 @@ def test_log_rejects_timeout_without_wait_new(cli: CliRunner) -> None:
 
 
 def test_wait_new_on_a_finished_session_returns_at_once(cli: CliRunner) -> None:
-    """SPEC --wait-new, the `logs -f` convention: following a stopped stream
+    """SPEC --wait-new, the `log --follow` convention: following a stopped stream
     ends — the full-timeout block would read as a hang."""
     session_id = run_mock(cli)
 
@@ -685,7 +685,7 @@ def test_wait_new_timeout_on_a_running_session_says_it_still_runs(cli: CliRunner
 
     assert result.exit_code == vocab.EXIT_TIMEOUT
     assert "still running (gave up waiting after 0.2s)" in result.stderr
-    assert f"acpc stop {meta.session_id} to cancel" in result.stderr
+    assert f"acpc cancel {meta.session_id} to cancel" in result.stderr
 
 
 def test_wait_timeout_on_a_running_session_says_it_still_runs(cli: CliRunner) -> None:
@@ -696,7 +696,7 @@ def test_wait_timeout_on_a_running_session_says_it_still_runs(cli: CliRunner) ->
 
     assert result.exit_code == vocab.EXIT_TIMEOUT
     assert "still running (gave up waiting after 0.1s)" in result.stderr
-    assert f"acpc stop {meta.session_id} to cancel" in result.stderr
+    assert f"acpc cancel {meta.session_id} to cancel" in result.stderr
 
 
 def test_log_wait_new_returns_after_the_transcript_grows(cli: CliRunner) -> None:
@@ -838,7 +838,7 @@ def test_follow_timeout_exits_124_and_leaves_the_session_alone(cli: CliRunner) -
 
     assert result.exit_code == vocab.EXIT_TIMEOUT
     assert "still running (gave up waiting after 0.2s)" in result.stderr
-    assert f"acpc stop {meta.session_id} to cancel" in result.stderr
+    assert f"acpc cancel {meta.session_id} to cancel" in result.stderr
     assert "cursor:" in result.stderr
     assert sessions.load(meta.session_id).state == "running"
 
@@ -963,14 +963,14 @@ def test_follow_and_wait_new_are_mutually_exclusive(cli: CliRunner) -> None:
     assert "mutually exclusive" in result.stderr
 
 
-def test_follow_accepts_the_short_flag(cli: CliRunner) -> None:
-    """-f is a real flag on `log` now, not an alias hint."""
+def test_follow_rejects_the_removed_short_flag(cli: CliRunner) -> None:
+    """-f is reserved for --force and log teaches the canonical spelling."""
     meta = session_with_messages(3)
 
     result = invoke(cli, "log", meta.session_id, "-f")
 
-    assert result.exit_code == vocab.EXIT_OK
-    assert '"event-2"' in result.stdout
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert "--follow" in result.stderr
 
 
 def test_follow_quiet_suppresses_the_footer(cli: CliRunner) -> None:

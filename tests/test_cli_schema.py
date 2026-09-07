@@ -17,7 +17,7 @@ import click
 import pytest
 from click.testing import CliRunner
 
-from acpc import effects, vocab
+from acpc import effects, schema, vocab
 from acpc.cli import main
 
 D7_FIELDS = {
@@ -139,7 +139,19 @@ def test_schema_is_not_a_command_entry(runner: CliRunner) -> None:
     assert "schema" not in names
     # Nor is a group that dispatches nothing of its own.
     assert "daemon" not in names
-    assert {"daemon status", "daemon stop", "agents", "agents init"} <= names
+    assert {
+        "agents check",
+        "agents create",
+        "agents delete",
+        "agents get",
+        "agents list",
+        "daemon status",
+        "daemon stop",
+        "skills get",
+        "skills list",
+    } <= names
+    assert "agents" not in names
+    assert "skills" not in names
 
 
 def test_every_indexed_command_has_detail(runner: CliRunner) -> None:
@@ -248,15 +260,13 @@ def test_global_flags_are_exactly_the_flags_every_command_accepts(runner: CliRun
         assert flag["description"].strip()
 
 
-def test_hidden_flags_are_published(runner: CliRunner) -> None:
-    detail = read_detail(runner, "continue")
+def test_continue_has_no_hidden_flags(runner: CliRunner) -> None:
     hidden = {
         parameter.opts[0].lstrip("-")
         for parameter in click_command("continue").params
         if isinstance(parameter, click.Option) and parameter.hidden
     }
-    assert hidden
-    assert hidden <= {flag["name"] for flag in detail["flags"]}
+    assert hidden == set()
 
 
 def test_argument_descriptors_cover_every_accepted_argument(runner: CliRunner) -> None:
@@ -273,37 +283,43 @@ def test_argument_descriptors_cover_every_accepted_argument(runner: CliRunner) -
         assert [arg["name"] for arg in detail["args"]] == accepted, entry["name"]
 
 
-@pytest.mark.parametrize(
-    ("group", "renders"),
-    [
-        ("agents", "Render one named adapter or variant."),
-        ("skills", "Render one named bundled skill."),
-    ],
-)
-def test_every_listed_name_reaches_the_published_argument(
-    runner: CliRunner, group: str, renders: str
-) -> None:
-    """`<group> <name>` takes every name the bare listing shows.
-
-    The descriptor promises a name "as listed by bare `acpc <group>`", so a
-    listed name the parser routes somewhere else makes the published contract
-    false — which is what a name colliding with a subcommand used to do. The
-    help of the call says where it went, and asking for it starts nothing.
-    """
-    assert [arg["name"] for arg in read_detail(runner, group)["args"]] == ["name"]
-    listed = json.loads(invoke(runner, group, "--json").stdout)["items"]
+@pytest.mark.parametrize("group", ["agents", "skills"])
+def test_every_listed_name_reaches_the_get_command(runner: CliRunner, group: str) -> None:
+    listed = json.loads(invoke(runner, group, "list", "--json").stdout)["items"]
     names = [item["name"] for item in listed]
     assert names
     for name in names:
-        result = invoke(runner, group, name, "--help")
+        result = invoke(runner, group, "get", name, "--help")
         assert result.exit_code == 0, (name, result.output)
-        assert renders in result.stdout, (name, result.stdout)
+        assert "Show" in result.stdout or "Print" in result.stdout, (name, result.stdout)
 
 
-def test_named_view_arguments_are_optional(runner: CliRunner) -> None:
+def test_group_prefixes_have_no_command_detail(runner: CliRunner) -> None:
     for name in ("agents", "skills"):
-        args = read_detail(runner, name)["args"]
-        assert [(arg["name"], arg["required"]) for arg in args] == [("name", False)]
+        result = invoke(runner, "schema", name)
+        assert result.exit_code == vocab.EXIT_USAGE
+        assert name in result.stderr
+
+
+def test_help_only_group_is_not_a_command_entry() -> None:
+    @click.group()
+    def root() -> None:
+        pass
+
+    @root.group(invoke_without_command=True)
+    @click.pass_context
+    def help_only(ctx: click.Context) -> None:
+        click.echo(ctx.get_help())
+
+    assert "help-only" not in schema.commands(root)
+
+
+def test_background_alias_and_timeout_contract_are_published(runner: CliRunner) -> None:
+    flags = {flag["name"]: flag for flag in read_detail(runner, "run")["flags"]}
+
+    assert flags["background"]["aliases"] == ["bg"]
+    assert "the session keeps running" in flags["timeout"]["description"]
+    assert "changes the work itself" in flags["cancel-after"]["description"]
 
 
 def test_descriptors_are_well_formed(runner: CliRunner) -> None:
@@ -336,7 +352,7 @@ def test_no_descriptor_publishes_a_sentinel_default(runner: CliRunner) -> None:
 def test_run_time_resolved_values_are_not_published_as_defaults(runner: CliRunner) -> None:
     """A value that comes from the registry or the environment is not a default."""
     flags = {flag["name"]: flag for flag in read_detail(runner, "run")["flags"]}
-    for name in ("permissions", "model", "effort", "cwd", "home", "timeout"):
+    for name in ("permissions", "model", "effort", "cwd", "home", "timeout", "cancel-after"):
         assert "default" not in flags[name], name
         assert flags[name]["description"].strip()
     # A real built-in default, on the other hand, is published.
@@ -370,7 +386,7 @@ def test_confirm_marks_every_command_that_accepts_yes(runner: CliRunner) -> None
         assert detail["confirm"] == accepts_yes, entry["name"]
         if accepts_yes:
             gated.add(entry["name"])
-    assert gated == {"rm", "prune", "install", "daemon stop"}
+    assert gated == {"delete", "prune", "install", "daemon stop"}
 
 
 def test_effects_match_the_declaration_on_the_command(runner: CliRunner) -> None:
@@ -384,7 +400,7 @@ def test_unknown_path_names_the_nearest_valid_paths(runner: CliRunner) -> None:
     envelope = json.loads(result.stderr.strip().splitlines()[-1])
     assert envelope["error"]["kind"] == "invalid_input"
     message = envelope["error"]["message"]
-    assert "agents init" in message and "agents delete" in message
+    assert "agents create" in message and "agents delete" in message
     assert "wait" not in message
 
 
@@ -401,16 +417,16 @@ def test_unknown_first_word_names_every_path(runner: CliRunner) -> None:
     result = invoke(runner, "schema", "nope")
     assert result.exit_code == vocab.EXIT_USAGE
     message = json.loads(result.stderr.strip().splitlines()[-1])["error"]["message"]
-    for name in ("run", "agents init", "daemon status"):
+    for name in ("run", "agents create", "daemon status"):
         assert name in message
 
 
 def test_a_quoted_path_is_not_a_path(runner: CliRunner) -> None:
     """Segments are separate arguments; one quoted word is not two segments."""
-    result = invoke(runner, "schema", "agents init")
+    result = invoke(runner, "schema", "agents create")
     assert result.exit_code == vocab.EXIT_USAGE
     message = json.loads(result.stderr.strip().splitlines()[-1])["error"]["message"]
-    assert "acpc schema agents init" in message
+    assert "acpc schema agents create" in message
     # The shell ate the quotes, so the message has to name the difference
     # rather than repeat the string the caller can already see.
     assert "one argument" in message and "pass 2 arguments" in message

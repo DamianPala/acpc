@@ -257,24 +257,10 @@ def _descriptor(
     return descriptor
 
 
-def _argument_source(command: click.Command) -> click.Command:
-    """Where a command's positional arguments are actually parsed.
-
-    `acpc agents <name>` and `acpc skills <name>` are parsed by a hidden
-    command the group hands an unrecognized first word to.  The group and
-    that command declare the same flags, so the group's entry borrows its
-    arguments and they become optional: the group runs bare as well.
-    """
-    source = getattr(command, "view_command", None)
-    return source if isinstance(source, click.Command) else command
-
-
 def _args(command: click.Command) -> list[dict[str, Any]]:
-    source = _argument_source(command)
-    borrowed = source is not command
     return [
-        _descriptor(parameter, source, required=False if borrowed else None)
-        for parameter in source.params
+        _descriptor(parameter, command)
+        for parameter in command.params
         if isinstance(parameter, click.Argument)
     ]
 
@@ -322,7 +308,10 @@ def _walk(group: click.Group, prefix: tuple[str, ...] = ()) -> Iterator[tuple[st
         if path == (COMMAND_NAME,):
             continue
         if isinstance(command, click.Group):
-            if command.invoke_without_command:
+            # A group may use ``invoke_without_command`` to produce a usage
+            # error or help.  Only a group explicitly marked as doing useful
+            # work without a subcommand is itself a dispatchable command.
+            if getattr(command, "_acpc_dispatches_without_command", False):
                 yield " ".join(path), command
             yield from _walk(command, path)
         else:
@@ -408,8 +397,8 @@ def document(root: click.Group, path: Sequence[str]) -> dict[str, Any]:
     known = commands(root)
     name = " ".join(path)
     # A segment holding a space is one quoted word, not two segments: the
-    # caller wrote `schema "agents init"` where the path is `schema agents
-    # init`.  Accepting it would make two spellings of the same path, and
+    # caller wrote `schema "agents create"` where the path is `schema agents
+    # create`.  Accepting it would make two spellings of the same path, and
     # only one of them survives being built from a `name` split on spaces.
     command = None if any(" " in segment for segment in path) else known.get(name)
     if command is None:

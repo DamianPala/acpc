@@ -1033,7 +1033,7 @@ def ensure_deletable(meta: SessionMeta) -> None:
     session is a conflict, not something a confirmation would resolve.
     """
     if meta.is_active:
-        raise SessionBusy(f"session {meta.session_id} is {meta.state} — stop it before rm")
+        raise SessionBusy(f"session {meta.session_id} is {meta.state} — cancel it before delete")
 
 
 def delete_session(session_id: str, *, clock: Clock | None = None) -> None:

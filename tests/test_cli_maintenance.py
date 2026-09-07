@@ -132,17 +132,17 @@ def _start_slow_session(cli: CliRunner, prompt: str = "slow:5 daemon stop probe"
 
 
 @pytest.mark.parametrize("state", sorted(vocab.FINISHED_STATES))
-def test_stop_is_a_successful_noop_for_every_finished_state(cli: CliRunner, state: str) -> None:
+def test_cancel_is_a_successful_noop_for_every_finished_state(cli: CliRunner, state: str) -> None:
     session_id = _finished_session(state)
 
-    result = invoke(cli, "stop", session_id)
+    result = invoke(cli, "cancel", session_id)
 
     assert result.exit_code == vocab.EXIT_OK
     assert sessions.read_meta(session_id).state == state
 
 
-def test_stop_unknown_session_is_not_found(cli: CliRunner) -> None:
-    result = invoke(cli, "stop", "does-not-exist")
+def test_cancel_unknown_session_is_not_found(cli: CliRunner) -> None:
+    result = invoke(cli, "cancel", "does-not-exist")
 
     assert result.exit_code == vocab.EXIT_AGENT_ERROR
     assert json.loads(result.stderr)["error"]["kind"] == "not_found"
@@ -437,7 +437,7 @@ def test_daemon_stop_uses_singular_and_plural_active_session_wording(
     assert "1 active session" not in result.stderr
 
 
-def test_stop_running_session_cancels_daemon_and_preserves_artifacts(
+def test_cancel_running_session_cancels_daemon_and_preserves_artifacts(
     cli: CliRunner, state_root: Path, live_daemon: None
 ) -> None:
     result = invoke(cli, "run", "mock", "run the slow scenario", "--bg", "--quiet")
@@ -445,7 +445,7 @@ def test_stop_running_session_cancels_daemon_and_preserves_artifacts(
     session_id = result.stdout.strip().splitlines()[0]
     _wait_until_running(cli, session_id)
 
-    stopped = invoke(cli, "stop", session_id)
+    stopped = invoke(cli, "cancel", session_id)
 
     assert stopped.exit_code == vocab.EXIT_OK
     assert sessions.read_meta(session_id).state == "canceled"
@@ -454,10 +454,10 @@ def test_stop_running_session_cancels_daemon_and_preserves_artifacts(
     assert answer.exists()
 
 
-def test_stop_json_is_one_object_on_stdout(cli: CliRunner) -> None:
+def test_cancel_json_is_one_object_on_stdout(cli: CliRunner) -> None:
     session_id = _finished_session()
 
-    result = invoke(cli, "stop", session_id, "--json")
+    result = invoke(cli, "cancel", session_id, "--json")
 
     assert result.exit_code == vocab.EXIT_OK
     assert json.loads(result.stdout) == {
@@ -466,26 +466,26 @@ def test_stop_json_is_one_object_on_stdout(cli: CliRunner) -> None:
         "stop_reason": "test",
         "changed": False,
     }
-    assert result.stderr.startswith("-- stop ")
+    assert result.stderr.startswith("-- canceled ")
 
 
-def test_rm_deletes_a_finished_session(cli: CliRunner) -> None:
+def test_delete_deletes_a_finished_session(cli: CliRunner) -> None:
     session_id = _finished_session()
 
-    result = invoke(cli, "rm", session_id, "--yes")
+    result = invoke(cli, "delete", session_id, "--yes")
 
     assert result.exit_code == vocab.EXIT_OK
     assert not sessions.session_dir(session_id).exists()
 
 
-def test_rm_unknown_session_is_not_found(cli: CliRunner) -> None:
-    result = invoke(cli, "rm", "does-not-exist")
+def test_delete_unknown_session_is_not_found(cli: CliRunner) -> None:
+    result = invoke(cli, "delete", "does-not-exist")
 
     assert result.exit_code == vocab.EXIT_AGENT_ERROR
     assert json.loads(result.stderr)["error"]["kind"] == "not_found"
 
 
-def test_rm_rejects_a_running_session_and_suggests_stop(cli: CliRunner) -> None:
+def test_delete_rejects_a_running_session_and_suggests_cancel(cli: CliRunner) -> None:
     meta = sessions.create_session(entry="mock", base_adapter="mock", prompt="active")
     sessions.mark_running(
         meta.session_id,
@@ -493,21 +493,21 @@ def test_rm_rejects_a_running_session_and_suggests_stop(cli: CliRunner) -> None:
         process_start_time=proc.process_start_time(),
     )
 
-    result = invoke(cli, "rm", meta.session_id)
+    result = invoke(cli, "delete", meta.session_id)
 
     assert result.exit_code == vocab.EXIT_AGENT_ERROR
     envelope = json.loads(result.stderr)["error"]
     assert envelope["kind"] == "conflict"
     assert envelope["retryable"] is True
-    assert "stop" in envelope["message"]
+    assert "cancel" in envelope["message"]
     assert envelope["context"]["session_id"] == meta.session_id
     assert sessions.session_dir(meta.session_id).exists()
 
 
-def test_rm_json_reports_the_removed_session(cli: CliRunner) -> None:
+def test_delete_json_reports_the_removed_session(cli: CliRunner) -> None:
     session_id = _finished_session()
 
-    result = invoke(cli, "rm", session_id, "--yes", "--json")
+    result = invoke(cli, "delete", session_id, "--yes", "--json")
 
     assert result.exit_code == vocab.EXIT_OK
     payload = json.loads(result.stdout)

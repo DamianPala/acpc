@@ -294,6 +294,14 @@ def test_continue_accepts_a_suffixed_timeout(cli: CliRunner) -> None:
     assert "waited 2s" in result.stdout
 
 
+def test_continue_rejects_run_only_flags_with_a_run_hint(cli: CliRunner) -> None:
+    result = invoke(cli, "continue", "abcd", "try again", "--model", "mock-opus-5")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert "--model" in result.stderr
+    assert "acpc run" in result.stderr
+
+
 def test_status_exposes_daemon_resume_preparation(cli: CliRunner, live_daemon: None) -> None:
     session_id = start_session(cli, "turn one")
     stop_session_daemon(session_id)
@@ -324,7 +332,7 @@ def test_status_exposes_daemon_resume_preparation(cli: CliRunner, live_daemon: N
     assert sessions.load(session_id).state == "succeeded"
 
 
-def test_stop_during_daemon_preparation_is_cancelled_and_resumable(
+def test_cancel_during_daemon_preparation_is_cancelled_and_resumable(
     cli: CliRunner,
     live_daemon: None,
     monkeypatch: pytest.MonkeyPatch,
@@ -354,7 +362,7 @@ def test_stop_during_daemon_preparation_is_cancelled_and_resumable(
         wait_for_path(ready)
         wait_for_preparing(cli, session_id)
 
-        stopped = invoke(cli, "stop", session_id, "--json")
+        stopped = invoke(cli, "cancel", session_id, "--json")
 
         assert stopped.exit_code == vocab.EXIT_OK, stopped.stderr
         assert json.loads(stopped.stdout)["status"] == "canceled"
@@ -540,7 +548,7 @@ def test_cancelled_restore_drops_late_frame_after_mux_release(
     )
     try:
         wait_for_path(restore_ready)
-        stopped = invoke(cli, "stop", session_id, "--json")
+        stopped = invoke(cli, "cancel", session_id, "--json")
         assert stopped.exit_code == vocab.EXIT_OK, stopped.stderr
         assert json.loads(stopped.stdout)["status"] == "canceled"
         assert sessions.answer_path(session_id).read_text(encoding="utf-8") == (
@@ -591,7 +599,7 @@ def test_continue_waits_for_cancelled_restore_to_settle_before_preparing(
     second: subprocess.Popen[str] | None = None
     try:
         wait_for_path(restore_ready)
-        stopped = invoke(cli, "stop", session_id, "--json")
+        stopped = invoke(cli, "cancel", session_id, "--json")
         assert stopped.exit_code == vocab.EXIT_OK, stopped.stderr
         first.wait(timeout=10)
         assert first.returncode != vocab.EXIT_OK
@@ -1917,7 +1925,7 @@ def test_two_background_sessions_resume_only_their_own_context(
     assert "1\n" in cursor_file.read_text(encoding="utf-8")
 
 
-def test_inherited_ceiling_clamps_a_background_continue_and_stop_uses_new_target(
+def test_inherited_ceiling_clamps_a_background_continue_and_cancel_uses_new_target(
     cli: CliRunner, live_daemon: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     session_id = json.loads(
@@ -1939,7 +1947,7 @@ def test_inherited_ceiling_clamps_a_background_continue_and_stop_uses_new_target
     assert meta.target != original.target
     assert meta.target == runner.call_target(runner.resolution_from_session(meta))
 
-    stopped = invoke(cli, "stop", session_id)
+    stopped = invoke(cli, "cancel", session_id)
 
     assert stopped.exit_code == vocab.EXIT_OK
     assert sessions.load(session_id).state == "canceled"
@@ -2461,7 +2469,7 @@ def test_background_policy_change_updates_wait_and_stop_target(
     assert connected == [new_target]
 
     connected.clear()
-    stopped = invoke(cli, "stop", session_id)
+    stopped = invoke(cli, "cancel", session_id)
     assert stopped.exit_code == vocab.EXIT_OK
     assert sessions.load(session_id).state == "canceled"
     assert connected == [new_target]

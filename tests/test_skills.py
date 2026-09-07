@@ -117,7 +117,7 @@ def test_list_has_header_alignment_sorting_and_bounded_rendered_description(
         "---\na\n",
     )
 
-    result = invoke(cli, "skills", "--format", "text")
+    result = invoke(cli, "skills", "list", "--format", "text")
 
     assert result.exit_code == vocab.EXIT_OK
     lines = result.stdout.splitlines()
@@ -130,7 +130,7 @@ def test_list_has_header_alignment_sorting_and_bounded_rendered_description(
     alpha = lines[1]
     assert alpha.index("A long") == header.index("DESCRIPTION")
     assert "..." in alpha
-    assert "full: acpc skills alpha-name-longer-than-header" in alpha
+    assert "full: acpc skills get alpha-name-longer-than-header" in alpha
     assert "repeated whitespace and" in alpha
 
 
@@ -141,7 +141,7 @@ def test_detail_preserves_body_and_places_directory_metadata_on_stderr(
     body = "# Exact body\n\nUnicode: café\nwithout final newline"
     directory = _write_skill(root, "exact", f"---\ndescription: x\n---\n{body}")
 
-    result = invoke(cli, "skills", "exact", "--format", "text")
+    result = invoke(cli, "skills", "get", "exact", "--format", "text")
 
     assert result.exit_code == vocab.EXIT_OK
     assert result.stdout == body
@@ -155,8 +155,8 @@ def test_json_views_include_paths_body_and_null_description(
     root = _resource_root(tmp_path, monkeypatch)
     directory = _write_skill(root, "json-skill", "---\nname: ignored\n---\nbody\n")
 
-    listed = invoke(cli, "skills", "--json")
-    detail = invoke(cli, "skills", "json-skill", "--json")
+    listed = invoke(cli, "skills", "list", "--json")
+    detail = invoke(cli, "skills", "get", "json-skill", "--json")
 
     assert listed.exit_code == vocab.EXIT_OK
     assert detail.exit_code == vocab.EXIT_OK
@@ -180,18 +180,18 @@ def test_json_views_include_paths_body_and_null_description(
     }
     assert f"-- skill json-skill | dir {directory}" in detail.stderr
 
-    before_the_name = invoke(cli, "skills", "--json", "json-skill")
+    before_the_name = invoke(cli, "skills", "get", "json-skill", "--json")
     assert before_the_name.exit_code == vocab.EXIT_OK
     assert json.loads(before_the_name.stdout) == detail_payload
 
 
 def test_unknown_skill_is_not_found_pointing_at_listing_command(cli: CliRunner) -> None:
-    result = invoke(cli, "skills", "does-not-exist")
+    result = invoke(cli, "skills", "get", "does-not-exist")
 
     assert result.exit_code == vocab.EXIT_AGENT_ERROR
     envelope = json.loads(result.stderr)["error"]
     assert envelope["kind"] == "not_found"
-    assert envelope["hint"] == "Run: acpc skills"
+    assert envelope["hint"] == "Run: acpc skills list"
 
 
 def test_directory_without_skill_file_is_skipped(
@@ -201,7 +201,7 @@ def test_directory_without_skill_file_is_skipped(
     (root / "half-installed").mkdir()
     _write_skill(root, "complete", "---\ndescription: ready\n---\nbody\n")
 
-    result = invoke(cli, "skills")
+    result = invoke(cli, "skills", "list")
 
     assert result.exit_code == vocab.EXIT_OK
     assert "complete" in result.stdout
@@ -209,8 +209,8 @@ def test_directory_without_skill_file_is_skipped(
 
 
 def test_skill_help_pages_document_json(cli: CliRunner) -> None:
-    group = invoke(cli, "skills", "--help")
-    detail = invoke(cli, "skills", "provider-bringup", "--help")
+    group = invoke(cli, "skills", "list", "--help")
+    detail = invoke(cli, "skills", "get", "provider-bringup", "--help")
 
     assert group.exit_code == vocab.EXIT_OK
     assert detail.exit_code == vocab.EXIT_OK

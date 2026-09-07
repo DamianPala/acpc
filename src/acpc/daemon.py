@@ -943,7 +943,7 @@ class Daemon:
             resolution=resolution,
             prompt=payload.get("prompt", ""),
             cwd=payload.get("cwd"),
-            timeout=payload.get("timeout"),
+            cancel_after=payload.get("cancel_after"),
             resume_adapter_session=payload.get("resume_adapter_session"),
             defer_rotation=bool(payload.get("defer_rotation", False)),
             rotation_resolution=payload.get("rotation_resolution"),
