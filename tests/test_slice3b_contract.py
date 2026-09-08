@@ -171,9 +171,7 @@ EXPECTED_ENUMS: dict[str, dict[str, tuple[str, ...]]] = {
     "agents list": {"$.items[].kind": ("adapter", "variant")},
     "cancel": {
         "$.status": (
-            "starting",
             "running",
-            "preparing",
             "succeeded",
             "failed",
             "canceled",

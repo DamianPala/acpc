@@ -2067,6 +2067,7 @@ async def _await_session(session_id: str, target: str | None, timeout: float | N
     """
     deadline = None if timeout is None else asyncio.get_running_loop().time() + timeout
     daemon = None
+    waiting: asyncio.Task[Any] | None = None
     if target is not None:
         routed = await daemon_client.connect(target)
         daemon = routed
@@ -2078,6 +2079,8 @@ async def _await_session(session_id: str, target: str | None, timeout: float | N
                 reply = await asyncio.wait_for(asyncio.shield(waiting), timeout=timeout)
             except TimeoutError:
                 waiting.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await waiting
                 return None
             outcome = reply.get("outcome") or {}
             return str(outcome.get("state", "failed"))
@@ -2090,6 +2093,11 @@ async def _await_session(session_id: str, target: str | None, timeout: float | N
                 return None
             await asyncio.sleep(WAIT_POLL_INTERVAL)
     finally:
+        if waiting is not None and not waiting.done():
+            waiting.cancel()
+        if waiting is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await waiting
         if daemon is not None:
             with contextlib.suppress(Exception):
                 await daemon.close()

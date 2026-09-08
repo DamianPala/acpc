@@ -188,9 +188,11 @@ def test_help_explains_session_lifecycle_and_retention(runner: CliRunner) -> Non
 
     assert "Cancel a running session; it stays usable with ``acpc continue``." in stop_help
     assert "Cancels the turn in flight (ACP ``session/cancel``)" in stop_help
+    assert "an unknown id is reported as ``not_found``" in stop_help
     assert "List liveness-verified sessions as a bounded collection." in list_help
     assert "Return at most N sessions" in list_help
     assert "Show liveness-verified metadata for one session" in status_help
+    assert "absent, text on a TTY and JSON on non-TTY" in status_help
     assert "and exit 124; the session keeps running" in wait_help
     assert "The exit code mirrors the session result." in wait_help
     assert "the free way to reprint an answer." in wait_help

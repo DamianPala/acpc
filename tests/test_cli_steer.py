@@ -7,6 +7,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 from click.testing import CliRunner
@@ -170,11 +171,11 @@ def test_steer_degrades_to_a_plain_continue_when_the_turn_finished_first(
     never interrupted, so the preamble would lie — and the caller is told."""
     session_id = mid_turn_session(cli)
 
-    async def finish_instead_of_cancelling(target: str, selector: str) -> bool:
+    async def finish_instead_of_cancelling(target: str, selector: str) -> dict[str, Any]:
         # Stands in for the daemon — another process — reporting a cancel that
         # reached a turn which had already ended on its own.
         sessions.transition(selector, "succeeded", exit_code=0, stop_reason="end_turn")
-        return True
+        return {"ok": True, "turn_token": sessions.read_meta(selector).turns}
 
     monkeypatch.setattr(daemon_client, "cancel_turn", finish_instead_of_cancelling)
 

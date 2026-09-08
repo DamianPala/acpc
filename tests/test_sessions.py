@@ -128,7 +128,11 @@ class TestCreateSession:
 
     @pytest.mark.parametrize(
         ("legacy_state", "canonical_state"),
-        [("done", "succeeded"), ("cancelled", "canceled")],
+        [
+            ("done", "succeeded"),
+            ("cancelled", "canceled"),
+            ("timeout", "failed"),
+        ],
     )
     def test_legacy_meta_is_read_and_rewritten_with_canonical_fields(
         self, legacy_state: str, canonical_state: str
@@ -139,10 +143,16 @@ class TestCreateSession:
         payload["state"] = legacy_state
         payload.pop("status")
         payload["created_at"] = BASE_TIME
+        if legacy_state == "timeout":
+            payload["exit_code"] = vocab.EXIT_TIMEOUT
+            payload["stop_reason"] = "timeout"
         path.write_text(json.dumps(payload))
 
         loaded = sessions.read_meta(meta.session_id)
         assert loaded.state == canonical_state
+        if legacy_state == "timeout":
+            assert loaded.stop_reason == "error"
+            assert loaded.exit_code == vocab.EXIT_AGENT_ERROR
 
         sessions.update_meta(meta.session_id, name="rewritten")
         rewritten = json.loads(path.read_text())

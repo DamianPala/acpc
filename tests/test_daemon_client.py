@@ -135,7 +135,8 @@ def test_an_unusable_socket_path_degrades_with_a_reason() -> None:
 
 
 def test_cancelling_a_target_with_no_daemon_is_not_an_error() -> None:
-    assert asyncio.run(daemon_client.cancel_turn(target_name(), "abcd")) is False
+    result = asyncio.run(daemon_client.cancel_turn(target_name(), "abcd"))
+    assert isinstance(result, daemon_client.DaemonUnavailable)
 
 
 def test_connect_reports_no_daemon_rather_than_raising() -> None:

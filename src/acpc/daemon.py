@@ -98,6 +98,7 @@ class _Turn:
     backup: "_PreparationBackup | None" = None
     preparation_cancelable: bool = False
     preparation_done: "asyncio.Future[dict[str, Any]] | None" = None
+    turn_token: int | None = None
     waiters: list["asyncio.Future[dict[str, Any]]"] = field(default_factory=list)
     result: dict[str, Any] | None = None
 
@@ -625,7 +626,7 @@ class Daemon:
             # down. Cancelling the daemon-owned preparation task runs its
             # reservation, adapter binding and replay-generation finalizers.
             turn.task.cancel()
-        return {"ok": True}
+        return {"ok": True, "turn_token": turn.turn_token}
 
     async def _start(self, frame: dict[str, Any]) -> dict[str, Any]:
         session_id = frame.get("session_id", "")
@@ -678,6 +679,9 @@ class Daemon:
                     "state", **{"from": "starting", "to": "running"}
                 )
             turn.claim_established = True
+            turn.turn_token = request.turn_token
+            if turn.turn_token is None:
+                turn.turn_token = sessions.read_meta(session_id).turns
         except runner.ResumeRotationError as error:
             if error.turn_token is None:
                 self._rollback_preparation(session_id, turn)

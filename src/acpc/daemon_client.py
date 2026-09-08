@@ -281,7 +281,7 @@ def _unlock(handle: IO[bytes]) -> None:
         handle.close()
 
 
-async def cancel_turn(target: str, session_id: str) -> bool:
+async def cancel_turn(target: str, session_id: str) -> dict[str, Any] | DaemonUnavailable | None:
     """Cancel a turn over a connection of its own.
 
     A cancel has to overtake the `await` it is interrupting, and one
@@ -290,11 +290,11 @@ async def cancel_turn(target: str, session_id: str) -> bool:
     """
     daemon = await connect(target)
     if daemon is None:
-        return False
+        return DaemonUnavailable(f"no live daemon for {target}")
     try:
         reply = await daemon.cancel(session_id)
     except (ConnectionError, OSError):
-        return False
+        return None
     finally:
         await daemon.close()
-    return bool(reply.get("ok"))
+    return reply

@@ -698,7 +698,11 @@ def test_wait_timeout_on_a_running_session_says_it_still_runs(cli: CliRunner) ->
     assert "still running (gave up waiting after 0.1s)" in result.stderr
     assert f"acpc cancel {meta.session_id} to cancel" in result.stderr
     error = json.loads(result.stderr.splitlines()[-1])["error"]
-    assert error["context"] == {"session_id": meta.session_id, "status": "running"}
+    assert error["context"] == {
+        "session_id": meta.session_id,
+        "status": "running",
+        "retry_after_ms": 100,
+    }
 
 
 def test_log_wait_new_returns_after_the_transcript_grows(cli: CliRunner) -> None:

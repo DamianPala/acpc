@@ -61,6 +61,10 @@ _NULLABLE_INTEGER = {"type": ["integer", "null"]}
 _SESSION_STATUS = {"type": "string", "enum": list(vocab.SESSION_STATES)}
 _SESSION_WORK_STATUS = {"type": "string", "enum": ["starting", "running", "succeeded"]}
 _SESSION_SUCCEEDED_STATUS = {"type": "string", "enum": ["succeeded"]}
+_CANCEL_STATUS = {
+    "type": "string",
+    "enum": ["running", "succeeded", "failed", "canceled", "unknown"],
+}
 
 _PATHS = _object(
     {name: _STRING for name in ("dir", "prompt", "transcript", "answer")},
@@ -454,7 +458,7 @@ _OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
     "cancel": _object(
         {
             "session_id": _STRING,
-            "status": _SESSION_STATUS,
+            "status": _CANCEL_STATUS,
             "stop_reason": _NULLABLE_STRING,
             "changed": _BOOLEAN,
         },

@@ -158,6 +158,33 @@ def test_wait_pruned_session_is_not_found_without_a_status(
     assert error["context"] == {"session_id": meta.session_id, "status": None}
 
 
+def test_wait_corrupt_state_carries_the_identifier_and_null_status(cli: CliRunner) -> None:
+    meta = sessions.create_session(entry="mock", base_adapter="mock", prompt="corrupt")
+    sessions.meta_path(meta.session_id).write_text("{", encoding="utf-8")
+
+    result = invoke(cli, "wait", meta.session_id, "--json")
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    error = envelope(result)
+    assert error["kind"] == "corrupt_state"
+    assert error["context"] == {"session_id": meta.session_id, "status": None}
+
+
+def test_wait_output_file_failure_carries_the_last_observed_status(cli: CliRunner) -> None:
+    meta = sessions.create_session(entry="mock", base_adapter="mock", prompt="done")
+    sessions.mark_running(
+        meta.session_id, pid=os.getpid(), process_start_time=proc.process_start_time()
+    )
+    sessions.transition(meta.session_id, "succeeded", exit_code=0, stop_reason="end_turn")
+
+    result = invoke(cli, "wait", meta.session_id, "--json", "--output-file", "/proc/acpc/nope")
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    error = envelope(result)
+    assert error["kind"] == "operation_failed"
+    assert error["context"] == {"session_id": meta.session_id, "status": "succeeded"}
+
+
 def test_a_person_at_a_terminal_gets_the_line_and_its_hint_instead(
     cli: CliRunner, terminal_stderr: None
 ) -> None:
@@ -166,7 +193,6 @@ def test_a_person_at_a_terminal_gets_the_line_and_its_hint_instead(
     assert result.exit_code == vocab.EXIT_AGENT_ERROR
     assert result.stderr.splitlines() == [
         "Error: unknown session 'does-not-exist'",
-        "Run: acpc status",
     ]
 
 
@@ -240,7 +266,7 @@ def test_the_document_has_exactly_one_top_level_field(cli: CliRunner) -> None:
     assert list(document) == ["error"]
     # Which fields are there, not what order they came in: key order in a JSON
     # object is not part of the contract, and unset fields are absent.
-    assert set(document["error"]) == {"kind", "message", "hint"}
+    assert set(document["error"]) == {"kind", "message"}
 
 
 def test_a_failure_after_the_session_exists_carries_its_id(cli: CliRunner) -> None:
@@ -359,7 +385,34 @@ def test_ctrl_c_on_wait_exits_130_and_leaves_the_session_alone() -> None:
     assert "Traceback" not in stderr
     error = json.loads(stderr.splitlines()[-1])["error"]
     assert error["kind"] == "interrupted"
+    assert error["context"] == {"session_id": meta.session_id, "status": "running"}
     assert (sessions.meta_path(meta.session_id)).read_text(encoding="utf-8") == before
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal semantics")
+def test_ctrl_c_on_daemon_wait_cleans_up_the_pending_rpc(cli: CliRunner, live_daemon: None) -> None:
+    started = invoke(
+        cli, "run", "mock", "slow:30 daemon wait interrupt", "--bg", "--json", "--quiet"
+    )
+    assert started.exit_code == vocab.EXIT_OK, started.stderr
+    session_id = json.loads(started.stdout)["session_id"]
+
+    watcher = run_cli("wait", session_id, "--json")
+    try:
+        wait_until_ready(watcher)
+        watcher.send_signal(signal.SIGINT)
+        _stdout, stderr = watcher.communicate(timeout=10)
+    finally:
+        if watcher.poll() is None:
+            watcher.kill()
+            watcher.wait(timeout=10)
+        invoke(cli, "cancel", session_id, "--json")
+
+    assert watcher.returncode == vocab.EXIT_CANCELLED
+    assert "Traceback" not in stderr
+    error = json.loads(stderr.splitlines()[-1])["error"]
+    assert error["kind"] == "interrupted"
+    assert error["context"] == {"session_id": session_id, "status": "running"}
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal semantics")

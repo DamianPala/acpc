@@ -1114,6 +1114,8 @@ if begin_section S11-maintenance "cancel no-op semantics, delete, prune"; then
     assert_eq "cancel on an unknown id fails" "1" "$LAST_RC"
     assert_eq "cancel on an unknown id is not_found" "not_found" \
         "$(jq -r '.error.kind' <<<"$(tail -n1 <<<"$LAST_ERR")")"
+    assert_not_contains "cancel unknown id has no stale status hint" "$LAST_ERR" \
+        "Run: acpc status"
 
     run_acpc run mock "session to be removed" --quiet --json
     RM_ID="$(json_field "$LAST_OUT" '.session_id')"

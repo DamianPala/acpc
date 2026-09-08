@@ -481,13 +481,23 @@ def meta_from_dict(data: Mapping[str, Any], *, path: Path) -> SessionMeta:
         raise CorruptSessionError(f"{path}: missing session_id or entry")
 
     raw_state = known.get("status", known.get("state"))
-    state = vocab.normalize_session_state(_coerce_str(raw_state, "status", path) or "starting")
+    raw_state_text = _coerce_str(raw_state, "status", path) or "starting"
+    state = vocab.normalize_session_state(raw_state_text)
     if state not in vocab.SESSION_STATES:
         raise CorruptSessionError(f"{path}: unknown session status {state!r}")
 
     resolution = known.get("resolution") or {}
     if not isinstance(resolution, dict):
         raise CorruptSessionError(f"{path}: resolution is not an object")
+
+    exit_code = _coerce_int(known.get("exit_code"), "exit_code", path)
+    stop_reason = _coerce_str(known.get("stop_reason"), "stop_reason", path)
+    if raw_state_text == "timeout":
+        # Legacy timeout was a terminal session state; in 1.0 only a client's
+        # wait deadline uses 124, so a migrated failed turn uses its canonical
+        # failure fields instead of publishing two incompatible stories.
+        exit_code = vocab.EXIT_AGENT_ERROR
+        stop_reason = "error"
 
     return SessionMeta(
         session_id=session_id,
@@ -501,8 +511,8 @@ def meta_from_dict(data: Mapping[str, Any], *, path: Path) -> SessionMeta:
         started_at=parse_timestamp(known.get("started_at"), "started_at", path),
         finished_at=parse_timestamp(known.get("finished_at"), "finished_at", path),
         turns=_coerce_int(known.get("turns"), "turns", path) or 1,
-        exit_code=_coerce_int(known.get("exit_code"), "exit_code", path),
-        stop_reason=_coerce_str(known.get("stop_reason"), "stop_reason", path),
+        exit_code=exit_code,
+        stop_reason=stop_reason,
         failure=_coerce_str(known.get("failure"), "failure", path),
         tokens=_coerce_int(known.get("tokens"), "tokens", path) or 0,
         cost=_coerce_float(known.get("cost"), "cost", path),

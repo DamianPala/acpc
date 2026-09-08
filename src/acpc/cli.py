@@ -14,7 +14,7 @@ import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -280,7 +280,7 @@ def _raise_wait_timeout(session_id: str, output_file: str | None) -> NoReturn:
     )
 
 
-def _not_found(message: str, *, hint: str) -> AcpcError:
+def _not_found(message: str, *, hint: str | None = None) -> AcpcError:
     """A named target does not exist: exit 1, because the call was well formed.
 
     Exit 2 means the caller wrote the command wrong.  `acpc status q7x2` for a
@@ -332,7 +332,7 @@ def _session_problem(error: sessions.SessionError) -> AcpcError:
     argument the store will never accept.
     """
     if isinstance(error, sessions.SessionNotFound):
-        return _not_found(str(error), hint="Run: acpc status")
+        return _not_found(str(error))
     if isinstance(error, sessions.CorruptSessionError):
         return AcpcError(str(error), kind=errors.CORRUPT_STATE)
     if isinstance(error, sessions.SessionIdsExhausted):
@@ -588,6 +588,25 @@ def _interrupted(**context: Any) -> AcpcError:
     )
 
 
+def _wait_failure(
+    error: BaseException, *, session_id: str, observed_status: str | None
+) -> AcpcError:
+    """Add M1b's recovery context to every failure after ``wait`` parsed."""
+    if isinstance(error, (click.Abort, KeyboardInterrupt)):
+        problem = _interrupted()
+    elif isinstance(error, AcpcError):
+        problem = error
+    elif isinstance(error, sessions.SessionError):
+        problem = _session_problem(error)
+    elif isinstance(error, runner.RunnerError):
+        problem = _runner_problem(error)
+    elif isinstance(error, Exception):
+        problem = _unclassified_problem(error)
+    else:
+        problem = AcpcError(f"acpc failed unexpectedly ({type(error).__name__})", action="none")
+    return problem.with_context(session_id=session_id, status=observed_status)
+
+
 def _fail(error: AcpcError) -> NoReturn:
     """Write the failure to stderr and leave with its code."""
     errors.emit(error)
@@ -616,6 +635,39 @@ def _matching_option_hint(message: str, hints: Mapping[str, str]) -> str | None:
         if _no_such_option(message, spelling):
             return replacement
     return None
+
+
+def _status_option_hint(message: str) -> str | None:
+    hint = _matching_option_hint(
+        message,
+        {
+            "--limit": "--limit belongs to: acpc list --limit N",
+            "--plain": "--plain belongs to: acpc list --plain --limit N",
+        },
+    )
+    if hint is not None:
+        return hint
+    if "Invalid value for '--format'" in message and "plain" in message:
+        return "--format plain belongs to: acpc list --format plain --limit N"
+    return None
+
+
+def _continue_option_hint(message: str) -> str | None:
+    return _matching_option_hint(
+        message,
+        {
+            flag: f"{flag} is a run-only flag — use acpc run; continue reuses stored settings"
+            for flag in (
+                "--model",
+                "--effort",
+                "--mode",
+                "--cwd",
+                "--home",
+                "--name",
+                "--resolve",
+            )
+        },
+    )
 
 
 def _friendly_option_hint(message: str, command_parts: list[str]) -> str | None:
@@ -648,33 +700,11 @@ def _friendly_option_hint(message: str, command_parts: list[str]) -> str | None:
         if hint is not None:
             return hint
     if command_parts[-1:] == ["status"]:
-        hint = _matching_option_hint(
-            message,
-            {
-                "--limit": "--limit belongs to: acpc list --limit N",
-                "--plain": "--plain belongs to: acpc list --plain --limit N",
-            },
-        )
+        hint = _status_option_hint(message)
         if hint is not None:
             return hint
-        if "Invalid value for '--format'" in message and "plain" in message:
-            return "--format plain belongs to: acpc list --format plain --limit N"
     if command_parts[-1:] == ["continue"]:
-        hint = _matching_option_hint(
-            message,
-            {
-                flag: f"{flag} is a run-only flag — use acpc run; continue reuses stored settings"
-                for flag in (
-                    "--model",
-                    "--effort",
-                    "--mode",
-                    "--cwd",
-                    "--home",
-                    "--name",
-                    "--resolve",
-                )
-            },
-        )
+        hint = _continue_option_hint(message)
         if hint is not None:
             return hint
     if command_parts[-1:] == ["run"] and _no_such_option(message, "--resolve"):
@@ -2445,51 +2475,103 @@ def install_command(agent: str, assume_yes: bool, format_name: str | None, json_
         )
 
 
-async def _cancel_with_daemon(target: str, session_id: str) -> bool | None:
+@dataclass(frozen=True, slots=True)
+class _DaemonCancelReply:
+    """The daemon's answer, including the turn generation it accepted."""
+
+    accepted: bool
+    turn_token: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class _CancelResult:
+    """The observed state and whether this call caused a cancellation request."""
+
+    meta: sessions.SessionMeta
+    changed: bool
+
+
+async def _cancel_with_daemon(
+    target: str, session_id: str
+) -> _DaemonCancelReply | daemon_client.DaemonUnavailable | None:
     """Request cancellation without allowing a dead daemon to hang ``cancel``."""
     try:
-        return await asyncio.wait_for(
+        reply = await asyncio.wait_for(
             daemon_client.cancel_turn(target, session_id),
             timeout=runner.CANCEL_ACK_TIMEOUT,
         )
     except TimeoutError:
         return None
     except Exception:  # noqa: BLE001
-        return False
+        return None
+    if isinstance(reply, daemon_client.DaemonUnavailable):
+        return reply
+    if not isinstance(reply, Mapping):
+        return None
+    turn_token = reply.get("turn_token")
+    return _DaemonCancelReply(
+        accepted=reply.get("ok") is True,
+        turn_token=turn_token
+        if isinstance(turn_token, int) and not isinstance(turn_token, bool)
+        else None,
+    )
 
 
-def _wait_for_cancel(session_id: str) -> sessions.SessionMeta:
+def _wait_for_cancel(session_id: str, *, expected_turn: int | None = None) -> sessions.SessionMeta:
     """Give a daemon's cancellation time to finalize the session on disk."""
     deadline = time.monotonic() + runner.CANCEL_ACK_TIMEOUT
     while True:
         meta = sessions.load(session_id)
-        if not meta.is_active or time.monotonic() >= deadline:
+        current_generation = expected_turn is None or meta.turns == expected_turn
+        if current_generation and (not meta.is_active or time.monotonic() >= deadline):
             return meta
+        if time.monotonic() >= deadline:
+            raise AcpcError(
+                f"could not observe the canceled turn for session {session_id}",
+                kind=errors.OUTCOME_UNKNOWN,
+                context={"session_id": session_id, "status": None},
+            )
         time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
 
 
-def _cancel_local_session(meta: sessions.SessionMeta) -> sessions.SessionMeta:
+def _cancel_local_session(meta: sessions.SessionMeta) -> _CancelResult:
     if meta.pid is None:
-        return sessions.transition(
-            meta.session_id,
-            "canceled",
-            exit_code=vocab.EXIT_CANCELLED,
-            stop_reason="stopped by user",
+        return _CancelResult(
+            sessions.transition(
+                meta.session_id,
+                "canceled",
+                exit_code=vocab.EXIT_CANCELLED,
+                stop_reason="stopped by user",
+            ),
+            True,
         )
     command_line = proc.process_cmdline(meta.pid)
     if command_line is not None and "acpc.direct_worker" in command_line:
         try:
             os.kill(meta.pid, signal.SIGINT)
         except ProcessLookupError:
-            return sessions.load(meta.session_id)
+            return _CancelResult(sessions.load(meta.session_id), False)
         except OSError as error:
             raise AcpcError(
                 f"could not cancel session {meta.session_id}: {error}",
                 kind=errors.UNAVAILABLE,
                 context={"session_id": meta.session_id},
             ) from None
-        return _wait_for_cancel(meta.session_id)
+        return _CancelResult(
+            _wait_for_cancel(meta.session_id, expected_turn=meta.turns),
+            True,
+        )
+    if command_line is not None and "acpc.daemon" in command_line:
+        # Never kill the shared daemon from a one-session cancel: its PID in
+        # meta.json is not the target's worker and doing so destroys siblings.
+        raise AcpcError(
+            f"could not cancel session {meta.session_id}: its saved process is the daemon",
+            kind=errors.OUTCOME_UNKNOWN,
+            context={"session_id": meta.session_id, "status": meta.state},
+        )
     result = proc.kill_process_tree(meta.pid, meta.process_start_time)
+    if result == "already_gone":
+        return _CancelResult(sessions.load(meta.session_id), False)
     if result == "refused":
         # The process is there and would not take the signal, so acpc did not
         # observe the cancellation it was asked for and must not report one.
@@ -2498,10 +2580,13 @@ def _cancel_local_session(meta: sessions.SessionMeta) -> sessions.SessionMeta:
             kind=errors.UNAVAILABLE,
             context={"session_id": meta.session_id},
         )
-    return _wait_for_cancel(meta.session_id)
+    return _CancelResult(
+        _wait_for_cancel(meta.session_id, expected_turn=meta.turns),
+        True,
+    )
 
 
-def _cancel_session(meta: sessions.SessionMeta) -> sessions.SessionMeta:
+def _cancel_session(meta: sessions.SessionMeta) -> _CancelResult:
     """Cancel an active session and return the state it settled into.
 
     SPEC `cancel`: graceful `session/cancel` with a bounded wait for the ack,
@@ -2509,13 +2594,30 @@ def _cancel_session(meta: sessions.SessionMeta) -> sessions.SessionMeta:
     the same cancel in front of a follow-up turn, so it lives here rather
     than inside `cancel`.
     """
-    cancelled = False
+    expected_turn = meta.turns
     if meta.target is not None:
-        cancelled = asyncio.run(_cancel_with_daemon(meta.target, meta.session_id))
-    if cancelled is True:
-        return _wait_for_cancel(meta.session_id)
-    if cancelled is None:
-        return sessions.load(meta.session_id)
+        reply = asyncio.run(_cancel_with_daemon(meta.target, meta.session_id))
+        if isinstance(reply, daemon_client.DaemonUnavailable):
+            current = sessions.load(meta.session_id)
+            if not current.is_active:
+                return _CancelResult(current, False)
+            return _cancel_local_session(current)
+        if reply is not None and reply.accepted:
+            turn_token = reply.turn_token if reply.turn_token is not None else expected_turn
+            return _CancelResult(
+                _wait_for_cancel(meta.session_id, expected_turn=turn_token),
+                True,
+            )
+        current = sessions.load(meta.session_id)
+        if not current.is_active:
+            return _CancelResult(current, False)
+        if reply is None:
+            raise AcpcError(
+                f"cancel request for session {meta.session_id} was not confirmed",
+                kind=errors.OUTCOME_UNKNOWN,
+                context={"session_id": meta.session_id, "status": current.state},
+            )
+        return _cancel_local_session(current)
     return _cancel_local_session(meta)
 
 
@@ -2544,7 +2646,7 @@ def cancel_command(selector: str, format_name: str | None, json_mode: bool) -> N
     continuation preparation it cancels the preparation and writes a no-prompt
     placeholder. Transcript, meta and the partial answer stay on disk for
     post-mortem. Stopping an already-finished session is a successful no-op that
-    reports the state it found; an unknown id is a usage error.
+    reports the state it found; an unknown id is reported as ``not_found``.
 
     Example: ``acpc cancel q7x2``
     """
@@ -2555,8 +2657,11 @@ def cancel_command(selector: str, format_name: str | None, json_mode: bool) -> N
         meta = _status_view_meta(meta)
         was_active = meta.is_active
     if was_active:
-        meta = _cancel_session(meta)
-    changed = was_active and meta.state == "canceled"
+        result = _cancel_session(meta)
+        meta = result.meta
+        changed = result.changed
+    else:
+        changed = False
 
     payload = {
         "session_id": meta.session_id,
@@ -2837,7 +2942,7 @@ def _latest_failure_message(session_id: str) -> str | None:
     "--format",
     "format_name",
     type=click.Choice(("text", "json")),
-    help=_FORMAT_NATIVE_HELP,
+    help=_FORMAT_OUTPUT_HELP,
 )
 @_color_option()
 @_json_option("Emit a JSON status object.")
@@ -4334,7 +4439,7 @@ def steer_command(
             context={"session_id": meta.session_id},
         )
 
-    meta = _cancel_session(meta)
+    meta = _cancel_session(meta).meta
     interrupted = (
         meta.state == "canceled" and meta.stop_reason != runner.PREPARATION_CANCELLED_REASON
     )
@@ -4416,70 +4521,76 @@ def wait_command(
 
     Example: ``acpc wait <session-id> --timeout 120``
     """
-    selected_format = _select_format(format_name, json_mode, native_text=True)
+    session_id = selector
+    observed_status: str | None = None
     try:
+        selected_format = _select_format(format_name, json_mode, native_text=True)
         meta = _load_view_session(selector)
-    except AcpcError as error:
-        if error.kind == errors.NOT_FOUND:
-            raise error.with_context(session_id=selector, status=None) from None
-        raise
-    try:
+        session_id = meta.session_id
+        observed_status = meta.state
         state = runner.wait_for_session(meta.session_id, timeout=timeout)
-    except sessions.SessionNotFound as error:
-        raise _session_problem(error).with_context(
-            session_id=meta.session_id, status=None
-        ) from None
-    if state is None:
-        # SPEC `wait`: the timeout stops waiting only — the session runs on.
-        if not quiet:
-            _echo_metadata(_still_running_note(meta.session_id, timeout))
-        try:
-            observed_status = sessions.read_meta(meta.session_id).state
-        except (sessions.SessionError, OSError):
+        if state is None:
+            # SPEC `wait`: the timeout stops waiting only — the session runs on.
+            if not quiet:
+                _echo_metadata(_still_running_note(meta.session_id, timeout))
+            try:
+                observed_status = sessions.read_meta(meta.session_id).state
+            except (sessions.SessionError, OSError):
+                raise AcpcError(
+                    f"gave up waiting for session {meta.session_id}; its state is unknown",
+                    kind=errors.OUTCOME_UNKNOWN,
+                    retryable=False,
+                    context={"session_id": meta.session_id, "status": None},
+                ) from None
             raise AcpcError(
-                f"gave up waiting for session {meta.session_id}; its state is unknown",
-                kind=errors.OUTCOME_UNKNOWN,
-                retryable=False,
-                context={"session_id": meta.session_id, "status": None},
-            ) from None
-        raise AcpcError(
-            f"gave up waiting for session {meta.session_id}; it is still running",
-            kind=errors.TIMEOUT,
-            exit_code=vocab.EXIT_TIMEOUT,
-            retryable=True,
-            hint=f"Run: acpc wait {meta.session_id}",
-            context={"session_id": meta.session_id, "status": observed_status},
+                f"gave up waiting for session {meta.session_id}; it is still running",
+                kind=errors.TIMEOUT,
+                exit_code=vocab.EXIT_TIMEOUT,
+                retryable=True,
+                hint=f"Run: acpc wait {meta.session_id}",
+                context={
+                    "session_id": meta.session_id,
+                    "status": observed_status,
+                    "retry_after_ms": int(runner.WAIT_POLL_INTERVAL * 1000),
+                },
+            )
+
+        observed_status = state
+        final = sessions.read_meta(meta.session_id)
+        observed_status = final.state
+        answer = _answer_text(meta.session_id)
+
+        result = output.render_result(
+            final,
+            answer,
+            json_mode=selected_format == "json",
+            max_output=max_output,
         )
-
-    final = sessions.read_meta(meta.session_id)
-    answer = _answer_text(meta.session_id)
-
-    result = output.render_result(
-        final,
-        answer,
-        json_mode=selected_format == "json",
-        max_output=max_output,
-    )
-    exit_code = runner.exit_code_for(final.state, final.stop_reason)
-    _emit_turn_result(
-        result,
-        output_file=output_file,
-        json_mode=selected_format == "json",
-        success=exit_code == vocab.EXIT_OK,
-    )
-    if not quiet:
-        summary = output.format_summary(final)
-        if final.state == "failed" and (
-            failure_message := _latest_failure_message(final.session_id)
-        ):
-            summary += f" | failure: {failure_message}"
-        _echo_metadata(summary)
-    _end_turn(
-        final.session_id,
-        final.state,
-        final.stop_reason,
-        exit_code,
-    )
+        exit_code = runner.exit_code_for(final.state, final.stop_reason)
+        _emit_turn_result(
+            result,
+            output_file=output_file,
+            json_mode=selected_format == "json",
+            success=exit_code == vocab.EXIT_OK,
+        )
+        if not quiet:
+            summary = output.format_summary(final)
+            if final.state == "failed" and (
+                failure_message := _latest_failure_message(final.session_id)
+            ):
+                summary += f" | failure: {failure_message}"
+            _echo_metadata(summary)
+        _end_turn(
+            final.session_id,
+            final.state,
+            final.stop_reason,
+            exit_code,
+        )
+    except (click.Abort, KeyboardInterrupt) as error:
+        raise _wait_failure(error, session_id=session_id, observed_status=observed_status) from None
+    except Exception as error:  # noqa: BLE001
+        # Output and state failures can happen after the last observation too.
+        raise _wait_failure(error, session_id=session_id, observed_status=observed_status) from None
 
 
 def _answer_text(session_id: str) -> str:
