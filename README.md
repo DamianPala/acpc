@@ -8,9 +8,9 @@ acpc is built for a specific primary user: **another agent calling it through a 
 
 ## The whole mental model
 
-*`run` blocks and prints the answer; `--background` (alias `--bg`) returns an ID; `status`/`log`/`wait`/`continue`/`steer`/`cancel` operate on that ID; everything is on disk under a predictable path.*
+*`run` blocks and prints the answer; `--background` (alias `--bg`) returns an ID; `status`/`list`/`log`/`wait`/`continue`/`steer`/`cancel` operate on that ID; everything is on disk under a predictable path.*
 
-`status` is a lightweight pulse: active sessions show `idle <age>` since their newest transcript event, while finished sessions show `·`. The JSON view exposes the same value as `idle_seconds` (`null` when unavailable or finished). Every row also names the model the session resolved to, because entry names hide it — two variants that both `extend` the same parent run the same model, and only the column says so.
+`list` is the bounded collection view; active sessions show `idle <age>` since their newest transcript event, while finished sessions show `·`. `status <id>` is the fixed-cost detail view. The JSON view exposes the same idle value as `idle_seconds` (`null` when unavailable or finished). Every row also names the model the session resolved to, because entry names hide it — two variants that both `extend` the same parent run the same model, and only the column says so.
 
 A failed run is not lost: `acpc status <id>` names the failure on its `failure` line, and `acpc continue <id>` resumes the session with its transcript context intact — the failed turn's partial answer is parked as `answer.<n>.md` in the session dir.
 
@@ -37,13 +37,15 @@ An agent caller reads the session id straight from the `--background` output —
 
 ```
 run <agent> (prompt | - | --prompt-file) [options]   # default: block, stdout = final answer
+resolve <agent> [options]                             # preview one call, dispatch nothing
 continue <id> (prompt | - | --prompt-file)           # follow-up in the same session context
 steer <id> (instruction | - | --prompt-file)         # interrupt the running turn and redirect it
-status [id]                # no id: active + recent; with id: one session's vitals
+status <id>                # one session's liveness-verified vitals
+list                       # active + recent sessions, bounded by 20
 log <id> [--since CURSOR] [--limit N] [--prose] [--wait-new | --follow]   # incremental transcript access
 wait <id> [--timeout S]    # block until done, print the answer
 cancel <id>
-delete <id> | prune [--older-than D] [--dry-run]
+delete <id> --yes | prune [--older-than D] [--dry-run] [--yes]
 agents list|get|check|create|delete          # adapters + variants
 agents create <name> --extends <agent>       # scaffold a variant
 probe <entry> --discover [--json]             # read the adapter's advertised modes; report only
@@ -53,6 +55,8 @@ daemon status|stop [target] [--force]   # plumbing escape hatch — never needed
 ```
 
 `acpc --help` is a self-contained cheat sheet; `acpc <cmd> --help` is that command's full reference. `<id>` accepts a session id or a `--name` alias; `last` works on a TTY only.
+
+For one-time changes from earlier releases, see [MIGRATION.md](MIGRATION.md).
 
 ## Bundled skills
 
@@ -77,7 +81,7 @@ acpc skills get refresh-adapter-models
 
 `steer <id> "…"` interrupts the turn in flight and redirects the session in one call — `cancel` plus `continue` without the race in the middle. During daemon-owned `continue` preparation, nothing has reached the callee yet: acpc cancels that preparation, reports that nothing was interrupted, and sends the instruction plainly without the interruption preamble. Once a prompt is in flight, the instruction reaches the callee under the fixed preamble naming the interruption, and the interrupted turn's partial answer is kept as that turn's answer file.
 
-`status` reports that daemon-owned window as `preparing`. `cancel` and Ctrl-C finish a cancelled preparation with a no-prompt placeholder, releasing the session reservation and the adapter binding. What acpc cannot do is unsend a restore already in flight — ACP defines no cancellation for `session/load` or `session/resume` — so the promise is about what a turn runs against rather than about what the adapter does: the next `continue` waits for that restore to settle before preparing its own, and no turn ever runs against a half-restored session.
+`status` reports that daemon-owned window as `preparing`. `cancel` and Ctrl-C finish a canceled preparation with a no-prompt placeholder, releasing the session reservation and the adapter binding. What acpc cannot do is unsend a restore already in flight — ACP defines no cancellation for `session/load` or `session/resume` — so the promise is about what a turn runs against rather than about what the adapter does: the next `continue` waits for that restore to settle before preparing its own, and no turn ever runs against a half-restored session.
 
 ## Reading a run
 
@@ -98,10 +102,10 @@ $ acpc log x7k2 --since 42
 |------|---------|
 | 0 | success (`end_turn`) |
 | 1 | agent error — crash, refusal, missing auth |
-| 2 | usage error — bad flags, unknown session, rejected mode/permissions combination |
+| 2 | usage error — malformed flags or a rejected mode/permissions combination |
 | 4 | output budget exhausted — `log --follow` stopped because `--max-output` ran out before the session ended |
 | 124 | timeout (`run`: gave up waiting, session runs on; `wait`/`log --wait-new`/`log --follow`: same) |
-| 130 | cancelled — SIGINT or `cancel` |
+| 130 | canceled — SIGINT or `cancel` |
 | 141 / 143 | SIGPIPE / SIGTERM |
 
 **Client death ≠ session death.** SIGINT cancels the session. SIGTERM — a harness killing the tool call on its own timeout, the normal case for an agent caller — *detaches*: the session keeps running under the daemon, the client's last stderr line names the id and its options (`wait` for the answer, `cancel` to cancel), and `wait <id>` collects the answer later.
@@ -133,7 +137,7 @@ env_passthrough = ["OPENROUTER_API_KEY"]   # names read from the caller's env, n
 MODEL_PROVIDER = "openrouter"
 ```
 
-The `home` field is the provider switch: OpenAI vs OpenRouter vs a local endpoint is just a different vendor home. Resolution stays fully inspectable — `acpc agents get builder` shows what the entry resolves to with per-field provenance, `run --resolve` shows one concrete call.
+The `home` field is the provider switch: OpenAI vs OpenRouter vs a local endpoint is just a different vendor home. Resolution stays fully inspectable — `acpc agents get builder` shows what the entry resolves to with per-field provenance, `acpc resolve builder` shows one concrete call.
 
 `--model fast|standard|max` resolves through the adapter's preset table (overridable per adapter in `agents/`). When the vendor advertises new model ids, upgrade that adapter's binary first, then `acpc skills get refresh-adapter-models` — it writes only the operator overlay, after a confirm. The adapter's environment is **constructed, not inherited**: a base system set, capability variables (ssh agent, proxies, CA bundles), and the entry's declared env — the rest of your ambient environment never reaches the adapter.
 
@@ -180,7 +184,7 @@ Keep it to purpose only. Models, efforts and flags belong to the tool — `acpc 
     answer.md                # final answer (earlier turns: answer.<n>.md)
 ```
 
-File-based state is a feature: grep it, read fragments selectively, depend on nothing but the filesystem. `answer.md` exists whatever the final state — partial answers for failed or cancelled turns, a placeholder naming what died for orphaned ones. A failed session also records why it failed: an `error` event carrying what acpc observed, one next step, and — for a turn that ran under a daemon — the tail that turn added to the target's log, surfaced by `log` and by `wait`. Session states are verified, not trusted: a `running` session whose process is gone reports `orphaned`, never a stale `running`.
+File-based state is a feature: grep it, read fragments selectively, depend on nothing but the filesystem. `answer.md` exists whatever the final state — partial answers for failed or canceled turns, or a placeholder naming an unobserved outcome. A failed session also records why it failed: an `error` event carrying what acpc observed, one next step, and — for a turn that ran under a daemon — the tail that turn added to the target's log, surfaced by `log` and by `wait`. Session states are verified, not trusted: a `running` session whose process is gone reports `unknown`, never a stale `running`.
 
 A cold `continue` reports whether the adapter session was verified: the summary and `--json` contain `resume: verified` when a check passes, or `resume: unverified — ...` when neither available check could run. If acpc could not account for every delivered prompt, it reports `resume: unverified — delivery record incomplete` even when replay comparison passes. An unverified resume still runs, but is visible to callers.
 

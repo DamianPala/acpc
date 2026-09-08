@@ -653,21 +653,20 @@ def _status_option_hint(message: str) -> str | None:
 
 
 def _continue_option_hint(message: str) -> str | None:
-    return _matching_option_hint(
-        message,
-        {
-            flag: f"{flag} is a run-only flag — use acpc run; continue reuses stored settings"
-            for flag in (
-                "--model",
-                "--effort",
-                "--mode",
-                "--cwd",
-                "--home",
-                "--name",
-                "--resolve",
-            )
-        },
-    )
+    hints = {
+        flag: f"{flag} is a run-only flag — use acpc run; continue reuses stored settings"
+        for flag in (
+            "--model",
+            "--effort",
+            "--mode",
+            "--cwd",
+            "--home",
+            "--name",
+            "--resolve",
+        )
+    }
+    hints["--dry-run"] = "--dry-run was removed from continue — use acpc resolve <agent>"
+    return _matching_option_hint(message, hints)
 
 
 def _friendly_option_hint(message: str, command_parts: list[str]) -> str | None:
