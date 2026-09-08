@@ -717,7 +717,9 @@ class TestDeletion:
     def test_a_finished_session_is_deletable(self) -> None:
         session_id = finished_session()
         sessions.delete_session(session_id, clock=at(100.0))
-        assert not sessions.session_dir(session_id).exists()
+        assert sessions.session_dir(session_id).is_dir()
+        assert sessions.tombstone_path(session_id).is_file()
+        assert not sessions.meta_path(session_id).exists()
 
     def test_a_running_session_is_refused(self) -> None:
         meta = make_session()
@@ -737,7 +739,8 @@ class TestDeletion:
             meta.session_id, pid=_dead_pid(), process_start_time="tok", clock=at(1.0)
         )
         sessions.delete_session(meta.session_id, clock=at(2.0))
-        assert not sessions.session_dir(meta.session_id).exists()
+        assert sessions.tombstone_path(meta.session_id).is_file()
+        assert not sessions.meta_path(meta.session_id).exists()
 
     def test_deleting_an_unknown_session_is_not_found(self) -> None:
         with pytest.raises(sessions.SessionNotFound):

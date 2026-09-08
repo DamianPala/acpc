@@ -1121,8 +1121,8 @@ if begin_section S11-maintenance "cancel no-op semantics, delete, prune"; then
     RM_ID="$(json_field "$LAST_OUT" '.session_id')"
     run_acpc delete "$RM_ID" --yes
     assert_eq "delete on a finished session exits 0" "0" "$LAST_RC"
-    assert_true "delete removes the session dir" \
-        "$([[ ! -e "${ACPC_HOME}/sessions/${RM_ID}" ]] && echo 0 || echo 1)"
+    assert_true "delete leaves an identifier tombstone" \
+        "$([[ -f "${ACPC_HOME}/sessions/${RM_ID}/.tombstone" ]] && echo 0 || echo 1)"
     run_acpc delete "$RM_ID"
     assert_eq "delete on an already-gone id fails" "1" "$LAST_RC"
     assert_eq "delete on an already-gone id is not_found" "not_found" \

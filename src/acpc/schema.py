@@ -59,7 +59,8 @@ _NULLABLE_STRING = {"type": ["string", "null"]}
 _NULLABLE_NUMBER = {"type": ["number", "null"]}
 _NULLABLE_INTEGER = {"type": ["integer", "null"]}
 _SESSION_STATUS = {"type": "string", "enum": list(vocab.SESSION_STATES)}
-_SESSION_WORK_STATUS = {"type": "string", "enum": ["starting", "running", "succeeded"]}
+_SESSION_WORK_STATUS = {"type": "string", "enum": ["running", "succeeded"]}
+_SESSION_FOLLOW_UP_STATUS = {"type": "string", "enum": ["running", "succeeded"]}
 _SESSION_SUCCEEDED_STATUS = {"type": "string", "enum": ["succeeded"]}
 _CANCEL_STATUS = {
     "type": "string",
@@ -464,7 +465,7 @@ _OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
         },
         ("session_id", "status", "stop_reason", "changed"),
     ),
-    "continue": _session_result_schema(changed=True),
+    "continue": _session_result_schema(changed=True, status=_SESSION_FOLLOW_UP_STATUS),
     "daemon status": _DAEMON_STATUS,
     "daemon stop": _TARGET_MUTATION,
     "delete": _object(
@@ -503,7 +504,7 @@ _OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
     ),
     "list": _STATUS,
     "status": _STATUS_DETAIL,
-    "steer": _session_result_schema(changed=True),
+    "steer": _session_result_schema(changed=True, status=_SESSION_FOLLOW_UP_STATUS),
     "wait": _session_result_schema(
         changed=False, foreground_only=True, status=_SESSION_SUCCEEDED_STATUS
     ),

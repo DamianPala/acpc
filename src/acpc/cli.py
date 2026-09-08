@@ -2743,8 +2743,9 @@ def delete_command(
 
     Errors on a starting or running session — cancel it first. The transcript,
     the prompt and the answer go with it and acpc cannot bring them back, so
-    the call needs ``--yes``. Prints the removed session id; ``--json`` also
-    lists the deleted paths.
+    the call needs ``--yes``. The session directory remains as an identifier
+    tombstone for one year; ``list`` and ``status`` do not treat it as a session.
+    Prints the removed session id; ``--json`` also lists the deleted paths.
 
     Example: ``acpc delete q7x2 --yes``
     """
@@ -2815,6 +2816,8 @@ def prune_command(
     never "delete everything". ``--older-than`` overrides it for this call, and
     deleting every finished session takes an explicit ``--older-than 0d``. Age is
     measured from when the session finished. Running sessions are never touched.
+    Identifier tombstones are removed only after one year, when their ids become
+    available again.
 
     It decides what to delete as it runs, so deleting needs ``--yes``;
     ``--dry-run`` lists the same targets and never does.

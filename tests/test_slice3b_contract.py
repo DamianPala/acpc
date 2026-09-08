@@ -178,14 +178,14 @@ EXPECTED_ENUMS: dict[str, dict[str, tuple[str, ...]]] = {
             "unknown",
         )
     },
-    "continue": {"$.status": ("starting", "running", "succeeded")},
+    "continue": {"$.status": ("running", "succeeded")},
     "log": {
         "$.type": tuple(sorted(("error", "msg", "permission", "state", "thought", "tool", "usage")))
     },
     "probe": {
         "$.diff[].status": ("advertised-missing", "entry-missing"),
     },
-    "run": {"$.status": ("starting", "running", "succeeded")},
+    "run": {"$.status": ("running", "succeeded")},
     "list": {
         "$.items[].status": (
             "starting",
@@ -208,7 +208,7 @@ EXPECTED_ENUMS: dict[str, dict[str, tuple[str, ...]]] = {
             "unknown",
         )
     },
-    "steer": {"$.status": ("starting", "running", "succeeded")},
+    "steer": {"$.status": ("running", "succeeded")},
     "wait": {"$.status": ("succeeded",)},
 }
 

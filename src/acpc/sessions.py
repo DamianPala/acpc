@@ -54,6 +54,7 @@ STARTUP_GRACE_SECONDS = 30.0
 RESERVED_NAME = "last"
 
 META_NAME = "meta.json"
+TOMBSTONE_NAME = ".tombstone"
 PROMPT_NAME = "prompt.md"
 ANSWER_NAME = "answer.md"
 TRANSCRIPT_NAME = "transcript.ndjson"
@@ -61,6 +62,7 @@ LOCK_NAME = "lock"
 
 _PROMPT_SNIPPET_LIMIT = 200
 _ID_ALLOCATION_ATTEMPTS = 64
+TOMBSTONE_RETENTION_SECONDS = 365 * 24 * 60 * 60
 
 # SPEC.md *Session states*. Finished states are terminal for the current turn;
 # a new turn re-opens the session through `rotate_turn`.
@@ -226,6 +228,7 @@ class SessionMeta:
         defensive: `meta.json` can come from an older writer or a torn write,
         and a status view must never be the thing that raises.
         """
+
         resolved = self.resolution.get("resolved")
         if not isinstance(resolved, dict):
             return None
@@ -238,6 +241,14 @@ class SessionMeta:
 
 _META_FIELDS: tuple[str, ...] = tuple(f.name for f in fields(SessionMeta) if f.name != "extra")
 DELIVERY_RECORD_INCOMPLETE = "delivery_record_incomplete"
+
+
+@dataclass(frozen=True, slots=True)
+class SessionTombstone:
+    """An identifier reservation left after a session was deleted."""
+
+    session_id: str
+    deleted_at: float
 
 
 # --------------------------------------------------------------------------
@@ -263,6 +274,10 @@ def answer_path(session_id: str) -> Path:
 
 def transcript_path(session_id: str) -> Path:
     return session_dir(session_id) / TRANSCRIPT_NAME
+
+
+def tombstone_path(session_id: str) -> Path:
+    return session_dir(session_id) / TOMBSTONE_NAME
 
 
 def session_paths(session_id: str) -> dict[str, str]:
@@ -648,6 +663,37 @@ def allocate_session_id(*, rng: random.Random | None = None) -> str:
     )
 
 
+def _is_tombstone(directory: Path) -> bool:
+    return (directory / TOMBSTONE_NAME).is_file()
+
+
+def _clear_directory(directory: Path) -> None:
+    for child in sorted(directory.iterdir(), reverse=True):
+        if child.is_dir() and not child.is_symlink():
+            _remove_tree(child)
+        else:
+            child.unlink()
+
+
+def _read_tombstone(directory: Path) -> SessionTombstone | None:
+    path = directory / TOMBSTONE_NAME
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        deleted_at = parse_timestamp(data["deleted_at"], "deleted_at", path)
+    except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError, CorruptSessionError):
+        return None
+    if deleted_at is None:
+        return None
+    return SessionTombstone(directory.name, deleted_at)
+
+
+def _write_tombstone(directory: Path, deleted_at: float) -> None:
+    paths.atomic_write(
+        directory / TOMBSTONE_NAME,
+        {"deleted_at": format_timestamp(deleted_at)},
+    )
+
+
 def create_session(
     *,
     entry: str,
@@ -948,6 +994,8 @@ def list_sessions(*, clock: Clock | None = None, verify: bool = True) -> list[Se
     for directory in entries:
         if not directory.is_dir():
             continue
+        if _is_tombstone(directory):
+            continue
         try:
             meta = read_meta(directory.name)
         except SessionError:
@@ -1053,7 +1101,9 @@ def delete_session(session_id: str, *, clock: Clock | None = None) -> None:
     """
     resolved_clock = _resolve_clock(clock)
     ensure_deletable(load(session_id, clock=resolved_clock))
-    _remove_tree(session_dir(session_id))
+    directory = session_dir(session_id)
+    _clear_directory(directory)
+    _write_tombstone(directory, resolved_clock())
 
 
 def prune_sessions(
@@ -1061,7 +1111,7 @@ def prune_sessions(
     older_than: float,
     dry_run: bool = False,
     clock: Clock | None = None,
-) -> list[SessionMeta]:
+) -> list[SessionMeta | SessionTombstone]:
     """Delete finished sessions older than `older_than` seconds.
 
     Age is measured from `finished_at` (SPEC.md `prune`), falling back to
@@ -1070,7 +1120,7 @@ def prune_sessions(
     """
     resolved_clock = _resolve_clock(clock)
     now = resolved_clock()
-    removed: list[SessionMeta] = []
+    removed: list[SessionMeta | SessionTombstone] = []
     for meta in list_sessions(clock=resolved_clock):
         if meta.is_active:
             continue
@@ -1080,4 +1130,18 @@ def prune_sessions(
         if not dry_run:
             _remove_tree(session_dir(meta.session_id))
         removed.append(meta)
+    root = paths.sessions_dir()
+    try:
+        entries = sorted(root.iterdir())
+    except (FileNotFoundError, NotADirectoryError):
+        return removed
+    for directory in entries:
+        if not directory.is_dir() or not _is_tombstone(directory):
+            continue
+        tombstone = _read_tombstone(directory)
+        if tombstone is None or now - tombstone.deleted_at < TOMBSTONE_RETENTION_SECONDS:
+            continue
+        if not dry_run:
+            _remove_tree(directory)
+        removed.append(tombstone)
     return removed

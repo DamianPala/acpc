@@ -666,7 +666,9 @@ def test_delete_deletes_a_finished_session(cli: CliRunner) -> None:
     result = invoke(cli, "delete", session_id, "--yes")
 
     assert result.exit_code == vocab.EXIT_OK
-    assert not sessions.session_dir(session_id).exists()
+    assert sessions.session_dir(session_id).is_dir()
+    assert sessions.tombstone_path(session_id).is_file()
+    assert not sessions.meta_path(session_id).exists()
 
 
 def test_delete_unknown_session_is_not_found(cli: CliRunner) -> None:

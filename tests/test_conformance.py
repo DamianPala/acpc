@@ -7,9 +7,12 @@ published command; they are never used to decide which commands exist.
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import os
 import pty
+import random
 import re
 import signal
 import subprocess
@@ -23,7 +26,7 @@ import pytest
 from click.testing import CliRunner
 
 import acpc.cli as cli_module
-from acpc import daemon_client, errors, proc, sessions, transcript, vocab
+from acpc import daemon_client, errors, proc, runner, sessions, transcript, vocab
 from acpc.cli import main
 
 MOCK_AGENT_SCRIPT = str(Path(__file__).with_name("mock_agent.py"))
@@ -38,11 +41,170 @@ home_env = "MOCK_HOME"
 default = {{ grants = "read", delegates = true }}
 '''
 
-STANDARD_PATH = Path(
-    "/home/haz/ai/lab/projects/skills-starter/haz-skills/cli-design/references/"
-    "cli-design-standard.md"
-)
+STANDARD_SNAPSHOT = Path(__file__).with_name("fixtures") / "cli-design-standard.md"
+STANDARD_METADATA = STANDARD_SNAPSHOT.with_suffix(".meta.json")
+EXPECTED_TOOL_VERSION = "0.7.1"
+EXPECTED_STANDARD_NAME = "cli-design-standard"
+EXPECTED_STANDARD_VERSION = "0.1.0-draft.6"
+EXPECTED_EXTENSIONS = ["managed"]
+EXPECTED_EXIT_DESCRIPTIONS = {
+    "0": "Success, including an empty result: the turn ended normally, or the view rendered.",
+    "1": (
+        "Generic failure: the agent errored — a crash, a refusal, exhausted context, "
+        "missing auth — or the command could not do what was asked."
+    ),
+    "2": (
+        "Usage error: the call cannot be accepted in this form — bad flags, a mode that "
+        "exceeds the policy, or a policy no declared mode satisfies."
+    ),
+    "4": (
+        "Output budget exhausted: `log --follow` stopped because `--max-output` ran out "
+        "before the session ended; the footer's cursor covers what was printed."
+    ),
+    "124": (
+        "Timeout: `run --timeout` stopped waiting and left the session running; `wait` "
+        "and `log --wait-new` do the same."
+    ),
+    "130": (
+        "Cancelled by SIGINT or `acpc cancel`. Answer-printing commands mirror the session "
+        "result, so `wait` on a cancelled session also exits 130."
+    ),
+    "141": "SIGPIPE: a downstream reader closed the pipe.",
+    "143": "SIGTERM: the client detached from a daemon-owned session, or ended the turn.",
+}
 SCHEMA_KEYS = {"type", "enum", "properties", "required", "items"}
+EXPECTED_REQUIRED_FIELDS = {
+    "agents check": {"items", "has_more"},
+    "agents create": {"name", "extends", "path", "changed"},
+    "agents delete": {"name", "path", "changed"},
+    "agents get": {"agent"},
+    "agents list": {"items", "has_more"},
+    "cancel": {"session_id", "status", "stop_reason", "changed"},
+    "continue": {
+        "status",
+        "session_id",
+        "created_at",
+        "started_at",
+        "finished_at",
+        "paths",
+        "truncated",
+        "denied",
+        "permissions_clamp",
+        "changed",
+    },
+    "daemon status": {"items", "has_more"},
+    "daemon stop": {"targets", "changed", "requires_confirmation"},
+    "delete": {"session_id", "removed", "changed", "paths"},
+    "install": {"agent", "ok", "returncode", "changed"},
+    "list": {"items", "has_more"},
+    "log": {"i", "ts", "type"},
+    "probe": {
+        "entry",
+        "base_adapter",
+        "discover_only",
+        "turns",
+        "current_mode",
+        "advertised_modes",
+        "mode_reports",
+        "verdicts",
+        "refusal_violations",
+        "implied_modes",
+        "unmeasured",
+        "current_modes",
+        "diff",
+    },
+    "prune": {"targets", "changed", "requires_confirmation"},
+    "resolve": {"entry", "base_adapter", "command", "cwd", "env", "env_passthrough", "resolved"},
+    "run": {
+        "status",
+        "session_id",
+        "created_at",
+        "started_at",
+        "finished_at",
+        "paths",
+        "truncated",
+        "denied",
+        "permissions_clamp",
+        "changed",
+    },
+    "skills get": {"name", "description", "path", "body"},
+    "skills list": {"items", "has_more"},
+    "status": {
+        "session_id",
+        "status",
+        "pid",
+        "turns",
+        "entry",
+        "base_adapter",
+        "model",
+        "name",
+        "runtime_seconds",
+        "idle_seconds",
+        "tokens",
+        "cost",
+        "exit_code",
+        "stop_reason",
+        "failure",
+        "paths",
+        "created_at",
+        "started_at",
+        "finished_at",
+    },
+    "steer": {
+        "status",
+        "session_id",
+        "created_at",
+        "started_at",
+        "finished_at",
+        "paths",
+        "truncated",
+        "denied",
+        "permissions_clamp",
+        "changed",
+    },
+    "wait": {
+        "status",
+        "session_id",
+        "created_at",
+        "started_at",
+        "finished_at",
+        "stop_reason",
+        "cost",
+        "answer",
+        "paths",
+        "truncated",
+        "denied",
+        "permissions_clamp",
+    },
+}
+EXPECTED_OUTPUT_ENUMS = {
+    "agents list.output.items[].kind": {"adapter", "variant"},
+    "cancel.output.status": {"running", "succeeded", "failed", "canceled", "unknown"},
+    "continue.output.status": {"running", "succeeded"},
+    "list.output.items[].status": {
+        "starting",
+        "running",
+        "preparing",
+        "succeeded",
+        "failed",
+        "canceled",
+        "unknown",
+    },
+    "log.output.type": {"error", "msg", "permission", "state", "thought", "tool", "usage"},
+    "probe.output.diff[].status": {"advertised-missing", "entry-missing"},
+    "run.output.status": {"running", "succeeded"},
+    "status.output.status": {
+        "starting",
+        "running",
+        "preparing",
+        "succeeded",
+        "failed",
+        "canceled",
+        "unknown",
+    },
+    "steer.output.status": {"running", "succeeded"},
+    "wait.output.status": {"succeeded"},
+}
 
 
 @pytest.fixture(autouse=True)
@@ -143,6 +305,18 @@ def _finished_session(state: str = "succeeded") -> str:
     )
     sessions.transition(meta.session_id, state, exit_code=0, stop_reason="test")
     return meta.session_id
+
+
+class _SequenceRng(random.Random):
+    """Return a fixed stream of characters so allocator collisions are deterministic."""
+
+    def __init__(self, values: str) -> None:
+        super().__init__(0)
+        self._values = iter(values)
+
+    def choice(self, seq: Any) -> Any:
+        del seq
+        return next(self._values)
 
 
 def _active_session(*, target: str | None = None, pid: int | None = None) -> str:
@@ -337,6 +511,42 @@ def _assert_machine_output(detail: dict[str, Any], result: Any) -> None:
         _assert_schema_value(detail["output"], value, "stdout")
 
 
+def _snapshot_tree(root: Path) -> dict[str, bytes]:
+    if not root.exists():
+        return {}
+    return {
+        str(path.relative_to(root)): path.read_bytes()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+def test_R1a_read_only_agents_list_preserves_its_intended_state(
+    cli: CliRunner, state_root: Path
+) -> None:
+    registry = state_root / "agents"
+    before = _snapshot_tree(registry)
+    result = invoke(cli, "agents", "list", "--json")
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    after = _snapshot_tree(registry)
+    assert before == after
+    # Cache files, daemon logs and liveness metadata are incidental artifacts;
+    # the registry is the intended state of this read-only command.
+
+
+def test_R5a_agents_create_changed_matches_the_observed_transition(
+    cli: CliRunner, state_root: Path
+) -> None:
+    registry = state_root / "agents"
+    before = _snapshot_tree(registry)
+    result = invoke(cli, "agents", "create", "observed", "--extends", "mock", "--json")
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    after = _snapshot_tree(registry)
+    payload = json.loads(result.stdout)
+    assert payload["changed"] is (before != after)
+    assert (registry / "observed.toml").is_file()
+
+
 def test_D1_D3b_help_and_SPEC_match_the_generated_command_set(cli: CliRunner) -> None:
     index = read_index(cli)
     names = [entry["name"] for entry in index["commands"]]
@@ -344,6 +554,7 @@ def test_D1_D3b_help_and_SPEC_match_the_generated_command_set(cli: CliRunner) ->
     assert len(names) == len(set(names))
 
     root_help = invoke(cli, "--help").stdout
+    assert "dispatch coding agents over ACP" in root_help
     assert "acpc schema" in root_help
     assert "--json" in root_help
     spec = Path("SPEC.md").read_text(encoding="utf-8")
@@ -403,6 +614,10 @@ def test_D1_D3b_help_and_SPEC_match_the_generated_command_set(cli: CliRunner) ->
                 spelling.startswith("--") and spelling in result.stdout for spelling in option.opts
             )
 
+    list_help = invoke(cli, "list", "--help").stdout
+    assert "Return at most N sessions" in list_help
+    assert "has_more" in list_help
+
 
 def test_D6b_parser_descriptors_and_D7a_global_flags_are_generated(cli: CliRunner) -> None:
     index = read_index(cli)
@@ -458,7 +673,19 @@ def test_D6d_routing_D7b_flat_entries_and_D7c_shape(cli: CliRunner) -> None:
         "conformance",
         "commands",
     }
+    assert isinstance(index["schema_version"], str)
     assert index["schema_version"].isdecimal()
+    assert int(index["schema_version"]) > 0
+    assert index["tool_version"] == EXPECTED_TOOL_VERSION
+    version = invoke(cli, "--version")
+    assert version.exit_code == 0
+    assert version.stdout == f"{EXPECTED_TOOL_VERSION}\n"
+    assert index["exit_codes"] == EXPECTED_EXIT_DESCRIPTIONS
+    assert index["conformance"] == {
+        "name": EXPECTED_STANDARD_NAME,
+        "standard": EXPECTED_STANDARD_VERSION,
+        "extensions": EXPECTED_EXTENSIONS,
+    }
     names = [entry["name"] for entry in index["commands"]]
     for entry in index["commands"]:
         assert set(entry) == {"name", "description", "effects"}
@@ -470,6 +697,9 @@ def test_D6d_routing_D7b_flat_entries_and_D7c_shape(cli: CliRunner) -> None:
         output = detail.get("output", {})
         if "next" in output.get("properties", {}):
             assert "next" not in output.get("required", [])
+        assert set(output.get("required", [])) == EXPECTED_REQUIRED_FIELDS[entry["name"]]
+        if entry["name"] in {"run", "continue", "steer"}:
+            assert {"truncated", "output_file"} <= set(output["properties"])
 
     prefixes = {parts[0] for parts in (name.split() for name in names) if len(parts) > 1}
     for prefix in prefixes:
@@ -540,7 +770,12 @@ def test_O2a_O2b_default_format_is_exercised_for_every_indexed_command(
     state_root: Path,
     live_daemon: None,
 ) -> None:
-    for entry in read_index(cli)["commands"]:
+    index = read_index(cli)
+    assert index["format_defaults"] == {"tty": "text", "non_tty": "json"}
+    default_list = invoke(cli, "list")
+    assert default_list.exit_code == vocab.EXIT_OK, default_list.stderr
+    assert json.loads(default_list.stdout) == {"items": [], "has_more": False}
+    for entry in index["commands"]:
         name = entry["name"]
         detail = read_detail(cli, name)
         result = _success_call(cli, name, "default", f"default-{name}", state_root)
@@ -644,6 +879,63 @@ def test_O1_O2b_O3a_F2a_F2c_machine_matrix(
     assert _error(preformat)["kind"] == errors.INVALID_INPUT
 
 
+ERROR_SCENARIOS: dict[str, tuple[str, ...] | None] = {
+    "agents check": None,
+    "agents create": ("agents", "create", "bad", "--extends", "missing", "--json"),
+    "agents delete": ("agents", "delete", "missing", "--json"),
+    "agents get": ("agents", "get", "missing", "--json"),
+    "agents list": ("agents", "list", "--json", "--no-such-flag"),
+    "cancel": ("cancel", "missing", "--json"),
+    "continue": ("continue", "missing", "echo:x", "--json"),
+    "daemon status": ("daemon", "status", "--json", "--format", "invalid"),
+    "daemon stop": ("daemon", "stop", "--json", "--format", "invalid"),
+    "delete": ("delete", "missing", "--json"),
+    "install": ("install", "missing", "--json"),
+    "list": ("list", "--json", "--no-such-flag"),
+    "log": ("log", "missing", "--json", "--quiet"),
+    "probe": ("probe", "missing", "--discover", "--json"),
+    "prune": ("prune", "--json", "--older-than", "nonsense"),
+    "resolve": ("resolve", "missing", "--json"),
+    "run": ("run", "missing", "probe", "--json", "--quiet"),
+    "skills get": ("skills", "get", "missing", "--json"),
+    "skills list": ("skills", "list", "--json", "--no-such-flag"),
+    "status": ("status", "missing", "--json"),
+    "steer": ("steer", "missing", "echo:x", "--json"),
+    "wait": ("wait", "missing", "--json", "--quiet"),
+}
+ERROR_SCENARIO_SKIPS = {
+    "agents check": "requires a corrupt registry fixture and is covered by registry tests",
+}
+
+
+def _assert_error_location(result: Any) -> None:
+    assert result.exit_code != vocab.EXIT_OK
+    assert result.stdout == ""
+    lines = [line for line in result.stderr.splitlines() if line.strip()]
+    assert lines, result.stderr
+    envelope = json.loads(lines[-1])
+    assert set(envelope) == {"error"}
+    assert envelope["error"]["message"] in result.stderr
+    assert envelope["error"]["kind"]
+
+
+def test_F2_error_matrix_is_explicit_for_every_command(cli: CliRunner) -> None:
+    names = {entry["name"] for entry in read_index(cli)["commands"]}
+    assert set(ERROR_SCENARIOS) == names
+    for args in ERROR_SCENARIOS.values():
+        if args is None:
+            continue
+        result = invoke(cli, *args)
+        _assert_error_location(result)
+
+
+def test_F2_error_matrix_records_why_known_errors_are_not_scenarios() -> None:
+    assert set(ERROR_SCENARIO_SKIPS) == {
+        name for name, args in ERROR_SCENARIOS.items() if args is None
+    }
+    assert all(ERROR_SCENARIO_SKIPS.values())
+
+
 def test_H5b_plain_alias_is_byte_identical_for_every_plain_collection(cli: CliRunner) -> None:
     for name, path in (
         ("agents list", ("agents", "list")),
@@ -733,6 +1025,45 @@ def test_R7a_R7b_R7c_background_changes_wait_only_and_keeps_identifier(
     assert sessions.read_meta(session_id).state == "succeeded"
 
 
+def test_R7b_deleted_identifier_stays_reserved_until_tombstone_prune(
+    cli: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rng = _SequenceRng("a" * 8 + "b" * 4)
+    monkeypatch.setattr(sessions.random, "SystemRandom", lambda: rng)
+
+    first = invoke(cli, "run", "mock", "echo:first", "--json", "--quiet")
+    assert first.exit_code == vocab.EXIT_OK, first.stderr
+    first_id = json.loads(first.stdout)["session_id"]
+    deleted = invoke(cli, "delete", first_id, "--yes", "--json")
+    assert deleted.exit_code == vocab.EXIT_OK, deleted.stderr
+    assert sessions.tombstone_path(first_id).is_file()
+
+    second = invoke(cli, "run", "mock", "echo:second", "--json", "--quiet")
+    assert second.exit_code == vocab.EXIT_OK, second.stderr
+    assert json.loads(second.stdout)["session_id"] != first_id
+
+    old = sessions.create_session(
+        entry="mock",
+        base_adapter="mock",
+        prompt="old tombstone",
+        clock=lambda: 0.0,
+        rng=_SequenceRng("c" * 4),
+    )
+    sessions.delete_session(old.session_id, clock=lambda: 100.0)
+    before_expiry = sessions.prune_sessions(
+        older_than=0.0,
+        clock=lambda: 100.0 + sessions.TOMBSTONE_RETENTION_SECONDS - 1,
+    )
+    assert all(entry.session_id != old.session_id for entry in before_expiry)
+    sessions.prune_sessions(
+        older_than=0.0,
+        clock=lambda: 100.0 + sessions.TOMBSTONE_RETENTION_SECONDS,
+    )
+    recycled = sessions.allocate_session_id(rng=_SequenceRng("c" * 4))
+    assert recycled == old.session_id
+
+
 def _enum_values(value: Any, path: str = "") -> list[tuple[str, list[Any]]]:
     found: list[tuple[str, list[Any]]] = []
     if isinstance(value, dict):
@@ -792,7 +1123,13 @@ def _observe_flag_enums(
                 observed[key] = observed.get(key, set()) | {value}
 
 
-def _observe_session_statuses(cli: CliRunner, observed: dict[str, set[Any]]) -> None:
+def _observe_session_statuses(
+    cli: CliRunner,
+    observed: dict[str, set[Any]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_cancel_with_daemon = cli_module._cancel_with_daemon
+    real_wait_for_cancel = cli_module._wait_for_cancel
     for state in vocab.SESSION_STATES:
         session_id = sessions.create_session(
             entry="mock", base_adapter="mock", prompt=state
@@ -820,9 +1157,83 @@ def _observe_session_statuses(cli: CliRunner, observed: dict[str, set[Any]]) -> 
             sessions.transition(session_id, state, exit_code=0, stop_reason="test")
         result = invoke(cli, "status", session_id, "--json")
         assert result.exit_code == vocab.EXIT_OK
-        observed["session.status"] = observed.get("session.status", set()) | {
+        status = json.loads(result.stdout)["status"]
+        observed["status.output.status"] = observed.get("status.output.status", set()) | {status}
+    listed = invoke(cli, "list", "--json")
+    assert listed.exit_code == vocab.EXIT_OK, listed.stderr
+    observed["list.output.items[].status"] = {
+        item["status"] for item in json.loads(listed.stdout)["items"]
+    }
+    for state in ("succeeded", "failed", "canceled", "unknown"):
+        session_id = _finished_session(state)
+        result = invoke(cli, "cancel", session_id, "--json")
+        assert result.exit_code == vocab.EXIT_OK, result.stderr
+        observed["cancel.output.status"] = observed.get("cancel.output.status", set()) | {
             json.loads(result.stdout)["status"]
         }
+    active = sessions.create_session(
+        entry="mock", base_adapter="mock", prompt="cancel status", target="mock-target"
+    )
+    sessions.mark_running(
+        active.session_id, pid=os.getpid(), process_start_time=proc.process_start_time()
+    )
+
+    async def accepted_cancel(*_args: Any, **_kwargs: Any) -> Any:
+        return cli_module._DaemonCancelReply(accepted=True, turn_token=active.turns)
+
+    monkeypatch.setattr(cli_module, "_cancel_with_daemon", accepted_cancel)
+    monkeypatch.setattr(
+        cli_module,
+        "_wait_for_cancel",
+        lambda *_args, **_kwargs: sessions.read_meta(active.session_id),
+    )
+    result = invoke(cli, "cancel", active.session_id, "--json")
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    observed["cancel.output.status"] = observed.get("cancel.output.status", set()) | {
+        json.loads(result.stdout)["status"]
+    }
+    monkeypatch.setattr(cli_module, "_cancel_with_daemon", real_cancel_with_daemon)
+    monkeypatch.setattr(cli_module, "_wait_for_cancel", real_wait_for_cancel)
+
+
+def _observe_work_statuses(cli: CliRunner, observed: dict[str, set[Any]]) -> None:
+    foreground = {
+        "run": ("run", "mock", "echo:enum foreground"),
+        "continue": ("continue", "PLACEHOLDER", "echo:enum foreground"),
+        "steer": ("steer", "PLACEHOLDER", "echo:enum foreground"),
+    }
+    for name, args in (
+        ("run", ("run", "mock", "slow:1 enum run")),
+        ("continue", ("continue", "PLACEHOLDER", "slow:1 enum continue")),
+        ("steer", ("steer", "PLACEHOLDER", "slow:1 enum steer")),
+    ):
+        if name == "continue":
+            started = invoke(cli, "run", "mock", "echo:enum base", "--json", "--quiet")
+            assert started.exit_code == vocab.EXIT_OK, started.stderr
+            args = ("continue", json.loads(started.stdout)["session_id"], *args[2:])
+        elif name == "steer":
+            started_id = _background_session(cli, "slow:30 enum steer base")
+            args = ("steer", started_id, *args[2:])
+        foreground_args = foreground[name]
+        if name != "run":
+            foreground_args = (foreground_args[0], args[1], *foreground_args[2:])
+        foreground_result = invoke(cli, *foreground_args, "--json", "--quiet")
+        assert foreground_result.exit_code == vocab.EXIT_OK, (name, foreground_result.stderr)
+        observed.setdefault(f"{name}.output.status", set()).add(
+            json.loads(foreground_result.stdout)["status"]
+        )
+        if name == "steer":
+            args = ("steer", _background_session(cli, "slow:30 enum steer background"), *args[2:])
+        background_args = ["--background", "--json", "--quiet"]
+        if name != "steer":
+            background_args[1:1] = ["--permissions", "read"]
+        result = invoke(cli, *args, *background_args)
+        assert result.exit_code == vocab.EXIT_OK, (name, result.stderr)
+        observed.setdefault(f"{name}.output.status", set()).add(json.loads(result.stdout)["status"])
+    waited_id = _background_session(cli, "slow:1 enum wait")
+    waited = invoke(cli, "wait", waited_id, "--json", "--quiet")
+    assert waited.exit_code == vocab.EXIT_OK, waited.stderr
+    observed["wait.output.status"] = {json.loads(waited.stdout)["status"]}
 
 
 def _observe_log_types(cli: CliRunner, observed: dict[str, set[Any]]) -> None:
@@ -841,7 +1252,9 @@ def _observe_log_types(cli: CliRunner, observed: dict[str, set[Any]]) -> None:
         events.append(event_type, **event_fields[event_type])
     log_result = invoke(cli, "log", log_id, "--json")
     assert log_result.exit_code == vocab.EXIT_OK
-    observed["log.type"] = {json.loads(line)["type"] for line in log_result.stdout.splitlines()}
+    observed["log.output.type"] = {
+        json.loads(line)["type"] for line in log_result.stdout.splitlines()
+    }
 
 
 def _observe_discovery_enums(
@@ -850,40 +1263,47 @@ def _observe_discovery_enums(
     _probe_fixture(state_root)
     probe_result = invoke(cli, "probe", "mock", "--discover", "--json")
     assert probe_result.exit_code == vocab.EXIT_OK, probe_result.stderr
-    observed["probe.diff.status"] = {
+    observed["probe.output.diff[].status"] = {
         item["status"] for item in json.loads(probe_result.stdout)["diff"]
     }
     agents_result = invoke(cli, "agents", "list", "--json")
     assert agents_result.exit_code == vocab.EXIT_OK, agents_result.stderr
-    observed["agents.kind"] = {item["kind"] for item in json.loads(agents_result.stdout)["items"]}
+    observed["agents list.output.items[].kind"] = {
+        item["kind"] for item in json.loads(agents_result.stdout)["items"]
+    }
 
 
 def _assert_reachable_output_enums(
     cli: CliRunner, index: dict[str, Any], observed: dict[str, set[Any]]
 ) -> None:
+    declared: dict[str, set[Any]] = {}
     for entry in index["commands"]:
         detail = read_detail(cli, entry["name"])
-        for path, values in _enum_values(detail.get("output", {}), entry["name"] + ".output"):
-            key = "session.status" if path.endswith("status") else path.rsplit(".", 1)[-1]
-            if path.endswith("type"):
-                key = "log.type"
-            if path.endswith("kind"):
-                key = "agents.kind"
-            if "probe" in path and path.endswith("status"):
-                key = "probe.diff.status"
-            assert set(values) <= observed.get(key, set()), (path, values, observed)
+        declared.update(
+            {
+                path: set(values)
+                for path, values in _enum_values(
+                    detail.get("output", {}), entry["name"] + ".output"
+                )
+            }
+        )
+    assert declared == EXPECTED_OUTPUT_ENUMS
+    for path, values in declared.items():
+        assert observed.get(path, set()) == values, (path, values, observed.get(path))
 
 
 @pytest.mark.timeout(120)
 def test_O4c_declared_enums_have_reachable_values(
     cli: CliRunner,
     state_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
     live_daemon: None,
 ) -> None:
     index = read_index(cli)
     observed: dict[str, set[Any]] = {}
     _observe_flag_enums(cli, index, state_root, observed)
-    _observe_session_statuses(cli, observed)
+    _observe_session_statuses(cli, observed, monkeypatch)
+    _observe_work_statuses(cli, observed)
     _observe_log_types(cli, observed)
     _observe_discovery_enums(cli, state_root, observed)
     _assert_reachable_output_enums(cli, index, observed)
@@ -902,6 +1322,21 @@ def _assert_process_alive(pid: int) -> None:
     assert proc.process_liveness(pid, proc.process_start_time(pid)) == "verified"
 
 
+def _stop_session_daemon(session_id: str, connect: Any) -> None:
+    resolution = runner.resolution_from_session(sessions.load(session_id))
+
+    async def stop() -> None:
+        daemon = await connect(runner.call_target(resolution))
+        if daemon is None:
+            return
+        try:
+            await daemon.stop()
+        finally:
+            await daemon.close()
+
+    asyncio.run(stop())
+
+
 @pytest.mark.parametrize(
     "layout",
     [
@@ -913,6 +1348,7 @@ def _assert_process_alive(pid: int) -> None:
         "cmdline_unknown",
     ],
 )
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal semantics")
 def test_M2_cancel_races_are_forced_and_preserve_the_daemon_and_sibling(
     cli: CliRunner,
     live_daemon: None,
@@ -920,95 +1356,78 @@ def test_M2_cancel_races_are_forced_and_preserve_the_daemon_and_sibling(
     layout: str,
 ) -> None:
     victim, sibling, daemon_pid = _start_daemon_pair(cli)
-    victim_meta = sessions.read_meta(victim)
+    real_connect = daemon_client.connect
 
-    if layout == "accepted_pending":
-
-        async def accepted(_target: str, _session_id: str) -> Any:
-            return cli_module._DaemonCancelReply(accepted=True, turn_token=victim_meta.turns)
-
-        monkeypatch.setattr(cli_module, "_cancel_with_daemon", accepted)
-        monkeypatch.setattr(
-            cli_module, "_wait_for_cancel", lambda *_args, **_kwargs: sessions.read_meta(victim)
-        )
-        result = invoke(cli, "cancel", victim, "--json")
-        assert result.exit_code == vocab.EXIT_OK
-        assert json.loads(result.stdout)["changed"] is True
-        assert json.loads(result.stdout)["status"] == "running"
-        assert sessions.read_meta(victim).state == "running"
-    elif layout == "rpc_unconfirmed":
-
-        async def unconfirmed(_target: str, _session_id: str) -> Any:
-            return None
-
-        monkeypatch.setattr(cli_module, "_cancel_with_daemon", unconfirmed)
-        result = invoke(cli, "cancel", victim, "--json")
-        assert result.exit_code == vocab.EXIT_AGENT_ERROR
-        error = _error(result)
-        assert error["kind"] == errors.OUTCOME_UNKNOWN
-        assert error["context"] == {"session_id": victim, "status": "running"}
-        assert sessions.read_meta(victim).state == "running"
-    elif layout == "terminal_before_read":
-        sessions.transition(victim, "succeeded", exit_code=0, stop_reason="race")
-
-        async def no_preparation(_targets: Any) -> set[str]:
-            return set()
-
-        monkeypatch.setattr(cli_module, "_collect_preparing_sessions", no_preparation)
-        result = invoke(cli, "cancel", victim, "--json")
-        assert result.exit_code == vocab.EXIT_OK
-        assert json.loads(result.stdout) == {
-            "session_id": victim,
-            "status": "succeeded",
-            "stop_reason": "race",
-            "changed": False,
-        }
-    elif layout == "terminal_between_rpc":
-
-        async def loses_race(_target: str, _session_id: str) -> Any:
+    try:
+        if layout == "accepted_pending":
+            result = invoke(cli, "cancel", victim, "--json")
+            assert result.exit_code == vocab.EXIT_OK, result.stderr
+            assert json.loads(result.stdout)["changed"] is True
+            assert json.loads(result.stdout)["status"] == "canceled"
+        elif layout == "rpc_unconfirmed":
+            os.kill(daemon_pid, signal.SIGSTOP)
+            try:
+                monkeypatch.setattr(cli_module.runner, "CANCEL_ACK_TIMEOUT", 0.05)
+                result = invoke(cli, "cancel", victim, "--json")
+            finally:
+                os.kill(daemon_pid, signal.SIGCONT)
+            assert result.exit_code == vocab.EXIT_AGENT_ERROR
+            error = _error(result)
+            assert error["kind"] == errors.OUTCOME_UNKNOWN
+            assert error["context"] == {"session_id": victim, "status": "running"}
+            assert sessions.read_meta(victim).state == "running"
+        elif layout == "terminal_before_read":
             sessions.transition(victim, "succeeded", exit_code=0, stop_reason="race")
-            return None
 
-        monkeypatch.setattr(cli_module, "_cancel_with_daemon", loses_race)
-        result = invoke(cli, "cancel", victim, "--json")
-        assert result.exit_code == vocab.EXIT_OK
-        assert json.loads(result.stdout)["status"] == "succeeded"
-        assert json.loads(result.stdout)["changed"] is False
-    elif layout == "preparing_stale":
-        sessions.transition(victim, "succeeded", exit_code=0, stop_reason="old turn")
+            async def no_preparation(_targets: Any) -> set[str]:
+                return set()
 
-        async def preparing(_targets: Any) -> set[str]:
-            return {victim}
+            monkeypatch.setattr(cli_module, "_collect_preparing_sessions", no_preparation)
+            result = invoke(cli, "cancel", victim, "--json")
+            assert result.exit_code == vocab.EXIT_OK
+            assert json.loads(result.stdout) == {
+                "session_id": victim,
+                "status": "succeeded",
+                "stop_reason": "race",
+                "changed": False,
+            }
+        elif layout == "terminal_between_rpc":
+            result = invoke(cli, "cancel", victim, "--json")
+            assert result.exit_code == vocab.EXIT_OK, result.stderr
+            payload = json.loads(result.stdout)
+            assert payload["status"] == "canceled"
+            assert payload["changed"] is True
+        elif layout == "preparing_stale":
+            sessions.transition(victim, "succeeded", exit_code=0, stop_reason="old turn")
 
-        async def accepted_preparation(_target: str, _session_id: str) -> Any:
-            return cli_module._DaemonCancelReply(accepted=True, turn_token=victim_meta.turns)
+            async def preparing(_targets: Any) -> set[str]:
+                return {victim}
 
-        monkeypatch.setattr(cli_module, "_collect_preparing_sessions", preparing)
-        monkeypatch.setattr(cli_module, "_cancel_with_daemon", accepted_preparation)
-        monkeypatch.setattr(
-            cli_module, "_wait_for_cancel", lambda *_args, **_kwargs: sessions.read_meta(victim)
-        )
-        result = invoke(cli, "cancel", victim, "--json")
-        assert result.exit_code == vocab.EXIT_OK
-        assert json.loads(result.stdout)["status"] == "succeeded"
-        assert json.loads(result.stdout)["changed"] is True
-        assert sessions.read_meta(victim).state == "succeeded"
-    else:
+            monkeypatch.setattr(cli_module, "_collect_preparing_sessions", preparing)
+            result = invoke(cli, "cancel", victim, "--json")
+            assert result.exit_code == vocab.EXIT_OK
+            payload = json.loads(result.stdout)
+            assert payload["status"] == "succeeded"
+            assert payload["changed"] is True
+            assert sessions.read_meta(victim).state == "succeeded"
+        else:
 
-        async def unavailable(_target: str, _session_id: str) -> Any:
-            return daemon_client.DaemonUnavailable("forced fallback")
+            async def no_connection(_target: str) -> None:
+                return None
 
-        monkeypatch.setattr(cli_module, "_cancel_with_daemon", unavailable)
-        monkeypatch.setattr(cli_module.proc, "process_cmdline", lambda _pid: None)
-        result = invoke(cli, "cancel", victim, "--json")
-        assert result.exit_code == vocab.EXIT_AGENT_ERROR
-        error = _error(result)
-        assert error["kind"] == errors.OUTCOME_UNKNOWN
-        assert error["context"] == {"session_id": victim, "status": "running"}
-        assert sessions.read_meta(victim).state == "running"
+            monkeypatch.setattr(daemon_client, "connect", no_connection)
+            monkeypatch.setattr(cli_module.proc, "process_cmdline", lambda _pid: None)
+            result = invoke(cli, "cancel", victim, "--json")
+            assert result.exit_code == vocab.EXIT_AGENT_ERROR
+            error = _error(result)
+            assert error["kind"] == errors.OUTCOME_UNKNOWN
+            assert error["context"] == {"session_id": victim, "status": "running"}
+            assert sessions.read_meta(victim).state == "running"
 
-    _assert_process_alive(daemon_pid)
-    assert sessions.read_meta(sibling).is_active
+        _assert_process_alive(daemon_pid)
+        assert sessions.read_meta(sibling).is_active
+    finally:
+        _stop_session_daemon(victim, real_connect)
 
 
 def _wait_for_ready(process: subprocess.Popen[bytes]) -> None:
@@ -1100,7 +1519,18 @@ def test_F2b_F5_wait_interrupts_in_pipe_and_pty_contexts(cli: CliRunner, live_da
     _wait_for_state(session_id, "succeeded", timeout=10)
 
 
-def test_D7c_claim_is_bound_to_the_standard_header(cli: CliRunner) -> None:
-    version = re.search(r"^\*\*Version:\*\*\s+(\S+)$", STANDARD_PATH.read_text(), re.MULTILINE)
+def test_D7c_claim_is_bound_to_the_versioned_standard_snapshot(cli: CliRunner) -> None:
+    snapshot = STANDARD_SNAPSHOT.read_bytes()
+    metadata = json.loads(STANDARD_METADATA.read_text(encoding="utf-8"))
+    assert metadata["source_commit"]
+    assert metadata["source"]
+    assert metadata["content_sha256"] == hashlib.sha256(snapshot).hexdigest()
+    version = re.search(r"^\*\*Version:\*\*\s+(\S+)$", snapshot.decode(), re.MULTILINE)
     assert version is not None
+    assert version.group(1) == EXPECTED_STANDARD_VERSION
     assert read_index(cli)["conformance"]["standard"] == version.group(1)
+
+    checkout = os.environ.get("ACPC_STANDARD_CHECKOUT")
+    if checkout is None:
+        pytest.skip("set ACPC_STANDARD_CHECKOUT to check the repository snapshot")
+    assert Path(checkout).read_bytes() == snapshot
