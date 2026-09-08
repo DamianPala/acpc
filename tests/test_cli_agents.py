@@ -301,7 +301,7 @@ def test_agents_detail_shows_mode_and_its_source(cli: CliRunner) -> None:
 def test_entry_permission_alias_resolves_canonically_and_warns_on_run(
     cli: CliRunner, fresh_permission_alias_warnings: None
 ) -> None:
-    result = invoke(cli, "run", "builder", "probe", "--resolve", "--json")
+    result = invoke(cli, "resolve", "builder", "--json")
 
     assert result.exit_code == vocab.EXIT_OK
     assert result.stdout
@@ -310,7 +310,7 @@ def test_entry_permission_alias_resolves_canonically_and_warns_on_run(
 
 
 def test_resolve_renders_and_serializes_mode_escalation(cli: CliRunner) -> None:
-    text_result = invoke(cli, "run", "builder", "probe", "--resolve", "--format", "text")
+    text_result = invoke(cli, "resolve", "builder", "--format", "text")
 
     assert text_result.exit_code == vocab.EXIT_OK
     mode_line = next(
@@ -323,14 +323,12 @@ def test_resolve_renders_and_serializes_mode_escalation(cli: CliRunner) -> None:
     # marker would claim in-vendor escalation for every mode and stay green.
     plain_text = invoke(
         cli,
-        "run",
+        "resolve",
         "mock",
-        "probe",
         "--mode",
         "default",
         "--permissions",
         "read",
-        "--resolve",
         "--format",
         "text",
     )
@@ -340,18 +338,16 @@ def test_resolve_renders_and_serializes_mode_escalation(cli: CliRunner) -> None:
     assert " · acpc-delegated" in plain_mode_line
     assert "escalates" not in plain_mode_line
 
-    escalating = json.loads(invoke(cli, "run", "builder", "probe", "--resolve", "--json").stdout)
+    escalating = json.loads(invoke(cli, "resolve", "builder", "--json").stdout)
     plain = json.loads(
         invoke(
             cli,
-            "run",
+            "resolve",
             "mock",
-            "probe",
             "--mode",
             "default",
             "--permissions",
             "read",
-            "--resolve",
             "--json",
         ).stdout
     )
@@ -795,7 +791,7 @@ def test_install_json_is_one_object(cli: CliRunner) -> None:
         "agent": "mock",
         "ok": True,
         "returncode": 0,
-        "changed": True,
+        "changed": None,
     }
 
 

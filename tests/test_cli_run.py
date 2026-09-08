@@ -277,11 +277,11 @@ def test_a_missing_adapter_binary_creates_no_session(cli: CliRunner, state_root:
     assert not sessions_dir.exists() or not list(sessions_dir.iterdir())
 
 
-# --- --resolve --------------------------------------------------------------
+# --- resolve -----------------------------------------------------------------
 
 
 def test_resolve_shows_the_resolved_model_and_its_source(cli: CliRunner) -> None:
-    result = invoke(cli, "run", "mock", "probe", "--resolve")
+    result = invoke(cli, "resolve", "mock")
 
     assert result.exit_code == vocab.EXIT_OK
     assert "mock-sonnet-5" in result.stdout
@@ -289,14 +289,14 @@ def test_resolve_shows_the_resolved_model_and_its_source(cli: CliRunner) -> None
 
 
 def test_resolve_runs_nothing(cli: CliRunner, state_root: Path) -> None:
-    invoke(cli, "run", "mock", "probe", "--resolve")
+    invoke(cli, "resolve", "mock")
 
     sessions_dir = state_root / "sessions"
     assert not sessions_dir.exists() or not list(sessions_dir.iterdir())
 
 
 def test_resolve_json_is_machine_readable(cli: CliRunner) -> None:
-    result = invoke(cli, "run", "mock", "probe", "--resolve", "--json")
+    result = invoke(cli, "resolve", "mock", "--json")
 
     payload = json.loads(result.stdout)
     assert payload["entry"] == "mock"
@@ -311,20 +311,18 @@ def test_resolve_reports_mode_for_entry_flag_and_unset_sources(
         'extends = "mock"\nmode = "plan"\n', encoding="utf-8"
     )
 
-    entry = json.loads(invoke(cli, "run", "pinned", "probe", "--resolve", "--json").stdout)
+    entry = json.loads(invoke(cli, "resolve", "pinned", "--json").stdout)
     flag = json.loads(
         invoke(
             cli,
-            "run",
+            "resolve",
             "pinned",
-            "probe",
             "--mode",
             "plan",
-            "--resolve",
             "--json",
         ).stdout
     )
-    unset = json.loads(invoke(cli, "run", "mock", "probe", "--resolve", "--json").stdout)
+    unset = json.loads(invoke(cli, "resolve", "mock", "--json").stdout)
 
     assert entry["resolved"]["mode"] == {
         "value": "plan",
@@ -350,7 +348,7 @@ def test_resolve_reports_mode_for_entry_flag_and_unset_sources(
 
 
 def test_resolve_reports_the_permission_policy_it_would_use(cli: CliRunner) -> None:
-    result = invoke(cli, "run", "mock", "probe", "--resolve", "--json")
+    result = invoke(cli, "resolve", "mock", "--json")
 
     # Non-interactive stdout, no --permissions: SPEC's default is `read`.
     assert json.loads(result.stdout)["resolved"]["permissions"]["value"] == "read"
@@ -361,7 +359,7 @@ def test_inherited_ceiling_clamps_a_nested_all_policy_and_reports_it(
 ) -> None:
     monkeypatch.setenv("ACPC_CEILING", "edit")
 
-    result = invoke(cli, "run", "mock", "probe", "--permissions", "all", "--resolve", "--json")
+    result = invoke(cli, "resolve", "mock", "--permissions", "all", "--json")
 
     permission = json.loads(result.stdout)["resolved"]["permissions"]
     assert permission["value"] == "edit"
@@ -378,7 +376,7 @@ def test_inherited_ceiling_keeps_a_lower_nested_policy(
 ) -> None:
     monkeypatch.setenv("ACPC_CEILING", "execute")
 
-    result = invoke(cli, "run", "mock", "probe", "--permissions", "read", "--resolve", "--json")
+    result = invoke(cli, "resolve", "mock", "--permissions", "read", "--json")
 
     permission = json.loads(result.stdout)["resolved"]["permissions"]
     assert permission["value"] == "read"
@@ -407,7 +405,7 @@ def test_nested_ask_is_rejected_by_a_numeric_ceiling(
 ) -> None:
     monkeypatch.setenv("ACPC_CEILING", ceiling)
 
-    result = invoke(cli, "run", "mock", "probe", "--permissions", "ask", "--resolve")
+    result = invoke(cli, "resolve", "mock", "--permissions", "ask")
 
     assert result.exit_code == vocab.EXIT_USAGE
     assert f"inherited ceiling {ceiling}" in result.stderr
@@ -422,7 +420,7 @@ def test_nested_ask_remains_ask_under_an_all_ceiling(
     monkeypatch.setattr(interaction, "stdin_is_tty", lambda: True)
     monkeypatch.setattr(interaction, "stdout_is_tty", lambda: True)
 
-    result = invoke(cli, "run", "mock", "probe", "--permissions", "ask", "--resolve")
+    result = invoke(cli, "resolve", "mock", "--permissions", "ask")
 
     assert result.exit_code == vocab.EXIT_OK
     assert "permissions ask" in " ".join(result.stdout.split())
@@ -433,7 +431,7 @@ def test_invalid_inherited_ceiling_is_a_usage_error(
 ) -> None:
     monkeypatch.setenv("ACPC_CEILING", "not-a-policy")
 
-    result = invoke(cli, "run", "mock", "probe", "--permissions", "all", "--resolve")
+    result = invoke(cli, "resolve", "mock", "--permissions", "all")
 
     assert result.exit_code == vocab.EXIT_USAGE
     assert "ACPC_CEILING='not-a-policy' is invalid" in result.stderr
@@ -442,11 +440,9 @@ def test_invalid_inherited_ceiling_is_a_usage_error(
 def test_write_alias_matches_execute_and_warns_once_per_process(
     cli: CliRunner, fresh_permission_alias_warnings: None
 ) -> None:
-    first = invoke(cli, "run", "mock", "probe", "--permissions", "write", "--resolve", "--json")
-    second = invoke(cli, "run", "mock", "probe", "--permissions", "write", "--resolve", "--json")
-    canonical = invoke(
-        cli, "run", "mock", "probe", "--permissions", "execute", "--resolve", "--json"
-    )
+    first = invoke(cli, "resolve", "mock", "--permissions", "write", "--json")
+    second = invoke(cli, "resolve", "mock", "--permissions", "write", "--json")
+    canonical = invoke(cli, "resolve", "mock", "--permissions", "execute", "--json")
 
     assert json.loads(first.stdout)["resolved"]["permissions"]["value"] == "execute"
     assert json.loads(first.stdout) == json.loads(canonical.stdout)
@@ -455,7 +451,7 @@ def test_write_alias_matches_execute_and_warns_once_per_process(
 
 
 def test_a_raw_model_id_on_the_call_is_labelled_as_a_call_flag(cli: CliRunner) -> None:
-    result = invoke(cli, "run", "mock", "probe", "--model", "mock-opus-5", "--resolve", "--json")
+    result = invoke(cli, "resolve", "mock", "--model", "mock-opus-5", "--json")
 
     resolved = json.loads(result.stdout)["resolved"]
     assert resolved["model"]["value"] == "mock-opus-5"
@@ -463,7 +459,7 @@ def test_a_raw_model_id_on_the_call_is_labelled_as_a_call_flag(cli: CliRunner) -
 
 
 def test_a_tier_name_resolves_through_the_entry_preset_that_defines_it(cli: CliRunner) -> None:
-    result = invoke(cli, "run", "mock", "probe", "--model", "max", "--resolve", "--json")
+    result = invoke(cli, "resolve", "mock", "--model", "max", "--json")
 
     resolved = json.loads(result.stdout)["resolved"]
     assert resolved["model"]["value"] == "mock-opus-5"
@@ -489,7 +485,7 @@ def test_prompt_alias_resolves_to_ask_on_a_tty(
     monkeypatch.setattr(interaction, "stdin_is_tty", lambda: True)
     monkeypatch.setattr(interaction, "stdout_is_tty", lambda: True)
 
-    result = invoke(cli, "run", "mock", "probe", "--permissions", "prompt", "--resolve")
+    result = invoke(cli, "resolve", "mock", "--permissions", "prompt")
 
     assert result.exit_code == vocab.EXIT_OK
     assert "permissions ask" in " ".join(result.stdout.split())
@@ -830,7 +826,7 @@ def test_a_default_cwd_resolves_to_the_callers_absolute_directory(
     caller_dir.mkdir()
     monkeypatch.chdir(caller_dir)
 
-    result = invoke(cli, "run", "mock", "echo:x", "--resolve", "--json")
+    result = invoke(cli, "resolve", "mock", "--json")
 
     payload = json.loads(result.stdout)
     assert payload["cwd"] == str(caller_dir.resolve())
@@ -932,14 +928,20 @@ def test_timeout_cannot_be_combined_with_background(cli: CliRunner) -> None:
 def test_resolve_rejects_deadlines_before_creating_a_session(
     cli: CliRunner, state_root: Path, deadline_flag: str
 ) -> None:
-    result = invoke(cli, "run", "mock", "probe", "--resolve", deadline_flag, "1", "--json")
+    result = invoke(cli, "resolve", "mock", deadline_flag, "1", "--json")
 
     assert result.exit_code == vocab.EXIT_USAGE
     envelope = error_envelope(result)
     assert envelope["kind"] == "invalid_input"
-    assert "--resolve" in envelope["message"]
     assert deadline_flag in envelope["message"]
     assert not (state_root / "sessions").exists()
+
+
+def test_run_resolve_flag_names_the_new_command(cli: CliRunner) -> None:
+    result = invoke(cli, "run", "mock", "probe", "--resolve")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert "acpc resolve <agent>" in error_envelope(result)["message"]
 
 
 def test_timeout_only_stops_waiting_and_reports_observed_state(
@@ -1071,7 +1073,7 @@ def test_an_invalid_timeout_has_the_pinned_duration_error(cli: CliRunner) -> Non
 
 @pytest.mark.parametrize("value", ["-1", "-1m"])
 def test_negative_timeout_is_a_usage_error(cli: CliRunner, value: str) -> None:
-    result = invoke(cli, "run", "mock", "hello", "--timeout", value, "--resolve")
+    result = invoke(cli, "run", "mock", "hello", "--timeout", value)
 
     assert result.exit_code == vocab.EXIT_USAGE
     assert "--timeout" in result.stderr
@@ -1121,7 +1123,7 @@ def test_an_execute_floor_refuses_policies_below_execute(
 def test_an_execute_floor_resolve_refusal_names_the_permission_floor(
     cli: CliRunner, grok_floor_entry: None
 ) -> None:
-    result = invoke(cli, "run", "grok-floor", "probe", "--resolve")
+    result = invoke(cli, "resolve", "grok-floor")
 
     assert result.exit_code == vocab.EXIT_USAGE
     assert "the lowest policy grok-floor runs under is execute" in error_envelope(result)["message"]
@@ -1183,16 +1185,14 @@ def test_an_edit_floor_refusal_names_the_permission_floor(cli: CliRunner, state_
 def test_unlisted_model_warns_on_resolve(cli: CliRunner) -> None:
     result = invoke(
         cli,
-        "run",
+        "resolve",
         "grok",
-        "probe",
         "--model",
         "grok-4.7",
         "--effort",
         "xhigh",
         "--permissions",
         "execute",
-        "--resolve",
     )
 
     assert result.exit_code == vocab.EXIT_OK
@@ -1226,16 +1226,14 @@ def test_unlisted_model_warns_on_run(cli: CliRunner, state_root: Path) -> None:
 def test_listed_model_does_not_warn_on_resolve(cli: CliRunner) -> None:
     result = invoke(
         cli,
-        "run",
+        "resolve",
         "grok",
-        "probe",
         "--model",
         "grok-4.6",
         "--effort",
         "high",
         "--permissions",
         "execute",
-        "--resolve",
     )
 
     assert result.exit_code == vocab.EXIT_OK

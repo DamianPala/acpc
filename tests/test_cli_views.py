@@ -446,15 +446,15 @@ def test_log_quiet_suppresses_the_stderr_footer(cli: CliRunner) -> None:
 
 
 def test_log_max_output_truncates_between_events_and_names_the_transcript(cli: CliRunner) -> None:
-    """Log --max-output stops at an event boundary and names transcript.ndjson."""
+    """Log --max-output stops at an event boundary and diagnoses on stderr."""
     meta = session_with_texts("event-0", "x" * 1000, "event-2")
 
-    result = invoke(cli, "log", meta.session_id, "--since", "0", "--max-output", "300")
+    result = invoke(cli, "log", meta.session_id, "--since", "0", "--max-output", "250")
 
     assert (
         "event-0" in result.stdout
         and "event-2" not in result.stdout
-        and "transcript.ndjson" in result.stdout
+        and "transcript.ndjson" in result.stderr
     )
 
 
@@ -852,11 +852,12 @@ def test_follow_budget_exhaustion_exits_four_and_says_how_to_resume(cli: CliRunn
     """
     meta = session_with_messages(25)
 
-    result = invoke(cli, "log", meta.session_id, "--follow", "--since", "0", "--max-output", "300")
+    result = invoke(cli, "log", meta.session_id, "--follow", "--since", "0", "--max-output", "200")
 
     assert result.exit_code == vocab.EXIT_BUDGET
-    assert "output truncated" in result.stdout
-    assert "--max-output 300 exhausted" in result.stderr
+    assert "output truncated" not in result.stdout
+    assert "full transcript:" in result.stderr
+    assert "--max-output 200 exhausted" in result.stderr
     assert f"acpc log {meta.session_id} --follow --since" in result.stderr
     assert "cursor:" in result.stderr
     last = [line for line in result.stderr.splitlines() if line.strip()][-1]
@@ -867,7 +868,7 @@ def test_follow_cursor_covers_exactly_what_was_printed(cli: CliRunner) -> None:
     """A caller resuming at the footer's cursor sees no gap and no repeat."""
     meta = session_with_messages(25)
 
-    cut = invoke(cli, "log", meta.session_id, "--follow", "--since", "0", "--max-output", "300")
+    cut = invoke(cli, "log", meta.session_id, "--follow", "--since", "0", "--max-output", "200")
     assert cut.exit_code == vocab.EXIT_BUDGET
     footer = next(line for line in cut.stderr.splitlines() if "cursor:" in line)
     cursor = int(footer.rsplit("cursor:", 1)[1].strip())
@@ -921,7 +922,7 @@ def test_follow_budget_spans_the_whole_stream(cli: CliRunner) -> None:
 
 
 def test_follow_json_stays_valid_ndjson_under_the_budget(cli: CliRunner) -> None:
-    """The cut appears as the typed `truncated` event, never a bare marker."""
+    """The cut keeps stdout as valid transcript NDJSON and diagnoses on stderr."""
     meta = session_with_messages(25)
 
     result = invoke(
@@ -939,7 +940,9 @@ def test_follow_json_stays_valid_ndjson_under_the_budget(cli: CliRunner) -> None
     assert result.exit_code == vocab.EXIT_BUDGET
     events = [json.loads(line) for line in result.stdout.splitlines()]
     assert all(isinstance(event, dict) for event in events)
-    assert events[-1]["type"] == "truncated"
+    assert events
+    assert all(event["type"] != "truncated" for event in events)
+    assert "full transcript:" in result.stderr
 
 
 def test_follow_prose_renders_full_messages(cli: CliRunner) -> None:

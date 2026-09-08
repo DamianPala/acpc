@@ -741,6 +741,21 @@ class TestPrune:
         assert [meta.session_id for meta in removed] == [old]
         assert not sessions.session_dir(old).exists()
 
+    def test_a_failed_removal_is_not_reported_as_removed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        old = finished_session()
+
+        def refuse_removal(directory: object) -> None:
+            del directory
+            raise OSError("read-only session directory")
+
+        monkeypatch.setattr(sessions, "_remove_tree", refuse_removal)
+
+        with pytest.raises(OSError, match="read-only session directory"):
+            sessions.prune_sessions(older_than=86_400.0, clock=at(200_000.0))
+        assert sessions.session_dir(old).exists()
+
     def test_recent_sessions_stay(self) -> None:
         recent = finished_session()
         assert sessions.prune_sessions(older_than=86_400.0, clock=at(100.0)) == []

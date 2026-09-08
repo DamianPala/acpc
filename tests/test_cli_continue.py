@@ -894,14 +894,12 @@ def test_continue_permissions_keeps_stored_effort_after_table_tightens(
     )
     refused = invoke(
         cli,
-        "run",
+        "resolve",
         "mock",
-        "fresh",
         "--model",
         "mock-sonnet-5",
         "--effort",
         "high",
-        "--resolve",
     )
     assert refused.exit_code == vocab.EXIT_USAGE
     assert "supported levels: low" in refused.stderr

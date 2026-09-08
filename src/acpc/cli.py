@@ -12,7 +12,7 @@ import signal
 import subprocess
 import sys
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
@@ -129,6 +129,63 @@ def _color_option() -> Any:
         callback=_record_color_policy,
         help="Color policy for human output; NO_COLOR and TERM=dumb disable color.",
     )
+
+
+def _resolution_options(function: Callable[..., Any]) -> Callable[..., Any]:
+    """Add the flags that select an agent call's resolved configuration."""
+    decorators = (
+        click.option(
+            "--cwd",
+            metavar="DIR",
+            help=(
+                "Working directory of the callee; absent, the directory acpc was invoked from. "
+                "A relative path resolves against that directory."
+            ),
+        ),
+        click.option(
+            "--model",
+            metavar="M",
+            help=(
+                "Model tier (fast/standard/max) or a raw model ID; absent, the entry's "
+                "configured model."
+            ),
+        ),
+        click.option(
+            "--effort",
+            metavar="E",
+            help="Reasoning effort level; absent, the entry's configured effort.",
+        ),
+        click.option(
+            "--permissions",
+            type=click.Choice(_PERMISSION_CHOICES),
+            metavar="P",
+            help=(
+                "\b\n"
+                "Permission scale: none, read, edit, execute, all or ask; absent, ask when acpc "
+                "could put the question — stdin and stdout both terminals, no --json, NO_INPUT "
+                "unset — and read in every other case, and --background asks which policy to detach "
+                "with. ask itself needs a terminal on stdin and refuses under --json, --background "
+                "or a set NO_INPUT. execute permits read, edit and execute; write and prompt are "
+                "deprecated aliases for execute and ask."
+            ),
+        ),
+        click.option(
+            "--mode",
+            metavar="M",
+            help=(
+                "Vendor mode override; normally unnecessary because --permissions selects the "
+                "mode. Refused when it grants more than the policy; values from agents get <name>."
+            ),
+        ),
+        click.option(
+            "--home",
+            metavar="DIR",
+            help="Vendor home override; absent, the entry's configured home.",
+        ),
+    )
+    for decorate in reversed(decorators):
+        function = decorate(function)
+    return function
 
 
 def _stdout_is_tty() -> bool:
@@ -411,7 +468,7 @@ Maintenance and setup:
   never needs it. --force is separate: it overrides a documented refusal.
 
 Common commands:
-  run, continue, steer, wait, status, log, agents, skills, daemon,
+  run, resolve, continue, steer, wait, status, log, agents, skills, daemon,
   probe, cancel, delete, prune, install
   Use `acpc <command> --help` for the command's full reference.
 
@@ -604,6 +661,8 @@ def _friendly_option_hint(message: str, command_parts: list[str]) -> str | None:
         )
         if hint is not None:
             return hint
+    if command_parts[-1:] == ["run"] and _no_such_option(message, "--resolve"):
+        return "--resolve moved to: acpc resolve <agent>"
     aliases = {
         "--follow": follow_hint,
         "-f": follow_hint,
@@ -973,7 +1032,7 @@ def _updated_session_resolution(
 # The source of a policy a person typed at the `--bg` prompt: neither `unset`
 # (somebody did set it) nor `default` (acpc did not pick it).
 PERMISSIONS_ANSWERED = "answered"
-# What a `--resolve` preview reports instead of putting that question itself.
+# What a `resolve` preview reports instead of putting that question itself.
 PERMISSIONS_ASKED_AT_DISPATCH = "asked at dispatch"
 
 
@@ -1890,7 +1949,7 @@ def agents_check_command(
     if name is not None:
         if ctx.get_parameter_source("limit") is click.core.ParameterSource.COMMANDLINE:
             raise UsageProblem("--limit is only supported when checking all agents")
-        if plain:
+        if selected_format == "plain":
             raise UsageProblem("--plain is only supported when checking all agents")
     elif (
         selected_format == "plain"
@@ -2289,8 +2348,11 @@ def install_command(agent: str, assume_yes: bool, format_name: str | None, json_
 
     Resolves the agent like ``run`` does, runs its ``install_command`` and
     relays the installer's output; a failing installer exits 1. The installer
-    is the vendor's, and acpc has no matching uninstall, so it asks first: a
-    person is asked on the terminal, and every other caller passes ``--yes``.
+    does not expose whether it changed the target, so successful calls report
+    ``changed: null`` rather than guessing from its exit code.
+    The installer is the vendor's, and acpc has no matching uninstall, so it asks
+    first: a person is asked on the terminal, and every other caller passes
+    ``--yes``.
 
     Example: ``acpc install codex --yes``
     """
@@ -2350,7 +2412,7 @@ def install_command(agent: str, assume_yes: bool, format_name: str | None, json_
         "agent": agent,
         "ok": return_code == 0,
         "returncode": return_code,
-        "changed": return_code == 0,
+        "changed": None,
     }
     if selected_format == "json" and return_code == 0:
         _emit_json(payload)
@@ -2609,6 +2671,12 @@ def prune_command(
         raise
     except sessions.SessionError as error:
         raise _session_problem(error) from None
+    except OSError as error:
+        raise AgentProblem(
+            f"prune could not remove session state: {error}",
+            kind=errors.OPERATION_FAILED,
+            context={"operation": "prune"},
+        ) from None
     except (config.ConfigError, ValueError) as error:
         raise UsageProblem(str(error)) from None
 
@@ -3037,6 +3105,8 @@ def _render_log_page(
     )
     _write_stdout(rendered.text)
     if not quiet:
+        if rendered.truncation_note is not None:
+            _echo_metadata(rendered.truncation_note)
         if since_note is not None:
             _echo_metadata(since_note)
         if gave_up_waiting and meta.state not in vocab.FINISHED_STATES:
@@ -3080,13 +3150,12 @@ def _emit_follow_page(
     used: int,
     transcript_path: Path,
     cursor: int,
-) -> tuple[int, int, bool, int | None, int | None]:
+) -> tuple[int, int, bool, int | None, int | None, str | None]:
     """Render one page inside the follow budget.
 
     SPEC `log --follow`: `--max-output` budgets the whole stream, so each page
-    is rendered against what is left of it.  A budget with nothing left still
-    renders one byte's worth, which is how the marker naming the transcript
-    reaches stdout instead of a silent stop.
+    is rendered against what is left of it.  Truncation diagnostics stay on
+    stderr, keeping stdout a stream of transcript records.
     """
     budget = 0 if max_output == 0 else max(1, max_output - used)
     rendered = render.render_events(
@@ -3104,6 +3173,7 @@ def _emit_follow_page(
         rendered.truncated,
         rendered.first_event,
         rendered.last_event,
+        rendered.truncation_note,
     )
 
 
@@ -3158,6 +3228,7 @@ def _follow_log(
     read_count = 0
     page_start: int | None = None
     page_end: int | None = None
+    truncation_note: str | None = None
 
     while True:
         page = _read_transcript_page(transcript_file, since=cursor)
@@ -3167,7 +3238,14 @@ def _follow_log(
                 if remaining <= 0:
                     break
                 page = transcript.TranscriptPage(page.events[:remaining], page.events[0]["i"] - 1)
-            cursor, used, exhausted, rendered_start, rendered_end = _emit_follow_page(
+            (
+                cursor,
+                used,
+                exhausted,
+                rendered_start,
+                rendered_end,
+                page_note,
+            ) = _emit_follow_page(
                 page.events,
                 prose=prose,
                 json_mode=json_mode,
@@ -3181,6 +3259,8 @@ def _follow_log(
                 if page_start is None:
                     page_start = rendered_start
                 page_end = rendered_end
+            if page_note is not None:
+                truncation_note = page_note
             if exhausted:
                 break
             if limit is not None and read_count >= limit:
@@ -3210,6 +3290,7 @@ def _follow_log(
         since_note=since_note,
         timeout=timeout,
         max_output=max_output,
+        truncation_note=truncation_note,
     )
 
 
@@ -3226,12 +3307,15 @@ def _finish_follow_log(
     since_note: str | None,
     timeout: float | None,
     max_output: int,
+    truncation_note: str | None,
 ) -> None:
     """Render follow's current footer and raise its bounded-ending status."""
     # The follow outlived the state it started with; the footer is the caller's
     # termination signal, so it has to be current.
     meta = _load_view_session(meta.session_id)
     if not quiet:
+        if truncation_note is not None:
+            _echo_metadata(truncation_note)
         if since_note is not None:
             _echo_metadata(since_note)
         if timed_out and meta.state not in vocab.FINISHED_STATES:
@@ -3334,6 +3418,64 @@ def _run_preview(
     _emit_resolution(payload, json_mode=selected_format == "json")
 
 
+@effects.read_only
+@schema.format_defaults(tty="text", non_tty="text")
+@schema.describes(
+    agent=(
+        "Registry entry whose call configuration is resolved without dispatching a turn; "
+        "an adapter or variant, as `acpc agents list` lists them."
+    ),
+)
+@main.command(name="resolve")
+@_resolution_options
+@click.argument("agent")
+@click.option(
+    "--format",
+    "format_name",
+    type=click.Choice(("text", "json")),
+    help=_FORMAT_NATIVE_HELP,
+)
+@_json_option("Emit the resolved call as JSON.")
+@_color_option()
+@click.help_option("-h", "--help")
+def resolve_command(
+    agent: str,
+    cwd: str | None,
+    model: str | None,
+    effort: str | None,
+    permissions: str | None,
+    mode: str | None,
+    home: str | None,
+    format_name: str | None,
+    json_mode: bool,
+) -> None:
+    """Show how an agent call resolves, without dispatching a session.
+
+    The output records the selected values, their provenance, the adapter command
+    and the working directory that a later ``run`` would use.
+
+    Example: ``acpc resolve codex --permissions execute``
+    """
+    selected_format = _select_format(format_name, json_mode, native_text=True)
+    permissions = _normalize_permission(permissions)
+    resolution = _resolve_run_call(
+        agent,
+        model=model,
+        effort=effort,
+        mode=mode,
+        permissions=permissions,
+        home=home,
+    )
+    resolved_cwd = str(Path(cwd).expanduser().resolve()) if cwd else os.getcwd()
+    _run_preview(
+        resolution,
+        permissions=permissions,
+        background=False,
+        cwd=resolved_cwd,
+        selected_format=selected_format,
+    )
+
+
 def _claim_run_alias(alias: str | None) -> None:
     if alias is None:
         return
@@ -3425,6 +3567,7 @@ def _run_foreground(
     output_file=_OUTPUT_FILE_DESCRIPTION,
 )
 @main.command(name="run")
+@_resolution_options
 @click.argument("agent")
 @click.argument("prompt_text", required=False)
 @click.option(
@@ -3435,51 +3578,6 @@ def _run_foreground(
         f"Read the prompt from a file; at most {_PROMPT_LIMIT_HELP}. One of three "
         "prompt sources with the argument and `-`, exactly one of which must be given."
     ),
-)
-@click.option(
-    "--cwd",
-    metavar="DIR",
-    help=(
-        "Working directory of the callee; absent, the directory acpc was invoked from. "
-        "A relative path resolves against that directory."
-    ),
-)
-@click.option(
-    "--model",
-    metavar="M",
-    help=(
-        "Model tier (fast/standard/max) or a raw model ID; absent, the entry's configured model."
-    ),
-)
-@click.option(
-    "--effort",
-    metavar="E",
-    help="Reasoning effort level; absent, the entry's configured effort.",
-)
-@click.option(
-    "--permissions",
-    type=click.Choice(_PERMISSION_CHOICES),
-    metavar="P",
-    help=(
-        "\b\n"
-        "Permission scale: none, read, edit, execute, all or ask; absent, ask when acpc "
-        "could put the question — stdin and stdout both terminals, no --json, NO_INPUT "
-        "unset — and read in every other case, and --background asks which policy to detach with. "
-        "ask itself needs a terminal on stdin and refuses under --json, --background or a set "
-        "NO_INPUT. execute permits read, edit and execute; write and prompt are "
-        "deprecated aliases for execute and ask."
-    ),
-)
-@click.option(
-    "--mode",
-    metavar="M",
-    help=(
-        "Vendor mode override; normally unnecessary because --permissions selects the mode. "
-        "Refused when it grants more than the policy; values from agents get <name>."
-    ),
-)
-@click.option(
-    "--home", metavar="DIR", help="Vendor home override; absent, the entry's configured home."
 )
 @click.option("--output-file", "output_file", metavar="FILE", help=_OUTPUT_FILE_HELP)
 @click.option(
@@ -3494,7 +3592,7 @@ def _run_foreground(
     metavar="S",
     help=(
         f"Stop waiting after this duration ({_DURATION_SYNTAX}); the session keeps running. "
-        "Cannot be combined with --resolve; use --cancel-after to cancel the session."
+        "Use --cancel-after to cancel the session."
     ),
 )
 @click.option(
@@ -3503,7 +3601,7 @@ def _run_foreground(
     metavar="S",
     help=(
         f"Cancel the session after this duration ({_DURATION_SYNTAX}); unlike --timeout, "
-        "this changes the work itself. Cannot be combined with --resolve."
+        "this changes the work itself."
     ),
 )
 @click.option(
@@ -3511,16 +3609,6 @@ def _run_foreground(
     "alias",
     metavar="ALIAS",
     help="Human-typeable handle for this session; `last` is reserved as a selector.",
-)
-@click.option(
-    "--resolve",
-    "resolve",
-    is_flag=True,
-    help=(
-        "Print what this call resolves to, then exit; nothing is dispatched, so the prompt "
-        "is not read and no question is put to anyone. Under --background without --permissions the "
-        "policy and the mode it selects print unresolved, sourced 'asked at dispatch'."
-    ),
 )
 @click.option(
     "--max-output",
@@ -3558,13 +3646,12 @@ def run_command(
     timeout: float | None,
     cancel_after: float | None,
     alias: str | None,
-    resolve: bool,
     background: bool,
     max_output: int,
     quiet: bool,
     json_mode: bool,
 ) -> None:
-    """Dispatch one agent; block by default, use ``--background`` or ``--bg`` to detach, or preview it with ``--resolve``.
+    """Dispatch one agent; block by default, or use ``--background`` or ``--bg`` to detach.
 
     One prompt source is required, and prompts over 1 MiB are rejected before
     session creation. Permission defaults follow the TTY and output format.
@@ -3574,10 +3661,6 @@ def run_command(
     selected_format = _select_format(format_name, json_mode, native_text=True)
     if background and timeout is not None:
         raise UsageProblem("--timeout only bounds waiting; use --cancel-after with --background")
-    if resolve and timeout is not None:
-        raise UsageProblem("--resolve cannot be combined with --timeout")
-    if resolve and cancel_after is not None:
-        raise UsageProblem("--resolve cannot be combined with --cancel-after")
     permissions = _normalize_permission(permissions)
     resolution = _resolve_run_call(
         agent,
@@ -3589,15 +3672,6 @@ def run_command(
     )
     defaulted_permissions = permissions is None and resolution.permissions is None
     resolved_cwd = str(Path(cwd).expanduser().resolve()) if cwd else os.getcwd()
-    if resolve:
-        _run_preview(
-            resolution,
-            permissions=permissions,
-            background=background,
-            cwd=resolved_cwd,
-            selected_format=selected_format,
-        )
-        return
     prompt = _read_prompt(prompt_text, prompt_file)
     try:
         runner.adapter_command(resolution)
@@ -3645,7 +3719,7 @@ def run_command(
     )
 
 
-# What a finished turn means when it did not end in `done`.  The exit code
+# What a finished turn means when it did not end in `succeeded`. The exit code
 # already says which ending it was; the kind is what a caller matches on.
 #
 # A command that waits for the turn it started reports any terminal state

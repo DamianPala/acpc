@@ -59,7 +59,8 @@ _NULLABLE_STRING = {"type": ["string", "null"]}
 _NULLABLE_NUMBER = {"type": ["number", "null"]}
 _NULLABLE_INTEGER = {"type": ["integer", "null"]}
 _SESSION_STATUS = {"type": "string", "enum": list(vocab.SESSION_STATES)}
-_NULLABLE_OBJECT = {"type": ["object", "null"], "properties": {}, "required": []}
+_SESSION_WORK_STATUS = {"type": "string", "enum": ["starting", "running", "succeeded"]}
+_SESSION_SUCCEEDED_STATUS = {"type": "string", "enum": ["succeeded"]}
 
 _PATHS = _object(
     {name: _STRING for name in ("dir", "prompt", "transcript", "answer")},
@@ -100,9 +101,57 @@ _SESSION_RESULT_PROPERTIES = {
     "changed": _BOOLEAN,
 }
 
+_RESOLUTION_CLAMP = _object(
+    {name: _STRING for name in ("requested", "ceiling", "effective")},
+    ("requested", "ceiling", "effective"),
+)
+_RESOLUTION_FIELD = _object(
+    {
+        "value": _NULLABLE_STRING,
+        "source": _STRING,
+        "grants": _STRING,
+        "delegates": _BOOLEAN,
+        "escalates": _BOOLEAN,
+        "clamp": _RESOLUTION_CLAMP,
+    },
+    ("value", "source"),
+)
+_RESOLUTION = _object(
+    {
+        "entry": _STRING,
+        "base_adapter": _STRING,
+        "command": _STRING,
+        "cwd": _STRING,
+        "env": {},
+        "env_passthrough": _array(_STRING),
+        "resolved": _object(
+            {
+                name: _RESOLUTION_FIELD
+                for name in ("model", "effort", "mode", "permissions", "home")
+            },
+            ("model", "effort", "mode", "permissions", "home"),
+        ),
+    },
+    (
+        "entry",
+        "base_adapter",
+        "command",
+        "cwd",
+        "env",
+        "env_passthrough",
+        "resolved",
+    ),
+)
 
-def _session_result_schema(*, changed: bool, foreground_only: bool = False) -> dict[str, Any]:
+
+def _session_result_schema(
+    *,
+    changed: bool,
+    foreground_only: bool = False,
+    status: dict[str, Any] = _SESSION_WORK_STATUS,
+) -> dict[str, Any]:
     properties = dict(_SESSION_RESULT_PROPERTIES)
+    properties["status"] = status
     if not changed:
         properties.pop("changed")
     required = [
@@ -316,12 +365,20 @@ _LOG_EVENT = _object(
         "decision": _STRING,
         "auto": _BOOLEAN,
         "message": _STRING,
+        "observation": _STRING,
+        "next_step": _STRING,
+        "adapter_log": _STRING,
+        "adapter_log_tail": _STRING,
         "from": _STRING,
         "to": _STRING,
         "tokens": _INTEGER,
         "cost": _NULLABLE_NUMBER,
     },
     ("i", "ts", "type"),
+)
+_MODE_FACTS = _object(
+    {"grants": _STRING, "delegates": _BOOLEAN, "escalates": _BOOLEAN},
+    ("grants", "delegates", "escalates"),
 )
 _PROBE = _object(
     {
@@ -348,8 +405,16 @@ _PROBE = _object(
                     "mode": _STRING,
                     "status": {"type": "string", "enum": ["advertised-missing", "entry-missing"]},
                     "description": _NULLABLE_STRING,
-                    "current": _NULLABLE_OBJECT,
-                    "proposed": _NULLABLE_OBJECT,
+                    "current": {
+                        "type": ["object", "null"],
+                        "properties": _MODE_FACTS["properties"],
+                        "required": _MODE_FACTS["required"],
+                    },
+                    "proposed": {
+                        "type": ["object", "null"],
+                        "properties": _MODE_FACTS["properties"],
+                        "required": _MODE_FACTS["required"],
+                    },
                 },
                 ("mode", "status", "description", "current", "proposed"),
             )
@@ -401,12 +466,18 @@ _OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
         ("session_id", "removed", "changed", "paths"),
     ),
     "install": _object(
-        {"agent": _STRING, "ok": _BOOLEAN, "returncode": _INTEGER, "changed": _BOOLEAN},
+        {
+            "agent": _STRING,
+            "ok": _BOOLEAN,
+            "returncode": _INTEGER,
+            "changed": {"type": ["boolean", "null"]},
+        },
         ("agent", "ok", "returncode", "changed"),
     ),
     "log": _LOG_EVENT,
     "probe": _PROBE,
     "prune": _TARGET_MUTATION,
+    "resolve": _RESOLUTION,
     "run": _session_result_schema(changed=True),
     "skills get": _object(
         {"name": _STRING, "description": _STRING, "path": _STRING, "body": _STRING},
@@ -426,7 +497,9 @@ _OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
     ),
     "status": _STATUS,
     "steer": _session_result_schema(changed=True),
-    "wait": _session_result_schema(changed=False, foreground_only=True),
+    "wait": _session_result_schema(
+        changed=False, foreground_only=True, status=_SESSION_SUCCEEDED_STATUS
+    ),
 }
 
 # Flags accepted by *every* command entry, and therefore not repeated in any

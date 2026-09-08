@@ -291,7 +291,8 @@ def test_log_budget_stops_before_next_event_and_keeps_cursor_on_printed_event() 
     assert len(result.text.encode("utf-8")) <= 200
     assert "first" in result.text
     assert "third" not in result.text
-    assert "full transcript: /tmp/transcript.ndjson" in result.text
+    assert result.truncation_note == "[output truncated; full transcript: /tmp/transcript.ndjson]"
+    assert "full transcript" not in result.text
 
 
 def test_single_over_budget_event_advances_cursor_and_is_utf8_safe() -> None:
@@ -302,6 +303,7 @@ def test_single_over_budget_event_advances_cursor_and_is_utf8_safe() -> None:
     result.text.encode("utf-8").decode("utf-8")
     assert result.truncated is True
     assert result.next_cursor == 9
+    assert result.truncation_note == "[output truncated; full transcript: transcript.ndjson]"
 
 
 def test_json_log_truncation_is_a_valid_typed_event() -> None:
@@ -316,7 +318,8 @@ def test_json_log_truncation_is_a_valid_typed_event() -> None:
     lines = [json.loads(line) for line in result.text.splitlines()]
 
     assert result.truncated is True
-    assert lines[-1] == {"type": "truncated", "path": "transcript.ndjson"}
+    assert lines == [{"i": 1, "ts": 1_700_000_000, "type": "msg", "text": "one"}]
+    assert result.truncation_note == "[output truncated; full transcript: transcript.ndjson]"
     assert result.next_cursor == 1
 
 
@@ -328,7 +331,8 @@ def test_json_single_over_budget_event_advances_the_cursor() -> None:
         transcript_path="transcript.ndjson",
     )
 
-    assert json.loads(result.text) == {"type": "truncated", "path": "transcript.ndjson"}
+    assert result.text == ""
+    assert result.truncation_note == "[output truncated; full transcript: transcript.ndjson]"
     assert result.next_cursor == 9
 
 

@@ -4,7 +4,7 @@ description: >-
   Bring up a new base adapter for acpc: any ACP-speaking process registered with
   its own command (no extends). Use when adding a vendor agent that is not
   already shipped (or a local ACP binary), writing ~/.acpc/agents/<name>.toml
-  with command/home/modes, or when run/--resolve refuse because the modes table is
+  with command/home/modes, or when run/resolve refuse because the modes table is
   empty. Not for pointing an existing adapter at a new provider (provider-bringup)
   or retargeting presets when the vendor catalogue moved (refresh-adapter-models).
 ---
@@ -112,13 +112,13 @@ env_passthrough = [
 
 ```bash
 acpc agents get "$NAME"
-acpc run "$NAME" "x" --resolve   # must refuse: empty [modes] — that is correct
+acpc resolve "$NAME"              # must refuse: empty [modes] — that is correct
 acpc probe "$NAME" --discover    # works without [modes]; never edits the entry
 ```
 
 ### 4. Fill `[modes]` (assumed, not measured)
 
-acpc cannot select a mode over an empty table: `run` and `--resolve` refuse.
+acpc cannot select a mode over an empty table: `run` and `resolve` refuse.
 Mode **ids** come from this binary, not from another adapter's table.
 
 **Path A — discovery non-empty.** Write every advertised id. Facts
@@ -201,7 +201,7 @@ When that fails (Method not found / unknown option), use entry overrides:
 
 ```bash
 acpc agents get "$NAME"
-acpc run "$NAME" "x" --resolve
+acpc resolve "$NAME"
 acpc run "$NAME" "Reply with exactly: OK" --timeout 180
 ```
 
@@ -245,7 +245,7 @@ Shape references (not values to copy): package `data/agents/claude.toml`,
 ## Traps
 
 - **UI ≠ adapter.** Wrong process, silent non-ACP.
-- **Empty `[modes]` blocks run/--resolve.** Expected until rung 4.
+- **Empty `[modes]` blocks run/resolve.** Expected until rung 4.
 - **Empty discovery ≠ "no modes exist".** May mean the agent does not advertise
   ACP modes; use Path B.
 - **`set_session_mode` OK on every string.** Acceptance ≠ measured ceiling.
@@ -260,7 +260,7 @@ Shape references (not values to copy): package `data/agents/claude.toml`,
 
 | Symptom | Actually means |
 |---|---|
-| `run` / `--resolve` refuse; message about modes/policy | Empty or unusable `[modes]`, not a missing model. Rung 4. |
+| `run` / `resolve` refuse; message about modes/policy | Empty or unusable `[modes]`, not a missing model. Rung 4. |
 | `probe --discover` → 0 advertised | Catalogue missing on the wire — not proof the binary has no permission modes. Path B. |
 | Mode name from another adapter "should work" | Mode ids are vendor-local. |
 | `the adapter rejected model|effort '…'` with Method not found, Unknown config option, or similar | Config-option path missing — set `model_via` / `effort_via` after proving the alternate wire, or drop pins. |

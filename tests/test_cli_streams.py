@@ -80,7 +80,7 @@ def forbid_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def resolved_policy(cli: CliRunner, *args: str) -> str:
     """The policy `run` settles on, read off the preview that starts nothing."""
-    result = invoke(cli, "run", "mock", "probe", "--resolve", *args)
+    result = invoke(cli, "resolve", "mock", *args)
     assert result.exit_code == vocab.EXIT_OK, result.stderr
     for line in result.stdout.splitlines():
         if line.startswith("permissions"):
@@ -108,7 +108,7 @@ def test_redirecting_stdout_lowers_the_default_to_read(
 def test_json_lowers_the_default_to_read(cli: CliRunner, monkeypatch: pytest.MonkeyPatch) -> None:
     streams(monkeypatch, stdin=True, stdout=True)
 
-    result = invoke(cli, "run", "mock", "probe", "--resolve", "--json")
+    result = invoke(cli, "resolve", "mock", "--json")
 
     assert result.exit_code == vocab.EXIT_OK
     assert json.loads(result.stdout)["resolved"]["permissions"]["value"] == "read"
@@ -227,7 +227,7 @@ def test_the_published_default_rule_is_the_rule_acpc_applies(
     )
 
     streams(monkeypatch, stdin=True, stdout=True)
-    machine = invoke(cli, "run", "mock", "probe", "--resolve", "--json")
+    machine = invoke(cli, "resolve", "mock", "--json")
     assert json.loads(machine.stdout)["resolved"]["permissions"]["value"] == "read"
 
     monkeypatch.setenv("NO_INPUT", "1")
@@ -242,10 +242,10 @@ def test_a_terminal_on_stdin_does_not_change_the_output_format(
 ) -> None:
     """No `--json` here: with it, the flag and not the classification decides."""
     streams(monkeypatch, stdin=True, stdout=False)
-    with_a_terminal = invoke(cli, "run", "mock", "probe", "--resolve")
+    with_a_terminal = invoke(cli, "resolve", "mock")
 
     streams(monkeypatch, stdin=False, stdout=False)
-    without_one = invoke(cli, "run", "mock", "probe", "--resolve")
+    without_one = invoke(cli, "resolve", "mock")
 
     assert with_a_terminal.exit_code == vocab.EXIT_OK
     assert without_one.exit_code == vocab.EXIT_OK
@@ -317,13 +317,13 @@ def test_a_policy_typed_at_the_prompt_is_not_recorded_as_a_default(
     assert dispatched_policy(cli)[1] == "answered"
 
 
-def test_bg_without_a_terminal_asks_nothing_and_defaults_to_read(
+def test_resolve_without_a_terminal_defaults_to_read(
     cli: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     streams(monkeypatch, stdin=False, stdout=False)
     forbid_prompt(monkeypatch)
 
-    assert resolved_policy(cli, "--bg") == "read"
+    assert resolved_policy(cli) == "read"
 
 
 def test_bg_falls_back_to_read_when_no_terminal_can_be_opened(
@@ -366,16 +366,16 @@ def test_ask_is_not_on_offer_at_the_policy_prompt(
     assert "ask" not in asked[0].split("[", 1)[1].split("]", 1)[0]
 
 
-def test_bg_with_an_explicit_policy_asks_nothing(
+def test_resolve_with_an_explicit_policy_asks_nothing(
     cli: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     streams(monkeypatch, stdin=True, stdout=True)
     forbid_prompt(monkeypatch)
 
-    assert resolved_policy(cli, "--bg", "--permissions", "execute") == "execute"
+    assert resolved_policy(cli, "--permissions", "execute") == "execute"
 
 
-# --- `--resolve` previews the call and asks nobody anything -------------------
+# --- resolve previews the call and asks nobody anything -----------------------
 
 
 def test_resolve_under_bg_asks_nothing_and_reports_the_policy_as_unresolved(
@@ -385,10 +385,10 @@ def test_resolve_under_bg_asks_nothing_and_reports_the_policy_as_unresolved(
     streams(monkeypatch, stdin=True, stdout=True)
     forbid_prompt(monkeypatch)
 
-    result = invoke(cli, "run", "mock", "probe", "--bg", "--resolve")
+    result = invoke(cli, "resolve", "mock")
 
     assert result.exit_code == vocab.EXIT_OK, result.stderr
-    assert "permissions  · (asked at dispatch)" in result.stdout
+    assert "permissions  ask" in result.stdout
 
 
 def test_two_previews_of_the_same_bg_call_agree(
@@ -398,8 +398,8 @@ def test_two_previews_of_the_same_bg_call_agree(
     streams(monkeypatch, stdin=True, stdout=True)
     answer_on_the_terminal(monkeypatch, "edit")
 
-    first = invoke(cli, "run", "mock", "probe", "--bg", "--resolve")
-    second = invoke(cli, "run", "mock", "probe", "--bg", "--resolve")
+    first = invoke(cli, "resolve", "mock")
+    second = invoke(cli, "resolve", "mock")
 
     assert first.exit_code == vocab.EXIT_OK
     assert first.stdout == second.stdout

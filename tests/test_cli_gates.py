@@ -125,6 +125,7 @@ DECLARED_EFFECTS = {
     "probe": effects.READ_ONLY,
     "prune": effects.NON_IDEMPOTENT,
     "delete": effects.NON_IDEMPOTENT,
+    "resolve": effects.READ_ONLY,
     "run": effects.NON_IDEMPOTENT,
     "schema": effects.READ_ONLY,
     "skills": effects.READ_ONLY,
@@ -710,11 +711,11 @@ def test_the_prompt_limit_is_named_in_help(cli: CliRunner) -> None:
     assert str(vocab.MAX_PROMPT_BYTES) in help_text
 
 
-# --- run --resolve ----------------------------------------------------------
+# --- resolve -----------------------------------------------------------------
 
 
 def test_resolve_starts_neither_a_session_nor_a_daemon(cli: CliRunner, state_root: Path) -> None:
-    result = invoke(cli, "run", "mock", "probe", "--resolve")
+    result = invoke(cli, "resolve", "mock")
 
     assert result.exit_code == vocab.EXIT_OK
     assert not (state_root / "sessions").exists()

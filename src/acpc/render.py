@@ -26,6 +26,7 @@ class RenderedEvents:
     printed_events: int
     first_event: int | None = None
     last_event: int | None = None
+    truncation_note: str | None = None
 
 
 def format_table(
@@ -254,15 +255,8 @@ def _utf8_head(text: str, byte_limit: int) -> str:
     return encoded[:byte_limit].decode("utf-8", errors="ignore")
 
 
-def _truncation_marker(path: Path | str) -> str:
-    return f"[output truncated; full transcript: {path}]\n"
-
-
-def _text_with_marker(text: str, max_output: int, marker: str) -> str:
-    marker_bytes = len(marker.encode("utf-8"))
-    if marker_bytes >= max_output:
-        return marker
-    return _utf8_head(text, max_output - marker_bytes) + marker
+def _truncation_note(path: Path | str) -> str:
+    return f"[output truncated; full transcript: {path}]"
 
 
 def _json_line(event: Mapping[str, Any]) -> str:
@@ -358,16 +352,14 @@ def render_events(
     printed_events = 0
     first_event: int | None = None
     last_event: int | None = None
-    marker = _truncation_marker(transcript_path)
+    note = _truncation_note(transcript_path)
     for index, (event_cursor, unit) in enumerate(entries):
         if not unit:
             next_cursor = event_cursor
             continue
 
-        has_later_output = any(later_unit for _, later_unit in entries[index + 1 :])
         fits = max_output == 0 or len((output + unit).encode("utf-8")) <= max_output
-        marker_fits = max_output == 0 or len((output + unit + marker).encode("utf-8")) <= max_output
-        if fits and (not has_later_output or marker_fits):
+        if fits:
             output += unit
             next_cursor = event_cursor
             printed_events += 1
@@ -377,13 +369,19 @@ def render_events(
             continue
 
         if not output:
-            output = _text_with_marker(unit, max_output, marker)
+            output = _utf8_head(unit, max_output)
             next_cursor = event_cursor
             printed_events += 1
             first_event = last_event = event_cursor
-        else:
-            output += marker
-        return RenderedEvents(output, next_cursor, True, printed_events, first_event, last_event)
+        return RenderedEvents(
+            output,
+            next_cursor,
+            True,
+            printed_events,
+            first_event,
+            last_event,
+            note,
+        )
 
     return RenderedEvents(output, next_cursor, False, printed_events, first_event, last_event)
 
@@ -403,11 +401,8 @@ def _render_json_events(
     for index, event in enumerate(events):
         event_cursor = _event_index(event, next_cursor)
         line = _json_line(event)
-        has_later_events = index < len(events) - 1
         fits = max_output == 0 or len((output + line).encode("utf-8")) <= max_output
-        marker = _json_line({"type": "truncated", "path": str(transcript_path)})
-        marker_fits = max_output == 0 or len((output + line + marker).encode("utf-8")) <= max_output
-        if fits and (not has_later_events or marker_fits):
+        if fits:
             output += line
             next_cursor = event_cursor
             printed_events += 1
@@ -416,14 +411,20 @@ def _render_json_events(
             last_event = event_cursor
             continue
 
-        # A partial JSON object would make the stream unusable.  The marker is
-        # itself a typed NDJSON event, and therefore remains parseable even if
-        # the event that crossed the budget was larger than the budget alone.
+        # A partial JSON object would make the stream unusable.  The diagnostic
+        # naming the complete transcript is emitted on stderr by the CLI.
         had_output = bool(output)
-        output += marker
         if not had_output:
             next_cursor = event_cursor
-        return RenderedEvents(output, next_cursor, True, printed_events, first_event, last_event)
+        return RenderedEvents(
+            output,
+            next_cursor,
+            True,
+            printed_events,
+            first_event,
+            last_event,
+            _truncation_note(transcript_path),
+        )
 
     return RenderedEvents(output, next_cursor, False, printed_events, first_event, last_event)
 

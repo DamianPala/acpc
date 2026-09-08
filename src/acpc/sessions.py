@@ -1067,8 +1067,7 @@ def prune_sessions(
         reference = meta.finished_at if meta.finished_at is not None else meta.created_at
         if reference is None or now - reference < older_than:
             continue
-        removed.append(meta)
         if not dry_run:
-            with contextlib.suppress(OSError):
-                _remove_tree(session_dir(meta.session_id))
+            _remove_tree(session_dir(meta.session_id))
+        removed.append(meta)
     return removed

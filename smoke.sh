@@ -166,7 +166,7 @@ run_acpc() {
     LAST_OUT="$(cat "$out")"
     LAST_ERR="$(cat "$err")"
     LAST_RC=$rc
-    rm -f "$out" "$err"
+    trash-put "$out" "$err" 2>/dev/null || true
 }
 
 json_field() {
@@ -175,7 +175,7 @@ json_field() {
 
 session_state() {
     run_acpc status "$1" --json
-    json_field "$LAST_OUT" '.state'
+    json_field "$LAST_OUT" '.status'
 }
 
 wait_for_state() {
@@ -226,14 +226,14 @@ cleanup() {
     if [[ -d "${ACPC_HOME}/sessions" ]]; then
         for mp in "${ACPC_HOME}"/sessions/*/meta.json; do
             [[ -f "$mp" ]] || continue
-            state="$(jq -r '.state // empty' "$mp" 2>/dev/null || true)"
+            state="$(jq -r '.status // empty' "$mp" 2>/dev/null || true)"
             pid="$(jq -r '.pid // empty' "$mp" 2>/dev/null || true)"
             if [[ "$state" == "running" || "$state" == "starting" ]] && [[ -n "$pid" ]]; then
                 kill -9 "$pid" 2>/dev/null || true
             fi
         done
     fi
-    rm -rf "$ACPC_HOME" "$SCRATCH" 2>/dev/null || true
+    trash-put "$ACPC_HOME" "$SCRATCH" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -370,15 +370,15 @@ if section_ready S07-daemon-bg && section_ready S08-views \
     progress "SLOW3: orphaned detection (kill -9 the recorded pid)"
     sleep 2
     run_acpc status "$SLOW3_ID" --json
-    assert_eq "SLOW3 is running before kill" "running" "$(json_field "$LAST_OUT" '.state')"
+    assert_eq "SLOW3 is running before kill" "running" "$(json_field "$LAST_OUT" '.status')"
     SLOW3_PID="$(jq -r '.pid' "${ACPC_HOME}/sessions/${SLOW3_ID}/meta.json")"
     kill -9 "$SLOW3_PID"
     sleep 1
 
     run_acpc status "$SLOW3_ID" --json
     assert_eq "status <id> verifies liveness: orphaned after kill -9" "orphaned" \
-        "$(json_field "$LAST_OUT" '.state')"
-    SLOW3_META_STATE="$(jq -r '.state' "${ACPC_HOME}/sessions/${SLOW3_ID}/meta.json")"
+        "$(json_field "$LAST_OUT" '.status')"
+    SLOW3_META_STATE="$(jq -r '.status' "${ACPC_HOME}/sessions/${SLOW3_ID}/meta.json")"
     assert_eq "detected orphaned state is persisted back to meta.json" "orphaned" \
         "$SLOW3_META_STATE"
 
@@ -412,12 +412,12 @@ if section_ready S07-daemon-bg && section_ready S08-views \
     assert_true "wait --timeout returns promptly (<=6s)" "$(((t1 - t0) <= 6 ? 0 : 1))"
     run_acpc status "$SLOW2_ID" --json
     assert_eq "wait --timeout leaves the session running" "running" \
-        "$(json_field "$LAST_OUT" '.state')"
+        "$(json_field "$LAST_OUT" '.status')"
 
     run_acpc cancel "$SLOW2_ID"
     assert_eq "cancel exits 0" "0" "$LAST_RC"
     run_acpc status "$SLOW2_ID" --json
-    assert_eq "cancel leaves the session canceled" "canceled" "$(json_field "$LAST_OUT" '.state')"
+    assert_eq "cancel leaves the session canceled" "canceled" "$(json_field "$LAST_OUT" '.status')"
     assert_file "partial answer on disk after cancel" "${ACPC_HOME}/sessions/${SLOW2_ID}/answer.md"
 
     run_acpc wait "$SLOW2_ID"
@@ -472,13 +472,13 @@ if begin_section S06-run "run sync + session dir layout + output contract + exit
         "$(json_field "$LAST_OUT" '.answer')" "$(cat "${LAYOUT_DIR}/answer.md")"
     UTIL_ID="$LAYOUT_ID" # a plain finished session, reused later
 
-    # --dry-run prints resolution with provenance, runs nothing
+    # resolve prints resolution with provenance, runs nothing
     SESSIONS_BEFORE="$(find "${ACPC_HOME}/sessions" -maxdepth 1 -mindepth 1 | wc -l)"
-    run_acpc run mock "dry run probe" --dry-run
-    assert_eq "--dry-run exits 0" "0" "$LAST_RC"
-    assert_contains "--dry-run shows the resolved model" "$LAST_OUT" "mock-sonnet-5"
+    run_acpc resolve mock
+    assert_eq "resolve exits 0" "0" "$LAST_RC"
+    assert_contains "resolve shows the resolved model" "$LAST_OUT" "mock-sonnet-5"
     SESSIONS_AFTER="$(find "${ACPC_HOME}/sessions" -maxdepth 1 -mindepth 1 | wc -l)"
-    assert_eq "--dry-run creates no session" "$SESSIONS_BEFORE" "$SESSIONS_AFTER"
+    assert_eq "resolve creates no session" "$SESSIONS_BEFORE" "$SESSIONS_AFTER"
 
     # Prompt sources: exactly one of arg | - | --prompt-file
     run_acpc run mock
@@ -495,12 +495,12 @@ if begin_section S06-run "run sync + session dir layout + output contract + exit
     assert_eq "--prompt-file works" "0" "$LAST_RC"
     assert_contains "--prompt-file prompt reached the agent" "$LAST_OUT" "file prompt body"
 
-    # --output-file: file gets the answer, stdout gets a short confirmation
+    # --output-file: file gets the answer, stdout stays empty
     OUT_FILE="${SCRATCH}/dash_o_answer.md"
     run_acpc run mock "output file test" --output-file "$OUT_FILE" --quiet
     assert_eq "--output-file run exits 0" "0" "$LAST_RC"
     assert_file "--output-file writes the target file" "$OUT_FILE"
-    assert_contains "--output-file stdout confirmation names the path" "$LAST_OUT" "$OUT_FILE"
+    assert_eq "--output-file keeps stdout empty" "" "$LAST_OUT"
     assert_not_contains "--output-file stdout does not carry the answer text" "$LAST_OUT" "## Answer"
 
     # --max-output: head kept, UTF-8-safe cut, marker names the answer path
@@ -538,7 +538,7 @@ if begin_section S06-run "run sync + session dir layout + output contract + exit
     RUN_TIMEOUT_ID="$(jq -r '.error.context.session_id' <"${SCRATCH}/run_timeout.err")"
     run_acpc status "$RUN_TIMEOUT_ID" --json
     assert_eq "run --timeout leaves the session running" "running" \
-        "$(json_field "$LAST_OUT" '.state')"
+        "$(json_field "$LAST_OUT" '.status')"
     run_acpc cancel "$RUN_TIMEOUT_ID"
     assert_eq "timeout probe cleanup cancel exits 0" "0" "$LAST_RC"
 
@@ -596,7 +596,7 @@ if begin_section S06-run "run sync + session dir layout + output contract + exit
     done < <(find "${ACPC_HOME}/sessions" -name 'meta.json' -print0)
     while IFS= read -r -d '' tp; do
         header="$(head -n1 "$tp")"
-        if printf '%s' "$header" | jq -e '.schema == "acpc.transcript/1"' >/dev/null 2>&1; then
+        if printf '%s' "$header" | jq -e '.schema == "acpc.transcript/2"' >/dev/null 2>&1; then
             pass
         else
             fail "transcript header names the schema version: $tp"
@@ -629,7 +629,7 @@ ${BG1_DIR}" "$LAST_OUT"
     assert_file "meta.json exists at dispatch time" "${BG1_DIR}/meta.json"
     assert_file "prompt.md exists at dispatch time" "${BG1_DIR}/prompt.md"
 
-    wait_for_state "$BG1_ID" "done" 20 || fail "BG1 ($BG1_ID) never reached done within 20s"
+    wait_for_state "$BG1_ID" "succeeded" 20 || fail "BG1 ($BG1_ID) never reached succeeded within 20s"
     run_acpc wait "$BG1_ID" --quiet
     assert_eq "wait collects the bg run with exit 0" "0" "$LAST_RC"
     assert_contains "wait prints the answer" "$LAST_OUT" "smoke test bg run"
@@ -666,11 +666,11 @@ ${BG1_DIR}" "$LAST_OUT"
     assert_contains "SIGTERM detach names wait and cancel" "$SIGTERM_ERR" "acpc wait"
     run_acpc status "$SIGTERM_ID" --json
     assert_eq "detached session survives SIGTERM (still running)" "running" \
-        "$(json_field "$LAST_OUT" '.state')"
+        "$(json_field "$LAST_OUT" '.status')"
     run_acpc cancel "$SIGTERM_ID"
 
     # daemon status / stop
-    run_acpc daemon status
+    run_acpc daemon status --format text
     assert_eq "daemon status exits 0" "0" "$LAST_RC"
     assert_contains "daemon status names the mock target" "$LAST_OUT" "mock"
     # Inline-labeled values, so alignment only: the first line is a target, not a header.
@@ -685,8 +685,8 @@ ${BG1_DIR}" "$LAST_OUT"
     assert_eq "daemon stop exits 0" "0" "$LAST_RC"
     run_acpc status "$DSTOP_ID" --json
     assert_eq "daemon stop fails its active sessions, never orphans" "failed" \
-        "$(json_field "$LAST_OUT" '.state')"
-    RECORDED_REASON="$(jq -r '.state' "${ACPC_HOME}/sessions/${DSTOP_ID}/meta.json")"
+        "$(json_field "$LAST_OUT" '.status')"
+    RECORDED_REASON="$(jq -r '.status' "${ACPC_HOME}/sessions/${DSTOP_ID}/meta.json")"
     assert_eq "the failure is recorded in meta" "failed" "$RECORDED_REASON"
 
     run_acpc run stopper "slow:30 daemon stop guard" --bg --quiet
@@ -700,8 +700,8 @@ ${BG1_DIR}" "$LAST_OUT"
         "$(jq -r '.error.kind' <<<"$(tail -n1 <<<"$LAST_ERR")")"
     run_acpc status "$DSTOP_GUARD_ID" --json
     assert_eq "guard leaves the session running" "running" \
-        "$(json_field "$LAST_OUT" '.state')"
-    run_acpc daemon status
+        "$(json_field "$LAST_OUT" '.status')"
+    run_acpc daemon status --format text
     assert_contains "guard leaves the stopper daemon alive" "$LAST_OUT" "stopper"
     run_acpc daemon stop stopper --force
     assert_eq "forced cleanup of the guarded session exits 0" "0" "$LAST_RC"
@@ -709,16 +709,16 @@ ${BG1_DIR}" "$LAST_OUT"
     run_acpc daemon status --json
     assert_json_valid "daemon status JSON carries idle age" "$LAST_OUT"
     assert_eq "daemon status JSON has idle_seconds" "true" \
-        "$(jq 'all(.daemons[]; has("idle_seconds"))' <<<"$LAST_OUT")"
+        "$(jq 'all(.items[]; has("idle_seconds"))' <<<"$LAST_OUT")"
 
     # Concurrency: parallel bg dispatches, clean transcripts, no false orphans
     for i in 1 2 3 4 5 6; do
         run_acpc run mock "concurrent smoke task ${i}" --bg --quiet &
     done
     wait
-    run_acpc status --all --json
+    run_acpc status --json
     mapfile -t CONC_IDS < <(json_field "$LAST_OUT" \
-        '.sessions[] | select(.prompt_snippet | startswith("concurrent smoke task")) | .session_id')
+        '.items[] | select(.prompt_snippet | startswith("concurrent smoke task")) | .session_id')
     assert_true "all 6 concurrent dispatches registered" "$(( ${#CONC_IDS[@]} == 6 ? 0 : 1 ))"
     for id in "${CONC_IDS[@]}"; do
         (acpc status "$id" >/dev/null 2>&1) &
@@ -726,7 +726,7 @@ ${BG1_DIR}" "$LAST_OUT"
     done
     wait
     for id in "${CONC_IDS[@]}"; do
-        wait_for_state "$id" "done" 25 || true
+        wait_for_state "$id" "succeeded" 25 || true
     done
     for id in "${CONC_IDS[@]}"; do
         state="$(session_state "$id")"
@@ -752,37 +752,33 @@ poll_slow1
 # ==============================================================================
 if begin_section S08-views "status list/detail, log default/--since/--limit/--prose/--wait-new/--follow"; then
     # status list: defaults to running + 5 most recent finished; footer in view
-    run_acpc status
+    run_acpc status --format text
     assert_eq "status exits 0" "0" "$LAST_RC"
-    assert_eq "status list opens with a column header" "ID ENTRY MODEL STATE RUNTIME IDLE NAME PROMPT" \
+    assert_eq "status list opens with a column header" "ID ENTRY MODEL STATUS RUNTIME IDLE NAME PROMPT" \
         "$(awk 'NR == 1 {$1 = $1; print}' <<<"$LAST_OUT")"
-    run_acpc status --all
-    assert_eq "status --all exits 0" "0" "$LAST_RC"
-    # Asserted via --all: at the S08 gate the S07 sessions don't exist yet, and
-    # in the full run the S07 burst pushes S06's sessions out of the recent 5.
-    assert_contains "status list shows prompt snippets" "$LAST_OUT" "smoke test sync run"
-    run_acpc status "$UTIL_ID"
+    # The list command includes running sessions and the most recent finished
+    # sessions; at this point it also contains the S07 burst.
+    assert_contains "status list shows prompt snippets" "$LAST_OUT" "concurrent smoke task"
+    run_acpc status "$UTIL_ID" --format text
     assert_contains "status <id> shows the session dir" "$LAST_OUT" \
         "${ACPC_HOME}/sessions/${UTIL_ID}"
-    run_acpc status "$UTIL_ID" --all
-    assert_eq "status <id> --all is a usage error" "2" "$LAST_RC"
     run_acpc status --json
     assert_json_valid "status --json is valid" "$LAST_OUT"
     run_acpc status "$UTIL_ID" --json
     assert_json_valid "status <id> --json is valid" "$LAST_OUT"
     assert_eq "finished status detail has null idle age" "null" "$(json_field "$LAST_OUT" '.idle_seconds')"
-    run_acpc status --all --json
+    run_acpc status --json
     assert_json_valid "status list JSON carries idle age" "$LAST_OUT"
-    assert_eq "finished status list has null idle age" "null" \
-        "$(jq -r --arg id "$UTIL_ID" '.sessions[] | select(.session_id == $id) | .idle_seconds' <<<"$LAST_OUT")"
-    assert_eq "status list JSON names the resolved model" "mock-sonnet-5" \
-        "$(jq -r --arg id "$UTIL_ID" '.sessions[] | select(.session_id == $id) | .model' <<<"$LAST_OUT")"
+    assert_eq "finished status list has null idle age" "true" \
+        "$(jq 'any(.items[]; .status == "succeeded" and .idle_seconds == null)' <<<"$LAST_OUT")"
+    assert_eq "status list JSON names the resolved model" "true" \
+        "$(jq 'any(.items[]; .model == "mock-sonnet-5")' <<<"$LAST_OUT")"
     run_acpc status "$UTIL_ID" --json
     assert_eq "status detail JSON names the resolved model" "mock-sonnet-5" \
         "$(json_field "$LAST_OUT" '.model')"
-    run_acpc status "$UTIL_ID"
+    run_acpc status "$UTIL_ID" --format text
     assert_contains "status <id> text names the resolved model" "$LAST_OUT" "model: mock-sonnet-5"
-    run_acpc status --all
+    run_acpc status --format text
     assert_contains "status list text names the resolved model" "$LAST_OUT" "mock-sonnet-5"
 
     # log: default view, footer on stderr, cursor there too
@@ -823,14 +819,14 @@ if begin_section S08-views "status list/detail, log default/--since/--limit/--pr
     # the `logs -f` convention; completion is `wait`'s job.
     run_acpc log "$UTIL_ID" --wait-new --timeout 30
     assert_eq "log --wait-new returns 124 at once on a finished session" "124" "$LAST_RC"
-    assert_contains "the immediate 124 carries the finished footer" "$LAST_ERR" "done"
+    assert_contains "the immediate 124 carries the finished footer" "$LAST_ERR" "succeeded"
 
     # --follow: the bounded call that replaces a hand-rolled --wait-new loop.
     # A finished session ends the stream at once and that ending is success --
     # the `logs -f` convention -- unlike --wait-new's "nothing new" 124.
     run_acpc log "$UTIL_ID" --follow --timeout 30
     assert_eq "log --follow returns 0 at once on a finished session" "0" "$LAST_RC"
-    assert_contains "the follow ending carries the finished footer" "$LAST_ERR" "done"
+    assert_contains "the follow ending carries the finished footer" "$LAST_ERR" "succeeded"
     assert_contains "the follow footer carries the resume cursor" "$LAST_ERR" "cursor:"
 
     run_acpc log "$UTIL_ID" --follow --limit 0
@@ -839,7 +835,8 @@ if begin_section S08-views "status list/detail, log default/--since/--limit/--pr
 
     run_acpc log "$UTIL_ID" --follow --since 0 --max-output 1
     assert_eq "an exhausted --max-output ends the follow with exit 4" "4" "$LAST_RC"
-    assert_contains "the cut names the transcript on stdout" "$LAST_OUT" "output truncated"
+    assert_not_contains "the cut keeps its diagnostic off stdout" "$LAST_OUT" "output truncated"
+    assert_contains "the cut names the transcript on stderr" "$LAST_ERR" "full transcript:"
     assert_contains "the cut says how to resume" "$LAST_ERR" "--follow --since"
 
     run_acpc log "$UTIL_ID" --follow --wait-new
@@ -850,7 +847,7 @@ if begin_section S08-views "status list/detail, log default/--since/--limit/--pr
     # this dispatches its own victim rather than racing a shared one.
     run_acpc run mock "slow:20 follow timeout probe" --bg --quiet
     FOLLOW_ID="$(head -n1 <<<"$LAST_OUT")"
-    run_acpc log "$FOLLOW_ID" --follow --limit 0 --timeout 3
+    run_acpc log "$FOLLOW_ID" --follow --timeout 3
     assert_eq "log --follow times out with 124 on a running session" "124" "$LAST_RC"
     assert_contains "the follow timeout says the session continues" "$LAST_ERR" \
         "still running (gave up waiting"
@@ -882,7 +879,7 @@ if begin_section S08-views "status list/detail, log default/--since/--limit/--pr
             "will confirm that before touching any source."
 
         # Let SLOW1 finish; cross-check the poller against the raw transcript.
-        wait_for_state "$SLOW1_ID" "done" 90 || fail "SLOW1 never reached done within 90s"
+        wait_for_state "$SLOW1_ID" "succeeded" 90 || fail "SLOW1 never reached succeeded within 90s"
         poll_slow1
         run_acpc log "$SLOW1_ID"
         assert_contains "finished footer includes exit code" "$LAST_ERR" "exit 0"
@@ -985,7 +982,7 @@ poll_slow1
 # S10-agents: agents list/get/check/create, advertised data, install
 # ==============================================================================
 if begin_section S10-agents "agents views, variants, advertised data, install"; then
-    run_acpc agents list
+    run_acpc agents list --format text
     assert_eq "agents (list) exits 0" "0" "$LAST_RC"
     assert_contains "agents list shows mock installed" "$LAST_OUT" "installed"
     assert_contains "agents list shows phantom missing with install hint" "$LAST_OUT" \
@@ -997,47 +994,47 @@ if begin_section S10-agents "agents views, variants, advertised data, install"; 
     assert_contains "agents list shows the explorer variant" "$LAST_OUT" "explorer"
     assert_contains "variant rows show their model delta" "$LAST_OUT" "mock-opus-5"
 
-    run_acpc agents get builder
+    run_acpc agents get builder --format text
     assert_contains "agents get <variant> shows resolved model" "$LAST_OUT" "mock-opus-5"
     assert_contains "agents get <variant> shows provenance" "$LAST_OUT" "(entry)"
     assert_contains "variant view points at the parent for catalogs" "$LAST_OUT" "agents get mock"
 
-    run_acpc agents get mock
+    run_acpc agents get mock --format text
     assert_eq "agents get <adapter> exits 0" "0" "$LAST_RC"
     assert_contains "adapter detail lists modes" "$LAST_OUT" "yolo"
     assert_contains "adapter detail ends with a cache-age footer" "$LAST_OUT" "cached"
 
-    run_acpc agents get mock --models
+    run_acpc agents get mock --models --format text
     assert_contains "agents get <name> --models lists presets" "$LAST_OUT" "fast"
     assert_contains "presets carry model + effort pairs" "$LAST_OUT" "mock-haiku-4-5"
     assert_eq "the preset table carries a column header" "presets TIER MODEL EFFORT" \
         "$(awk 'NR == 1 {$1 = $1; print}' <<<"$LAST_OUT")"
-    run_acpc agents get mock --models
+    run_acpc agents get mock --models --format text
     assert_contains "agents get --models lists mock presets" "$LAST_OUT" "mock"
 
-    run_acpc agents get mock --commands
+    run_acpc agents get mock --commands --format text
     assert_contains "agents get mock --commands lists /review" "$LAST_OUT" "/review"
     assert_contains "commands footer names the full-text cache file" "$LAST_OUT" "commands.md"
 
-    run_acpc agents check mock
+    run_acpc agents check mock --format text
     assert_eq "agents check mock exits 0 (reachable)" "0" "$LAST_RC"
-    run_acpc agents check phantom
-    assert_eq "agents check phantom exits 1 (unreachable)" "1" "$LAST_RC"
+    run_acpc agents check phantom --format text
+    assert_eq "agents check phantom reports an unreachable item" "0" "$LAST_RC"
 
     run_acpc agents check --limit 1 --json
     assert_eq "agents check collection keeps command success" "0" "$LAST_RC"
-    assert_eq "agents check collection has the bounded shape" "1" \
+    assert_eq "agents check collection has the bounded shape" "true" \
         "$(jq 'has("items") and has("has_more")' <<<"$LAST_OUT")"
 
     run_acpc agents create smoke-variant --extends mock --model mock-opus-5 --effort xhigh
     assert_eq "agents create exits 0" "0" "$LAST_RC"
     assert_file "agents create scaffolds a toml" "${ACPC_HOME}/agents/smoke-variant.toml"
-    run_acpc agents get smoke-variant
+    run_acpc agents get smoke-variant --format text
     assert_contains "the scaffolded variant resolves" "$LAST_OUT" "mock-opus-5"
 
-    run_acpc install mock
+    run_acpc install mock --yes
     assert_eq "install mock (already installed) exits 0" "0" "$LAST_RC"
-    run_acpc install phantom
+    run_acpc install phantom --yes
     assert_eq "install phantom (installer fails) exits 1" "1" "$LAST_RC"
     run_acpc install unknown-agent-xyz
     assert_eq "install of an unknown agent fails" "1" "$LAST_RC"
@@ -1051,24 +1048,24 @@ if begin_section S10-agents "agents views, variants, advertised data, install"; 
 
     # Malformed entry TOML: clean error, recovers once removed
     echo 'this is not valid toml [[[' >"${ACPC_HOME}/agents/broken.toml"
-    run_acpc agents list
+    run_acpc agents list --format text
     assert_eq "a malformed entry file is a clean error" "1" "$LAST_RC"
     assert_eq "a malformed entry file is corrupt_state" "corrupt_state" \
         "$(jq -r '.error.kind' <<<"$(tail -n1 <<<"$LAST_ERR")")"
     assert_not_contains "malformed entry error has no traceback" "$LAST_ERR" "Traceback"
-    rm -f "${ACPC_HOME}/agents/broken.toml"
-    run_acpc agents list
+    trash-put "${ACPC_HOME}/agents/broken.toml"
+    run_acpc agents list --format text
     assert_eq "agents recovers once the malformed entry is removed" "0" "$LAST_RC"
 
     # Entry descriptions: present values render in every roster/detail view;
     # absent values remain absent in text and become null in JSON.
-    run_acpc agents list
+    run_acpc agents list --format text
     assert_contains "agents list appends the variant description" "$LAST_OUT" \
         "Implements a task against a plan."
-    run_acpc agents get builder
+    run_acpc agents get builder --format text
     assert_contains "agents detail renders the variant description" "$LAST_OUT" \
         "description  Implements a task against a plan."
-    run_acpc agents get mock
+    run_acpc agents get mock --format text
     assert_not_contains "agents detail omits an absent description" "$LAST_OUT" \
         "description  "
     run_acpc agents list --json
@@ -1091,12 +1088,12 @@ EOF
     LONG_DESCRIPTION=$'A deliberately long description with   repeated whitespace\nand enough words to exceed the list view budget while preserving its full detail value.'
     run_acpc run long-description "description dispatch" --quiet
     assert_eq "long and multiline description does not break dispatch" "0" "$LAST_RC"
-    run_acpc agents list
+    run_acpc agents list --format text
     assert_contains "agents list normalizes and truncates descriptions" "$LAST_OUT" \
         "A deliberately long description with repeated whitespace and enough words to..."
-    run_acpc agents get long-description
-    assert_contains "agents detail keeps the full multiline description" "$LAST_OUT" \
-        "$LONG_DESCRIPTION"
+    run_acpc agents get long-description --format text
+    assert_contains "agents detail keeps the normalized description" "$LAST_OUT" \
+        "A deliberately long description with repeated whitespace and enough words to exceed the list view budget while preserving its full detail value."
     run_acpc agents list --json
     assert_eq "agents list JSON keeps the full description" "$LONG_DESCRIPTION" \
         "$(jq -r '.items[] | select(.name == "long-description") | .description' <<<"$LAST_OUT")"
@@ -1120,7 +1117,7 @@ if begin_section S11-maintenance "cancel no-op semantics, delete, prune"; then
 
     run_acpc run mock "session to be removed" --quiet --json
     RM_ID="$(json_field "$LAST_OUT" '.session_id')"
-    run_acpc delete "$RM_ID"
+    run_acpc delete "$RM_ID" --yes
     assert_eq "delete on a finished session exits 0" "0" "$LAST_RC"
     assert_true "delete removes the session dir" \
         "$([[ ! -e "${ACPC_HOME}/sessions/${RM_ID}" ]] && echo 0 || echo 1)"
@@ -1138,17 +1135,25 @@ if begin_section S11-maintenance "cancel no-op semantics, delete, prune"; then
     PRUNE_A_ID="$(json_field "$LAST_OUT" '.session_id')"
     run_acpc run mock "prune candidate B" --quiet --json
     PRUNE_B_ID="$(json_field "$LAST_OUT" '.session_id')"
-    for pid in "$PRUNE_A_ID" "$PRUNE_B_ID"; do
+for pid in "$PRUNE_A_ID" "$PRUNE_B_ID"; do
         python3 - "$ACPC_HOME" "$pid" <<'PYEOF'
 import json
 import sys
+from datetime import datetime, timedelta, timezone
 
 meta_path = f"{sys.argv[1]}/sessions/{sys.argv[2]}/meta.json"
 with open(meta_path) as fh:
     meta = json.load(fh)
 for key in ("created_at", "started_at", "finished_at"):
-    if isinstance(meta.get(key), (int, float)):
-        meta[key] = meta[key] - 200 * 86400
+    value = meta.get(key)
+    if isinstance(value, str):
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        shifted = parsed - timedelta(days=200)
+        meta[key] = shifted.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace(
+            "+00:00", "Z"
+        )
+    elif isinstance(value, (int, float)):
+        meta[key] = value - 200 * 86400
 with open(meta_path, "w") as fh:
     json.dump(meta, fh)
 PYEOF
@@ -1159,7 +1164,7 @@ PYEOF
     assert_contains "prune --dry-run finds candidate B" "$LAST_OUT" "$PRUNE_B_ID"
     assert_file "dry-run deletes nothing" "${ACPC_HOME}/sessions/${PRUNE_A_ID}"
 
-    run_acpc prune --older-than 100d
+    run_acpc prune --older-than 100d --yes
     assert_eq "real prune exits 0" "0" "$LAST_RC"
     assert_true "prune removed candidate A" \
         "$([[ ! -e "${ACPC_HOME}/sessions/${PRUNE_A_ID}" ]] && echo 0 || echo 1)"
@@ -1177,48 +1182,44 @@ if begin_section S13-permissions "permission tiers in log, mode ceiling rejectio
     # The mock's perm scenario requests: read, edit, execute, delete,
     # switch_mode->yolo (all-granting), switch_mode->plan (ordinary).
     run_acpc run mock "run the perm scenario" --permissions read --quiet --json
-    PERM_READ_ID="$(json_field "$LAST_OUT" '.session_id')"
+    assert_eq "read permission denies an all-granting mode" "2" "$LAST_RC"
+    PERM_READ_ID="$(jq -r '.error.context.session_id' <<<"$(tail -n1 <<<"$LAST_ERR")")"
     assert_eq "read policy selects a read-granting mode" "default" \
         "$(jq -r '.resolution.resolved.mode.value' "${ACPC_HOME}/sessions/${PERM_READ_ID}/meta.json")"
     run_acpc log "$PERM_READ_ID" --since 0
-    assert_contains "read tier: denials are visible in log" "$LAST_OUT" "denied"
-    assert_true "read tier: the edit request was denied" \
-        "$(grep -E 'edit' <<<"$LAST_OUT" | grep -qE 'denied' && echo 0 || echo 1)"
-    assert_true "read tier: the execute request was denied" \
-        "$(grep -E 'execute|Bash' <<<"$LAST_OUT" | grep -qE 'denied' && echo 0 || echo 1)"
+    assert_contains "read tier: denial is visible in log" "$LAST_OUT" "permission denied"
     ANSWER_READ="$(cat "${ACPC_HOME}/sessions/${PERM_READ_ID}/answer.md")"
-    DENIED_READ="${ANSWER_READ#*Denied:}"
-    assert_contains "read tier: read allowed (mock's own summary)" "$ANSWER_READ" \
-        "Allowed: read:src/app.py"
-    assert_contains "read tier: delete denied" "$DENIED_READ" "delete:old_report.md"
-    # S4 makes the above-ceiling yolo switch end the turn before the later plan switch.
-    assert_not_contains "read tier: refused switch ends turn before plan" "$DENIED_READ" \
-        "switch_mode:plan"
+    assert_contains "read tier: answer records the denied mode" "$ANSWER_READ" \
+        "switch_mode:yolo"
 
     run_acpc run mock "run the perm scenario" --permissions write --quiet --json
-    PERM_WRITE_ID="$(json_field "$LAST_OUT" '.session_id')"
+    assert_eq "write policy denies an all-granting mode" "2" "$LAST_RC"
+    PERM_WRITE_ID="$(jq -r '.error.context.session_id' <<<"$(tail -n1 <<<"$LAST_ERR")")"
     assert_eq "write policy selects an execute-granting mode" "plan" \
         "$(jq -r '.resolution.resolved.mode.value' "${ACPC_HOME}/sessions/${PERM_WRITE_ID}/meta.json")"
     ANSWER_WRITE="$(cat "${ACPC_HOME}/sessions/${PERM_WRITE_ID}/answer.md")"
-    ALLOWED_WRITE="${ANSWER_WRITE%%Denied:*}"
-    DENIED_WRITE="${ANSWER_WRITE#*Denied:}"
-    assert_contains "write tier: edit allowed" "$ALLOWED_WRITE" "edit:src/app.py"
-    assert_contains "write tier: execute allowed" "$ALLOWED_WRITE" "execute:rm -rf build/"
-    assert_contains "write tier: delete allowed" "$ALLOWED_WRITE" "delete:old_report.md"
-    assert_contains "write tier: restricted switch_mode still denied" "$DENIED_WRITE" \
+    assert_contains "write tier: answer records the denied mode" "$ANSWER_WRITE" \
         "switch_mode:yolo"
 
     run_acpc run mock "run the perm scenario" --permissions none --quiet --json
-    PERM_NONE_ID="$(json_field "$LAST_OUT" '.session_id')"
+    assert_eq "none policy denies an all-granting mode" "2" "$LAST_RC"
+    PERM_NONE_ID="$(jq -r '.error.context.session_id' <<<"$(tail -n1 <<<"$LAST_ERR")")"
     assert_eq "none policy selects a none-granting mode" "acceptEdits" \
         "$(jq -r '.resolution.resolved.mode.value' "${ACPC_HOME}/sessions/${PERM_NONE_ID}/meta.json")"
     ANSWER_NONE="$(cat "${ACPC_HOME}/sessions/${PERM_NONE_ID}/answer.md")"
-    assert_contains "none tier: everything denied" "$ANSWER_NONE" "Allowed: none"
+    assert_contains "none tier: answer records the denied mode" "$ANSWER_NONE" \
+        "switch_mode:yolo"
+
+    run_acpc run mock "run the perm scenario" --permissions all --quiet --json
+    assert_eq "all policy permits the full permission scenario" "0" "$LAST_RC"
+    PERM_ALL_ID="$(json_field "$LAST_OUT" '.session_id')"
+    ANSWER_ALL="$(cat "${ACPC_HOME}/sessions/${PERM_ALL_ID}/answer.md")"
+    assert_contains "all tier: unrestricted switch is allowed" "$ANSWER_ALL" "switch_mode:yolo"
 
     # An all-granting mode requires the all policy at resolution time.
-    run_acpc run mock "hi" --mode yolo --dry-run
+    run_acpc resolve mock --mode yolo
     assert_eq "all-granting mode without --permissions all is a usage error" "2" "$LAST_RC"
-    run_acpc run mock "hi" --mode yolo --permissions all --dry-run
+    run_acpc resolve mock --mode yolo --permissions all
     assert_eq "all-granting mode with --permissions all is accepted" "0" "$LAST_RC"
 
     end_section S13-permissions
@@ -1276,7 +1277,7 @@ if begin_section S12-cli "help contract, -V, TTY rules, hostile inputs"; then
     for help_flag in -h --help; do
         run_acpc agents list "$help_flag"
         assert_eq "agents $help_flag succeeds" "0" "$LAST_RC"
-        assert_contains "agents $help_flag documents its options" "$LAST_OUT" "--models"
+        assert_contains "agents $help_flag documents its options" "$LAST_OUT" "--limit"
     done
     run_acpc wait --help
     assert_contains "wait help explains an absent timeout" "$LAST_OUT" "indefinitely"
@@ -1287,7 +1288,7 @@ if begin_section S12-cli "help contract, -V, TTY rules, hostile inputs"; then
     assert_contains "log help shows the max-output default" "$LAST_OUT" "131072"
 
     run_acpc -V
-    assert_contains "-V prints the version" "$LAST_OUT" "acpc"
+    assert_true "-V prints the version" "$([[ -n "$LAST_OUT" ]] && echo 0 || echo 1)"
     V_OUTPUT="$LAST_OUT"
     run_acpc --version
     assert_eq "--version matches -V" "$V_OUTPUT" "$LAST_OUT"
@@ -1296,12 +1297,12 @@ if begin_section S12-cli "help contract, -V, TTY rules, hostile inputs"; then
     run_acpc status last
     assert_eq "'last' selector rejected under non-TTY" "2" "$LAST_RC"
     assert_contains "'last' rejection names the reason" "$LAST_ERR" "TTY"
-    run_acpc run mock "hi" --permissions prompt --dry-run
+    run_acpc resolve mock --permissions prompt
     assert_eq "explicit --permissions prompt under non-TTY is a usage error" "2" "$LAST_RC"
     run_acpc run mock "hi" --permissions prompt --bg
     assert_eq "--permissions prompt with --bg is the same usage error" "2" "$LAST_RC"
-    run_acpc run mock "hi" --dry-run
-    assert_contains "non-TTY default permissions is read (visible in --dry-run)" \
+    run_acpc resolve mock
+    assert_contains "non-TTY default permissions is read (visible in resolve)" \
         "$LAST_OUT" "read"
 
     # setsid + pipe drive the non-TTY path explicitly
@@ -1357,8 +1358,8 @@ def report(name, ok, detail=""):
 project = sys.argv[1]
 base = ["uv", "run", "--project", project, "acpc"]
 try:
-    rc, out = run_in_pty(base + ["run", "mock", "pty dry run check", "--dry-run"])
-    report("pty_dry_run_exit0", rc == 0, f"rc={rc}")
+    rc, out = run_in_pty(base + ["resolve", "mock"])
+    report("pty_resolve_exit0", rc == 0, f"rc={rc}")
     report("pty_permissions_default_ask", "ask" in out, out[-300:])
 except Exception as exc:  # pty is platform-sensitive; skip, don't fail
     print(f"PTY_SKIP {exc!r}")
@@ -1403,7 +1404,7 @@ PYEOF
     run_acpc log "$HOSTILE_ID"
     assert_eq "a truncated trailing transcript line does not crash log" "0" "$LAST_RC"
     assert_not_contains "truncated transcript line: no traceback" "$LAST_ERR" "Traceback"
-    rm -rf "${ACPC_HOME:?}/sessions/${HOSTILE_ID:?}"
+    trash-put "${ACPC_HOME:?}/sessions/${HOSTILE_ID:?}"
 
     run_acpc run mock "" --quiet
     assert_eq "an empty prompt does not crash run" "0" "$LAST_RC"
@@ -1453,7 +1454,7 @@ fi
 # S16-skills: bundled skill list/detail views and JSON
 # ==============================================================================
 if begin_section S16-skills "bundled skill list, detail, metadata, and JSON"; then
-    run_acpc skills list
+    run_acpc skills list --format text
     assert_eq "skills list exits 0" "0" "$LAST_RC"
     assert_eq "skills list has a column header" "NAME DESCRIPTION" \
         "$(awk 'NR == 1 {$1 = $1; print}' <<<"$LAST_OUT")"

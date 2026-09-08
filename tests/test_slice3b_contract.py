@@ -44,12 +44,104 @@ COMMANDS_WITH_OUTPUT = {
     "log",
     "probe",
     "prune",
+    "resolve",
     "run",
     "skills get",
     "skills list",
     "status",
     "steer",
     "wait",
+}
+
+EXPECTED_REQUIRED: dict[str, tuple[str, ...]] = {
+    "agents check": ("items", "has_more"),
+    "agents create": ("name", "extends", "path", "changed"),
+    "agents delete": ("name", "path", "changed"),
+    "agents get": ("agent",),
+    "agents list": ("items", "has_more"),
+    "cancel": ("session_id", "status", "stop_reason", "changed"),
+    "continue": (
+        "status",
+        "session_id",
+        "paths",
+        "truncated",
+        "denied",
+        "permissions_clamp",
+        "changed",
+    ),
+    "daemon status": ("items", "has_more"),
+    "daemon stop": ("targets", "changed", "requires_confirmation"),
+    "delete": ("session_id", "removed", "changed", "paths"),
+    "install": ("agent", "ok", "returncode", "changed"),
+    "log": ("i", "ts", "type"),
+    "probe": (
+        "entry",
+        "base_adapter",
+        "discover_only",
+        "turns",
+        "current_mode",
+        "advertised_modes",
+        "mode_reports",
+        "verdicts",
+        "refusal_violations",
+        "implied_modes",
+        "unmeasured",
+        "current_modes",
+        "diff",
+    ),
+    "prune": ("targets", "changed", "requires_confirmation"),
+    "resolve": (
+        "entry",
+        "base_adapter",
+        "command",
+        "cwd",
+        "env",
+        "env_passthrough",
+        "resolved",
+    ),
+    "run": ("status", "session_id", "paths", "truncated", "denied", "permissions_clamp", "changed"),
+    "skills get": ("name", "description", "path", "body"),
+    "skills list": ("items", "has_more"),
+    "status": (),
+    "steer": (
+        "status",
+        "session_id",
+        "paths",
+        "truncated",
+        "denied",
+        "permissions_clamp",
+        "changed",
+    ),
+    "wait": (
+        "status",
+        "session_id",
+        "stop_reason",
+        "cost",
+        "answer",
+        "paths",
+        "truncated",
+        "denied",
+        "permissions_clamp",
+    ),
+}
+
+EXPECTED_ENUMS: dict[str, dict[str, tuple[str, ...]]] = {
+    "agents list": {"$.items[].kind": ("adapter", "variant")},
+    "cancel": {"$.status": tuple(vocab.SESSION_STATES)},
+    "continue": {"$.status": ("starting", "running", "succeeded")},
+    "log": {
+        "$.type": tuple(sorted(("error", "msg", "permission", "state", "thought", "tool", "usage")))
+    },
+    "probe": {
+        "$.diff[].status": ("advertised-missing", "entry-missing"),
+    },
+    "run": {"$.status": ("starting", "running", "succeeded")},
+    "status": {
+        "$.items[].status": tuple(vocab.SESSION_STATES),
+        "$.status": tuple(vocab.SESSION_STATES),
+    },
+    "steer": {"$.status": ("starting", "running", "succeeded")},
+    "wait": {"$.status": ("succeeded",)},
 }
 
 
@@ -158,13 +250,18 @@ def test_every_command_publishes_an_o4_output_schema(cli: CliRunner) -> None:
         _assert_o4_schema(detail["output"], name)
 
 
-def test_session_state_enums_follow_the_public_vocabulary(cli: CliRunner) -> None:
-    for command in ("cancel", "run", "continue", "steer", "wait", "status"):
+def test_output_required_fields_are_independent_contract_expectations(cli: CliRunner) -> None:
+    for command, required in EXPECTED_REQUIRED.items():
+        assert schema_for(cli, command)["required"] == list(required), command
+
+
+def test_output_enums_are_independent_reachable_value_expectations(cli: CliRunner) -> None:
+    for command in COMMANDS_WITH_OUTPUT:
         contract = schema_for(cli, command)
-        statuses = _find_properties(contract, "status")
-        assert statuses, command
-        for status in statuses:
-            assert status["enum"] == list(vocab.SESSION_STATES), command
+        found = {
+            path: tuple(node["enum"]) for path, node in _schema_nodes(contract) if "enum" in node
+        }
+        assert found == EXPECTED_ENUMS.get(command, {}), command
 
 
 def test_next_is_declared_as_an_optional_breadcrumb(cli: CliRunner) -> None:
@@ -180,25 +277,29 @@ def test_mutating_commands_require_a_boolean_changed_field(cli: CliRunner) -> No
         if entry["effects"] == "read_only":
             continue
         contract = schema_for(cli, entry["name"])
-        assert contract["properties"]["changed"] == {"type": "boolean"}
+        expected_type = (
+            {"type": ["boolean", "null"]} if entry["name"] == "install" else {"type": "boolean"}
+        )
+        assert contract["properties"]["changed"] == expected_type
         assert "changed" in contract["required"], entry["name"]
 
 
-def _find_properties(contract: Mapping[str, Any], name: str) -> list[Mapping[str, Any]]:
-    found: list[Mapping[str, Any]] = []
+def _schema_nodes(
+    contract: Mapping[str, Any], path: str = "$"
+) -> list[tuple[str, Mapping[str, Any]]]:
+    nodes = [(path, contract)]
     properties = contract.get("properties")
-    if isinstance(properties, Mapping) and name in properties:
-        candidate = properties[name]
-        if isinstance(candidate, Mapping):
-            found.append(candidate)
     if isinstance(properties, Mapping):
-        for child in properties.values():
-            if isinstance(child, Mapping):
-                found.extend(_find_properties(child, name))
+        nodes.extend(
+            child_nodes
+            for name, child in properties.items()
+            if isinstance(child, Mapping)
+            for child_nodes in _schema_nodes(child, f"{path}.{name}")
+        )
     items = contract.get("items")
     if isinstance(items, Mapping):
-        found.extend(_find_properties(items, name))
-    return found
+        nodes.extend(_schema_nodes(items, f"{path}[]"))
+    return nodes
 
 
 def test_real_collection_payloads_match_their_published_schemas(cli: CliRunner) -> None:
@@ -294,6 +395,20 @@ def test_real_document_payloads_match_their_published_schemas(
     assert log_result.exit_code == vocab.EXIT_OK, log_result.stderr
     log_schema = schema_for(cli, "log")
     for line in log_result.stdout.splitlines():
+        validate_json(json.loads(line), log_schema)
+
+    truncated_log = invoke(cli, "log", log_id, "--json", "--max-output", "1")
+    assert truncated_log.exit_code == vocab.EXIT_OK
+    assert "truncated" not in truncated_log.stdout
+    assert f"full transcript: {sessions.transcript_path(log_id)}" in truncated_log.stderr
+
+    failed_run = invoke(cli, "run", "mock", "failure-details:contract", "--json", "--quiet")
+    assert failed_run.exit_code == vocab.EXIT_AGENT_ERROR
+    failure = json.loads(failed_run.stderr.splitlines()[-1])["error"]
+    failed_id = failure["context"]["session_id"]
+    failed_log = invoke(cli, "log", failed_id, "--json", "--quiet")
+    assert failed_log.exit_code == vocab.EXIT_OK
+    for line in failed_log.stdout.splitlines():
         validate_json(json.loads(line), log_schema)
 
     assert_json_payload(cli, "prune", "--older-than", "0d", "--dry-run")

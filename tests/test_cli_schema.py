@@ -342,10 +342,16 @@ def test_background_alias_and_timeout_contract_are_published(runner: CliRunner) 
     assert flags["background"]["aliases"] == ["bg"]
     assert "the session keeps running" in flags["timeout"]["description"]
     assert "changes the work itself" in flags["cancel-after"]["description"]
-    assert "Cannot be combined with --resolve" in flags["timeout"]["description"]
-    assert "Cannot be combined with --resolve" in flags["cancel-after"]["description"]
     assert "block by default" in read_detail(runner, "run")["description"]
     assert "--background" in read_detail(runner, "run")["description"]
+
+
+def test_resolve_publishes_the_shared_resolution_flags(runner: CliRunner) -> None:
+    detail = read_detail(runner, "resolve")
+    assert detail["effects"] == "read_only"
+    assert [argument["name"] for argument in detail["args"]] == ["agent"]
+    flags = {flag["name"] for flag in detail["flags"]}
+    assert {"cwd", "model", "effort", "mode", "permissions", "home"} <= flags
 
 
 def test_agents_check_publishes_its_scope_and_conflicts(runner: CliRunner) -> None:

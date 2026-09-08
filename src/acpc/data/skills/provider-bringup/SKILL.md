@@ -126,7 +126,7 @@ variant (`extends`); a base adapter with `command` and no `extends` is
 
 ```bash
 acpc agents get <name>          # what the entry resolves to, with provenance
-acpc run <name> "x" --resolve   # what this call resolves to, incl. env
+acpc resolve <name>              # what this call resolves to, incl. env
 acpc run <name> "Reply with exactly: OK" --timeout 180
 ```
 

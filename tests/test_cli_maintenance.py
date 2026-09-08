@@ -623,6 +623,25 @@ def test_prune_json_is_one_object_on_stdout(cli: CliRunner, state_root: Path) ->
     assert result.stderr.startswith("-- prune ")
 
 
+def test_prune_removal_failure_is_reported_as_an_operation_error(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse_removal(**kwargs: Any) -> list[Any]:
+        del kwargs
+        raise OSError("read-only session directory")
+
+    monkeypatch.setattr(sessions, "prune_sessions", refuse_removal)
+
+    result = invoke(cli, "prune", "--older-than", "0d", "--yes", "--json")
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    assert result.stdout == ""
+    error = json.loads(result.stderr)["error"]
+    assert error["kind"] == "operation_failed"
+    assert "read-only session directory" in error["message"]
+    assert error["context"] == {"operation": "prune"}
+
+
 def test_prune_rejects_an_invalid_duration(cli: CliRunner) -> None:
     result = invoke(cli, "prune", "--older-than", "not-a-duration")
 
