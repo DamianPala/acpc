@@ -536,7 +536,7 @@ def test_an_unreadable_agent_entry_is_corrupt_state_not_a_bad_call(
     assert envelope(result)["kind"] == "corrupt_state"
 
 
-def test_an_exhausted_session_id_pool_is_unavailable_and_names_prune(
+def test_an_exhausted_session_id_pool_is_unavailable_without_a_prune_hint(
     cli: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """acpc's own id space, not the call and not a missing target."""
@@ -548,7 +548,7 @@ def test_an_exhausted_session_id_pool_is_unavailable_and_names_prune(
     error = envelope(result)
     assert error["kind"] == "unavailable"
     assert error["action"] == "user"
-    assert "prune" in error["hint"]
+    assert "hint" not in error
 
 
 def test_an_unreadable_prompt_file_is_a_refusal_and_a_missing_one_is_not(

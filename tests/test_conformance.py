@@ -8,18 +8,20 @@ published command; they are never used to decide which commands exist.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import os
 import pty
 import random
 import re
+import select
 import signal
 import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 import click
 import pytest
@@ -204,6 +206,462 @@ EXPECTED_OUTPUT_ENUMS = {
     },
     "steer.output.status": {"running", "succeeded"},
     "wait.output.status": {"succeeded"},
+}
+
+EXPECTED_EFFECTS = {
+    "agents check": "read_only",
+    "agents create": "non_idempotent",
+    "agents delete": "non_idempotent",
+    "agents get": "read_only",
+    "agents list": "read_only",
+    "cancel": "idempotent",
+    "continue": "non_idempotent",
+    "daemon status": "read_only",
+    "daemon stop": "idempotent",
+    "delete": "non_idempotent",
+    "install": "non_idempotent",
+    "list": "read_only",
+    "log": "read_only",
+    "probe": "read_only",
+    "prune": "non_idempotent",
+    "resolve": "read_only",
+    "run": "non_idempotent",
+    "skills get": "read_only",
+    "skills list": "read_only",
+    "status": "read_only",
+    "steer": "non_idempotent",
+    "wait": "read_only",
+}
+
+MUTATING_ORACLE_NOTES = {
+    "agents create": "file creation changes the registry and reports changed=true",
+    "agents delete": "file deletion changes the registry and reports changed=true",
+    "cancel": "finished-session cancellation is an observed idempotent no-op",
+    "continue": "a follow-up changes the session transcript and reports changed=true",
+    "daemon stop": "dry-run over an absent target is an observed idempotent no-op",
+    "delete": "deletion clears session data and leaves a reservation marker",
+    "install": "the external installer owns the transition, so changed=null is required",
+    "prune": "dry-run is unchanged; mutation clears data and leaves a marker",
+    "run": "starting a turn creates a session and reports changed=true",
+    "steer": "steering a live turn changes the managed session and reports changed=true",
+}
+
+_SESSION_OUTPUT_PROPERTIES = frozenset(
+    {
+        "session_id",
+        "status",
+        "stop_reason",
+        "paths",
+        "cost",
+        "answer",
+        "truncated",
+        "output_file",
+        "denied",
+        "permissions_clamp",
+        "next",
+        "resume",
+        "created_at",
+        "started_at",
+        "finished_at",
+        "changed",
+    }
+)
+_PATHS_PROPERTIES = frozenset({"dir", "prompt", "transcript", "answer"})
+_DENIAL_PROPERTIES = frozenset({"category", "count", "minimum_policy", "remedy", "target"})
+_PERMISSIONS_CLAMP_PROPERTIES = frozenset({"requested", "ceiling", "effective"})
+_RESOLUTION_PROPERTIES = frozenset({"model", "effort", "mode", "permissions", "home"})
+_RESOLUTION_FIELD_PROPERTIES = frozenset(
+    {"value", "source", "grants", "delegates", "escalates", "clamp"}
+)
+_RESOLUTION_FIELD_REQUIRED = frozenset({"value", "source"})
+_RESOLUTION_CLAMP_REQUIRED = frozenset({"requested", "ceiling", "effective"})
+
+
+def _session_output_oracle(
+    required: set[str], *, include_changed: bool = True
+) -> dict[str, tuple[frozenset[str], frozenset[str]]]:
+    properties = (
+        _SESSION_OUTPUT_PROPERTIES if include_changed else _SESSION_OUTPUT_PROPERTIES - {"changed"}
+    )
+    return {
+        "output": (properties, frozenset(required)),
+        "output.paths": (_PATHS_PROPERTIES, frozenset(_PATHS_PROPERTIES)),
+        "output.denied[]": (_DENIAL_PROPERTIES, frozenset(_DENIAL_PROPERTIES - {"target"})),
+        "output.permissions_clamp": (
+            _PERMISSIONS_CLAMP_PROPERTIES,
+            frozenset(_PERMISSIONS_CLAMP_PROPERTIES),
+        ),
+    }
+
+
+EXPECTED_OUTPUT_ORACLES: dict[str, dict[str, tuple[frozenset[str], frozenset[str]]]] = {
+    "agents check": {
+        "output": (frozenset({"items", "has_more"}), frozenset({"items", "has_more"})),
+        "output.items[]": (
+            frozenset({"agent", "ok", "models", "error"}),
+            frozenset({"agent", "ok"}),
+        ),
+    },
+    "agents create": {
+        "output": (
+            frozenset({"name", "extends", "path", "changed"}),
+            frozenset({"name", "extends", "path", "changed"}),
+        )
+    },
+    "agents delete": {
+        "output": (
+            frozenset({"name", "path", "changed"}),
+            frozenset({"name", "path", "changed"}),
+        )
+    },
+    "agents get": {
+        "output": (
+            frozenset(
+                {
+                    "agent",
+                    "base_adapter",
+                    "description",
+                    "resolved",
+                    "env",
+                    "env_passthrough",
+                    "advertised",
+                    "presets",
+                    "models",
+                    "commands",
+                }
+            ),
+            frozenset({"agent"}),
+        ),
+        "output.resolved": (
+            frozenset({"model", "effort", "mode", "permissions", "home"}),
+            frozenset({"model", "effort", "mode", "permissions", "home"}),
+        ),
+        "output.resolved.model": (
+            frozenset({"value", "source"}),
+            frozenset({"value", "source"}),
+        ),
+        "output.resolved.effort": (
+            frozenset({"value", "source"}),
+            frozenset({"value", "source"}),
+        ),
+        "output.resolved.mode": (
+            frozenset({"value", "source"}),
+            frozenset({"value", "source"}),
+        ),
+        "output.resolved.permissions": (
+            frozenset({"value", "source"}),
+            frozenset({"value", "source"}),
+        ),
+        "output.resolved.home": (
+            frozenset({"value", "source"}),
+            frozenset({"value", "source"}),
+        ),
+        "output.advertised": (
+            frozenset({"modes", "mode_specs", "models", "commands"}),
+            frozenset({"modes", "mode_specs", "models", "commands"}),
+        ),
+        "output.commands[]": (
+            frozenset({"name", "description"}),
+            frozenset({"name", "description"}),
+        ),
+    },
+    "agents list": {
+        "output": (frozenset({"items", "has_more"}), frozenset({"items", "has_more"})),
+        "output.items[]": (
+            frozenset(
+                {
+                    "name",
+                    "kind",
+                    "display_name",
+                    "status",
+                    "base_adapter",
+                    "model",
+                    "effort",
+                    "permissions",
+                    "home",
+                    "description",
+                }
+            ),
+            frozenset({"name", "kind", "description"}),
+        ),
+    },
+    "cancel": {
+        "output": (
+            frozenset({"session_id", "status", "stop_reason", "changed"}),
+            frozenset({"session_id", "status", "stop_reason", "changed"}),
+        )
+    },
+    "daemon status": {
+        "output": (frozenset({"items", "has_more"}), frozenset({"items", "has_more"})),
+        "output.items[]": (
+            frozenset(
+                {
+                    "target",
+                    "version",
+                    "pid",
+                    "uptime_seconds",
+                    "log",
+                    "sessions",
+                    "preparing",
+                    "restoring",
+                    "max_concurrent",
+                    "idle_seconds",
+                }
+            ),
+            frozenset(
+                {
+                    "target",
+                    "version",
+                    "pid",
+                    "uptime_seconds",
+                    "log",
+                    "sessions",
+                    "preparing",
+                    "restoring",
+                    "max_concurrent",
+                    "idle_seconds",
+                }
+            ),
+        ),
+    },
+    "daemon stop": {
+        "output": (
+            frozenset({"targets", "changed", "requires_confirmation"}),
+            frozenset({"targets", "changed", "requires_confirmation"}),
+        )
+    },
+    "delete": {
+        "output": (
+            frozenset({"session_id", "removed", "changed", "paths"}),
+            frozenset({"session_id", "removed", "changed", "paths"}),
+        ),
+        "output.paths": (_PATHS_PROPERTIES, _PATHS_PROPERTIES),
+    },
+    "install": {
+        "output": (
+            frozenset({"agent", "ok", "returncode", "changed"}),
+            frozenset({"agent", "ok", "returncode", "changed"}),
+        )
+    },
+    "list": {
+        "output": (frozenset({"items", "has_more"}), frozenset({"items", "has_more"})),
+        "output.items[]": (
+            frozenset(
+                {
+                    "session_id",
+                    "entry",
+                    "model",
+                    "status",
+                    "name",
+                    "prompt_snippet",
+                    "runtime_seconds",
+                    "idle_seconds",
+                    "created_at",
+                    "started_at",
+                    "finished_at",
+                }
+            ),
+            frozenset(
+                {
+                    "session_id",
+                    "entry",
+                    "model",
+                    "status",
+                    "name",
+                    "prompt_snippet",
+                    "runtime_seconds",
+                    "idle_seconds",
+                    "created_at",
+                    "started_at",
+                    "finished_at",
+                }
+            ),
+        ),
+    },
+    "log": {
+        "output": (
+            frozenset(
+                {
+                    "i",
+                    "ts",
+                    "type",
+                    "text",
+                    "name",
+                    "args_summary",
+                    "status",
+                    "duration_ms",
+                    "kind",
+                    "decision",
+                    "auto",
+                    "message",
+                    "observation",
+                    "next_step",
+                    "adapter_log",
+                    "adapter_log_tail",
+                    "from",
+                    "to",
+                    "tokens",
+                    "cost",
+                }
+            ),
+            frozenset({"i", "ts", "type"}),
+        )
+    },
+    "probe": {
+        "output": (
+            frozenset(
+                {
+                    "entry",
+                    "base_adapter",
+                    "discover_only",
+                    "turns",
+                    "current_mode",
+                    "advertised_modes",
+                    "mode_reports",
+                    "verdicts",
+                    "refusal_violations",
+                    "implied_modes",
+                    "unmeasured",
+                    "current_modes",
+                    "diff",
+                }
+            ),
+            frozenset(
+                {
+                    "entry",
+                    "base_adapter",
+                    "discover_only",
+                    "turns",
+                    "current_mode",
+                    "advertised_modes",
+                    "mode_reports",
+                    "verdicts",
+                    "refusal_violations",
+                    "implied_modes",
+                    "unmeasured",
+                    "current_modes",
+                    "diff",
+                }
+            ),
+        ),
+        "output.advertised_modes[]": (
+            frozenset({"id", "name", "description"}),
+            frozenset({"id", "name", "description"}),
+        ),
+        "output.diff[]": (
+            frozenset({"mode", "status", "description", "current", "proposed"}),
+            frozenset({"mode", "status", "description", "current", "proposed"}),
+        ),
+        "output.diff[].current": (
+            frozenset({"grants", "delegates", "escalates"}),
+            frozenset({"grants", "delegates", "escalates"}),
+        ),
+        "output.diff[].proposed": (
+            frozenset({"grants", "delegates", "escalates"}),
+            frozenset({"grants", "delegates", "escalates"}),
+        ),
+    },
+    "prune": {
+        "output": (
+            frozenset({"targets", "changed", "requires_confirmation"}),
+            frozenset({"targets", "changed", "requires_confirmation"}),
+        )
+    },
+    "resolve": {
+        "output": (
+            frozenset(
+                {"entry", "base_adapter", "command", "cwd", "env", "env_passthrough", "resolved"}
+            ),
+            frozenset(
+                {"entry", "base_adapter", "command", "cwd", "env", "env_passthrough", "resolved"}
+            ),
+        ),
+        "output.resolved": (
+            _RESOLUTION_PROPERTIES,
+            _RESOLUTION_PROPERTIES,
+        ),
+        **{
+            f"output.resolved.{field}": (
+                _RESOLUTION_FIELD_PROPERTIES,
+                _RESOLUTION_FIELD_REQUIRED,
+            )
+            for field in _RESOLUTION_PROPERTIES
+        },
+        **{
+            f"output.resolved.{field}.clamp": (
+                _PERMISSIONS_CLAMP_PROPERTIES,
+                _RESOLUTION_CLAMP_REQUIRED,
+            )
+            for field in _RESOLUTION_PROPERTIES
+        },
+    },
+    "skills get": {
+        "output": (
+            frozenset({"name", "description", "path", "body"}),
+            frozenset({"name", "description", "path", "body"}),
+        )
+    },
+    "skills list": {
+        "output": (frozenset({"items", "has_more"}), frozenset({"items", "has_more"})),
+        "output.items[]": (
+            frozenset({"name", "description", "path"}),
+            frozenset({"name", "description", "path"}),
+        ),
+    },
+    "status": {
+        "output": (
+            frozenset(
+                {
+                    "session_id",
+                    "status",
+                    "pid",
+                    "turns",
+                    "entry",
+                    "base_adapter",
+                    "model",
+                    "name",
+                    "runtime_seconds",
+                    "idle_seconds",
+                    "tokens",
+                    "cost",
+                    "exit_code",
+                    "stop_reason",
+                    "failure",
+                    "paths",
+                    "created_at",
+                    "started_at",
+                    "finished_at",
+                }
+            ),
+            frozenset(EXPECTED_REQUIRED_FIELDS["status"]),
+        ),
+        "output.paths": (_PATHS_PROPERTIES, _PATHS_PROPERTIES),
+    },
+}
+
+for _name in ("continue", "run", "steer"):
+    EXPECTED_OUTPUT_ORACLES[_name] = _session_output_oracle(EXPECTED_REQUIRED_FIELDS[_name])
+EXPECTED_OUTPUT_ORACLES["wait"] = _session_output_oracle(
+    EXPECTED_REQUIRED_FIELDS["wait"], include_changed=False
+)
+
+EXPECTED_EMPTY_OUTPUT_OBJECTS = {
+    "agents get.output.env": "free-form environment values are intentionally untyped",
+    "agents get.output.advertised.mode_specs": "adapter mode reports are vendor-defined",
+    "agents get.output.advertised.commands[]": "adapter command details are vendor-defined",
+    "agents get.output.presets": "adapter presets are vendor-defined",
+    "probe.output.mode_reports": "probe reports are vendor-defined",
+    "probe.output.verdicts": "probe verdicts are vendor-defined",
+    "probe.output.refusal_violations[]": "violation records are vendor-defined",
+    "probe.output.implied_modes": "probe mode facts are vendor-defined",
+    "probe.output.unmeasured[]": "unmeasured records are vendor-defined",
+    "probe.output.current_modes": "probe mode facts are vendor-defined",
+    "resolve.output.env": "resolved environment values are vendor-defined",
+}
+
+COMMAND_ORACLE_NOTES = {
+    name: "covered by the indexed success scenario and the independent output oracle"
+    for name in EXPECTED_EFFECTS
 }
 
 
@@ -547,6 +1005,138 @@ def test_R5a_agents_create_changed_matches_the_observed_transition(
     assert (registry / "observed.toml").is_file()
 
 
+def test_R1_R5_every_mutating_command_has_a_semantic_oracle(
+    cli: CliRunner, state_root: Path, live_daemon: None
+) -> None:
+    index = read_index(cli)
+    mutating = {entry["name"] for entry in index["commands"] if entry["effects"] != "read_only"}
+    assert set(MUTATING_ORACLE_NOTES) == mutating
+
+    registry = state_root / "agents"
+    before = _snapshot_tree(registry)
+    created = invoke(cli, "agents", "create", "stage-r", "--extends", "mock", "--json")
+    after = _snapshot_tree(registry)
+    assert created.exit_code == vocab.EXIT_OK, created.stderr
+    assert json.loads(created.stdout)["changed"] is (before != after)
+
+    before = _snapshot_tree(registry)
+    deleted = invoke(cli, "agents", "delete", "stage-r", "--json")
+    after = _snapshot_tree(registry)
+    assert deleted.exit_code == vocab.EXIT_OK, deleted.stderr
+    assert json.loads(deleted.stdout)["changed"] is (before != after)
+
+    canceled_id = _finished_session()
+    before = _snapshot_tree(sessions.session_dir(canceled_id))
+    canceled = invoke(cli, "cancel", canceled_id, "--json")
+    after = _snapshot_tree(sessions.session_dir(canceled_id))
+    assert canceled.exit_code == vocab.EXIT_OK, canceled.stderr
+    assert json.loads(canceled.stdout)["changed"] is False
+    assert before == after
+
+    started = invoke(cli, "run", "mock", "echo:continue-base", "--json", "--quiet")
+    assert started.exit_code == vocab.EXIT_OK, started.stderr
+    continued_id = json.loads(started.stdout)["session_id"]
+    before = _snapshot_tree(sessions.session_dir(continued_id))
+    continued = invoke(cli, "continue", continued_id, "echo:continued", "--json", "--quiet")
+    after = _snapshot_tree(sessions.session_dir(continued_id))
+    assert continued.exit_code == vocab.EXIT_OK, continued.stderr
+    assert json.loads(continued.stdout)["changed"] is True
+    assert before != after
+
+    daemon_root = state_root / "daemon"
+    before = _snapshot_tree(daemon_root)
+    stopped = invoke(cli, "daemon", "stop", "never-started", "--dry-run", "--json")
+    after = _snapshot_tree(daemon_root)
+    assert stopped.exit_code == vocab.EXIT_OK, stopped.stderr
+    assert json.loads(stopped.stdout)["changed"] is False
+    assert before == after
+
+    deleted_meta = sessions.create_session(
+        entry="mock", base_adapter="mock", prompt="delete oracle", clock=lambda: 0.0
+    )
+    sessions.mark_running(
+        deleted_meta.session_id,
+        pid=os.getpid(),
+        process_start_time=proc.process_start_time(),
+        clock=lambda: 0.0,
+    )
+    sessions.transition(deleted_meta.session_id, "succeeded", exit_code=0, clock=lambda: 0.0)
+    before = _snapshot_tree(sessions.session_dir(deleted_meta.session_id))
+    deleted = invoke(cli, "delete", deleted_meta.session_id, "--yes", "--json")
+    after = _snapshot_tree(sessions.session_dir(deleted_meta.session_id))
+    assert deleted.exit_code == vocab.EXIT_OK, deleted.stderr
+    assert json.loads(deleted.stdout)["changed"] is True
+    assert before != after
+    assert sessions.tombstone_path(deleted_meta.session_id).is_file()
+
+    installed = invoke(cli, "install", "mock", "--yes", "--json")
+    assert installed.exit_code == vocab.EXIT_OK, installed.stderr
+    assert json.loads(installed.stdout)["changed"] is None
+
+    pruned_meta = sessions.create_session(
+        entry="mock", base_adapter="mock", prompt="prune oracle", clock=lambda: 0.0
+    )
+    sessions.mark_running(
+        pruned_meta.session_id,
+        pid=os.getpid(),
+        process_start_time=proc.process_start_time(),
+        clock=lambda: 0.0,
+    )
+    sessions.transition(pruned_meta.session_id, "succeeded", exit_code=0, clock=lambda: 0.0)
+    before = _snapshot_tree(sessions.session_dir(pruned_meta.session_id))
+    preview = invoke(cli, "prune", "--older-than", "0d", "--dry-run", "--json")
+    assert preview.exit_code == vocab.EXIT_OK, preview.stderr
+    assert json.loads(preview.stdout)["changed"] is False
+    assert before == _snapshot_tree(sessions.session_dir(pruned_meta.session_id))
+    pruned = invoke(cli, "prune", "--older-than", "0d", "--yes", "--json")
+    after = _snapshot_tree(sessions.session_dir(pruned_meta.session_id))
+    assert pruned.exit_code == vocab.EXIT_OK, pruned.stderr
+    assert json.loads(pruned.stdout)["changed"] is True
+    assert before != after
+    assert sessions.tombstone_path(pruned_meta.session_id).is_file()
+
+    run_before = _snapshot_tree(state_root / "sessions")
+    run_result = invoke(cli, "run", "mock", "echo:run-oracle", "--json", "--quiet")
+    run_after = _snapshot_tree(state_root / "sessions")
+    assert run_result.exit_code == vocab.EXIT_OK, run_result.stderr
+    assert json.loads(run_result.stdout)["changed"] is True
+    assert run_before != run_after
+
+    steer_id = _background_session(cli, "slow:1 steer oracle")
+    steered = invoke(cli, "steer", steer_id, "echo:steered", "--json", "--quiet")
+    assert steered.exit_code == vocab.EXIT_OK, steered.stderr
+    assert json.loads(steered.stdout)["changed"] is True
+
+
+def test_R2_R3_irreversible_mutations_keep_their_confirmation_gate(cli: CliRunner) -> None:
+    deleted_meta = sessions.create_session(entry="mock", base_adapter="mock", prompt="gate")
+    sessions.mark_running(
+        deleted_meta.session_id,
+        pid=os.getpid(),
+        process_start_time=proc.process_start_time(),
+    )
+    sessions.transition(deleted_meta.session_id, "succeeded", exit_code=0)
+    before = _snapshot_tree(sessions.session_dir(deleted_meta.session_id))
+    delete_result = invoke(cli, "delete", deleted_meta.session_id, "--json")
+    assert delete_result.exit_code == vocab.EXIT_AGENT_ERROR
+    assert _error(delete_result)["kind"] == errors.CONFIRMATION_REQUIRED
+    assert before == _snapshot_tree(sessions.session_dir(deleted_meta.session_id))
+
+    pruned_meta = sessions.create_session(entry="mock", base_adapter="mock", prompt="gate prune")
+    sessions.mark_running(
+        pruned_meta.session_id,
+        pid=os.getpid(),
+        process_start_time=proc.process_start_time(),
+        clock=lambda: 0.0,
+    )
+    sessions.transition(pruned_meta.session_id, "succeeded", exit_code=0, clock=lambda: 0.0)
+    before = _snapshot_tree(sessions.session_dir(pruned_meta.session_id))
+    prune_result = invoke(cli, "prune", "--older-than", "0d", "--json")
+    assert prune_result.exit_code == vocab.EXIT_AGENT_ERROR
+    assert _error(prune_result)["kind"] == errors.CONFIRMATION_REQUIRED
+    assert before == _snapshot_tree(sessions.session_dir(pruned_meta.session_id))
+
+
 def test_D1_D3b_help_and_SPEC_match_the_generated_command_set(cli: CliRunner) -> None:
     index = read_index(cli)
     names = [entry["name"] for entry in index["commands"]]
@@ -622,10 +1212,16 @@ def test_D1_D3b_help_and_SPEC_match_the_generated_command_set(cli: CliRunner) ->
 def test_D6b_parser_descriptors_and_D7a_global_flags_are_generated(cli: CliRunner) -> None:
     index = read_index(cli)
     global_flags = {flag["name"]: flag for flag in index["global_flags"]}
+    for flag in index["global_flags"]:
+        _assert_input_descriptor(flag, f"global_flags.{flag['name']}")
     per_command: dict[str, set[str]] = {}
     for entry in index["commands"]:
         name = entry["name"]
         detail = read_detail(cli, name)
+        for argument in detail["args"]:
+            _assert_input_descriptor(argument, f"{name}.args.{argument['name']}")
+        for flag in detail["flags"]:
+            _assert_input_descriptor(flag, f"{name}.flags.{flag['name']}")
         command = click_command(name)
         args = [
             parameter.name for parameter in command.params if isinstance(parameter, click.Argument)
@@ -687,10 +1283,14 @@ def test_D6d_routing_D7b_flat_entries_and_D7c_shape(cli: CliRunner) -> None:
         "extensions": EXPECTED_EXTENSIONS,
     }
     names = [entry["name"] for entry in index["commands"]]
+    assert set(names) == set(EXPECTED_EFFECTS)
+    assert set(COMMAND_ORACLE_NOTES) == set(names)
     for entry in index["commands"]:
         assert set(entry) == {"name", "description", "effects"}
         assert entry["name"] and "  " not in entry["name"]
         assert entry["effects"] in {"read_only", "idempotent", "non_idempotent"}
+        assert entry["effects"] == EXPECTED_EFFECTS[entry["name"]]
+        assert entry["description"] == _descriptor_description(click_command(entry["name"]))
         detail = read_detail(cli, entry["name"])
         assert detail["name"] == entry["name"]
         assert detail["effects"] == entry["effects"]
@@ -722,6 +1322,8 @@ def _check_schema_shape(schema: dict[str, Any], path: str) -> None:
     assert set(types) <= {"string", "integer", "number", "boolean", "array", "object", "null"}
     if "object" in types:
         assert "properties" in schema and "required" in schema, path
+        assert len(schema["required"]) == len(set(schema["required"])), path
+        assert set(schema["required"]) <= set(schema["properties"]), path
         for key, child in schema["properties"].items():
             _check_schema_shape(child, f"{path}.{key}")
     if "array" in types:
@@ -729,6 +1331,62 @@ def _check_schema_shape(schema: dict[str, Any], path: str) -> None:
         _check_schema_shape(schema["items"], f"{path}[]")
     if "enum" in schema:
         assert isinstance(schema["enum"], list) and schema["enum"], path
+
+
+def _schema_nodes(schema: dict[str, Any], path: str = "output") -> dict[str, dict[str, Any]]:
+    nodes: dict[str, dict[str, Any]] = {}
+    if not schema:
+        return nodes
+    types = schema.get("type", [])
+    types = types if isinstance(types, list) else [types]
+    if "object" in types and "properties" in schema:
+        nodes[path] = schema
+        for name, child in schema["properties"].items():
+            nodes.update(_schema_nodes(child, f"{path}.{name}"))
+    if "array" in types and "items" in schema:
+        nodes.update(_schema_nodes(schema["items"], f"{path}[]"))
+    return nodes
+
+
+def _empty_schema_paths(schema: dict[str, Any], path: str = "output") -> set[str]:
+    paths: set[str] = set()
+    if not schema:
+        paths.add(path)
+        return paths
+    types = schema.get("type", [])
+    types = types if isinstance(types, list) else [types]
+    if "object" in types:
+        for name, child in schema.get("properties", {}).items():
+            paths.update(_empty_schema_paths(child, f"{path}.{name}"))
+    if "array" in types and "items" in schema:
+        paths.update(_empty_schema_paths(schema["items"], f"{path}[]"))
+    return paths
+
+
+def _assert_output_oracle(name: str, detail: dict[str, Any]) -> None:
+    output = detail["output"]
+    actual_nodes = _schema_nodes(output)
+    expected_nodes = EXPECTED_OUTPUT_ORACLES[name]
+    assert set(actual_nodes) == set(expected_nodes), name
+    for path, (properties, required) in expected_nodes.items():
+        assert set(actual_nodes[path]["properties"]) == set(properties), (name, path)
+        assert set(actual_nodes[path]["required"]) == set(required), (name, path)
+    empty_paths = {f"{name}.{path}" for path in _empty_schema_paths(output)}
+    expected_empty = {path for path in EXPECTED_EMPTY_OUTPUT_OBJECTS if path.startswith(f"{name}.")}
+    assert empty_paths == expected_empty, name
+
+
+def _descriptor_description(command: click.Command) -> str:
+    text = command.short_help or command.help or ""
+    return " ".join(text.split("\n\n", 1)[0].replace("``", "`").replace("\b", " ").split())
+
+
+def _assert_input_descriptor(descriptor: dict[str, Any], path: str) -> None:
+    assert {"name", "type", "required", "description"} <= set(descriptor), path
+    assert isinstance(descriptor["name"], str) and descriptor["name"], path
+    assert descriptor["type"] in {"string", "integer", "number", "boolean"}, path
+    assert isinstance(descriptor["required"], bool), path
+    assert isinstance(descriptor["description"], str) and descriptor["description"].strip(), path
 
 
 @pytest.mark.timeout(120)
@@ -744,6 +1402,7 @@ def test_D8_O4a_O4d_R1a_R1b_R5a_schema_and_success_matrix(
             name = entry["name"]
             detail = read_detail(cli, name)
             _check_schema_shape(detail["output"], f"{name}.output")
+            _assert_output_oracle(name, detail)
             assert detail["effects"] == entry["effects"]
             assert detail["effects"] in {"read_only", "idempotent", "non_idempotent"}
             accepts_yes = any("--yes" in option.opts for option in accepted_options(name))
@@ -762,6 +1421,7 @@ def test_D8_O4a_O4d_R1a_R1b_R5a_schema_and_success_matrix(
                 raise AssertionError(f"{name} ({selection}): {error}") from error
             if any(option.name == "quiet" for option in accepted_options(name)):
                 assert result.stderr == "" or result.stderr.endswith("\n")
+            assert detail["interactive"] is False
         monkeypatch.setenv("NO_INPUT", "1")
 
 
@@ -813,24 +1473,37 @@ def _run_with_stream_context(
         else:
             slaves.append(None)
             targets.append(subprocess.PIPE)
-    process = subprocess.Popen(
-        [sys.executable, "-c", "from acpc.cli import main; raise SystemExit(main())", *args],
-        stdin=subprocess.DEVNULL,
-        stdout=targets[0],
-        stderr=targets[1],
-        env=os.environ.copy(),
-    )
-    for slave in slaves:
-        if slave is not None:
-            os.close(slave)
-    pipe_stdout, pipe_stderr = process.communicate(timeout=10)
-    tty_output = [_read_fd(master) for master in masters]
-    output = iter(tty_output)
-    stdout = next(output) if stdout_tty else pipe_stdout
-    stderr = next(output) if not stdout_tty and stderr_tty else pipe_stderr
-    if stdout_tty and stderr_tty:
-        stderr = next(output)
-    return process.returncode, stdout or b"", stderr or b""
+    process: subprocess.Popen[bytes] | None = None
+    try:
+        process = subprocess.Popen(
+            [sys.executable, "-c", "from acpc.cli import main; raise SystemExit(main())", *args],
+            stdin=subprocess.DEVNULL,
+            stdout=targets[0],
+            stderr=targets[1],
+            env=os.environ.copy(),
+        )
+        for slave in slaves:
+            if slave is not None:
+                os.close(slave)
+        pipe_stdout, pipe_stderr = process.communicate(timeout=10)
+        tty_output = [_read_fd(master) for master in masters]
+        output = iter(tty_output)
+        stdout = next(output) if stdout_tty else pipe_stdout
+        stderr = next(output) if not stdout_tty and stderr_tty else pipe_stderr
+        if stdout_tty and stderr_tty:
+            stderr = next(output)
+        return process.returncode, stdout or b"", stderr or b""
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait(timeout=10)
+        for slave in slaves:
+            if slave is not None:
+                with contextlib.suppress(OSError):
+                    os.close(slave)
+        for master in masters:
+            with contextlib.suppress(OSError):
+                os.close(master)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="PTY is not available")
@@ -847,6 +1520,7 @@ def test_O1_stream_contexts_are_independent_for_a_machine_document() -> None:
         assert stderr == b""
 
 
+@pytest.mark.timeout(60)
 @pytest.mark.parametrize("no_input", [False, True], ids=["input-allowed", "no-input"])
 def test_O1_O2b_O3a_F2a_F2c_machine_matrix(
     cli: CliRunner,
@@ -906,27 +1580,55 @@ ERROR_SCENARIOS: dict[str, tuple[str, ...] | None] = {
 ERROR_SCENARIO_SKIPS = {
     "agents check": "requires a corrupt registry fixture and is covered by registry tests",
 }
+EXPECTED_ERROR_RESULTS = {
+    "agents create": (errors.NOT_FOUND, vocab.EXIT_AGENT_ERROR),
+    "agents delete": (errors.NOT_FOUND, vocab.EXIT_AGENT_ERROR),
+    "agents get": (errors.NOT_FOUND, vocab.EXIT_AGENT_ERROR),
+    "agents list": (errors.INVALID_INPUT, vocab.EXIT_USAGE),
+    "cancel": (errors.NOT_FOUND, vocab.EXIT_AGENT_ERROR),
+    "continue": (errors.NOT_FOUND, vocab.EXIT_AGENT_ERROR),
+    "daemon status": (errors.INVALID_INPUT, vocab.EXIT_USAGE),
+    "daemon stop": (errors.INVALID_INPUT, vocab.EXIT_USAGE),
+    "delete": (errors.NOT_FOUND, vocab.EXIT_AGENT_ERROR),
+    "install": (errors.NOT_FOUND, vocab.EXIT_AGENT_ERROR),
+    "list": (errors.INVALID_INPUT, vocab.EXIT_USAGE),
+    "log": (errors.NOT_FOUND, vocab.EXIT_AGENT_ERROR),
+    "probe": (errors.NOT_FOUND, vocab.EXIT_AGENT_ERROR),
+    "prune": (errors.INVALID_INPUT, vocab.EXIT_USAGE),
+    "resolve": (errors.NOT_FOUND, vocab.EXIT_AGENT_ERROR),
+    "run": (errors.NOT_FOUND, vocab.EXIT_AGENT_ERROR),
+    "skills get": (errors.NOT_FOUND, vocab.EXIT_AGENT_ERROR),
+    "skills list": (errors.INVALID_INPUT, vocab.EXIT_USAGE),
+    "status": (errors.NOT_FOUND, vocab.EXIT_AGENT_ERROR),
+    "steer": (errors.NOT_FOUND, vocab.EXIT_AGENT_ERROR),
+    "wait": (errors.NOT_FOUND, vocab.EXIT_AGENT_ERROR),
+}
 
 
-def _assert_error_location(result: Any) -> None:
-    assert result.exit_code != vocab.EXIT_OK
+def _assert_error_location(
+    result: Any, *, expected_kind: str, expected_exit_code: int
+) -> dict[str, Any]:
+    assert result.exit_code == expected_exit_code
     assert result.stdout == ""
     lines = [line for line in result.stderr.splitlines() if line.strip()]
     assert lines, result.stderr
     envelope = json.loads(lines[-1])
     assert set(envelope) == {"error"}
     assert envelope["error"]["message"] in result.stderr
-    assert envelope["error"]["kind"]
+    assert envelope["error"]["kind"] == expected_kind
+    return envelope["error"]
 
 
 def test_F2_error_matrix_is_explicit_for_every_command(cli: CliRunner) -> None:
     names = {entry["name"] for entry in read_index(cli)["commands"]}
     assert set(ERROR_SCENARIOS) == names
-    for args in ERROR_SCENARIOS.values():
+    assert set(EXPECTED_ERROR_RESULTS) == names - set(ERROR_SCENARIO_SKIPS)
+    for name, args in ERROR_SCENARIOS.items():
         if args is None:
             continue
         result = invoke(cli, *args)
-        _assert_error_location(result)
+        kind, exit_code = EXPECTED_ERROR_RESULTS[name]
+        _assert_error_location(result, expected_kind=kind, expected_exit_code=exit_code)
 
 
 def test_F2_error_matrix_records_why_known_errors_are_not_scenarios() -> None:
@@ -934,6 +1636,19 @@ def test_F2_error_matrix_records_why_known_errors_are_not_scenarios() -> None:
         name for name, args in ERROR_SCENARIOS.items() if args is None
     }
     assert all(ERROR_SCENARIO_SKIPS.values())
+
+
+def test_M1_wait_failure_reports_the_observed_terminal_meaning(cli: CliRunner) -> None:
+    session_id = _finished_session("failed")
+
+    result = invoke(cli, "wait", session_id, "--json", "--quiet")
+
+    error = _assert_error_location(
+        result,
+        expected_kind=errors.OPERATION_FAILED,
+        expected_exit_code=vocab.EXIT_AGENT_ERROR,
+    )
+    assert error["context"] == {"session_id": session_id, "status": "failed"}
 
 
 def test_H5b_plain_alias_is_byte_identical_for_every_plain_collection(cli: CliRunner) -> None:
@@ -1025,43 +1740,112 @@ def test_R7a_R7b_R7c_background_changes_wait_only_and_keeps_identifier(
     assert sessions.read_meta(session_id).state == "succeeded"
 
 
-def test_R7b_deleted_identifier_stays_reserved_until_tombstone_prune(
-    cli: CliRunner,
+def test_D5a_background_breadcrumb_is_an_executable_wait_vector(
+    cli: CliRunner, live_daemon: None
+) -> None:
+    started = invoke(
+        cli,
+        "run",
+        "mock",
+        "slow:1 breadcrumb",
+        "--background",
+        "--permissions",
+        "read",
+        "--json",
+        "--quiet",
+    )
+    assert started.exit_code == vocab.EXIT_OK, started.stderr
+    payload = json.loads(started.stdout)
+    assert payload["next"] == ["acpc", "wait", payload["session_id"]]
+
+    waited = invoke(cli, *payload["next"][1:], "--json", "--quiet")
+    assert waited.exit_code == vocab.EXIT_OK, waited.stderr
+    assert json.loads(waited.stdout)["session_id"] == payload["session_id"]
+
+
+def test_O8_broken_pipe_is_a_documented_pipe_exit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    rng = _SequenceRng("a" * 8 + "b" * 4)
-    monkeypatch.setattr(sessions.random, "SystemRandom", lambda: rng)
+    def broken_write(_text: str) -> None:
+        raise BrokenPipeError
 
-    first = invoke(cli, "run", "mock", "echo:first", "--json", "--quiet")
-    assert first.exit_code == vocab.EXIT_OK, first.stderr
-    first_id = json.loads(first.stdout)["session_id"]
-    deleted = invoke(cli, "delete", first_id, "--yes", "--json")
-    assert deleted.exit_code == vocab.EXIT_OK, deleted.stderr
-    assert sessions.tombstone_path(first_id).is_file()
+    def leave() -> NoReturn:
+        raise SystemExit(vocab.EXIT_SIGPIPE)
 
-    second = invoke(cli, "run", "mock", "echo:second", "--json", "--quiet")
-    assert second.exit_code == vocab.EXIT_OK, second.stderr
-    assert json.loads(second.stdout)["session_id"] != first_id
+    monkeypatch.setattr(cli_module, "_write_stdout", broken_write)
+    monkeypatch.setattr(cli_module, "_leave_on_broken_pipe", leave)
 
+    with pytest.raises(SystemExit) as raised:
+        main.main(args=("list",), standalone_mode=True)
+
+    assert raised.value.code == vocab.EXIT_SIGPIPE
+
+
+@pytest.mark.parametrize("cleanup", ["delete", "prune_explicit", "prune_bare"])
+def test_R7b_deleted_identifier_stays_reserved_forever(
+    cli: CliRunner,
+    cleanup: str,
+) -> None:
     old = sessions.create_session(
         entry="mock",
         base_adapter="mock",
         prompt="old tombstone",
         clock=lambda: 0.0,
-        rng=_SequenceRng("c" * 4),
+        rng=_SequenceRng("a" * 4),
     )
-    sessions.delete_session(old.session_id, clock=lambda: 100.0)
-    before_expiry = sessions.prune_sessions(
-        older_than=0.0,
-        clock=lambda: 100.0 + sessions.TOMBSTONE_RETENTION_SECONDS - 1,
+    sessions.mark_running(
+        old.session_id,
+        pid=os.getpid(),
+        process_start_time=proc.process_start_time(),
+        clock=lambda: 0.0,
     )
-    assert all(entry.session_id != old.session_id for entry in before_expiry)
+    sessions.transition(old.session_id, "succeeded", exit_code=0, clock=lambda: 0.0)
+
+    if cleanup == "delete":
+        result = invoke(cli, "delete", old.session_id, "--yes", "--json")
+    elif cleanup == "prune_explicit":
+        result = invoke(cli, "prune", "--older-than", "0d", "--yes", "--json")
+    else:
+        result = invoke(cli, "prune", "--yes", "--json")
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    assert sessions.tombstone_path(old.session_id).is_file()
+    assert sessions.session_dir(old.session_id).is_dir()
+    assert not sessions.meta_path(old.session_id).exists()
+
+    sessions.prune_sessions(older_than=0.0, clock=lambda: 365 * 24 * 60 * 60)
+    assert sessions.tombstone_path(old.session_id).is_file()
     sessions.prune_sessions(
         older_than=0.0,
-        clock=lambda: 100.0 + sessions.TOMBSTONE_RETENTION_SECONDS,
+        clock=lambda: 100.0 + 365 * 24 * 60 * 60,
     )
-    recycled = sessions.allocate_session_id(rng=_SequenceRng("c" * 4))
-    assert recycled == old.session_id
+    with pytest.raises(sessions.SessionIdsExhausted):
+        sessions.allocate_session_id(rng=_SequenceRng("a" * (4 * 64)))
+
+
+def test_R7b_exhausted_allocation_does_not_offer_prune_hint(
+    cli: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    occupied = sessions.create_session(
+        entry="mock",
+        base_adapter="mock",
+        prompt="occupied",
+        rng=_SequenceRng("a" * 4),
+    )
+    assert occupied.session_id == "aaaa"
+    monkeypatch.setattr(
+        sessions.random,
+        "SystemRandom",
+        lambda: _SequenceRng("a" * (4 * 64)),
+    )
+
+    result = invoke(cli, "run", "mock", "echo:unavailable", "--json", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    error = _error(result)
+    assert error["kind"] == errors.UNAVAILABLE
+    assert "prune" not in error["message"]
+    assert "hint" not in error
 
 
 def _enum_values(value: Any, path: str = "") -> list[tuple[str, list[Any]]]:
@@ -1439,6 +2223,10 @@ def _read_pty(fd: int, marker: bytes) -> bytes:
     data = bytearray()
     deadline = time.monotonic() + 5
     while marker not in data and time.monotonic() < deadline:
+        remaining = max(0.0, deadline - time.monotonic())
+        ready, _, _ = select.select([fd], [], [], remaining)
+        if not ready:
+            break
         try:
             data.extend(os.read(fd, 4096))
         except OSError as error:
@@ -1452,10 +2240,13 @@ def _drain_pty(fd: int) -> bytes:
     os.set_blocking(fd, False)
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
+        remaining = max(0.0, deadline - time.monotonic())
+        ready, _, _ = select.select([fd], [], [], remaining)
+        if not ready:
+            break
         try:
             chunk = os.read(fd, 4096)
         except BlockingIOError:
-            time.sleep(0.01)
             continue
         except OSError:
             break
@@ -1465,12 +2256,20 @@ def _drain_pty(fd: int) -> bytes:
     return bytes(data)
 
 
+@pytest.mark.timeout(60)
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal semantics")
 def test_F2b_F5_wait_interrupts_in_pipe_and_pty_contexts(cli: CliRunner, live_daemon: None) -> None:
     session_id = _background_session(cli, "slow:5 wait interruption")
     ready_code = (
-        "from acpc.cli import main; import sys; sys.stderr.write('READY\\n'); "
-        "sys.stderr.flush(); raise SystemExit(main())"
+        "import sys\n"
+        "import acpc.cli as cli\n"
+        "original = cli._select_format\n"
+        "def ready(format_name, json_mode, **kwargs):\n"
+        "    sys.stderr.write('READY\\n')\n"
+        "    sys.stderr.flush()\n"
+        "    return original(format_name, json_mode, **kwargs)\n"
+        "cli._select_format = ready\n"
+        "raise SystemExit(cli.main())\n"
     )
     command = [
         sys.executable,
@@ -1487,10 +2286,14 @@ def test_F2b_F5_wait_interrupts_in_pipe_and_pty_contexts(cli: CliRunner, live_da
         stderr=subprocess.PIPE,
         env=os.environ.copy(),
     )
-    _wait_for_ready(process)
-    time.sleep(0.2)
-    process.send_signal(signal.SIGINT)
-    stdout, stderr = process.communicate(timeout=10)
+    try:
+        _wait_for_ready(process)
+        process.send_signal(signal.SIGINT)
+        stdout, stderr = process.communicate(timeout=10)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=10)
     assert process.returncode == vocab.EXIT_CANCELLED
     assert stdout == b""
     assert json.loads(stderr.splitlines()[-1])["error"]["kind"] == errors.INTERRUPTED
@@ -1506,13 +2309,20 @@ def test_F2b_F5_wait_interrupts_in_pipe_and_pty_contexts(cli: CliRunner, live_da
         start_new_session=True,
         env=os.environ.copy(),
     )
-    os.close(slave)
-    ready = _read_pty(master, b"READY")
-    time.sleep(0.2)
-    os.killpg(pty_process.pid, signal.SIGINT)
-    stdout, _ = pty_process.communicate(timeout=10)
-    stderr = ready + _drain_pty(master)
-    os.close(master)
+    try:
+        os.close(slave)
+        ready = _read_pty(master, b"READY")
+        os.killpg(pty_process.pid, signal.SIGINT)
+        stdout, _ = pty_process.communicate(timeout=10)
+        stderr = ready + _drain_pty(master)
+    finally:
+        if pty_process.poll() is None:
+            os.killpg(pty_process.pid, signal.SIGKILL)
+            pty_process.wait(timeout=10)
+        with contextlib.suppress(OSError):
+            os.close(slave)
+        with contextlib.suppress(OSError):
+            os.close(master)
     assert pty_process.returncode == vocab.EXIT_CANCELLED
     assert stdout == b""
     assert json.loads(stderr.splitlines()[-1])["error"]["kind"] == errors.INTERRUPTED
@@ -1522,8 +2332,17 @@ def test_F2b_F5_wait_interrupts_in_pipe_and_pty_contexts(cli: CliRunner, live_da
 def test_D7c_claim_is_bound_to_the_versioned_standard_snapshot(cli: CliRunner) -> None:
     snapshot = STANDARD_SNAPSHOT.read_bytes()
     metadata = json.loads(STANDARD_METADATA.read_text(encoding="utf-8"))
-    assert metadata["source_commit"]
-    assert metadata["source"]
+    repo_root = Path(__file__).resolve().parents[1]
+    source_path = Path(metadata["source"])
+    assert not source_path.is_absolute()
+    source_blob = subprocess.run(
+        ["git", "show", f"{metadata['source_commit']}:{source_path.as_posix()}"],
+        cwd=repo_root,
+        check=False,
+        capture_output=True,
+    )
+    assert source_blob.returncode == 0, source_blob.stderr.decode(errors="replace")
+    assert source_blob.stdout == snapshot
     assert metadata["content_sha256"] == hashlib.sha256(snapshot).hexdigest()
     version = re.search(r"^\*\*Version:\*\*\s+(\S+)$", snapshot.decode(), re.MULTILINE)
     assert version is not None

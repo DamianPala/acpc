@@ -236,7 +236,8 @@ def test_prune_preview_and_mutation_share_one_shape_and_differ_in_changed(
         "changed": True,
         "requires_confirmation": True,
     }
-    assert not sessions.session_dir(session_id).exists()
+    assert sessions.session_dir(session_id).is_dir()
+    assert sessions.tombstone_path(session_id).is_file()
 
 
 def test_prune_refuses_an_unreadable_age_rather_than_asking_for_yes(cli: CliRunner) -> None:

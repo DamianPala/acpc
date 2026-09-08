@@ -126,7 +126,7 @@ Named `daemon stop AGENT` stops the targeted daemon without a confirmation gate.
 delete SELECTOR [--yes] [--format text|json]
 ```
 
-`delete` clears the selected session directory only after the session is finished and the caller has supplied `--yes`, then leaves a tombstone marker in that directory. It does not prompt at a terminal. The session's transcript, prompt, answer and metadata are removed together. The identifier remains reserved for at least one year after deletion, so repeating the call reports `not_found` and a later session cannot reuse it during that period. The structured result contains `session_id`, `removed`, `changed` and `paths`.
+`delete` clears the selected session directory only after the session is finished and the caller has supplied `--yes`, then leaves a permanent tombstone marker in that directory. It does not prompt at a terminal. The session's transcript, prompt, answer and metadata are removed together. The identifier remains reserved forever, so repeating the call reports `not_found` and no later session can reuse it. The structured result contains `session_id`, `removed`, `changed` and `paths`.
 
 ### `install`
 
@@ -182,7 +182,7 @@ probe ENTRY --discover [--format text|json]
 prune [--older-than D] [--dry-run] [--yes] [--format text|json]
 ```
 
-`prune` deletes only finished sessions whose age from `finished_at` exceeds the threshold and removes identifier tombstones only after one year from deletion. Without `--older-than`, the session threshold is `config.toml`'s `retention`, default `90d`. A zero retention value requires an explicit `--older-than 0d`; active sessions are never candidates. Tombstone expiry is independent of the session threshold. `--dry-run` reports the same `targets` and `requires_confirmation: true` without deleting, and does not require `--yes`. A mutating call requires confirmation. The result uses `targets`, `changed` and `requires_confirmation`, not a collection envelope.
+`prune` clears only finished sessions whose age from `finished_at` exceeds the threshold and leaves a permanent identifier tombstone in each selected directory. Without `--older-than`, the session threshold is `config.toml`'s `retention`, default `90d`. A zero retention value requires an explicit `--older-than 0d`; active sessions are never candidates. Removing session data never releases its identifier. `--dry-run` reports the same `targets` and `requires_confirmation: true` without deleting, and does not require `--yes`. A mutating call requires confirmation. The result uses `targets`, `changed` and `requires_confirmation`, not a collection envelope.
 
 ### `resolve`
 
@@ -405,7 +405,7 @@ Historical metadata is normalized when read. The former terminal deadline state 
 Retention is measured from `finished_at`.
 Auto-prune runs opportunistically after a run according to `retention`.
 Explicit delete always needs confirmation, while prune uses `--dry-run` to preview and `--yes` for the mutation.
-A session id remains unique for at least one year after deletion. The allocator reserves ids by creating their directories, and `prune` may remove a tombstone after that retention period so the id can return to the pool.
+Once allocated, a session id is never assigned to another session. The allocator reserves ids by creating their directories; delete and every prune path release session data but never the identifier reservation. If the finite id space is exhausted, allocation fails with `unavailable` and does not suggest that pruning will free an id.
 
 ## Agent variants
 

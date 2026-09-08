@@ -355,12 +355,11 @@ def _session_problem(error: sessions.SessionError) -> AcpcError:
         return AcpcError(str(error), kind=errors.CORRUPT_STATE)
     if isinstance(error, sessions.SessionIdsExhausted):
         # acpc's own id space is full.  Nothing about the call is wrong and no
-        # repeat frees an id; only deleting finished sessions does.
+        # repeat or cleanup frees an id because reservations are permanent.
         return AcpcError(
             str(error),
             kind=errors.UNAVAILABLE,
             action="user",
-            hint="Run: acpc prune --yes",
         )
     if isinstance(error, sessions.SessionNameTaken | sessions.SessionBusy):
         # The session is busy or bound; the same call works once it settles.
@@ -2743,8 +2742,8 @@ def delete_command(
 
     Errors on a starting or running session — cancel it first. The transcript,
     the prompt and the answer go with it and acpc cannot bring them back, so
-    the call needs ``--yes``. The session directory remains as an identifier
-    tombstone for one year; ``list`` and ``status`` do not treat it as a session.
+    the call needs ``--yes``. The session directory remains as a permanent
+    identifier tombstone; ``list`` and ``status`` do not treat it as a session.
     Prints the removed session id; ``--json`` also lists the deleted paths.
 
     Example: ``acpc delete q7x2 --yes``
@@ -2816,8 +2815,8 @@ def prune_command(
     never "delete everything". ``--older-than`` overrides it for this call, and
     deleting every finished session takes an explicit ``--older-than 0d``. Age is
     measured from when the session finished. Running sessions are never touched.
-    Identifier tombstones are removed only after one year, when their ids become
-    available again.
+    Identifier tombstones are permanent: pruning releases session data, never an
+    identifier reservation.
 
     It decides what to delete as it runs, so deleting needs ``--yes``;
     ``--dry-run`` lists the same targets and never does.

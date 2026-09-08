@@ -62,7 +62,6 @@ LOCK_NAME = "lock"
 
 _PROMPT_SNIPPET_LIMIT = 200
 _ID_ALLOCATION_ATTEMPTS = 64
-TOMBSTONE_RETENTION_SECONDS = 365 * 24 * 60 * 60
 
 # SPEC.md *Session states*. Finished states are terminal for the current turn;
 # a new turn re-opens the session through `rotate_turn`.
@@ -241,14 +240,6 @@ class SessionMeta:
 
 _META_FIELDS: tuple[str, ...] = tuple(f.name for f in fields(SessionMeta) if f.name != "extra")
 DELIVERY_RECORD_INCOMPLETE = "delivery_record_incomplete"
-
-
-@dataclass(frozen=True, slots=True)
-class SessionTombstone:
-    """An identifier reservation left after a session was deleted."""
-
-    session_id: str
-    deleted_at: float
 
 
 # --------------------------------------------------------------------------
@@ -659,7 +650,7 @@ def allocate_session_id(*, rng: random.Random | None = None) -> str:
         return candidate
     raise SessionIdsExhausted(
         f"could not allocate a free session id after {_ID_ALLOCATION_ATTEMPTS} attempts — "
-        f"run 'acpc prune' to clear finished sessions"
+        "the session id space is exhausted and allocated identifiers are permanently reserved"
     )
 
 
@@ -673,18 +664,6 @@ def _clear_directory(directory: Path) -> None:
             _remove_tree(child)
         else:
             child.unlink()
-
-
-def _read_tombstone(directory: Path) -> SessionTombstone | None:
-    path = directory / TOMBSTONE_NAME
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        deleted_at = parse_timestamp(data["deleted_at"], "deleted_at", path)
-    except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError, CorruptSessionError):
-        return None
-    if deleted_at is None:
-        return None
-    return SessionTombstone(directory.name, deleted_at)
 
 
 def _write_tombstone(directory: Path, deleted_at: float) -> None:
@@ -1111,7 +1090,7 @@ def prune_sessions(
     older_than: float,
     dry_run: bool = False,
     clock: Clock | None = None,
-) -> list[SessionMeta | SessionTombstone]:
+) -> list[SessionMeta]:
     """Delete finished sessions older than `older_than` seconds.
 
     Age is measured from `finished_at` (SPEC.md `prune`), falling back to
@@ -1120,7 +1099,7 @@ def prune_sessions(
     """
     resolved_clock = _resolve_clock(clock)
     now = resolved_clock()
-    removed: list[SessionMeta | SessionTombstone] = []
+    removed: list[SessionMeta] = []
     for meta in list_sessions(clock=resolved_clock):
         if meta.is_active:
             continue
@@ -1128,20 +1107,8 @@ def prune_sessions(
         if reference is None or now - reference < older_than:
             continue
         if not dry_run:
-            _remove_tree(session_dir(meta.session_id))
+            directory = session_dir(meta.session_id)
+            _clear_directory(directory)
+            _write_tombstone(directory, now)
         removed.append(meta)
-    root = paths.sessions_dir()
-    try:
-        entries = sorted(root.iterdir())
-    except (FileNotFoundError, NotADirectoryError):
-        return removed
-    for directory in entries:
-        if not directory.is_dir() or not _is_tombstone(directory):
-            continue
-        tombstone = _read_tombstone(directory)
-        if tombstone is None or now - tombstone.deleted_at < TOMBSTONE_RETENTION_SECONDS:
-            continue
-        if not dry_run:
-            _remove_tree(directory)
-        removed.append(tombstone)
     return removed

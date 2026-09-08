@@ -1168,10 +1168,14 @@ PYEOF
 
     run_acpc prune --older-than 100d --yes
     assert_eq "real prune exits 0" "0" "$LAST_RC"
-    assert_true "prune removed candidate A" \
-        "$([[ ! -e "${ACPC_HOME}/sessions/${PRUNE_A_ID}" ]] && echo 0 || echo 1)"
-    assert_true "prune removed candidate B" \
-        "$([[ ! -e "${ACPC_HOME}/sessions/${PRUNE_B_ID}" ]] && echo 0 || echo 1)"
+    assert_file "prune keeps candidate A reservation" \
+        "${ACPC_HOME}/sessions/${PRUNE_A_ID}/.tombstone"
+    assert_file "prune keeps candidate B reservation" \
+        "${ACPC_HOME}/sessions/${PRUNE_B_ID}/.tombstone"
+    assert_true "prune removes candidate A metadata" \
+        "$([[ ! -e "${ACPC_HOME}/sessions/${PRUNE_A_ID}/meta.json" ]] && echo 0 || echo 1)"
+    assert_true "prune removes candidate B metadata" \
+        "$([[ ! -e "${ACPC_HOME}/sessions/${PRUNE_B_ID}/meta.json" ]] && echo 0 || echo 1)"
     assert_file "an unrelated finished session survives" "${ACPC_HOME}/sessions/${UTIL_ID}"
 
     end_section S11-maintenance

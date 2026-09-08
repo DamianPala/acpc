@@ -759,7 +759,8 @@ def test_prune_uses_configured_retention_by_default(cli: CliRunner, state_root: 
     result = invoke(cli, "prune", "--yes")
 
     assert result.exit_code == vocab.EXIT_OK
-    assert not sessions.session_dir(session_id).exists()
+    assert sessions.session_dir(session_id).is_dir()
+    assert sessions.tombstone_path(session_id).is_file()
 
 
 def test_bare_prune_zero_retention_is_safe_but_explicit_zero_deletes(
@@ -779,7 +780,8 @@ def test_bare_prune_zero_retention_is_safe_but_explicit_zero_deletes(
     explicit = invoke(cli, "prune", "--older-than", "0d", "--yes")
 
     assert explicit.exit_code == vocab.EXIT_OK
-    assert not sessions.session_dir(session_id).exists()
+    assert sessions.session_dir(session_id).is_dir()
+    assert sessions.tombstone_path(session_id).is_file()
 
 
 def test_zero_retention_disables_the_auto_prune_sweep(cli: CliRunner, state_root: Path) -> None:

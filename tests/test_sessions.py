@@ -752,7 +752,9 @@ class TestPrune:
         old = finished_session()
         removed = sessions.prune_sessions(older_than=86_400.0, clock=at(200_000.0))
         assert [meta.session_id for meta in removed] == [old]
-        assert not sessions.session_dir(old).exists()
+        assert sessions.session_dir(old).is_dir()
+        assert sessions.tombstone_path(old).is_file()
+        assert not sessions.meta_path(old).exists()
 
     def test_a_failed_removal_is_not_reported_as_removed(
         self, monkeypatch: pytest.MonkeyPatch
@@ -763,7 +765,7 @@ class TestPrune:
             del directory
             raise OSError("read-only session directory")
 
-        monkeypatch.setattr(sessions, "_remove_tree", refuse_removal)
+        monkeypatch.setattr(sessions, "_clear_directory", refuse_removal)
 
         with pytest.raises(OSError, match="read-only session directory"):
             sessions.prune_sessions(older_than=86_400.0, clock=at(200_000.0))
@@ -811,7 +813,9 @@ class TestPrune:
         removed = sessions.prune_sessions(older_than=86_400.0, clock=at(500_000.0))
 
         assert [entry.session_id for entry in removed] == [meta.session_id]
-        assert not sessions.session_dir(meta.session_id).exists()
+        assert sessions.session_dir(meta.session_id).is_dir()
+        assert sessions.tombstone_path(meta.session_id).is_file()
+        assert not sessions.meta_path(meta.session_id).exists()
 
     def test_a_just_detected_unknown_outcome_is_not_old_enough_to_prune(self) -> None:
         meta = make_session()
