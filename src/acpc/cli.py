@@ -2585,7 +2585,14 @@ def _cancel_local_session(meta: sessions.SessionMeta) -> _CancelResult:
             True,
         )
     command_line = proc.process_cmdline(meta.pid)
-    if command_line is not None and "acpc.direct_worker" in command_line:
+    if command_line is None:
+        raise AcpcError(
+            f"could not identify the process hosting session {meta.session_id}",
+            kind=errors.OUTCOME_UNKNOWN,
+            hint=f"Run: acpc status {meta.session_id}",
+            context={"session_id": meta.session_id, "status": meta.state},
+        )
+    if "acpc.direct_worker" in command_line:
         try:
             os.kill(meta.pid, signal.SIGINT)
         except ProcessLookupError:
