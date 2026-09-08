@@ -85,8 +85,8 @@ acpc skills get refresh-adapter-models
 
 ## Reading a run
 
-- **stdout carries exactly one thing**: the answer (default), a confirmation (`--output-file`), a JSON envelope (`--json`), or id + session dir (`--background`). Never spinners, logs, or diagnostics.
-- **stderr carries acpc's own metadata**, every line prefixed `--`: the end-of-run summary (duration, tokens, exit, session id, dir) and `log`/`status` footers. Harnesses that merge streams can still separate the two mechanically.
+- **stdout carries exactly one thing**: the answer (default), a JSON envelope (`--json`), or id + session dir (`--background`). With `--output-file`, success leaves stdout empty and writes the exact selected payload to the file. Never spinners, logs, or diagnostics.
+- **Textual acpc metadata and footers on stderr** are prefixed `--`: the end-of-run summary (duration, tokens, exit, session id, dir) and `log`/`status` footers. Error envelopes are unprefixed JSON. Harnesses that merge streams can still separate the two mechanically.
 - **`log <id>`** is the progress view — condensed one-liners, tool calls and prose interleaved. **`log <id> --prose`** is the content view — clean markdown of what the agent wrote. `--since CURSOR` never re-emits events, so polling is cheap and stateless.
 
 ```
@@ -108,11 +108,11 @@ $ acpc log x7k2 --since 42
 | 130 | canceled — SIGINT or `cancel` |
 | 141 / 143 | SIGPIPE / SIGTERM |
 
-**Client death ≠ session death.** SIGINT cancels the session. SIGTERM — a harness killing the tool call on its own timeout, the normal case for an agent caller — *detaches*: the session keeps running under the daemon, the client's last stderr line names the id and its options (`wait` for the answer, `cancel` to cancel), and `wait <id>` collects the answer later.
+**Client death and session death depend on ownership.** SIGINT cancels the session. SIGTERM — a harness killing the tool call on its own timeout, the normal case for an agent caller — detaches only work already taken over by the daemon. A direct-worker turn ends with the client. A detached session's last stderr line names the id and its options (`wait` for the answer, `cancel` to cancel), and `wait <id>` collects the answer later.
 
 ## Permissions
 
-`--permissions none|read|edit|execute|all|ask` names a ceiling for ACP permission requests, classified by tool-call kind. `ask` is off the scale: reads are allowed and other categories ask on `/dev/tty`. Default: `ask` on a TTY, `read` otherwise (`--background` counts as non-TTY). `write` and `prompt` remain accepted as deprecated aliases for `execute` and `ask`.
+`--permissions none|read|edit|execute|all|ask` names a ceiling for ACP permission requests, classified by tool-call kind. `ask` is off the scale: reads are allowed and other categories ask on `/dev/tty`. The default is `ask` when stdin and stdout are terminals and the context permits a question, and `read` otherwise. A terminal `run --background` without an explicit policy asks once which policy to detach with. No policy question is asked under `--json`, when stdin is not a terminal, or when `NO_INPUT` is non-empty. `write` and `prompt` remain accepted as deprecated aliases for `execute` and `ask`.
 
 Three edges worth internalizing:
 
@@ -152,10 +152,10 @@ Add only the routing knowledge an agent cannot infer from the tool, e.g. in your
 - Models available in your harness's own subagent tool → use that tool.
   acpc is for external agents only.
 - First contact: `acpc --help` (complete cheat sheet).
-- Entries and what each is for: `acpc agents`.
+- Entries and what each is for: `acpc agents list`.
 ```
 
-Give every entry in `~/.acpc/agents/` a one-line `description`. `acpc agents` prints it beside each entry, so an agent reading the roster learns what `builder` is *for* from the tool rather than from documentation you have to keep in sync.
+Give every entry in `~/.acpc/agents/` a one-line `description`. `acpc agents list` prints it beside each entry, so an agent reading the roster learns what `builder` is *for* from the tool rather than from documentation you have to keep in sync. Use `acpc agents get NAME` for one entry's details.
 
 If your roster is stable, add a purpose table so the agent knows the roles before its first call — this is routing knowledge, not usage documentation:
 
@@ -167,7 +167,7 @@ If your roster is stable, add a purpose table so the agent knows the roles befor
 | codex | the real vendor CLI for heavier work |
 ```
 
-Keep it to purpose only. Models, efforts and flags belong to the tool — `acpc agents` always shows the current truth.
+Keep it to purpose only. Models, efforts and flags belong to the tool — `acpc agents list` always shows the current roster, and `acpc agents get NAME` shows one entry's current truth.
 
 ## State on disk
 
@@ -190,7 +190,7 @@ A cold `continue` reports whether the adapter session was verified: the summary 
 
 ## The daemon
 
-A performance cache, nothing more: it keeps adapters warm so the next turn starts in ~2 s instead of a cold start. Auto-managed — starts on first use, expires after 30 min idle, restarts itself on version skew, heals itself if its adapter dies. One daemon per *target* (agent + home + declared env), so different providers or credentials never share a process. If a daemon cannot start at all, `run` falls back to a direct child and says so on stderr.
+A performance cache, nothing more: it keeps adapters warm so the next turn starts in ~2 s instead of a cold start. Auto-managed — starts on first use, expires after 30 min idle, restarts itself on version skew, heals itself if its adapter dies. One daemon per *target* (agent entry + vendor home + literal declared env + named passthrough values + resolved permission policy + process-level spawn identity when `effort_via = "cli"`), so different providers, credentials or permission ceilings never share a process. Secret values affect the target hash but are never exposed. If a daemon cannot start at all, `run` falls back to a direct child and says so on stderr.
 
 ```bash
 acpc daemon status          # acpc version, pid, uptime, idle age, per-target log path

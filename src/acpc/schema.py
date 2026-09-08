@@ -519,7 +519,8 @@ GLOBAL_FLAGS: list[dict[str, Any]] = [
         "name": "json",
         "description": (
             "Emit this command's result as JSON on stdout instead of text; failures answer "
-            "in the machine envelope either way."
+            "in the machine envelope either way. On `log`, mutually exclusive with `--prose`; "
+            "when `--format` is available, cannot be combined with a different format value."
         ),
         "type": "boolean",
         "required": False,

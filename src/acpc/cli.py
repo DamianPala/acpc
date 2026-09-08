@@ -93,16 +93,34 @@ _OUTPUT_FILE_DESCRIPTION = (
     "directory is created."
 )
 
-_FORMAT_OUTPUT_HELP = "Select text or JSON output; absent, text on a TTY and JSON on non-TTY."
-_FORMAT_COLLECTION_HELP = (
-    "Select text, JSON, or one-item-per-line output; absent, text on a TTY and JSON on non-TTY."
+_FORMAT_OUTPUT_HELP = (
+    "Select text or JSON output; absent, text on a TTY and JSON on non-TTY. "
+    "--json cannot be combined with a different --format value."
 )
-_FORMAT_NATIVE_HELP = "Select text or JSON output; absent, text on both TTY and non-TTY."
-_FORMAT_STREAM_HELP = "Select text or NDJSON output; absent, text on both TTY and non-TTY."
+_FORMAT_COLLECTION_HELP = (
+    "Select text, JSON, or one-item-per-line output; absent, text on a TTY and JSON on non-TTY. "
+    "--json cannot be combined with a different --format value."
+)
+_FORMAT_NATIVE_HELP = (
+    "Select text or JSON output; absent, text on both TTY and non-TTY. "
+    "--json cannot be combined with a different --format value."
+)
+_FORMAT_STREAM_HELP = (
+    "Select text or NDJSON output; absent, text on both TTY and non-TTY. "
+    "NDJSON is mutually exclusive with --prose."
+)
 
 _PERMISSION_CHOICES = (*vocab.PERMISSION_VALUES, *vocab.PERMISSION_ALIASES)
 _WARNED_PERMISSION_ALIASES: set[str] = set()
-_json_option = errors.json_option
+
+
+def _json_option(help_text: str) -> Any:
+    """Declare JSON output and publish its format conflict."""
+    return errors.json_option(
+        f"{help_text} --json cannot be combined with a different --format value."
+    )
+
+
 _COLOR_POLICY: str | None = None
 
 
@@ -464,7 +482,8 @@ Maintenance and setup:
   prune --yes       delete finished sessions older than retention (--older-than D)
   install <agent>   install the agent's adapter (--yes unless you are at a terminal)
   skills list       list bundled how-to skills; skills get <name> prints the body
-  Killing acpc does not cancel the session — acpc cancel does.
+  SIGINT cancels the turn owned by this command. SIGTERM detaches work already
+  taken over by the daemon and ends a direct-worker turn.
   Deleting needs --yes; --dry-run previews prune and bare daemon stop, and
   never needs it. --force is separate: it overrides a documented refusal.
 
@@ -662,9 +681,9 @@ def _continue_option_hint(message: str) -> str | None:
             "--cwd",
             "--home",
             "--name",
-            "--resolve",
         )
     }
+    hints["--resolve"] = "--resolve moved to: acpc resolve <agent>"
     hints["--dry-run"] = "--dry-run was removed from continue — use acpc resolve <agent>"
     return _matching_option_hint(message, hints)
 
@@ -706,8 +725,11 @@ def _friendly_option_hint(message: str, command_parts: list[str]) -> str | None:
         hint = _continue_option_hint(message)
         if hint is not None:
             return hint
-    if command_parts[-1:] == ["run"] and _no_such_option(message, "--resolve"):
-        return "--resolve moved to: acpc resolve <agent>"
+    if command_parts[-1:] == ["run"]:
+        if _no_such_option(message, "--dry-run"):
+            return "--dry-run was removed from run — use acpc resolve <agent>"
+        if _no_such_option(message, "--resolve"):
+            return "--resolve moved to: acpc resolve <agent>"
     aliases = {
         "--follow": follow_hint,
         "-f": follow_hint,
@@ -1777,7 +1799,12 @@ def agents_group(ctx: click.Context) -> None:
     help="Return at most N agents in the collection; default 20.",
 )
 @click.option(
-    "--plain", is_flag=True, help="Print one agent name per line; requires explicit --limit."
+    "--plain",
+    is_flag=True,
+    help=(
+        "Print one agent name per line; requires explicit --limit and cannot be combined "
+        "with --json or a different --format."
+    ),
 )
 @click.option(
     "--format",
@@ -1845,8 +1872,16 @@ def _emit_agent_detail(registry: AgentRegistry, entry: ResolvedEntry, selected_f
 @schema.describes(name="Adapter or variant to render, as listed by `acpc agents list`.")
 @agents_group.command(name="get")
 @click.argument("name")
-@click.option("--models", is_flag=True, help="Show full advertised presets and models.")
-@click.option("--commands", is_flag=True, help="Show advertised slash commands.")
+@click.option(
+    "--models",
+    is_flag=True,
+    help="Show full advertised presets and models; mutually exclusive with --commands.",
+)
+@click.option(
+    "--commands",
+    is_flag=True,
+    help="Show advertised slash commands; mutually exclusive with --models.",
+)
 @click.option(
     "--format",
     "format_name",
@@ -1956,8 +1991,8 @@ _CHECK_TIMEOUT_DEFAULT = "30s"
     "--plain",
     is_flag=True,
     help=(
-        "Print one checked agent name per line; only valid without NAME and requires an "
-        "explicit --limit."
+        "Print one checked agent name per line; only valid without NAME, requires an explicit "
+        "--limit, and cannot be combined with --json or a different --format."
     ),
 )
 @click.option(
@@ -2333,7 +2368,12 @@ def skills_group(ctx: click.Context) -> None:
     help="Return at most N skills in the collection; default 20.",
 )
 @click.option(
-    "--plain", is_flag=True, help="Print one skill name per line; requires explicit --limit."
+    "--plain",
+    is_flag=True,
+    help=(
+        "Print one skill name per line; requires explicit --limit and cannot be combined "
+        "with --json or a different --format."
+    ),
 )
 @click.option(
     "--format",
@@ -2993,7 +3033,10 @@ def _status_collection(
 @effects.read_only
 @schema.describes(
     limit="Return at most N sessions; the default is finite and has_more reports the rest.",
-    plain="Print one session id per line; requires explicit --limit.",
+    plain=(
+        "Print one session id per line; requires explicit --limit and cannot be combined "
+        "with --json or a different --format."
+    ),
 )
 @main.command(name="list")
 @click.option(
@@ -3005,7 +3048,12 @@ def _status_collection(
     help="Return at most N sessions; the default is finite and has_more reports the rest.",
 )
 @click.option(
-    "--plain", is_flag=True, help="Print one session id per line; requires explicit --limit."
+    "--plain",
+    is_flag=True,
+    help=(
+        "Print one session id per line; requires explicit --limit and cannot be combined "
+        "with --json or a different --format."
+    ),
 )
 @click.option(
     "--format",
@@ -3066,8 +3114,12 @@ def list_command(
     metavar="N",
     help="Bound records; without --follow the default is 20, while --follow has no default limit.",
 )
-@click.option("--prose", is_flag=True, help="Render full agent messages.")
-@_json_option("Emit raw transcript events as NDJSON.")
+@click.option(
+    "--prose",
+    is_flag=True,
+    help="Render full agent messages; mutually exclusive with --json and --format ndjson.",
+)
+@_json_option("Emit raw transcript events as NDJSON; mutually exclusive with --prose.")
 @click.option(
     "--format",
     "format_name",
@@ -3082,11 +3134,18 @@ def list_command(
     metavar="BYTES",
     help="Cap rendered output bytes; 0 disables the cap.",
 )
-@click.option("--wait-new", is_flag=True, help="Wait for new transcript events.")
+@click.option(
+    "--wait-new",
+    is_flag=True,
+    help="Wait for new transcript events; mutually exclusive with --follow.",
+)
 @click.option(
     "--follow",
     is_flag=True,
-    help="Collect events until the session ends; exit 124 on --timeout, 4 on --max-output.",
+    help=(
+        "Collect events until the session ends; exit 124 on --timeout, 4 on --max-output; "
+        "mutually exclusive with --wait-new."
+    ),
 )
 @click.option(
     "--timeout",
@@ -4630,7 +4689,12 @@ def daemon_group() -> None:
     help="Return at most N daemons.",
 )
 @click.option(
-    "--plain", is_flag=True, help="Print one daemon target per line; requires explicit --limit."
+    "--plain",
+    is_flag=True,
+    help=(
+        "Print one daemon target per line; requires explicit --limit and cannot be combined "
+        "with --json or a different --format."
+    ),
 )
 @click.option(
     "--format",

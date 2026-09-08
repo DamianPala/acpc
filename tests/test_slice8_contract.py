@@ -6,6 +6,7 @@ import json
 import re
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 from click.testing import CliRunner
@@ -27,6 +28,14 @@ default = {{ grants = "read", delegates = true }}
 
 STALE_DOCUMENT_PATTERNS = (
     ("removed session verb", re.compile(r"\bacpc (?:stop|rm)\b")),
+    (
+        "bare agents group spelling",
+        re.compile(r"\bacpc agents\b(?!\s+(?:list|get|check)\b)"),
+    ),
+    (
+        "bare skills group spelling",
+        re.compile(r"\bacpc skills\b(?!\s+(?:list|get)\b)"),
+    ),
     ("removed agent creation verb", re.compile(r"\bagents init\b")),
     ("removed check spelling", re.compile(r"\bagents --check\b")),
     ("removed log flag", re.compile(r"--tail\b")),
@@ -38,34 +47,39 @@ STALE_DOCUMENT_PATTERNS = (
     ),
 )
 
-LEGACY_HINT_CASES = (
-    (("agents",), "acpc agents list"),
-    (("agents", "mock"), "acpc agents get"),
-    (("agents", "mock", "--models"), "acpc agents get"),
-    (("agents", "mock", "--commands"), "acpc agents get"),
-    (("agents", "--models"), "acpc agents get <name> --models"),
-    (("agents", "--commands"), "acpc agents get <name> --commands"),
-    (("agents", "--check"), "acpc agents check"),
-    (("agents", "init", "variant", "--extends", "mock"), "agents create"),
-    (("skills",), "acpc skills list"),
-    (("skills", "adapter-bringup"), "acpc skills get"),
-    (("rm", "abcd"), "acpc delete"),
-    (("stop", "abcd"), "acpc cancel"),
-    (("log", "abcd", "--tail", "1"), "--limit"),
-    (("log", "abcd", "-f"), "--follow"),
-    (("run", "mock", "hello", "-o", "answer.md"), "--output-file"),
-    (("run", "mock", "hello", "--resolve"), "acpc resolve <agent>"),
-    (("continue", "abcd", "hello", "--model", "x"), "acpc run"),
-    (("continue", "abcd", "hello", "--effort", "high"), "acpc run"),
-    (("continue", "abcd", "hello", "--mode", "x"), "acpc run"),
-    (("continue", "abcd", "hello", "--cwd", "."), "acpc run"),
-    (("continue", "abcd", "hello", "--home", "."), "acpc run"),
-    (("continue", "abcd", "hello", "--name", "x"), "acpc run"),
-    (("continue", "abcd", "hello", "--resolve"), "acpc run"),
-    (("continue", "abcd", "hello", "--dry-run"), "acpc resolve <agent>"),
-    (("status",), "acpc list"),
-    (("status", "--limit", "1"), "acpc list"),
-    (("status", "--plain", "--limit", "1"), "acpc list"),
+MIGRATION_HINT_CASES = (
+    ("acpc agents", ("agents",)),
+    ("acpc agents NAME", ("agents", "mock")),
+    ("acpc agents NAME --models", ("agents", "mock", "--models")),
+    ("acpc agents NAME --commands", ("agents", "mock", "--commands")),
+    ("acpc agents --models", ("agents", "--models")),
+    ("acpc agents --commands", ("agents", "--commands")),
+    ("acpc agents --check [NAME]", ("agents", "--check")),
+    (
+        "acpc agents init NAME --extends BASE",
+        ("agents", "init", "variant", "--extends", "mock"),
+    ),
+    ("acpc skills", ("skills",)),
+    ("acpc skills NAME", ("skills", "adapter-bringup")),
+    ("acpc rm ID", ("rm", "abcd")),
+    ("acpc stop ID", ("stop", "abcd")),
+    ("acpc log ID --tail N", ("log", "abcd", "--tail", "1")),
+    ("acpc log ID -f", ("log", "abcd", "-f")),
+    ("acpc run AGENT PROMPT --dry-run", ("run", "mock", "hello", "--dry-run")),
+    ("acpc continue ID PROMPT --dry-run", ("continue", "abcd", "hello", "--dry-run")),
+    ("acpc continue ID PROMPT --resolve", ("continue", "abcd", "hello", "--resolve")),
+    ("-o FILE", ("run", "mock", "hello", "-o", "answer.md")),
+    ("--output FILE", ("run", "mock", "hello", "--output", "answer.md")),
+    ("continue --model", ("continue", "abcd", "hello", "--model", "x")),
+    ("continue --effort", ("continue", "abcd", "hello", "--effort", "high")),
+    ("continue --mode", ("continue", "abcd", "hello", "--mode", "x")),
+    ("continue --cwd", ("continue", "abcd", "hello", "--cwd", ".")),
+    ("continue --home", ("continue", "abcd", "hello", "--home", ".")),
+    ("continue --name", ("continue", "abcd", "hello", "--name", "x")),
+    ("acpc status", ("status",)),
+    ("acpc status --json", ("status", "--json")),
+    ("acpc status --limit N", ("status", "--limit", "1")),
+    ("acpc status --plain --limit N", ("status", "--plain", "--limit", "1")),
 )
 
 
@@ -105,15 +119,17 @@ def test_spec_command_index_matches_schema_both_ways(
     assert spec_commands == schema_commands
 
 
-def test_live_docs_contain_no_removed_surface_spellings() -> None:
+def test_public_docs_and_bundled_skills_contain_no_removed_surface_spellings() -> None:
+    skill_docs = sorted(Path("src/acpc/data/skills").rglob("*.md"))
     documents = "\n".join(
-        path.read_text(encoding="utf-8") for path in (Path("SPEC.md"), Path("README.md"))
+        path.read_text(encoding="utf-8")
+        for path in (Path("SPEC.md"), Path("README.md"), *skill_docs)
     )
     for label, pattern in STALE_DOCUMENT_PATTERNS:
         assert pattern.search(documents) is None, label
 
 
-def test_removed_spellings_name_the_current_command(
+def test_migration_rows_name_the_current_command(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cli: CliRunner
 ) -> None:
     root = tmp_path / "state"
@@ -121,7 +137,72 @@ def test_removed_spellings_name_the_current_command(
     agents.mkdir(parents=True)
     (agents / "mock.toml").write_text(MOCK_ENTRY, encoding="utf-8")
     monkeypatch.setenv("ACPC_HOME", str(root))
-    for args, hint in LEGACY_HINT_CASES:
+    migration_rows: dict[str, str] = {}
+    for line in Path("MIGRATION.md").read_text(encoding="utf-8").splitlines():
+        cells = line.split("|")
+        if len(cells) < 4:
+            continue
+        old_calls = re.findall(r"`([^`]+)`", cells[1])
+        current_match = re.search(r"`([^`]+)`", cells[2])
+        if current_match:
+            for old_call in old_calls:
+                migration_rows[old_call] = current_match.group(1)
+    assert {old for old, _args in MIGRATION_HINT_CASES} <= migration_rows.keys()
+    for old_call, args in MIGRATION_HINT_CASES:
+        current_call = migration_rows[old_call]
+        current_path = " ".join(
+            token
+            for token in current_call.removeprefix("acpc ").split()
+            if not token.startswith(("-", "[")) and token.upper() != token
+        )
+        if not current_path:
+            current_path = current_call.split()[0].strip("`")
+        assert current_path
         result = invoke(cli, *args)
         assert result.exit_code == vocab.EXIT_USAGE, (args, result.output)
-        assert hint in result.stderr, (args, result.stderr)
+        assert current_path in result.stderr, (old_call, current_call, result.stderr)
+
+
+def test_schema_publishes_parser_conflicts_in_flag_descriptions(cli: CliRunner) -> None:
+    def flags(path: tuple[str, ...]) -> dict[str, dict[str, Any]]:
+        detail = json.loads(invoke(cli, "schema", *path).stdout)
+        return {flag["name"]: flag for flag in detail["flags"]}
+
+    index = json.loads(invoke(cli, "schema").stdout)
+    global_flags = {flag["name"]: flag for flag in index["global_flags"]}
+    agent_flags = flags(("agents", "get"))
+    assert "--commands" in agent_flags["models"]["description"]
+    assert "--models" in agent_flags["commands"]["description"]
+
+    log_flags = flags(("log",))
+    assert "--json" in log_flags["prose"]["description"]
+    assert "--prose" in global_flags["json"]["description"]
+    assert "--prose" in log_flags["format"]["description"]
+    assert "--follow" in log_flags["wait-new"]["description"]
+    assert "--wait-new" in log_flags["follow"]["description"]
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    (
+        (
+            ("agents", "get", "mock", "--models", "--commands"),
+            "--models and --commands are mutually exclusive",
+        ),
+        (
+            ("log", "missing", "--prose", "--format", "ndjson"),
+            "--prose and --json are mutually exclusive views",
+        ),
+        (
+            ("log", "missing", "--wait-new", "--follow"),
+            "--wait-new and --follow are mutually exclusive",
+        ),
+    ),
+)
+def test_parser_rejects_each_published_mutual_exclusion(
+    cli: CliRunner, arguments: tuple[str, ...], message: str
+) -> None:
+    result = invoke(cli, *arguments)
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert message in result.stderr

@@ -1249,8 +1249,8 @@ if begin_section S12-cli "help contract, -V, TTY rules, hostile inputs"; then
         "$HELP_MAIN" "block until done, prints the answer"
     assert_contains "cheat sheet frames the file read as the fallback" \
         "$HELP_MAIN" "Truncated or huge answer?"
-    assert_contains "cheat sheet warns that killing acpc leaves the session running" \
-        "$HELP_MAIN" "acpc cancel does."
+    assert_contains "cheat sheet distinguishes SIGINT from SIGTERM" \
+        "$HELP_MAIN" "SIGINT cancels the turn owned by this command."
     assert_contains "cheat sheet frames --follow as the supervision case" \
         "$HELP_MAIN" "case for --follow"
     run_acpc -h

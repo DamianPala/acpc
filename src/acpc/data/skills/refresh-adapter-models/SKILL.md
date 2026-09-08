@@ -92,8 +92,9 @@ runnable: if this account / plan rejects the model itself, omit the row.
 
 `resolve` only checks acpc's table. A live turn that exits 0 is not
 enough: harnesses often fall back (unknown effort → default) and still
-answer. `meta.json` / `acpc status` record what acpc **sent**, not what
-the vendor applied.
+answer. `meta.json` / `acpc status <id>` record what acpc **sent**, not what
+the vendor applied. Use the `session_id` returned by the live `run` above,
+or find it with `acpc list`.
 
 For every **new** id, a level enters the row only from the **intersection**
 of docs and a live apply that did not reject:

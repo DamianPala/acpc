@@ -1,10 +1,14 @@
 # acpc Specification
 
-This is the normative contract for the acpc command-line tool. It describes the installed binary in this repository, and behavior changes land here in the same change as the implementation.
+This is the normative contract for the acpc command-line tool.
+It describes the installed binary in this repository, and behavior changes land here in the same change as the implementation.
 
 ## Command surface
 
-The primary caller is another agent using a shell tool. The default path is `run`, which waits and prints the answer once. `--background` returns a session id and directory; `wait` collects the answer later. All session state is inspectable under `ACPC_HOME`.
+The primary caller is another agent using a shell tool.
+The default path is `run`, which waits and prints the answer once.
+`--background` returns a session id and directory; `wait` collects the answer later.
+All session state is inspectable under `ACPC_HOME`.
 
 The following table is the machine-readable command index embedded in this document. It is deliberately small: the conformance test compares these paths and effects with `acpc schema`, while the prose and help text may evolve independently.
 
@@ -33,11 +37,20 @@ The following table is the machine-readable command index embedded in this docum
 | `steer` | `non_idempotent` |
 | `wait` | `read_only` |
 
-`agents`, `daemon` and `skills` are command groups, not command entries, when invoked without the subcommand that performs useful work. `schema` is reserved for introspection and is not listed in the index. The root command prints help.
+`agents`, `daemon` and `skills` are command groups, not command entries, when invoked without the subcommand that performs useful work.
+`schema` is reserved for introspection and is not listed in the index.
+The root command prints help.
 
-Every indexed command accepts `--json` and `--color`; these two flags are published once as `global_flags` by `acpc schema`. `--help` and `--version` are available through Click but are not command-surface flags. Command-specific flags are published by `acpc schema <path>`, with names without leading hyphens and short spellings in `aliases`.
+Every indexed command accepts `--json` and `--color`.
+These two flags are published once as `global_flags` by `acpc schema`.
+`--help` and `--version` are available through Click but are not command-surface flags.
+Command-specific flags are published by `acpc schema <path>`, with names without leading hyphens and short spellings in `aliases`.
 
-Every command declares one effect. `read_only` changes no state acpc manages, `idempotent` may change state but a repeated successful call with unchanged inputs does not perform a second transition, and `non_idempotent` has no such promise.
+Every command declares one effect.
+`read_only` does not change intended state.
+An observation may persist an observed liveness change and its placeholder response, such as `status` recording `unknown` after a daemon disappears.
+`idempotent` may change state but a repeated successful call with unchanged inputs does not perform a second transition.
+`non_idempotent` has no such promise.
 
 Every session selector accepts a four-character session id, a `--name` alias created by `run`, or `last`. `last` is resolved only in an interactive context, so an agent or script must use an id or an alias.
 
@@ -51,13 +64,16 @@ Every prompt-bearing command accepts exactly one prompt source: a positional arg
 agents list [--limit N] [--plain] [--format text|json|plain]
 agents get NAME [--models] [--commands] [--format text|json]
 agents check [NAME] [--limit N] [--plain] [--timeout S] [--format text|json|plain]
-agents create NAME --extends AGENT [--model M] [--effort E] [--mode MODE] [--permissions P] [--home DIR]
+agents create NAME --extends AGENT [--model M] [--effort E] [--mode MODE] [--permissions P] [--home DIR] [--format text|json]
 agents delete NAME [--format text|json]
 ```
 
 `agents list` returns a bounded collection with `items` and `has_more`, defaulting to 20 entries. `--plain` prints one adapter or variant name per line and requires an explicit `--limit`.
 
-`agents get` renders one adapter or variant. The detail contains resolved values with provenance, environment declarations, and the adapter's advertised modes, models and slash commands. `--models` and `--commands` select the corresponding advertised view. A variant points at its base adapter rather than duplicating the catalog.
+`agents get` renders one adapter or variant.
+The detail contains resolved values with provenance, environment declarations, and the adapter's advertised modes, models and slash commands.
+`--models` and `--commands` select the corresponding advertised view, and they are mutually exclusive.
+A variant points at its base adapter rather than duplicating the catalog.
 
 `agents check` runs the adapter connection check without sending a prompt. Without `NAME` it checks every registered adapter and variant, bounded by the default limit of 20. With `NAME` it checks exactly one entry and returns a one-item collection with `has_more: false`; `NAME` cannot be combined with `--limit` or `--plain`. The default connection timeout is 30 seconds. A check that reaches the adapter and reports `ok: false` is still a successful command with exit code 0; failed checks are summarized on stderr.
 
@@ -89,7 +105,11 @@ Replay from `session/load` or `session/resume` is silent. It does not add old me
 
 ### `daemon`
 
-Daemons are an automatic performance cache, one per concrete target consisting of an agent entry, vendor home and declared environment. A daemon starts on demand, keeps one adapter warm, serves up to `daemon_max_concurrent` turns at once, queues further turns, and expires after `daemon_ttl` of idleness. A detached session keeps its daemon alive. A version-skewed daemon stands down before the next mutating request; read-only status observes the running version instead.
+Daemons are an automatic performance cache, one per concrete target consisting of an agent entry, vendor home, literal declared environment, named passthrough values, resolved permission policy and process-level spawn identity when `effort_via = "cli"`.
+Secret values affect the target hash but are never exposed.
+A daemon starts on demand, keeps one adapter warm, serves up to `daemon_max_concurrent` turns at once, queues further turns, and expires after `daemon_ttl` of idleness.
+A detached session keeps its daemon alive.
+A version-skewed daemon stands down before the next mutating request; read-only status observes the running version instead.
 
 ```text
 daemon status [AGENT] [--limit N] [--plain] [--format text|json|plain]
@@ -132,9 +152,21 @@ log SELECTOR [--since CURSOR] [--limit N] [--prose]
     [--wait-new | --follow] [--timeout S] [--quiet]
 ```
 
-`log` is a read-only record stream. Its default snapshot is the last 20 transcript events. `--since` selects events after a global cursor and `--limit` bounds records; with `--follow`, an omitted limit is unbounded. `--prose` renders full agent messages while retaining error records. `--format ndjson` emits one raw transcript record per line and is the stream format selected by `--json`.
+`log` is a read-only record stream.
+Its default snapshot is the last 20 transcript events.
+`--since` first selects events after a global cursor, then a snapshot `--limit` selects the last N of those events.
+With `--follow`, an omitted limit is unbounded and an explicit limit ends observation after N emitted records.
+`--prose` renders full agent messages while retaining error records, and is mutually exclusive with `--json` and `--format ndjson`.
+`--format ndjson` emits one raw transcript record per line and is the stream format selected by `--json`.
 
-`--wait-new` waits for activity and `--follow` collects until the session ends. They are mutually exclusive. A wait deadline leaves the session unchanged and exits 124. A follow stopped by `--max-output` exits 4. The cursor in the stderr footer covers exactly what stdout emitted; a caller can resume with `--since CURSOR`. The footer, diagnostics and truncation note go to stderr, and a truncation never fabricates a transcript record.
+`--wait-new` waits for activity.
+`--follow` collects until the session ends.
+They are mutually exclusive.
+A wait deadline leaves the session unchanged and exits 124.
+A follow stopped by `--max-output` exits 4.
+The cursor in the stderr footer covers exactly what stdout emitted, so a caller can resume with `--since CURSOR`.
+The footer, diagnostics and truncation note go to stderr.
+A truncation never fabricates a transcript record.
 
 ### `probe`
 
@@ -231,7 +263,10 @@ The output format is selected by `--format` or the `--json` alias. The tool-wide
 
 The global `--color auto|always|never` policy affects human text only. The precedence is the explicit flag, `NO_COLOR`, `TERM=dumb`, then whether stdout is a terminal. Machine formats never contain ANSI or control bytes.
 
-stdout carries only the selected result: the answer, a machine document, a record stream, a confirmation written by `--output-file`, or the id and directory from `--background`. stderr carries acpc metadata, summaries, footers, diagnostics and adapter noise according to the command. A log footer never contaminates a prose or NDJSON stdout stream.
+stdout carries only the selected result: the answer, a machine document, a record stream, or the id and directory from `--background`.
+On success, `--output-file` leaves stdout empty and writes the exact payload of the selected format to the file.
+stderr carries acpc metadata, summaries, footers, diagnostics and adapter noise according to the command.
+A log footer never contaminates a prose or NDJSON stdout stream.
 
 ### Success documents
 
@@ -263,10 +298,13 @@ The produced kinds are:
 | `interrupted` | This client was interrupted, for example by Ctrl-C. |
 | `precondition_failed` | A documented condition that `--force` can override was not met. |
 | `operation_failed` | Work ended in a state other than the success the observing command expected. |
+| `confirmation_required` | A gated call lacked the required confirmation; exit code 1. |
 | `agent_error` | An external program reported an error that acpc cannot classify more narrowly. |
 | `corrupt_state` | State acpc owns exists but cannot be trusted. |
 | `not_supported` | The target exists but acpc does not offer the requested operation for it. |
 
+`confirmation_required` is produced when a gated call reaches the confirmation step without the required consent.
+Target validation and documented preconditions happen before the confirmation question.
 `unauthenticated` and `cursor_unavailable` are reserved kinds, not currently produced.
 
 ### Exit codes
@@ -284,7 +322,11 @@ The produced kinds are:
 
 Missing named resources and session conflicts are exit 1, because the command was spelled correctly. Exit 2 is reserved for a call that cannot be accepted in the form given, including an unsupported permission policy for the selected entry.
 
-Ctrl-C always produces exit 130 with `kind: interrupted` for the command that was interrupted. Interrupting `wait` or `log` never changes the observed session. Interrupting `run`, `continue` or `steer` cancels the owned turn. A SIGTERM from a harness detaches a daemon-owned session; the client reports the id and the commands that can wait or cancel it.
+Ctrl-C always produces exit 130 with `kind: interrupted` for the command that was interrupted.
+Interrupting `wait` or `log` never changes the observed session.
+Interrupting `run`, `continue` or `steer` cancels the owned turn.
+A SIGTERM from a harness detaches a session already taken over by the daemon and ends a direct-worker turn.
+The client reports the id and the commands that can wait or cancel a detached session.
 
 ## TTY vs non-TTY
 
@@ -360,7 +402,10 @@ Historical metadata is normalized when read. The former terminal deadline state 
 
 `cancel` accepts active sessions and is a no-op on finished sessions. `continue` accepts finished sessions, including `unknown`, and refuses active sessions. `delete` and `prune` remove only finished sessions. `status`, `list`, `log` and `wait` can observe any existing session.
 
-Retention is measured from `finished_at`. Auto-prune runs opportunistically after a run according to `retention`. Explicit delete always needs confirmation, while prune uses `--dry-run` to preview and `--yes` for the mutation. A removed or expired id is never rebound to a different session.
+Retention is measured from `finished_at`.
+Auto-prune runs opportunistically after a run according to `retention`.
+Explicit delete always needs confirmation, while prune uses `--dry-run` to preview and `--yes` for the mutation.
+A session id remains unique while its session directory exists, and the allocator may reuse it after removal or expiry.
 
 ## Agent variants
 

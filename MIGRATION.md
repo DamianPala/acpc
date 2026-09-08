@@ -22,7 +22,7 @@ This guide describes the public changes accumulated before acpc 1.0. The command
 | `acpc status --json` | `acpc list --json` | Collection-only flags belong to `list`. |
 | `acpc status --limit N` | `acpc list --limit N` | Collection limits belong to `list`. |
 | `acpc status --plain --limit N` | `acpc list --plain --limit N` | Plain collection output belongs to `list`. |
-| `acpc log ID --tail N` | `acpc log ID --limit N` | The selector is a record limit, not a tail view. |
+| `acpc log ID --tail N` | `acpc log ID --limit N` | The public name changed from `--tail` to `--limit`, but a snapshot still returns the last N records selected after `--since`; with `--follow`, an explicit limit ends observation after N emitted records. |
 | `acpc log ID -f` | `acpc log ID --follow` | `-f` is reserved for daemon `--force`. |
 | `acpc run AGENT PROMPT --dry-run` | `acpc resolve AGENT` | Resolution preview is a separate read-only command. |
 | `acpc continue ID PROMPT --dry-run` | `acpc resolve AGENT` | A session continuation has no resolution preview. |
@@ -62,6 +62,6 @@ Metadata is written under the canonical `status` key. The public transcript head
 
 ## Usage-error hints
 
-The binary names the current command in usage errors for the old command and flag forms above. In particular, the old collection forms point to `list`, named adapter and skill forms point to `get`, the old check form points to `agents check`, the old session verbs point to `delete` or `cancel`, the old log flags point to `--limit` or `--follow`, the old output flag points to `--output-file`, and the old resolution flags point to `resolve` or `run` as appropriate.
+The binary names the current command in usage errors for the old command and flag forms above. In particular, the old collection forms point to `list`, named adapter and skill forms point to `get`, the old check form points to `agents check`, the old session verbs point to `delete` or `cancel`, the old log flags point to `--limit` or `--follow`, the old output flag points to `--output-file`, and the old resolution flags point to `resolve` as appropriate.
 
-If a shell script needs to distinguish a migration error from a runtime failure, both are still `invalid_input` with exit 2. A missing resource or a state conflict is exit 1 because the current command spelling is valid.
+If a shell script needs to distinguish a migration error from a runtime failure, every recognized removed spelling is `invalid_input` with exit 2. A runtime failure has another `kind` and usually exits 1. A missing resource or a state conflict is exit 1 because the current command spelling is valid.
