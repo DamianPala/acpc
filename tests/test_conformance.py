@@ -47,7 +47,7 @@ STANDARD_SNAPSHOT = Path(__file__).with_name("fixtures") / "cli-design-standard.
 STANDARD_METADATA = STANDARD_SNAPSHOT.with_suffix(".meta.json")
 EXPECTED_TOOL_VERSION = "0.7.1"
 EXPECTED_STANDARD_NAME = "cli-design-standard"
-EXPECTED_STANDARD_VERSION = "0.1.0-draft.6"
+EXPECTED_STANDARD_VERSION = "0.1.0-draft.7"
 EXPECTED_EXTENSIONS = ["managed"]
 EXPECTED_EXIT_DESCRIPTIONS = {
     "0": "Success, including an empty result: the turn ended normally, or the view rendered.",
@@ -856,7 +856,9 @@ def _success_call(
         output_flags.extend(("--limit", "1"))
     quiet = _quiet_if_supported(name)
     if name == "agents check":
-        return invoke(cli, "agents", "check", *output_flags, *quiet)
+        # The format oracle needs the bounded collection shape, not a second
+        # ACP discovery run.  `agents check mock` covers the real boundary.
+        return invoke(cli, "agents", "check", "--limit", "0", *output_flags, *quiet)
     if name == "agents create":
         return invoke(
             cli,
@@ -1673,18 +1675,75 @@ def test_O7a_O7b_O7c_O7d_log_stream_is_framed_bounded_ordered_and_complete(
 ) -> None:
     session_id = _finished_session()
     events = transcript.Transcript(sessions.transcript_path(session_id))
-    for number in range(3):
+    for number in range(25):
         events.append("msg", text=f"event-{number}")
 
-    result = invoke(cli, "log", session_id, "--json", "--since", "0", "--limit", "2", "--quiet")
+    all_result = invoke(cli, "log", session_id, "--json", "--since", "0", "--quiet")
+    assert all_result.exit_code == vocab.EXIT_OK, all_result.stderr
+    all_records = [json.loads(line) for line in all_result.stdout.splitlines()]
+    assert len(all_records) > 20
+
+    tail_result = invoke(cli, "log", session_id, "--json", "--tail", "2", "--quiet")
+    assert tail_result.exit_code == vocab.EXIT_OK, tail_result.stderr
+    assert [json.loads(line) for line in tail_result.stdout.splitlines()] == all_records[-2:]
+
+    default_result = invoke(cli, "log", session_id, "--json", "--quiet")
+    assert default_result.exit_code == vocab.EXIT_OK, default_result.stderr
+    assert [json.loads(line) for line in default_result.stdout.splitlines()] == all_records[-20:]
+
+    cursor = all_records[2]["i"]
+    expected_after_cursor = [record for record in all_records if record["i"] > cursor]
+    assert expected_after_cursor[:2] != expected_after_cursor[-2:]
+    result = invoke(
+        cli,
+        "log",
+        session_id,
+        "--json",
+        "--since",
+        str(cursor),
+        "--limit",
+        "2",
+        "--quiet",
+    )
     assert result.exit_code == vocab.EXIT_OK, result.stderr
     framed = result.stdout.splitlines(keepends=True)
     assert len(framed) == 2
     assert all(line.endswith("\n") and line.strip() for line in framed)
     records = [json.loads(line) for line in framed]
-    assert all(record["type"] == "msg" for record in records)
+    assert records == expected_after_cursor[:2]
     assert [record["i"] for record in records] == sorted(record["i"] for record in records)
     assert result.stderr == ""
+
+    seen: list[dict[str, Any]] = []
+    page_cursor = 0
+    while True:
+        page_result = invoke(
+            cli,
+            "log",
+            session_id,
+            "--json",
+            "--since",
+            str(page_cursor),
+            "--limit",
+            "2",
+            "--quiet",
+        )
+        assert page_result.exit_code == vocab.EXIT_OK, page_result.stderr
+        page_records = [json.loads(line) for line in page_result.stdout.splitlines()]
+        if not page_records:
+            break
+        seen.extend(page_records)
+        page_cursor = page_records[-1]["i"]
+    assert seen == all_records
+
+    detail = read_detail(cli, "log")
+    flags = {flag["name"]: flag["description"] for flag in detail["flags"]}
+    assert "last 20" in flags["limit"] and "--follow" in flags["limit"]
+    assert "--tail" in flags["limit"]
+    assert "last 20" in flags["tail"] and "--follow" in flags["tail"]
+    conflict = invoke(cli, "log", session_id, "--tail", "2", "--limit", "2", "--json", "--quiet")
+    assert conflict.exit_code == vocab.EXIT_USAGE
+    assert _error(conflict)["kind"] == errors.INVALID_INPUT
 
     followed = invoke(
         cli,
@@ -1764,6 +1823,28 @@ def test_D5a_background_breadcrumb_is_an_executable_wait_vector(
 
 
 def test_O8_broken_pipe_is_a_documented_pipe_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BrokenStream:
+        def write(self, _text: str) -> None:
+            raise BrokenPipeError
+
+        def flush(self) -> None:
+            raise BrokenPipeError
+
+    def leave() -> NoReturn:
+        raise SystemExit(vocab.EXIT_SIGPIPE)
+
+    monkeypatch.setattr(cli_module.sys, "stdout", BrokenStream())
+    monkeypatch.setattr(cli_module, "_leave_on_broken_pipe", leave)
+
+    with pytest.raises(SystemExit) as raised:
+        cli_module._write_stdout("pipe")
+
+    assert raised.value.code == vocab.EXIT_SIGPIPE
+
+
+def test_O8_main_keeps_the_documented_pipe_exit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def broken_write(_text: str) -> None:
@@ -2332,17 +2413,9 @@ def test_F2b_F5_wait_interrupts_in_pipe_and_pty_contexts(cli: CliRunner, live_da
 def test_D7c_claim_is_bound_to_the_versioned_standard_snapshot(cli: CliRunner) -> None:
     snapshot = STANDARD_SNAPSHOT.read_bytes()
     metadata = json.loads(STANDARD_METADATA.read_text(encoding="utf-8"))
-    repo_root = Path(__file__).resolve().parents[1]
     source_path = Path(metadata["source"])
     assert not source_path.is_absolute()
-    source_blob = subprocess.run(
-        ["git", "show", f"{metadata['source_commit']}:{source_path.as_posix()}"],
-        cwd=repo_root,
-        check=False,
-        capture_output=True,
-    )
-    assert source_blob.returncode == 0, source_blob.stderr.decode(errors="replace")
-    assert source_blob.stdout == snapshot
+    assert metadata["source_repository"] == "https://github.com/DamianPala/haz-skills.git"
     assert metadata["content_sha256"] == hashlib.sha256(snapshot).hexdigest()
     version = re.search(r"^\*\*Version:\*\*\s+(\S+)$", snapshot.decode(), re.MULTILINE)
     assert version is not None
@@ -2352,4 +2425,21 @@ def test_D7c_claim_is_bound_to_the_versioned_standard_snapshot(cli: CliRunner) -
     checkout = os.environ.get("ACPC_STANDARD_CHECKOUT")
     if checkout is None:
         pytest.skip("set ACPC_STANDARD_CHECKOUT to check the repository snapshot")
-    assert Path(checkout).read_bytes() == snapshot
+    checkout_path = Path(checkout)
+    assert checkout_path.read_bytes() == snapshot
+    source_repository = Path(
+        os.environ.get("ACPC_STANDARD_SOURCE_REPOSITORY", checkout_path.parents[2])
+    )
+    source_blob = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(source_repository),
+            "show",
+            f"{metadata['source_commit']}:{source_path.as_posix()}",
+        ],
+        check=False,
+        capture_output=True,
+    )
+    assert source_blob.returncode == 0, source_blob.stderr.decode(errors="replace")
+    assert source_blob.stdout == snapshot

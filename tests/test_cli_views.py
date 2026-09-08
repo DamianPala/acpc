@@ -397,13 +397,15 @@ def test_negative_timeout_is_a_usage_error_for_waiting_views(
     assert "--timeout" in result.stderr
 
 
-def test_log_tail_limits_the_selected_events(cli: CliRunner) -> None:
-    """Log --limit bounds the number of rendered event lines."""
-    session_id = run_mock(cli)
+def test_log_limit_starts_at_the_selected_position(cli: CliRunner) -> None:
+    """Log --limit emits the first N events after the selected position."""
+    meta = session_with_messages(5)
 
-    result = invoke(cli, "log", session_id, "--limit", "1")
+    result = invoke(cli, "log", meta.session_id, "--limit", "2")
 
-    assert len(result.stdout.splitlines()) <= 1
+    assert "event-0" in result.stdout
+    assert "event-1" in result.stdout
+    assert "event-2" not in result.stdout
 
 
 def test_log_json_emits_indexed_ndjson(cli: CliRunner) -> None:
@@ -458,17 +460,39 @@ def test_log_max_output_truncates_between_events_and_names_the_transcript(cli: C
     )
 
 
-def test_log_applies_tail_after_since(cli: CliRunner) -> None:
-    """Log combines --since and --limit by bounding post-cursor events."""
+def test_log_limit_applies_after_since(cli: CliRunner) -> None:
+    """Log combines --since and --limit by taking the first post-cursor events."""
     meta = session_with_messages(5)
 
     result = invoke(cli, "log", meta.session_id, "--since", "1", "--limit", "2")
 
     assert (
-        "event-1" not in result.stdout
-        and "event-2" not in result.stdout
-        and "event-4" in result.stdout
+        "event-0" not in result.stdout
+        and "event-1" in result.stdout
+        and "event-2" in result.stdout
+        and "event-3" not in result.stdout
     )
+
+
+def test_log_tail_selects_the_last_matching_events(cli: CliRunner) -> None:
+    meta = session_with_messages(5)
+
+    result = invoke(cli, "log", meta.session_id, "--tail", "2")
+
+    assert "event-2" not in result.stdout
+    assert "event-3" in result.stdout
+    assert "event-4" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "args",
+    [("--tail", "2", "--limit", "2"), ("--tail", "2", "--follow")],
+)
+def test_log_rejects_conflicting_tail_selectors(cli: CliRunner, args: tuple[str, ...]) -> None:
+    result = invoke(cli, "log", "does-not-exist", *args, "--json")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert json.loads(result.stderr)["error"]["kind"] == "invalid_input"
 
 
 def test_log_since_past_the_end_notes_highest_cursor(cli: CliRunner) -> None:

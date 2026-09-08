@@ -1091,14 +1091,27 @@ def test_killed_adapter_records_a_failure_event(state_root: Path, live_daemon: N
 def test_authentication_refusal_records_the_remedy_even_with_an_empty_log(
     state_root: Path, live_daemon: None
 ) -> None:
-    session_id = new_session("auth:vendor needs credentials")
-    # "Empty log" is the condition under test, so establish it rather than
-    # inherit it: an earlier daemon in this root leaves its own shutdown note
-    # behind, and the assertion below would then be measuring test order.
     resolution = resolve()
     log_file = daemon.log_path_for_target(runner.call_target(resolution))
     log_file.parent.mkdir(parents=True, exist_ok=True)
+    warm_session = new_session("warm the daemon before testing an empty log")
+    warm_problem = asyncio.run(
+        runner.dispatch_background(
+            warm_session,
+            runner.TurnRequest(
+                resolution=resolution,
+                prompt="warm the daemon before testing an empty log",
+            ),
+        )
+    )
+    assert warm_problem is None
+    assert runner.wait_for_session(warm_session, timeout=5) == "succeeded"
+
+    # The daemon starts and its adapter initializes before the log is cleared.
+    # The test now owns the empty-log precondition for the following auth
+    # request rather than racing daemon startup and adapter initialization.
     log_file.write_bytes(b"")
+    session_id = new_session("auth:vendor needs credentials")
     problem = asyncio.run(
         runner.dispatch_background(
             session_id,
@@ -1107,7 +1120,8 @@ def test_authentication_refusal_records_the_remedy_even_with_an_empty_log(
     )
     assert problem is None
 
-    meta = _wait_for_finished(session_id)
+    assert runner.wait_for_session(session_id, timeout=5) == "failed"
+    meta = sessions.read_meta(session_id)
     assert meta.state == "failed"
     error_events = [event for event in _events(session_id) if event.get("type") == "error"]
     assert error_events

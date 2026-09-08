@@ -735,7 +735,7 @@ def _friendly_option_hint(message: str, command_parts: list[str]) -> str | None:
         "--detach": detach_hint,
         "-d": detach_hint,
         "-C": "-C is not an acpc flag — the working-directory flag is --cwd DIR",
-        "--tail": "--tail was renamed to --limit — use acpc log <id> --limit N",
+        "--tail": "--tail belongs to: acpc log <id> --tail N",
         "-o": "-o was renamed to --output-file — use --output-file FILE",
         "--output": "--output was renamed to --output-file — use --output-file FILE",
     }
@@ -2923,6 +2923,7 @@ def _wait_for_new_events(
     *,
     since: int,
     tail: int | None,
+    limit: int | None,
     timeout: float | None,
     condense: bool = False,
 ) -> transcript.TranscriptPage | None:
@@ -2940,7 +2941,13 @@ def _wait_for_new_events(
 
         available = _read_transcript_page(transcript_file, since=since)
         if available.events:
-            return _read_transcript_page(transcript_file, since=since, tail=tail, condense=condense)
+            return _read_transcript_page(
+                transcript_file,
+                since=since,
+                tail=tail,
+                limit=limit,
+                condense=condense,
+            )
 
 
 def _read_transcript_page(
@@ -2948,6 +2955,7 @@ def _read_transcript_page(
     *,
     since: int = 0,
     tail: int | None = None,
+    limit: int | None = None,
     condense: bool = False,
 ) -> transcript.TranscriptPage:
     """Turn damaged transcript state into the CLI's one-line usage error."""
@@ -2958,13 +2966,17 @@ def _read_transcript_page(
             else transcript_file.read(since=since, tail=tail)
         )
         if not condense:
-            return page
+            if limit is None:
+                return page
+            selected = page.events[:limit]
+            next_cursor = int(selected[-1]["i"]) if selected else since
+            return transcript.TranscriptPage(selected, next_cursor)
         selected = render.condense_events(page.events)
         if tail is not None:
             selected = selected[-tail:] if tail else []
-            next_cursor = int(selected[-1]["i"]) if selected else since
-        else:
-            next_cursor = page.next_cursor
+        if limit is not None:
+            selected = selected[:limit]
+        next_cursor = int(selected[-1]["i"]) if selected else since
         return transcript.TranscriptPage(selected, next_cursor)
     except transcript.TranscriptError as error:
         raise AcpcError(str(error), kind=errors.CORRUPT_STATE) from None
@@ -3099,12 +3111,17 @@ def list_command(
 @schema.describes(
     selector=_SELECTOR_HELP,
     since=(
-        "Show only events after this cursor; 0 or greater. Without --since or --limit, "
-        "the last 20 events."
+        "Select events after this cursor; 0 or greater. With --limit, emit the first N "
+        "selected events in transcript order."
     ),
     limit=(
-        "Bound records returned by this read; 0 or greater. Without --follow the default is "
-        "20; with --follow an omitted limit is unbounded."
+        "Emit at most N records from the selected position in transcript order; it does not "
+        "select that position. The default non-follow window is the last 20 records. With "
+        "--follow, it ends the read after N records. Conflicts with --tail."
+    ),
+    tail=(
+        "Select the last N matching records; 0 or greater. The default non-follow window is "
+        "the last 20 records. Conflicts with --limit and is unsupported with --follow."
     ),
 )
 @main.command(name="log")
@@ -3114,14 +3131,28 @@ def list_command(
     type=click.IntRange(min=0),
     default=None,
     metavar="N",
-    help="Show only events after this cursor; without --since or --limit, show the last 20 events.",
+    help="Select events after this cursor; with --limit, emit the first N selected events.",
 )
 @click.option(
     "--limit",
     type=click.IntRange(min=0),
     default=None,
     metavar="N",
-    help="Bound records; without --follow the default is 20, while --follow has no default limit.",
+    help=(
+        "Emit at most N records from the selected position; it does not select that position. "
+        "The default non-follow window is the last 20 records. With --follow it ends after N "
+        "records. Conflicts with --tail."
+    ),
+)
+@click.option(
+    "--tail",
+    type=click.IntRange(min=0),
+    default=None,
+    metavar="N",
+    help=(
+        "Select the last N matching records. The default non-follow window is the last 20 "
+        "records. Conflicts with --limit and is unsupported with --follow."
+    ),
 )
 @click.option(
     "--prose",
@@ -3173,6 +3204,7 @@ def log_command(
     selector: str,
     since: int | None,
     limit: int | None,
+    tail: int | None,
     prose: bool,
     json_mode: bool,
     format_name: str | None,
@@ -3184,7 +3216,7 @@ def log_command(
 ) -> None:
     """Render selected transcript events and keep metadata on stderr.
 
-    Without --since or --limit this shows the last 20 events.
+    Without --since, --limit, or --tail this shows the last 20 events.
 
     Example: ``acpc log <session-id> --prose --since 0``
     """
@@ -3196,6 +3228,10 @@ def log_command(
         raise UsageProblem(
             "--wait-new and --follow are mutually exclusive — --follow already waits"
         )
+    if limit is not None and tail is not None:
+        raise UsageProblem("--limit and --tail are mutually exclusive")
+    if tail is not None and follow:
+        raise UsageProblem("--tail is unsupported with --follow")
     if timeout is not None and not (wait_new or follow):
         raise UsageProblem("--timeout requires --wait-new or --follow")
 
@@ -3215,8 +3251,8 @@ def log_command(
         highest_cursor = _read_transcript_page(transcript_file).next_cursor
         if cursor > highest_cursor:
             since_note = _since_past_end_note(cursor, highest_cursor)
-    selection_tail = None if follow else limit
-    if selection_tail is None and not explicit_since and not follow:
+    selection_tail = None if follow else tail
+    if selection_tail is None and limit is None and not explicit_since and not follow:
         selection_tail = _LOG_DEFAULT_TAIL
 
     if follow:
@@ -3241,6 +3277,7 @@ def log_command(
         transcript_file,
         cursor=cursor,
         tail=selection_tail,
+        limit=limit,
         prose=prose,
         json_mode=json_mode,
         max_output=max_output,
@@ -3258,6 +3295,7 @@ def _render_log_page(
     *,
     cursor: int,
     tail: int | None,
+    limit: int | None,
     prose: bool,
     json_mode: bool,
     max_output: int,
@@ -3280,11 +3318,12 @@ def _render_log_page(
         transcript_file,
         since=cursor,
         tail=selection_tail,
+        limit=limit,
         condense=not prose and not json_mode,
     )
     timed_out = False
     gave_up_waiting = False
-    if wait_new and not page.events:
+    if wait_new and not page.events and limit != 0:
         if meta.state in vocab.FINISHED_STATES:
             # SPEC `--wait-new`: a finished session cannot produce new
             # activity, so the call returns at once (the `logs -f`
@@ -3295,6 +3334,7 @@ def _render_log_page(
                 transcript_file,
                 since=cursor,
                 tail=selection_tail,
+                limit=limit,
                 timeout=timeout,
                 condense=not prose and not json_mode,
             )

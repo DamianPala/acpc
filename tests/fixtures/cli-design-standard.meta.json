@@ -1,5 +1,6 @@
 {
-  "source": "tests/fixtures/cli-design-standard.md",
-  "source_commit": "d107db0e571ea092c2e5ec445cfa1a674b17c84d",
-  "content_sha256": "5d853a2f1cf365f2707fcd07ec93f8148c46ae97315350bfbdb67d0a7df00948"
+  "source_repository": "https://github.com/DamianPala/haz-skills.git",
+  "source": "cli-design/references/cli-design-standard.md",
+  "source_commit": "e98d0bdb19ba4c66cd9b34c45ce85ee1b89cc351",
+  "content_sha256": "a7a75df4d7aa6201170d81145a64c722ee3bd2c342fc6c1a407dfd74e239b918"
 }

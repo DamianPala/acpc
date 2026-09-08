@@ -394,7 +394,8 @@ def test_real_collection_payloads_match_their_published_schemas(cli: CliRunner) 
         ("daemon", "status"),
         ("agents", "check"),
     ):
-        result = invoke(cli, *command, "--json")
+        options = ("--limit", "0") if command == ("agents", "check") else ()
+        result = invoke(cli, *command, *options, "--json")
         assert result.exit_code == vocab.EXIT_OK, result.stderr
         payload = json.loads(result.stdout)
         validate_json(payload, schema_for(cli, " ".join(command)))

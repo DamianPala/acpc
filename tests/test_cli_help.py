@@ -148,7 +148,7 @@ def test_named_agents_view_accepts_both_help_spellings(runner: CliRunner, spelli
 
 def test_help_names_behavioral_defaults_and_global_output_default(runner: CliRunner) -> None:
     def normalized(text: str) -> str:
-        return " ".join(text.split()).replace("wall- clock", "wall-clock")
+        return " ".join(text.split()).replace("wall- clock", "wall-clock").replace("-- ", "--")
 
     run_help = normalized(invoke(runner, "run", "--help").stdout)
     continue_help = normalized(invoke(runner, "continue", "--help").stdout)
@@ -164,7 +164,9 @@ def test_help_names_behavioral_defaults_and_global_output_default(runner: CliRun
     assert "--cancel-after" in steer_help
     assert "absent, it blocks indefinitely" in wait_help
     assert "absent, it blocks indefinitely" in log_help
-    assert "without --since or --limit, show the last 20 events" in log_help
+    assert "Without --since, --limit, or --tail this shows the last 20 events" in log_help
+    assert "with --limit, emit the first N selected events" in log_help
+    assert "Conflicts with --tail" in log_help
     assert (
         "absent, ask when acpc could put the question — stdin and stdout both terminals, "
         "no --json, NO_INPUT unset — and read in every other case"

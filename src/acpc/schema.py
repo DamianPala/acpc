@@ -36,7 +36,7 @@ COMMAND_NAME = "schema"
 
 # The standard this surface is generated against.
 STANDARD_NAME = "cli-design-standard"
-STANDARD_VERSION = "0.1.0-draft.6"
+STANDARD_VERSION = "0.1.0-draft.7"
 
 # Default output format per context.  acpc renders text in both today; a
 # command that has a machine shape offers it behind its own `--json`.

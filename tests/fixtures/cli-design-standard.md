@@ -1,6 +1,6 @@
 # CLI Design Standard for Humans and Agents
 
-**Version:** 0.1.0-draft.6
+**Version:** 0.1.0-draft.7
 
 ## Scope
 
@@ -13,7 +13,7 @@ The standard is independent of the operating system, shell, implementation langu
 This section is non-normative. It records the decisions that shape the standard.
 
 - **A process contract.** The standard binds arguments, the standard streams, environment variables, exit codes, and one introspection command. It requires no daemon, socket, or protocol library, so any tool that can be executed can conform.
-- **A testable contract.** Each requirement has an observable pass or fail. A preference without a test belongs in guidance. For a requirement that a call must not produce an effect, the observable is the tool's declaration, not the effect's absence: a reviewer who may not mutate state verifies Stage R through the introspection command, its index, and command detail (D6, D7, D8). A tool that declares nothing is not thereby conforming; it is unverifiable, and this standard distinguishes the two.
+- **A testable contract.** Each requirement has an observable pass or fail. A preference without a test belongs in guidance. The introspection index and command detail let a reviewer inspect the tool's declared contracts without invoking domain operations (D7, D8). Checking those declarations alone does not establish that the tool's behavior satisfies them; the agreement rule (D1) still applies.
 - **An introspection command, not `--help --json`.** The introspection index and command detail (D7, D8) form a versioned contract (D9), fetched without credentials, configuration, or network (D6), and carry `effects`, `confirm`, and an output schema. Help output is a rendering for people and stays free to change.
 - **Context from the stdin TTY, an explicit machine-readable format, and `NO_INPUT`.** Terms define the *interactive context* once. Each signal can only force the *non-interactive context*, so none can contradict a TTY; a tool-defined signal for the same context would let two signals disagree. A tool's default format does not force it, so a machine caller that runs the tool in a PTY needs an explicit machine-readable format or `NO_INPUT`.
 - **Conditional requirements and named extensions, no profiles.** Applicability is stated per requirement: Stage R when a command mutates, R7 when work outlives the command that started it, O6 when a collection has no documented finite maximum. An extension names one guarantee a tool cannot provide by accident, and the name alone tells a caller what it may rely on: resumable pagination (`continuation`), observable accepted work with controls where cancellation or suspension exists (`managed`). A profile that bundled requirements across stages by choice would let one claim mean many things. An existing tool adopts by adding the introspection command and declaring, per command, what it keeps (Existing tools), so one claim keeps one meaning and the caller reads the exceptions from the index.
@@ -214,7 +214,7 @@ $ mytool schema
   ],
   "format_defaults": {"tty": "text", "non_tty": "json"},
   "exit_codes": {"0": "success", "1": "failure", "2": "usage error"},
-  "conformance": {"name": "cli-design-standard", "standard": "0.1.0-draft.6", "extensions": []},
+  "conformance": {"name": "cli-design-standard", "standard": "0.1.0-draft.7", "extensions": []},
   "commands": [
     {"name": "services get", "description": "Get a deployed service", "effects": "read_only"},
     {"name": "services list", "description": "List deployed services", "effects": "read_only"}
@@ -283,7 +283,7 @@ $ hashfile schema
   ],
   "format_defaults": {"tty": "text", "non_tty": "json"},
   "exit_codes": {"0": "success", "1": "failure", "2": "usage error"},
-  "conformance": {"name": "cli-design-standard", "standard": "0.1.0-draft.6", "extensions": []},
+  "conformance": {"name": "cli-design-standard", "standard": "0.1.0-draft.7", "extensions": []},
   "commands": [{"name": "", "description": "Hash a file", "effects": "read_only"}],
   "command": {
     "name": "",
@@ -355,7 +355,7 @@ Example descriptors:
 
 - Argument: `{"name": "file", "description": "Files to upload", "type": "string", "required": true, "variadic": true}`
 - Flag: `{"name": "tag", "description": "Tag to attach", "type": "string", "required": false, "aliases": ["t"], "repeatable": true}`
-- Relationship: `--follow` is command-specific and `--limit` is global, so the `--follow` description states that an explicit `--limit` still ends the read under O7b.
+- Relationship: when a command accepts both `--follow` and `--limit`, its `--follow` description states that an explicit `--limit` still ends the read under O7b.
 
 Together they accept `mytool upload --tag docs -t archive a.txt b.txt` and resolve both `file` and `tag` to ordered arrays.
 
@@ -472,7 +472,7 @@ The `--timeout` descriptor of a wait that is unbounded by default carries no `de
 
 ## Stage R: Repeatability and mutation safety
 
-This stage covers calls that mutate state or may be repeated. Safeguards follow the possible damage, not merely whether a command changes state. A tool whose every command declares `effects: read_only` has no mutation requirements under R2-R5. The rules for safe, bounded retries (R6) apply when the tool retries requests internally, and the rules for accepted work (R7) apply to an *accepting call*.
+This stage covers calls that mutate state or may be repeated. Safeguards follow the possible damage, not merely whether a command changes state. A tool whose every command declares `effects: read_only` has no mutation requirements under R2-R5. The rules for safe, bounded retries (R6) apply when the tool retries requests internally. The rules for accepted work (R7) cover identification, completion, and deadlines.
 
 ### R1: Effect metadata MUST be conservative.
 
@@ -486,7 +486,9 @@ This stage covers calls that mutate state or may be repeated. Safeguards follow 
 
 **R1b** The declaration MUST cover every valid call. Declare `non_idempotent` when any call lacks the repeat guarantee. Otherwise declare `idempotent` when any call can change intended state. Otherwise declare `read_only`. A changing response, incidental telemetry, logs, caches, metering, or rate limiting do not alone change the classification.
 
-For example, a delete by stable identifier whose repeat succeeds with `changed: false` is `idempotent`; a delete whose repeat fails with `not_found`, or whose targets are resolved at run time and may differ on a later repeat, such as the newest item or every stale item, is `non_idempotent`.
+For example, a delete by stable identifier whose repeat succeeds with `changed: false` is `idempotent`; a delete whose repeat fails with `not_found` is `non_idempotent`. Runtime target selection alone does not determine the classification; the successful-repeat guarantee (R1a) does. Deleting the newest item is `non_idempotent` when an immediate repeat selects and deletes the next item.
+
+A status read that only records that a worker has already exited can remain `read_only`; stopping the worker as part of the read changes intended state.
 
 ### R2: Mutation safeguards MUST match the blast radius.
 
@@ -579,7 +581,7 @@ For an *accepting call*, two clauses set the basics: the identifier (R7a) and th
 
 **R7a** An *accepting call* MUST return a non-empty canonical identifier in structured success output. Its field name is tool-defined but MUST remain consistent across the command that starts the work and every command that addresses it; in M1-M3, "the identifier" means that value under the same field name. If the command that starts the work fails after obtaining the identifier, any F3 object it emits MUST carry the identifier in `context` under the same field name.
 
-**R7b** Exit `0` means the work was accepted, not completed. The identifier MUST remain usable after the initiating process exits and MUST NOT later resolve to a different entity. The tool SHOULD document how a caller observes the work, and when a wait command exists, the identifier's D5 breadcrumb SHOULD name it.
+**R7b** Exit `0` means the work was accepted, not completed. The identifier MUST remain usable after the initiating process exits and, until expiry under a documented retention policy, MUST NOT resolve to a different entity. A tool MAY reassign it after expiry. The tool SHOULD document how a caller observes the work, and when a wait command exists, the identifier's D5 breadcrumb SHOULD name it.
 
 **R7c** When a command offers both waiting for completion and returning after acceptance, selecting the latter MUST change only how long the command waits, not the work it starts. The D8 `description` of a command that starts managed work MUST state whether it waits for completion by default.
 
@@ -692,7 +694,7 @@ Example schema:
 
 **O5c** Bounded values: a command that may cap a single inline value MUST declare a required boolean `truncated` and an optional string `output_file` in its D8 output schema. When `truncated` is `true`, `output_file` MUST identify a file that holds the complete value. The file SHOULD NOT be accessible to other users. The inline value is a preview, and the file's retention MUST be documented. Collections and record streams MUST use their own bounds instead (O6, O7).
 
-**O5d** Time: timestamps MUST use RFC 3339 with a numeric offset or `Z`. Timestamps within one document or stream SHOULD share one precision so that lexical and chronological order agree. Numeric duration field names MUST state their unit.
+**O5d** Time: timestamps MUST use RFC 3339 with a numeric offset or `Z`. Timestamps within one document or stream SHOULD share one precision. Numeric duration field names MUST state their unit.
 
 Output matching the O4 example schema:
 
@@ -749,9 +751,9 @@ This requirement applies to a *stream command*.
 
 **O7a** Framing: `--json` MUST emit UTF-8 NDJSON with one complete JSON object per LF-terminated line and no blank lines. Each record MUST conform to D8 `output` and become readable before the command waits for another record or exits. Each record keeps its declared value types without silent truncation (O5b), its timestamp form (O5d), and its field stability across compatible versions (D9).
 
-**O7b** Window: without `--follow`, the command MUST terminate. A stream without a documented finite maximum MUST use a finite default limit and accept `--limit`. `--follow`, an unbounded mode selected explicitly under I8c, removes that default limit when offered. An explicit `--limit` remains effective with or without `--follow` and ends the read after that many records. Reaching a limit ends that read, not the record source.
+**O7b** Window: without `--follow`, the command MUST terminate. A stream without a documented finite maximum MUST use a finite default window and accept at least one of `--limit`, `--head`, or `--tail`. `--limit N` is the maximum number of records emitted from the selected position in the documented order; it does not select that position. `--head N` selects the first N matching records and `--tail N` selects the last N matching records. A command MAY accept any subset of these flags. Its D8 descriptions MUST state the default window and how each accepted selector combines with `--follow`; unsupported combinations are usage errors under I6a. `--follow`, an unbounded mode selected explicitly under I8c, removes the default window when offered. An explicit `--limit` remains effective with or without `--follow` and ends the read after N records. Reaching a finite window that ends the read does not end the record source.
 
-**O7c** Ordering: the stream MUST use a stable, documented order and MUST NOT stop before the effective limit while matching records are available.
+**O7c** Ordering: the stream MUST use a stable, documented order and MUST NOT stop before a finite window that ends the read while matching records are available.
 
 **O7d** Completion: exit `0` means the requested read ended successfully, not that the record source is exhausted; empty stdout is valid. After a non-zero exit, prior LF-terminated records remain valid. An unterminated final fragment is not a record. This standard defines no end record; EOF and the exit status are authoritative.
 
@@ -767,7 +769,7 @@ $ mytool logs job_123 --limit 2 --json
 
 ### O8: Output MUST survive normal pipeline closure.
 
-When a downstream reader closes a pipe, a command that has not otherwise failed MUST stop writing and emit no stack trace or broken-pipe diagnostic. Its exit status MAY follow the platform's pipe-closure convention; any non-zero meaning MUST be documented under F1d. Exit `0` satisfies this requirement; a non-zero exit is exempt from the F2 object.
+When a downstream reader closes a pipe, a command that has not otherwise failed MUST stop writing and emit no stack trace or broken-pipe diagnostic. Exit `0` satisfies this requirement. The command MAY instead use the platform's pipe-closure exit status; its non-zero meaning MUST be documented under F1d. A non-zero exit caused only by pipe closure is exempt from the structured error object (F2).
 
 ## Stage F: Failure
 
@@ -911,6 +913,8 @@ A person at the terminal should find familiar flag names, standard environment b
 | More diagnostics | `--verbose` | `-v` | O3 |
 | Less diagnostics | `--quiet` | `-q` | O3, F2 |
 | Bound returned items or records | `--limit N` | No recommendation | O6, O7 |
+| Select first returned records | `--head N` | No recommendation | O7 |
+| Select last returned records | `--tail N` | No recommendation | O7 |
 | Resume a collection | `--cursor CURSOR` | No recommendation | C1 |
 | Resume a stream after a record | `--after-cursor CURSOR` | No recommendation | C2 |
 | Keep reading new records | `--follow` | No recommendation | O7 |
@@ -918,7 +922,7 @@ A person at the terminal should find familiar flag names, standard environment b
 | Control color | `--color WHEN` | No recommendation | H4 |
 | One item per line | `--plain` | No recommendation | H5 |
 
-### H2: Tools with nested commands SHOULD provide shell completions.
+### H2: Shell completions.
 
 Tools with nested commands SHOULD provide shell completions.
 
@@ -936,7 +940,7 @@ A tool that starts an editor MUST prefer `VISUAL` to `EDITOR` unless a documente
 
 At a terminal, `NO_COLOR=1 mytool services list` and `TERM=dumb mytool services list` print no color. In a pipe, a tool that accepts `--format` keeps color with `mytool services list --format text --color always | less -R` because the output is human-readable, while `mytool services list --color always | jq .` emits none because stdout is then machine-readable under O2 and O3.
 
-### H5: A command whose result is a complete collection under O6 SHOULD offer `--plain`.
+### H5: Plain collection output.
 
 A command whose result is a complete collection (O6) SHOULD offer `--plain`.
 
@@ -1027,7 +1031,7 @@ The two extensions below bind a tool that names them in D7 `conformance.extensio
 
 ## Extension `continuation`: Bounded reads MUST be resumable.
 
-A caller that received one page or one run of records can continue from where it stopped without repeating or skipping items. It builds on the bounds of collections (O6) and streams (O7); its terms, *stream command* and failing with a `kind`, are defined in the core.
+This extension defines cursor-based continuation for collections (C1) and streams (C2). It builds on the bounds of collections (O6) and streams (O7); its terms, *stream command* and failing with a `kind`, are defined in the core.
 
 ### C1: Collections MUST page by opaque cursor.
 
@@ -1062,7 +1066,7 @@ $ mytool jobs list --limit 2 --json
 
 **C2a** `output` MUST be an object schema with `cursor` as a required string property, and each `cursor` MUST be a non-empty opaque string.
 
-**C2b** The command MUST accept `--after-cursor` and resume strictly after that record without skipping any matching record in the same logical stream. Inputs selecting the source, filters, or order MUST remain the same; limits, following, timeouts, and output format MAY change.
+**C2b** The command MUST accept `--after-cursor` and resume strictly after that record without skipping any matching record in the same logical stream. A command that accepts a selector which would omit a matching record after `--after-cursor`, including `--tail`, MUST reject their combination as conflicting inputs under I6a. Inputs selecting the source, filters, or order MUST remain the same; limits, following, timeouts, and output format MAY change.
 
 **C2c** If this continuation cannot be guaranteed because the cursor or required history is invalid, expired, or incompatible, the command MUST fail with `kind` `cursor_unavailable`.
 

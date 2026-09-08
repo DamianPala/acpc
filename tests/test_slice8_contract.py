@@ -38,7 +38,6 @@ STALE_DOCUMENT_PATTERNS = (
     ),
     ("removed agent creation verb", re.compile(r"\bagents init\b")),
     ("removed check spelling", re.compile(r"\bagents --check\b")),
-    ("removed log flag", re.compile(r"--tail\b")),
     ("removed liveness state", re.compile(r"\borphaned\b")),
     ("removed run preview flag", re.compile(r"\brun --resolve\b")),
     (
@@ -63,7 +62,6 @@ MIGRATION_HINT_CASES = (
     ("acpc skills NAME", ("skills", "adapter-bringup")),
     ("acpc rm ID", ("rm", "abcd")),
     ("acpc stop ID", ("stop", "abcd")),
-    ("acpc log ID --tail N", ("log", "abcd", "--tail", "1")),
     ("acpc log ID -f", ("log", "abcd", "-f")),
     ("acpc run AGENT PROMPT --dry-run", ("run", "mock", "hello", "--dry-run")),
     ("acpc continue ID PROMPT --dry-run", ("continue", "abcd", "hello", "--dry-run")),

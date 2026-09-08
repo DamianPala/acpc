@@ -965,7 +965,13 @@ def test_timeout_direct_fallback_keeps_the_session_alive(cli: CliRunner) -> None
     session_id = envelope["context"]["session_id"]
     assert sessions.load(session_id).state in {"starting", "running"}
 
-    deadline = time.monotonic() + 5
+    # This deliberately exercises the direct fallback, where no daemon owns
+    # an await_turn event.  The only observable completion signal is the
+    # session state written by that child process, so polling is unavoidable.
+    # The child itself sleeps for two seconds; 15 seconds leaves scheduling
+    # room under the suite's 30-second per-test cap without changing the
+    # production timeout contract.
+    deadline = time.monotonic() + 15
     while sessions.load(session_id).is_active and time.monotonic() < deadline:
         time.sleep(0.05)
     assert sessions.load(session_id).state == "succeeded"

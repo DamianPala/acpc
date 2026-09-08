@@ -147,15 +147,17 @@ list [--limit N] [--plain] [--format text|json|plain]
 ### `log`
 
 ```text
-log SELECTOR [--since CURSOR] [--limit N] [--prose]
+log SELECTOR [--since CURSOR] [--limit N | --tail N] [--prose]
     [--format text|ndjson] [--max-output BYTES]
     [--wait-new | --follow] [--timeout S] [--quiet]
 ```
 
 `log` is a read-only record stream.
-Its default snapshot is the last 20 transcript events.
-`--since` first selects events after a global cursor, then a snapshot `--limit` selects the last N of those events.
-With `--follow`, an omitted limit is unbounded and an explicit limit ends observation after N emitted records.
+Its default non-follow window is the last 20 transcript events.
+`--since` selects events after a global cursor.
+`--limit N` then emits the first N records from that selected position in transcript order, while `--tail N` selects the last N matching records.
+`--limit` and `--tail` conflict.
+With `--follow`, an omitted limit is unbounded and an explicit `--limit` ends observation after N emitted records; `--tail` is unsupported.
 `--prose` renders full agent messages while retaining error records, and is mutually exclusive with `--json` and `--format ndjson`.
 `--format ndjson` emits one raw transcript record per line and is the stream format selected by `--json`.
 
@@ -253,7 +255,7 @@ wait SELECTOR [--timeout S] [--output-file FILE]
 
 The output field is a JSON Schema subset using only `type`, `enum`, `properties`, `required` and `items`. It describes the JSON success document, or one record for `log`. The generator walks the Click tree that actually parses the command. A group is indexed only when explicitly marked as dispatching useful work without a subcommand. An unknown schema path is an exit-2 usage error naming the nearest valid paths. Path segments are separate arguments.
 
-The installed binary currently publishes schema version `1`, tool version `0.7.1`, format defaults `{"tty": "text", "non_tty": "json"}`, and conformance name `cli-design-standard` at `0.1.0-draft.6` with extension `managed`. `tests/test_conformance.py` verifies the claim against the standard header and the behavior of every indexed command.
+The installed binary currently publishes schema version `1`, tool version `0.7.1`, format defaults `{"tty": "text", "non_tty": "json"}`, and conformance name `cli-design-standard` at `0.1.0-draft.7` with extension `managed`. `tests/test_conformance.py` verifies the claim against the standard header and the behavior of every indexed command.
 
 ## Output contract
 

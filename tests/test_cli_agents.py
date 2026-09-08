@@ -86,7 +86,6 @@ def invoke(cli: CliRunner, *args: str):
         (("agents", "init", "variant", "--extends", "mock"), "agents create"),
         (("rm", "abcd"), "acpc delete"),
         (("stop", "abcd"), "acpc cancel"),
-        (("log", "abcd", "--tail", "1"), "--limit"),
         (("log", "abcd", "-f"), "--follow"),
         (("run", "mock", "hello", "-o", "answer.md"), "--output-file"),
     ],

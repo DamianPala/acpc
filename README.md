@@ -42,7 +42,7 @@ continue <id> (prompt | - | --prompt-file)           # follow-up in the same ses
 steer <id> (instruction | - | --prompt-file)         # interrupt the running turn and redirect it
 status <id>                # one session's liveness-verified vitals
 list                       # active + recent sessions, bounded by 20
-log <id> [--since CURSOR] [--limit N] [--prose] [--wait-new | --follow]   # incremental transcript access
+log <id> [--since CURSOR] [--limit N | --tail N] [--prose] [--wait-new | --follow]   # incremental transcript access
 wait <id> [--timeout S]    # block until done, print the answer
 cancel <id>
 delete <id> --yes | prune [--older-than D] [--dry-run] [--yes]
@@ -87,7 +87,7 @@ acpc skills get refresh-adapter-models
 
 - **stdout carries exactly one thing**: the answer (default), a JSON envelope (`--json`), or id + session dir (`--background`). With `--output-file`, success leaves stdout empty and writes the exact selected payload to the file. Never spinners, logs, or diagnostics.
 - **Textual acpc metadata and footers on stderr** are prefixed `--`: the end-of-run summary (duration, tokens, exit, session id, dir) and `log`/`status` footers. Error envelopes are unprefixed JSON. Harnesses that merge streams can still separate the two mechanically.
-- **`log <id>`** is the progress view — condensed one-liners, tool calls and prose interleaved. **`log <id> --prose`** is the content view — clean markdown of what the agent wrote. `--since CURSOR` never re-emits events, so polling is cheap and stateless.
+- **`log <id>`** is the progress view — condensed one-liners, tool calls and prose interleaved. **`log <id> --prose`** is the content view — clean markdown of what the agent wrote. Its default non-follow window is the last 20 events. `--since CURSOR --limit N` emits the first N later events, so polling never skips the middle; `--tail N` selects the last N matching events and cannot be combined with `--limit` or `--follow`.
 
 ```
 $ acpc log x7k2 --since 42
