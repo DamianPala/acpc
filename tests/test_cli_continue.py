@@ -1,6 +1,7 @@
 """Behavioral tests for the ``continue`` verb."""
 
 import asyncio
+import errno
 import json
 import os
 import queue
@@ -181,8 +182,11 @@ def watch_for_file_open(path: Path) -> int:
         raise OSError(ctypes.get_errno(), "inotify_init1 failed")
     watch = libc.inotify_add_watch(fd, os.fsencode(path.parent), 0x20)
     if watch < 0:
+        error_number = ctypes.get_errno()
         os.close(fd)
-        raise OSError(ctypes.get_errno(), f"inotify_add_watch failed for {path.parent}")
+        if error_number == errno.ENOSPC:
+            pytest.skip("host exhausted its inotify watch limit")
+        raise OSError(error_number, f"inotify_add_watch failed for {path.parent}")
     return fd
 
 

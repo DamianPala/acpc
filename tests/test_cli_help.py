@@ -165,8 +165,10 @@ def test_help_names_behavioral_defaults_and_global_output_default(runner: CliRun
     assert "absent, it blocks indefinitely" in wait_help
     assert "absent, it blocks indefinitely" in log_help
     assert "Without --since, --limit, or --tail this shows the last 20 events" in log_help
-    assert "with --limit, emit the first N selected events" in log_help
+    assert "emit selected records in transcript order" in log_help
     assert "Conflicts with --tail" in log_help
+    assert "Select the last N matching records and emit them in transcript order" in log_help
+    assert "--tail replays its last N records first" in log_help
     assert (
         "absent, ask when acpc could put the question — stdin and stdout both terminals, "
         "no --json, NO_INPUT unset — and read in every other case"

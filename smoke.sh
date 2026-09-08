@@ -821,7 +821,7 @@ if begin_section S08-views "status list/detail, log default/--since/--limit/--pr
     assert_eq "log --wait-new returns 124 at once on a finished session" "124" "$LAST_RC"
     assert_contains "the immediate 124 carries the finished footer" "$LAST_ERR" "succeeded"
 
-    # --follow: the bounded call that replaces a hand-rolled --wait-new loop.
+    # --follow: an unbounded call that replaces a hand-rolled --wait-new loop.
     # A finished session ends the stream at once and that ending is success --
     # the `logs -f` convention -- unlike --wait-new's "nothing new" 124.
     run_acpc log "$UTIL_ID" --follow --timeout 30
@@ -1255,8 +1255,8 @@ if begin_section S12-cli "help contract, -V, TTY rules, hostile inputs"; then
         "$HELP_MAIN" "Truncated or huge answer?"
     assert_contains "cheat sheet distinguishes SIGINT from SIGTERM" \
         "$HELP_MAIN" "SIGINT cancels the turn owned by this command."
-    assert_contains "cheat sheet frames --follow as the supervision case" \
-        "$HELP_MAIN" "case for --follow"
+    assert_contains "cheat sheet makes the follow replay depth explicit" \
+        "$HELP_MAIN" "--tail 10 --follow"
     run_acpc -h
     assert_eq "-h matches --help" "$HELP_MAIN" "$LAST_OUT"
 

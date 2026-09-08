@@ -448,9 +448,8 @@ Checking on a run:
   acpc log <id>                    # the default: instant snapshot, condensed
   Need only the result? wait <id>. Don't block on a run you won't act on.
 
-Supervising a risky run you intend to steer/cancel mid-flight — the one
-case for --follow (a bounded digest, not a live view):
-  acpc log <id> --follow --timeout 60 --max-output 16384
+Supervising a risky run you intend to steer/cancel mid-flight:
+  acpc log <id> --tail 10 --follow --timeout 60 --max-output 16384
   Ends at session end (exit 0), the timeout (124) or the cap (4); resume
   with --since <cursor> from the footer.
 
@@ -2913,8 +2912,6 @@ def _status_view_meta(meta: sessions.SessionMeta) -> sessions.SessionMeta:
 
 
 _LOG_DEFAULT_TAIL = 20
-# SPEC `log --follow`: a bounded replay for orientation, the `tail -f` prior.
-_FOLLOW_DEFAULT_TAIL = 10
 _LOG_WAIT_POLL_INTERVAL = 0.05
 
 
@@ -3111,8 +3108,8 @@ def list_command(
 @schema.describes(
     selector=_SELECTOR_HELP,
     since=(
-        "Select events after this cursor; 0 or greater. With --limit, emit the first N "
-        "selected events in transcript order."
+        "Select events after this cursor; 0 or greater. Emit selected records in transcript "
+        "order. With --follow, start after this cursor and continue without a default window."
     ),
     limit=(
         "Emit at most N records from the selected position in transcript order; it does not "
@@ -3120,8 +3117,9 @@ def list_command(
         "--follow, it ends the read after N records. Conflicts with --tail."
     ),
     tail=(
-        "Select the last N matching records; 0 or greater. The default non-follow window is "
-        "the last 20 records. Conflicts with --limit and is unsupported with --follow."
+        "Select the last N matching records and emit them in transcript order; 0 or greater. "
+        "The default non-follow window is the last 20 records. With --follow, replay those "
+        "records, then continue without a default window. Conflicts with --limit."
     ),
 )
 @main.command(name="log")
@@ -3131,7 +3129,10 @@ def list_command(
     type=click.IntRange(min=0),
     default=None,
     metavar="N",
-    help="Select events after this cursor; with --limit, emit the first N selected events.",
+    help=(
+        "Select events after this cursor and emit selected records in transcript order; with "
+        "--follow, start there and continue without a default window."
+    ),
 )
 @click.option(
     "--limit",
@@ -3150,8 +3151,9 @@ def list_command(
     default=None,
     metavar="N",
     help=(
-        "Select the last N matching records. The default non-follow window is the last 20 "
-        "records. Conflicts with --limit and is unsupported with --follow."
+        "Select the last N matching records and emit them in transcript order. The default "
+        "non-follow window is the last 20 records. With --follow replay those records, then "
+        "continue without a default window. Conflicts with --limit."
     ),
 )
 @click.option(
@@ -3183,8 +3185,10 @@ def list_command(
     "--follow",
     is_flag=True,
     help=(
-        "Collect events until the session ends; exit 124 on --timeout, 4 on --max-output; "
-        "mutually exclusive with --wait-new."
+        "Collect transcript-order events until the session ends. Without --limit or --tail, "
+        "start after --since (or at the transcript start) with no default window; --tail "
+        "replays its last N records first, and --limit ends after N records. Exit 124 on "
+        "--timeout, 4 on --max-output; mutually exclusive with --wait-new."
     ),
 )
 @click.option(
@@ -3230,8 +3234,6 @@ def log_command(
         )
     if limit is not None and tail is not None:
         raise UsageProblem("--limit and --tail are mutually exclusive")
-    if tail is not None and follow:
-        raise UsageProblem("--tail is unsupported with --follow")
     if timeout is not None and not (wait_new or follow):
         raise UsageProblem("--timeout requires --wait-new or --follow")
 
@@ -3251,7 +3253,7 @@ def log_command(
         highest_cursor = _read_transcript_page(transcript_file).next_cursor
         if cursor > highest_cursor:
             since_note = _since_past_end_note(cursor, highest_cursor)
-    selection_tail = None if follow else tail
+    selection_tail = tail
     if selection_tail is None and limit is None and not explicit_since and not follow:
         selection_tail = _LOG_DEFAULT_TAIL
 
@@ -3261,7 +3263,7 @@ def log_command(
             transcript_file,
             cursor=cursor,
             limit=limit,
-            replay_tail=None if limit is not None else _FOLLOW_DEFAULT_TAIL,
+            replay_tail=tail,
             prose=prose,
             json_mode=json_mode,
             max_output=max_output,

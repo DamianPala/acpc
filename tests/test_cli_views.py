@@ -486,7 +486,7 @@ def test_log_tail_selects_the_last_matching_events(cli: CliRunner) -> None:
 
 @pytest.mark.parametrize(
     "args",
-    [("--tail", "2", "--limit", "2"), ("--tail", "2", "--follow")],
+    [("--tail", "2", "--limit", "2")],
 )
 def test_log_rejects_conflicting_tail_selectors(cli: CliRunner, args: tuple[str, ...]) -> None:
     result = invoke(cli, "log", "does-not-exist", *args, "--json")
@@ -771,16 +771,26 @@ def test_failed_log_expands_the_last_agent_message(cli: CliRunner) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_follow_replays_the_last_ten_events_by_default(cli: CliRunner) -> None:
-    """SPEC --follow: the start point is a bounded replay, for orientation."""
+def test_follow_without_a_selector_replays_every_event(cli: CliRunner) -> None:
+    """An unqualified follow starts at the transcript beginning without a hidden window."""
     meta = session_with_messages(25)
 
-    result = invoke(cli, "log", meta.session_id, "--follow")
+    result = invoke(cli, "log", meta.session_id, "--json", "--follow", "--quiet")
 
     assert result.exit_code == vocab.EXIT_OK
-    assert len(result.stdout.splitlines()) == 10
-    assert '"event-15"' in result.stdout
-    assert '"event-14"' not in result.stdout
+    records = [json.loads(line) for line in result.stdout.splitlines()]
+    assert [record["text"] for record in records] == [f"event-{index}" for index in range(25)]
+
+
+def test_follow_tail_replays_the_selected_window_then_follows(cli: CliRunner) -> None:
+    """An explicit tail chooses the replay depth for the tail-follow form."""
+    meta = session_with_messages(25)
+
+    result = invoke(cli, "log", meta.session_id, "--json", "--tail", "3", "--follow", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_OK
+    records = [json.loads(line) for line in result.stdout.splitlines()]
+    assert [record["text"] for record in records] == ["event-22", "event-23", "event-24"]
 
 
 def test_follow_limit_zero_replays_nothing(cli: CliRunner) -> None:

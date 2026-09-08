@@ -22,8 +22,9 @@ This guide describes the public changes accumulated before acpc 1.0. The command
 | `acpc status --json` | `acpc list --json` | Collection-only flags belong to `list`. |
 | `acpc status --limit N` | `acpc list --limit N` | Collection limits belong to `list`. |
 | `acpc status --plain --limit N` | `acpc list --plain --limit N` | Plain collection output belongs to `list`. |
-| `acpc log ID --tail N` | `acpc log ID --tail N` | `--tail` is restored and selects the last N matching records. It cannot be combined with `--limit` or `--follow`. |
+| `acpc log ID --tail N` | `acpc log ID --tail N` | `--tail` selects the last N matching records in transcript order. It conflicts with `--limit`; with `--follow`, it replays those N records and then keeps reading. |
 | `acpc log ID --limit N` from the earlier 1.0 draft | `acpc log ID --tail N` when the caller needs the last N records | `--limit` changes meaning for the second time in 1.0: it now emits the first N records from the selected position, including after `--since`; it no longer chooses the tail. Keep `--limit` for forward polling. |
+| `acpc log ID --follow` expecting a bounded replay | `acpc log ID --tail N --follow` | `--follow` now starts at the beginning of the transcript when no selector is present. Use an explicit `--tail N` to replay the last N matching records before following. |
 | `acpc log ID -f` | `acpc log ID --follow` | `-f` is reserved for daemon `--force`. |
 | `acpc run AGENT PROMPT --dry-run` | `acpc resolve AGENT` | Resolution preview is a separate read-only command. |
 | `acpc continue ID PROMPT --dry-run` | `acpc resolve AGENT` | A session continuation has no resolution preview. |

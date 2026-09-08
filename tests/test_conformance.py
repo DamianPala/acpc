@@ -20,6 +20,7 @@ import signal
 import subprocess
 import sys
 import time
+import warnings
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -49,6 +50,20 @@ EXPECTED_TOOL_VERSION = "0.7.1"
 EXPECTED_STANDARD_NAME = "cli-design-standard"
 EXPECTED_STANDARD_VERSION = "0.1.0-draft.7"
 EXPECTED_EXTENSIONS = ["managed"]
+REQUIRED_STANDARD_CLAUSES = (
+    (
+        "The identifier MUST remain usable after the initiating process exits and, until expiry "
+        "under a documented retention policy, MUST NOT resolve to a different entity."
+    ),
+    (
+        "`--limit N` is the maximum number of records emitted from the selected position in the "
+        "documented order; it does not select that position."
+    ),
+    (
+        "`--follow`, an unbounded mode selected explicitly under I8c, removes the default window "
+        "when offered."
+    ),
+)
 EXPECTED_EXIT_DESCRIPTIONS = {
     "0": "Success, including an empty result: the turn ended normally, or the view rendered.",
     "1": (
@@ -1741,6 +1756,9 @@ def test_O7a_O7b_O7c_O7d_log_stream_is_framed_bounded_ordered_and_complete(
     assert "last 20" in flags["limit"] and "--follow" in flags["limit"]
     assert "--tail" in flags["limit"]
     assert "last 20" in flags["tail"] and "--follow" in flags["tail"]
+    assert "transcript order" in flags["tail"]
+    assert "transcript-order events" in flags["follow"]
+    assert "--tail" in flags["follow"]
     conflict = invoke(cli, "log", session_id, "--tail", "2", "--limit", "2", "--json", "--quiet")
     assert conflict.exit_code == vocab.EXIT_USAGE
     assert _error(conflict)["kind"] == errors.INVALID_INPUT
@@ -1759,6 +1777,19 @@ def test_O7a_O7b_O7c_O7d_log_stream_is_framed_bounded_ordered_and_complete(
     )
     assert followed.exit_code == vocab.EXIT_OK, followed.stderr
     assert len(followed.stdout.splitlines()) == 1
+
+    followed_tail = invoke(
+        cli,
+        "log",
+        session_id,
+        "--json",
+        "--tail",
+        "3",
+        "--follow",
+        "--quiet",
+    )
+    assert followed_tail.exit_code == vocab.EXIT_OK, followed_tail.stderr
+    assert [json.loads(line) for line in followed_tail.stdout.splitlines()] == all_records[-3:]
 
 
 def test_F1e_O2f_exit_table_and_delegated_stdout_decision(cli: CliRunner) -> None:
@@ -2412,19 +2443,28 @@ def test_F2b_F5_wait_interrupts_in_pipe_and_pty_contexts(cli: CliRunner, live_da
 
 def test_D7c_claim_is_bound_to_the_versioned_standard_snapshot(cli: CliRunner) -> None:
     snapshot = STANDARD_SNAPSHOT.read_bytes()
+    snapshot_text = snapshot.decode()
     metadata = json.loads(STANDARD_METADATA.read_text(encoding="utf-8"))
     source_path = Path(metadata["source"])
     assert not source_path.is_absolute()
     assert metadata["source_repository"] == "https://github.com/DamianPala/haz-skills.git"
     assert metadata["content_sha256"] == hashlib.sha256(snapshot).hexdigest()
-    version = re.search(r"^\*\*Version:\*\*\s+(\S+)$", snapshot.decode(), re.MULTILINE)
+    version = re.search(r"^\*\*Version:\*\*\s+(\S+)$", snapshot_text, re.MULTILINE)
     assert version is not None
     assert version.group(1) == EXPECTED_STANDARD_VERSION
     assert read_index(cli)["conformance"]["standard"] == version.group(1)
+    for clause in REQUIRED_STANDARD_CLAUSES:
+        assert clause in snapshot_text
 
     checkout = os.environ.get("ACPC_STANDARD_CHECKOUT")
     if checkout is None:
-        pytest.skip("set ACPC_STANDARD_CHECKOUT to check the repository snapshot")
+        warnings.warn(
+            "conformance claim is unverified against its external source; set "
+            "ACPC_STANDARD_CHECKOUT to verify the repository snapshot",
+            pytest.PytestWarning,
+            stacklevel=2,
+        )
+        return
     checkout_path = Path(checkout)
     assert checkout_path.read_bytes() == snapshot
     source_repository = Path(

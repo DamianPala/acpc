@@ -87,7 +87,7 @@ acpc skills get refresh-adapter-models
 
 - **stdout carries exactly one thing**: the answer (default), a JSON envelope (`--json`), or id + session dir (`--background`). With `--output-file`, success leaves stdout empty and writes the exact selected payload to the file. Never spinners, logs, or diagnostics.
 - **Textual acpc metadata and footers on stderr** are prefixed `--`: the end-of-run summary (duration, tokens, exit, session id, dir) and `log`/`status` footers. Error envelopes are unprefixed JSON. Harnesses that merge streams can still separate the two mechanically.
-- **`log <id>`** is the progress view — condensed one-liners, tool calls and prose interleaved. **`log <id> --prose`** is the content view — clean markdown of what the agent wrote. Its default non-follow window is the last 20 events. `--since CURSOR --limit N` emits the first N later events, so polling never skips the middle; `--tail N` selects the last N matching events and cannot be combined with `--limit` or `--follow`.
+- **`log <id>`** is the progress view — condensed one-liners, tool calls and prose interleaved. **`log <id> --prose`** is the content view — clean markdown of what the agent wrote. Its default non-follow window is the last 20 events, emitted in transcript order. `--since CURSOR --limit N` emits the first N later events, so polling never skips the middle. `--follow` without a selector starts at the transcript beginning; `--since CURSOR --follow` starts after the cursor; `--tail N --follow` replays the last N matching events in transcript order and then keeps reading. `--limit` conflicts with `--tail` and ends a follow after N emitted events.
 
 ```
 $ acpc log x7k2 --since 42

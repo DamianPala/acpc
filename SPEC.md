@@ -155,14 +155,17 @@ log SELECTOR [--since CURSOR] [--limit N | --tail N] [--prose]
 `log` is a read-only record stream.
 Its default non-follow window is the last 20 transcript events.
 `--since` selects events after a global cursor.
-`--limit N` then emits the first N records from that selected position in transcript order, while `--tail N` selects the last N matching records.
+`--limit N` then emits the first N records from that selected position in transcript order, while `--tail N` selects the last N matching records and emits them in transcript order.
 `--limit` and `--tail` conflict.
-With `--follow`, an omitted limit is unbounded and an explicit `--limit` ends observation after N emitted records; `--tail` is unsupported.
+With `--follow`, omitting both `--limit` and `--tail` starts after `--since`, or at the beginning of the transcript, without a default window.
+`--since X --follow` starts after X without a default window.
+`--tail N --follow` replays the last N records matching any `--since` selection in transcript order, then continues without a default window.
+An explicit `--limit` ends observation after N emitted records, including with `--follow`.
 `--prose` renders full agent messages while retaining error records, and is mutually exclusive with `--json` and `--format ndjson`.
 `--format ndjson` emits one raw transcript record per line and is the stream format selected by `--json`.
 
 `--wait-new` waits for activity.
-`--follow` collects until the session ends.
+`--follow` collects transcript-order events until the session ends.
 They are mutually exclusive.
 A wait deadline leaves the session unchanged and exits 124.
 A follow stopped by `--max-output` exits 4.

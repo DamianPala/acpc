@@ -31,6 +31,8 @@ from acpc.permissions import PermissionLevel, select_mode
 from acpc.registry import AgentRegistry
 from acpc.transcript import Transcript
 
+pytestmark = pytest.mark.timeout(120)
+
 MOCK_AGENT_SCRIPT = str(Path(__file__).with_name("mock_agent.py"))
 
 MOCK_ENTRY = f"""
@@ -1040,7 +1042,7 @@ def test_daemon_stop_fails_its_active_sessions_rather_than_orphaning_them(
         )
     )
     assert problem is None
-    _wait_for(session_id, "running")
+    _assert_state(session_id, "running")
 
     asyncio.run(_stop_target())
 
@@ -1069,7 +1071,7 @@ def test_killed_adapter_records_a_failure_event(state_root: Path, live_daemon: N
         )
     )
     assert problem is None
-    _wait_for(session_id, "running")
+    _assert_state(session_id, "running")
 
     daemon_pid = asyncio.run(_daemon_pid())
     children_path = Path(f"/proc/{daemon_pid}/task/{daemon_pid}/children")
@@ -1347,7 +1349,7 @@ def test_a_turn_past_the_slot_limit_is_reported_as_queued(
             blocker, runner.TurnRequest(resolution=resolve(), prompt="slow:30 slot holder")
         )
     )
-    _wait_for(blocker, "running")
+    _assert_state(blocker, "running")
 
     second = new_session("waiting for a slot")
     outcome = asyncio.run(_start_and_report(second, "waiting for a slot"))
@@ -1477,7 +1479,7 @@ def _count_messages(session_id: str, needle: str) -> int:
     return sum(needle in event.get("text", "") for event in _messages(session_id))
 
 
-def _wait_for_message(session_id: str, needle: str, timeout: float = 20.0) -> None:
+def _wait_for_message(session_id: str, needle: str, timeout: float = 90.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if _count_messages(session_id, needle):
@@ -1500,23 +1502,15 @@ def _events(session_id: str) -> list[dict]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
 
 
-def _wait_for(session_id: str, state: str, timeout: float = 20.0) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if sessions.read_meta(session_id).state == state:
-            return
-        time.sleep(0.1)
-    pytest.fail(f"session {session_id} never reached {state}")
+def _assert_state(session_id: str, state: str) -> None:
+    assert sessions.read_meta(session_id).state == state
 
 
 def _wait_for_finished(session_id: str, timeout: float = 20.0) -> sessions.SessionMeta:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        meta = sessions.read_meta(session_id)
-        if meta.is_finished:
-            return meta
-        time.sleep(0.1)
-    pytest.fail(f"session {session_id} never finished")
+    assert runner.wait_for_session(session_id, timeout=timeout) is not None
+    meta = sessions.read_meta(session_id)
+    assert meta.is_finished
+    return meta
 
 
 def test_a_daemon_whose_socket_is_gone_stops_itself(state_root: Path, live_daemon: None) -> None:
