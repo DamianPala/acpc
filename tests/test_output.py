@@ -55,6 +55,9 @@ def test_json_envelope_has_pinned_fields_and_truncates_answer_only() -> None:
     assert set(payload) == {
         "status",
         "session_id",
+        "created_at",
+        "started_at",
+        "finished_at",
         "stop_reason",
         "paths",
         "cost",
@@ -84,6 +87,9 @@ def test_background_and_output_file_shapes_are_separate(tmp_path: Path) -> None:
     assert set(background) == {
         "session_id",
         "status",
+        "created_at",
+        "started_at",
+        "finished_at",
         "paths",
         "denied",
         "permissions_clamp",

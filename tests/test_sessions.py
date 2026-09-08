@@ -205,7 +205,7 @@ class TestTransitions:
         assert done.stop_reason == "end_turn"
         assert done.tokens == 41_000
 
-    @pytest.mark.parametrize("final", ["succeeded", "failed", "canceled", "timeout", "orphaned"])
+    @pytest.mark.parametrize("final", ["succeeded", "failed", "canceled", "unknown"])
     def test_every_final_state_is_reachable_from_running(self, final: str) -> None:
         meta = make_session()
         sessions.mark_running(meta.session_id, pid=1, process_start_time="tok", clock=at(1.0))
@@ -256,29 +256,29 @@ class TestLivenessAndOrphans:
         )
         assert sessions.load(meta.session_id, clock=at(600.0)).state == "running"
 
-    def test_a_dead_host_process_is_reported_and_persisted_as_orphaned(self) -> None:
+    def test_a_dead_host_process_is_reported_and_persisted_as_unknown(self) -> None:
         meta = make_session()
         sessions.mark_running(
             meta.session_id, pid=_dead_pid(), process_start_time="tok", clock=at(1.0)
         )
 
-        assert sessions.load(meta.session_id, clock=at(2.0)).state == "orphaned"
+        assert sessions.load(meta.session_id, clock=at(2.0)).state == "unknown"
         on_disk = json.loads(sessions.meta_path(meta.session_id).read_text())
-        assert on_disk["status"] == "orphaned"
-        assert on_disk["stop_reason"] == "orphaned"
+        assert on_disk["status"] == "unknown"
+        assert on_disk["stop_reason"] == "unknown"
         assert on_disk["exit_code"] == vocab.EXIT_AGENT_ERROR
         assert on_disk["finished_at"] == "2025-10-09T08:53:22.000000Z"
 
-    def test_orphan_detection_does_not_wait_for_the_startup_grace(self) -> None:
+    def test_unknown_outcome_detection_does_not_wait_for_the_startup_grace(self) -> None:
         # Once a pid is recorded, liveness decides immediately — smoke kills a
-        # freshly started session and expects `orphaned` within seconds.
+        # freshly started session and expects `unknown` within seconds.
         meta = make_session()
         sessions.mark_running(
             meta.session_id, pid=_dead_pid(), process_start_time="tok", clock=at(1.0)
         )
-        assert sessions.load(meta.session_id, clock=at(1.5)).state == "orphaned"
+        assert sessions.load(meta.session_id, clock=at(1.5)).state == "unknown"
 
-    def test_orphan_detection_writes_the_placeholder_answer(self) -> None:
+    def test_unknown_outcome_detection_writes_the_placeholder_answer(self) -> None:
         meta = make_session()
         dead = _dead_pid()
         sessions.mark_running(meta.session_id, pid=dead, process_start_time="tok", clock=at(1.0))
@@ -290,7 +290,7 @@ class TestLivenessAndOrphans:
         assert meta.session_id in placeholder
         assert placeholder.count("\n") == 1
 
-    def test_a_partial_answer_survives_orphan_detection(self) -> None:
+    def test_a_partial_answer_survives_unknown_outcome_detection(self) -> None:
         meta = make_session()
         sessions.write_answer(meta.session_id, "partial work\n")
         sessions.mark_running(
@@ -311,9 +311,9 @@ class TestLivenessAndOrphans:
             process_start_time="0",
             clock=at(1.0),
         )
-        assert sessions.load(meta.session_id, clock=at(2.0)).state == "orphaned"
+        assert sessions.load(meta.session_id, clock=at(2.0)).state == "unknown"
 
-    def test_a_killed_process_flips_every_reader_to_orphaned(self) -> None:
+    def test_a_killed_process_flips_every_reader_to_unknown(self) -> None:
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
         try:
             meta = make_session()
@@ -327,8 +327,8 @@ class TestLivenessAndOrphans:
             child.kill()
             child.wait(timeout=10)
 
-            assert sessions.load(meta.session_id, clock=at(3.0)).state == "orphaned"
-            assert sessions.list_sessions(clock=at(3.0))[0].state == "orphaned"
+            assert sessions.load(meta.session_id, clock=at(3.0)).state == "unknown"
+            assert sessions.list_sessions(clock=at(3.0))[0].state == "unknown"
             assert sessions.answer_path(meta.session_id).exists()
         finally:
             child.kill()
@@ -338,15 +338,15 @@ class TestLivenessAndOrphans:
         meta = make_session()
         assert sessions.load(meta.session_id, clock=at(29.0)).state == "starting"
 
-    def test_past_the_startup_grace_a_pidless_session_is_orphaned(self) -> None:
+    def test_past_the_startup_grace_a_pidless_session_is_unknown(self) -> None:
         meta = make_session()
-        assert sessions.load(meta.session_id, clock=at(31.0)).state == "orphaned"
+        assert sessions.load(meta.session_id, clock=at(31.0)).state == "unknown"
 
     def test_the_grace_window_runs_from_started_at_when_present(self) -> None:
         meta = make_session()
         sessions.update_meta(meta.session_id, started_at=BASE_TIME + 100.0)
         assert sessions.load(meta.session_id, clock=at(120.0)).state == "starting"
-        assert sessions.load(meta.session_id, clock=at(140.0)).state == "orphaned"
+        assert sessions.load(meta.session_id, clock=at(140.0)).state == "unknown"
 
     def test_a_finished_session_is_never_re_probed(self) -> None:
         session_id = finished_session()
@@ -359,7 +359,7 @@ class TestLivenessAndOrphans:
             meta.session_id, pid=_dead_pid(), process_start_time="tok", clock=at(1.0)
         )
         assert sessions.read_meta(meta.session_id).state == "running"
-        assert sessions.load(meta.session_id, clock=at(2.0)).state == "orphaned"
+        assert sessions.load(meta.session_id, clock=at(2.0)).state == "unknown"
 
 
 class TestTurnRotation:
@@ -577,7 +577,7 @@ class TestListing:
         sessions.mark_running(
             meta.session_id, pid=_dead_pid(), process_start_time="tok", clock=at(1.0)
         )
-        assert sessions.list_sessions(clock=at(2.0))[0].state == "orphaned"
+        assert sessions.list_sessions(clock=at(2.0))[0].state == "unknown"
 
     def test_a_damaged_session_does_not_hide_the_others(self) -> None:
         healthy = make_session(clock=at())
@@ -721,7 +721,7 @@ class TestDeletion:
             sessions.delete_session(meta.session_id, clock=at(2.0))
         assert sessions.session_dir(meta.session_id).exists()
 
-    def test_an_orphaned_session_is_deletable(self) -> None:
+    def test_an_unknown_session_is_deletable(self) -> None:
         meta = make_session()
         sessions.mark_running(
             meta.session_id, pid=_dead_pid(), process_start_time="tok", clock=at(1.0)
@@ -787,20 +787,20 @@ class TestPrune:
         assert sessions.prune_sessions(older_than=1.0, clock=at(500_000.0)) == []
         assert sessions.session_dir(meta.session_id).exists()
 
-    def test_orphaned_sessions_are_collected(self) -> None:
+    def test_unknown_sessions_are_collected(self) -> None:
         meta = make_session()
         sessions.mark_running(
             meta.session_id, pid=_dead_pid(), process_start_time="tok", clock=at(1.0)
         )
         # Detection is what ends the session, so its age runs from there.
-        assert sessions.load(meta.session_id, clock=at(2.0)).state == "orphaned"
+        assert sessions.load(meta.session_id, clock=at(2.0)).state == "unknown"
 
         removed = sessions.prune_sessions(older_than=86_400.0, clock=at(500_000.0))
 
         assert [entry.session_id for entry in removed] == [meta.session_id]
         assert not sessions.session_dir(meta.session_id).exists()
 
-    def test_a_just_detected_orphan_is_not_old_enough_to_prune(self) -> None:
+    def test_a_just_detected_unknown_outcome_is_not_old_enough_to_prune(self) -> None:
         meta = make_session()
         sessions.mark_running(
             meta.session_id, pid=_dead_pid(), process_start_time="tok", clock=at(1.0)

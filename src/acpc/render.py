@@ -610,7 +610,7 @@ def status_list_json(
     limit: int = DEFAULT_STATUS_LIMIT,
     clock: Clock | None = None,
 ) -> dict[str, Any]:
-    """Build the JSON shape for ``status`` without an id."""
+    """Build the JSON shape for the bounded ``list`` collection."""
     selected = _status_selection(sessions_in, limit=limit)
     rows = []
     for meta in selected:

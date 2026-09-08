@@ -457,7 +457,8 @@ Context care (agent callers):
   Every --timeout takes seconds (90) or a duration (90s, 5m, 1h).
 
 Maintenance and setup:
-  status            running + the 20 most recent sessions (--limit N to change)
+  status <id>       liveness-verified metadata for one session
+  list              running + the 20 most recent sessions (--limit N to change)
   cancel <id>       cancel a running session; it stays resumable with continue
   delete <id> --yes delete a finished session's on-disk state
   prune --yes       delete finished sessions older than retention (--older-than D)
@@ -468,7 +469,7 @@ Maintenance and setup:
   never needs it. --force is separate: it overrides a documented refusal.
 
 Common commands:
-  run, resolve, continue, steer, wait, status, log, agents, skills, daemon,
+  run, resolve, continue, steer, wait, status, list, log, agents, skills, daemon,
   probe, cancel, delete, prune, install
   Use `acpc <command> --help` for the command's full reference.
 
@@ -519,7 +520,10 @@ class _CheatSheetGroup(click.Group):
         except AcpcError as error:
             _fail(error)
         except click.ClickException as error:
-            _fail(AcpcError(error.format_message(), exit_code=error.exit_code))
+            error_context = getattr(error, "ctx", None)
+            command_path = getattr(error_context, "command_path", None)
+            message = _friendly_usage_message(error.format_message(), command_path=command_path)
+            _fail(AcpcError(message, exit_code=error.exit_code))
         except (click.Abort, KeyboardInterrupt):
             # Click turns Ctrl-C into Abort; a stack trace here would say the
             # tool broke, when the caller simply stopped it.
@@ -643,6 +647,18 @@ def _friendly_option_hint(message: str, command_parts: list[str]) -> str | None:
         )
         if hint is not None:
             return hint
+    if command_parts[-1:] == ["status"]:
+        hint = _matching_option_hint(
+            message,
+            {
+                "--limit": "--limit belongs to: acpc list --limit N",
+                "--plain": "--plain belongs to: acpc list --plain --limit N",
+            },
+        )
+        if hint is not None:
+            return hint
+        if "Invalid value for '--format'" in message and "plain" in message:
+            return "--format plain belongs to: acpc list --format plain --limit N"
     if command_parts[-1:] == ["continue"]:
         hint = _matching_option_hint(
             message,
@@ -729,6 +745,10 @@ def _friendly_command_hint(message: str, command_parts: list[str]) -> str | None
 def _friendly_usage_message(message: str, *, command_path: str | None = None) -> str:
     """Replace known neighboring-tool spellings with their acpc equivalents."""
     command_parts = (command_path or "").split()
+    if command_parts[-1:] == ["status"] and (
+        "Missing argument" in message or "Missing parameter" in message
+    ):
+        return "status requires a session id — use acpc list to list sessions"
     return (
         _friendly_option_hint(message, command_parts)
         or _friendly_command_hint(message, command_parts)
@@ -2530,11 +2550,13 @@ def cancel_command(selector: str, format_name: str | None, json_mode: bool) -> N
     """
     selected_format = _select_format(format_name, json_mode)
     meta = _load_view_session(selector)
-    if not meta.is_active:
+    was_active = meta.is_active
+    if not was_active:
         meta = _status_view_meta(meta)
-    changed = meta.is_active or meta.state == "preparing"
-    if changed:
+        was_active = meta.is_active
+    if was_active:
         meta = _cancel_session(meta)
+    changed = was_active and meta.state == "canceled"
 
     payload = {
         "session_id": meta.session_id,
@@ -2808,9 +2830,68 @@ def _latest_failure_message(session_id: str) -> str | None:
 
 
 @effects.read_only
-@schema.describes(selector=f"{_SELECTOR_HELP} Absent, it reports a bounded collection of sessions.")
+@schema.describes(selector=_SELECTOR_HELP)
 @main.command(name="status")
-@click.argument("selector", required=False)
+@click.argument("selector")
+@click.option(
+    "--format",
+    "format_name",
+    type=click.Choice(("text", "json")),
+    help=_FORMAT_NATIVE_HELP,
+)
+@_color_option()
+@_json_option("Emit a JSON status object.")
+@click.help_option("-h", "--help")
+def status_command(selector: str, format_name: str | None, json_mode: bool) -> None:
+    """Show liveness-verified metadata for one session without reading transcripts.
+
+    State is verified against the process behind it, so a ``running`` session
+    whose process is gone reads ``unknown`` rather than stale ``running``. A
+    daemon-owned continuation in its pre-prompt window is shown as ``preparing``.
+
+    Example: ``acpc status <session-id> --json``
+    """
+    selected_format = _select_format(format_name, json_mode)
+    meta = _status_view_meta(_load_view_session(selector))
+    if selected_format == "json":
+        _write_stdout(json.dumps(render.status_detail_json(meta), ensure_ascii=False) + "\n")
+    else:
+        _write_stdout(render.render_status_detail(meta))
+
+
+def _status_collection(
+    format_name: str | None,
+    json_mode: bool,
+    limit: int,
+    plain: bool,
+    explicit_limit: bool,
+) -> None:
+    selected_format = _select_format(format_name, json_mode, plain=plain)
+    if selected_format == "plain" and not explicit_limit:
+        raise UsageProblem("--plain requires an explicit --limit")
+    metas = sessions.list_sessions()
+    targets = [meta.target for meta in metas if meta.target is not None]
+    preparing = asyncio.run(_collect_preparing_sessions(targets)) if targets else set()
+    metas = [
+        replace(meta, state="preparing") if meta.session_id in preparing else meta for meta in metas
+    ]
+    if selected_format == "json":
+        _write_stdout(
+            json.dumps(render.status_list_json(metas, limit=limit), ensure_ascii=False) + "\n"
+        )
+    elif selected_format == "plain":
+        selected = render.status_items(metas, limit=limit)
+        _write_stdout("".join(f"{meta.session_id}\n" for meta in selected))
+    else:
+        _write_stdout(render.render_status_list(metas, limit=limit))
+
+
+@effects.read_only
+@schema.describes(
+    limit="Return at most N sessions; the default is finite and has_more reports the rest.",
+    plain="Print one session id per line; requires explicit --limit.",
+)
+@main.command(name="list")
 @click.option(
     "--limit",
     type=click.IntRange(min=0),
@@ -2829,59 +2910,26 @@ def _latest_failure_message(session_id: str) -> str | None:
     help=_FORMAT_COLLECTION_HELP,
 )
 @_color_option()
-@_json_option("Emit a JSON status object.")
+@_json_option("Emit a JSON session collection.")
 @click.help_option("-h", "--help")
 @click.pass_context
-def status_command(
+def list_command(
     ctx: click.Context,
-    selector: str | None,
     limit: int,
     plain: bool,
     format_name: str | None,
     json_mode: bool,
 ) -> None:
-    """Show liveness-verified session metadata without reading transcripts.
+    """List liveness-verified sessions as a bounded collection.
 
-    With no id: a bounded collection of sessions. With an id: that session's vitals.
-    State is verified against the
-    process behind it, so a ``running`` session whose process is gone reads
-    ``orphaned`` rather than a stale ``running``. A daemon-owned continuation in
-    its pre-prompt window is shown as ``preparing`` from the daemon's in-memory
-    register.
+    The collection includes active sessions and the most recent finished
+    sessions. A daemon-owned continuation in its pre-prompt window is shown as
+    ``preparing`` from the daemon's in-memory register.
 
-    Example: ``acpc status <session-id> --json``
+    Example: ``acpc list --limit 20 --json``
     """
-    selected_format = _select_format(format_name, json_mode, plain=plain)
     explicit_limit = ctx.get_parameter_source("limit") is click.core.ParameterSource.COMMANDLINE
-    if selector is not None and selected_format == "plain":
-        raise UsageProblem("--plain is available only for the status collection")
-    if selected_format == "plain" and not explicit_limit:
-        raise UsageProblem("--plain requires an explicit --limit")
-
-    if selector is not None:
-        meta = _load_view_session(selector)
-        meta = _status_view_meta(meta)
-        if selected_format == "json":
-            _write_stdout(json.dumps(render.status_detail_json(meta), ensure_ascii=False) + "\n")
-        else:
-            _write_stdout(render.render_status_detail(meta))
-        return
-
-    metas = sessions.list_sessions()
-    targets = [meta.target for meta in metas if meta.target is not None]
-    preparing = asyncio.run(_collect_preparing_sessions(targets)) if targets else set()
-    metas = [
-        replace(meta, state="preparing") if meta.session_id in preparing else meta for meta in metas
-    ]
-    if selected_format == "json":
-        _write_stdout(
-            json.dumps(render.status_list_json(metas, limit=limit), ensure_ascii=False) + "\n"
-        )
-    elif selected_format == "plain":
-        selected = render.status_items(metas, limit=limit)
-        _write_stdout("".join(f"{meta.session_id}\n" for meta in selected))
-    else:
-        _write_stdout(render.render_status_list(metas, limit=limit))
+    _status_collection(format_name, json_mode, limit, plain, explicit_limit)
 
 
 @effects.read_only
@@ -3093,7 +3141,7 @@ def _render_log_page(
         # footer is the caller's termination signal, so it must be current.
         meta = _load_view_session(meta.session_id)
 
-    full_last_message = meta.state in {"failed", "timeout", "orphaned"}
+    full_last_message = meta.state in {"failed", "unknown"}
     rendered = render.render_events(
         page.events,
         prose=prose,
@@ -3730,9 +3778,8 @@ def run_command(
 # that separates them travels in `context.status`.
 _TURN_FAILURE_KINDS = {
     "failed": errors.OPERATION_FAILED,
-    "orphaned": errors.OPERATION_FAILED,
+    "unknown": errors.OPERATION_FAILED,
     "canceled": errors.OPERATION_FAILED,
-    "timeout": errors.TIMEOUT,
     # The daemon still owns the turn: acpc stopped watching without seeing how
     # it ends, and saying "failed" would claim knowledge it does not have.
     "detached": errors.OUTCOME_UNKNOWN,
@@ -3742,13 +3789,12 @@ _TURN_FAILURE_KINDS = {
 # States `runner.exit_code_for` settles on their own, before it looks at
 # `stop_reason`.  `_end_turn` has to weigh the two in the same order, or a
 # turn could leave with one story in its exit code and another in its kind.
-_SIGNAL_STATES = frozenset({"canceled", "timeout", "detached", "terminated"})
+_SIGNAL_STATES = frozenset({"canceled", "detached", "terminated"})
 
 _TURN_FAILURE_MESSAGES = {
     "failed": "session {id} failed",
-    "orphaned": "session {id} is orphaned: the process behind it is gone",
+    "unknown": "session {id} has an unknown outcome: the process behind it is gone",
     "canceled": "session {id} was canceled",
-    "timeout": "session {id} timed out",
     "detached": "acpc detached from session {id}; the turn is still running",
     "terminated": "session {id} was terminated",
 }
@@ -3796,7 +3842,7 @@ def _end_turn(
         kind = _TURN_FAILURE_KINDS.get(state, errors.OPERATION_FAILED)
         template = _TURN_FAILURE_MESSAGES.get(state, "session {id} did not finish")
         message = template.format(id=session_id)
-    if state in {"failed", "orphaned"} and (detail := _latest_failure_message(session_id)):
+    if state in {"failed", "unknown"} and (detail := _latest_failure_message(session_id)):
         message = f"{message}: {detail}"
     hint = (
         f"Run: acpc wait {session_id}"
@@ -4371,19 +4417,38 @@ def wait_command(
     Example: ``acpc wait <session-id> --timeout 120``
     """
     selected_format = _select_format(format_name, json_mode, native_text=True)
-    meta = _load_view_session(selector)
-    state = runner.wait_for_session(meta.session_id, timeout=timeout)
+    try:
+        meta = _load_view_session(selector)
+    except AcpcError as error:
+        if error.kind == errors.NOT_FOUND:
+            raise error.with_context(session_id=selector, status=None) from None
+        raise
+    try:
+        state = runner.wait_for_session(meta.session_id, timeout=timeout)
+    except sessions.SessionNotFound as error:
+        raise _session_problem(error).with_context(
+            session_id=meta.session_id, status=None
+        ) from None
     if state is None:
         # SPEC `wait`: the timeout stops waiting only — the session runs on.
         if not quiet:
             _echo_metadata(_still_running_note(meta.session_id, timeout))
+        try:
+            observed_status = sessions.read_meta(meta.session_id).state
+        except (sessions.SessionError, OSError):
+            raise AcpcError(
+                f"gave up waiting for session {meta.session_id}; its state is unknown",
+                kind=errors.OUTCOME_UNKNOWN,
+                retryable=False,
+                context={"session_id": meta.session_id, "status": None},
+            ) from None
         raise AcpcError(
             f"gave up waiting for session {meta.session_id}; it is still running",
             kind=errors.TIMEOUT,
             exit_code=vocab.EXIT_TIMEOUT,
             retryable=True,
             hint=f"Run: acpc wait {meta.session_id}",
-            context={"session_id": meta.session_id},
+            context={"session_id": meta.session_id, "status": observed_status},
         )
 
     final = sessions.read_meta(meta.session_id)
@@ -4563,7 +4628,7 @@ async def _collect_daemon_status(
     "--force",
     "-f",
     is_flag=True,
-    help="Stop even when the target has running or starting sessions; they are failed, not orphaned.",
+    help="Stop even when the target has running or starting sessions; they are failed, not unknown.",
 )
 @click.option(
     "--dry-run", "-n", is_flag=True, help="List the daemons it would stop, and stop none."

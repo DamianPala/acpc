@@ -102,7 +102,7 @@ def test_index_carries_every_field(runner: CliRunner) -> None:
     assert index["conformance"] == {
         "name": "cli-design-standard",
         "standard": "0.1.0-draft.5",
-        "extensions": [],
+        "extensions": ["managed"],
     }
     assert index["exit_codes"] == vocab.EXIT_DESCRIPTIONS
     assert set(index["format_defaults"]) == {"tty", "non_tty"}

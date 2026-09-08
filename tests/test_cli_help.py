@@ -79,8 +79,9 @@ def test_root_help_is_a_compact_cheat_sheet(runner: CliRunner) -> None:
     assert len(result.stdout.splitlines()) <= 100
     assert "--permissions execute" in result.stdout
     assert "request_permission" in result.stdout
+    assert "status <id>       liveness-verified metadata for one session" in result.stdout
     assert (
-        "status            running + the 20 most recent sessions (--limit N to change)"
+        "list              running + the 20 most recent sessions (--limit N to change)"
         in result.stdout
     )
     assert (
@@ -178,6 +179,7 @@ def test_help_explains_session_lifecycle_and_retention(runner: CliRunner) -> Non
         return " ".join(text.split()).replace("mid- conversation", "mid-conversation")
 
     stop_help = normalized(invoke(runner, "cancel", "--help").stdout)
+    list_help = normalized(invoke(runner, "list", "--help").stdout)
     status_help = normalized(invoke(runner, "status", "--help").stdout)
     wait_help = normalized(invoke(runner, "wait", "--help").stdout)
     continue_help = normalized(invoke(runner, "continue", "--help").stdout)
@@ -186,8 +188,9 @@ def test_help_explains_session_lifecycle_and_retention(runner: CliRunner) -> Non
 
     assert "Cancel a running session; it stays usable with ``acpc continue``." in stop_help
     assert "Cancels the turn in flight (ACP ``session/cancel``)" in stop_help
-    assert "With no id: a bounded collection of sessions." in status_help
-    assert "Return at most N sessions" in status_help
+    assert "List liveness-verified sessions as a bounded collection." in list_help
+    assert "Return at most N sessions" in list_help
+    assert "Show liveness-verified metadata for one session" in status_help
     assert "and exit 124; the session keeps running" in wait_help
     assert "The exit code mirrors the session result." in wait_help
     assert "the free way to reprint an answer." in wait_help
@@ -347,11 +350,24 @@ def test_neighboring_tool_aliases_are_one_line_usage_errors(
     assert "Traceback" not in result.stderr
 
 
-def test_top_level_command_does_not_get_a_daemon_hint(runner: CliRunner) -> None:
-    result = invoke(runner, "list")
+def test_status_without_an_id_names_the_collection_command(runner: CliRunner) -> None:
+    result = invoke(runner, "status")
 
     assert result.exit_code == vocab.EXIT_USAGE
-    assert "daemon status" not in result.stderr
+    assert "acpc list" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "args",
+    [("status", "--limit", "1"), ("status", "--plain", "--limit", "1")],
+)
+def test_status_collection_flags_name_the_replacement_command(
+    runner: CliRunner, args: tuple[str, ...]
+) -> None:
+    result = invoke(runner, *args)
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert "acpc list" in result.stderr
 
 
 def test_short_version_matches_long_version(runner: CliRunner) -> None:
@@ -380,7 +396,7 @@ def test_fresh_nested_state_root_lists_no_sessions(
 ) -> None:
     monkeypatch.setenv("ACPC_HOME", str(tmp_path / "nested" / "state"))
 
-    result = invoke(runner, "status")
+    result = invoke(runner, "list")
 
     assert result.exit_code == vocab.EXIT_OK
 
@@ -395,7 +411,7 @@ def test_last_selector_is_rejected_without_a_tty(runner: CliRunner) -> None:
 
 
 def test_unknown_flag_is_a_usage_error(runner: CliRunner) -> None:
-    result = invoke(runner, "status", "--bogus")
+    result = invoke(runner, "list", "--bogus")
 
     assert result.exit_code == vocab.EXIT_USAGE
     assert "--bogus" in result.stderr

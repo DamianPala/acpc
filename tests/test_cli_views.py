@@ -126,7 +126,7 @@ def test_status_limit_hides_finished_sessions_beyond_the_bound(cli: CliRunner) -
     for index in range(6):
         finished_session(f"old prompt {index}", clock_value=100 + index)
 
-    result = invoke(cli, "status", "--limit", "5")
+    result = invoke(cli, "list", "--limit", "5")
 
     assert "old prompt 0" not in result.stdout and "old prompt 5" in result.stdout
 
@@ -136,7 +136,7 @@ def test_status_limit_includes_older_finished_sessions(cli: CliRunner) -> None:
     for index in range(6):
         finished_session(f"old prompt {index}", clock_value=100 + index)
 
-    result = invoke(cli, "status", "--limit", "6")
+    result = invoke(cli, "list", "--limit", "6")
 
     assert "old prompt 0" in result.stdout
 
@@ -168,7 +168,7 @@ def test_status_reports_the_model_a_real_dispatch_resolved(cli: CliRunner) -> No
 
     text = invoke(cli, "status", session_id, "--format", "text").stdout
     detail = json.loads(invoke(cli, "status", session_id, "--json").stdout)
-    row = json.loads(invoke(cli, "status", "--json").stdout)["items"][0]
+    row = json.loads(invoke(cli, "list", "--json").stdout)["items"][0]
 
     assert detail["model"] == "mock-sonnet-5"
     assert row["model"] == "mock-sonnet-5"
@@ -233,11 +233,11 @@ def test_continue_clears_the_previous_failure_from_status(cli: CliRunner) -> Non
     assert json.loads(invoke(cli, "status", session_id, "--json").stdout)["failure"] is None
 
 
-def test_status_json_without_an_id_returns_a_session_list(cli: CliRunner) -> None:
-    """Status JSON without an id returns the list envelope."""
+def test_list_json_returns_a_session_collection(cli: CliRunner) -> None:
+    """The list command returns the bounded collection envelope."""
     meta = finished_session()
 
-    result = invoke(cli, "status", "--json")
+    result = invoke(cli, "list", "--json")
 
     row = json.loads(result.stdout)["items"][0]
     assert row["session_id"] == meta.session_id
@@ -256,17 +256,14 @@ def test_status_without_a_transcript_is_clean_for_an_active_session(cli: CliRunn
     assert json.loads(json_result.stdout)["idle_seconds"] is None
 
 
-def test_status_plain_is_collection_only(cli: CliRunner) -> None:
-    """Status refuses one-item-per-line output for a particular session."""
-    meta = finished_session()
-
-    result = invoke(cli, "status", meta.session_id, "--plain", "--limit", "1")
+def test_status_rejects_collection_only_flags(cli: CliRunner) -> None:
+    result = invoke(cli, "status", "some-id", "--plain", "--limit", "1")
 
     assert result.exit_code == vocab.EXIT_USAGE
 
 
-def test_status_reports_a_dead_running_session_as_orphaned(cli: CliRunner) -> None:
-    """Status verifies liveness and creates no transcript for an orphan."""
+def test_status_reports_a_dead_running_session_as_unknown(cli: CliRunner) -> None:
+    """Status verifies liveness and creates no transcript for an unknown outcome."""
     meta = sessions.create_session(entry="mock", base_adapter="mock", prompt="live check")
     sessions.mark_running(
         meta.session_id,
@@ -276,7 +273,7 @@ def test_status_reports_a_dead_running_session_as_orphaned(cli: CliRunner) -> No
 
     result = invoke(cli, "status", meta.session_id, "--json")
 
-    assert json.loads(result.stdout)["status"] == "orphaned"
+    assert json.loads(result.stdout)["status"] == "unknown"
     assert not sessions.transcript_path(meta.session_id).exists()
 
 
@@ -363,9 +360,12 @@ def test_log_since_a_group_cursor_resumes_after_the_collapsed_reads(cli: CliRunn
 def test_wait_accepts_a_suffixed_timeout_on_a_finished_session(cli: CliRunner) -> None:
     session_id = run_mock(cli)
 
+    started = time.monotonic()
     result = invoke(cli, "wait", session_id, "--timeout", "1m", "--quiet")
+    elapsed = time.monotonic() - started
 
     assert result.exit_code == vocab.EXIT_OK
+    assert elapsed < 1.0
 
 
 def test_log_accepts_a_suffixed_timeout_on_a_finished_session(cli: CliRunner) -> None:
@@ -697,6 +697,8 @@ def test_wait_timeout_on_a_running_session_says_it_still_runs(cli: CliRunner) ->
     assert result.exit_code == vocab.EXIT_TIMEOUT
     assert "still running (gave up waiting after 0.1s)" in result.stderr
     assert f"acpc cancel {meta.session_id} to cancel" in result.stderr
+    error = json.loads(result.stderr.splitlines()[-1])["error"]
+    assert error["context"] == {"session_id": meta.session_id, "status": "running"}
 
 
 def test_log_wait_new_returns_after_the_transcript_grows(cli: CliRunner) -> None:

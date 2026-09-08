@@ -98,6 +98,9 @@ _SESSION_RESULT_PROPERTIES = {
     },
     "next": _array(_STRING),
     "resume": _STRING,
+    "created_at": _NULLABLE_STRING,
+    "started_at": _NULLABLE_STRING,
+    "finished_at": _NULLABLE_STRING,
     "changed": _BOOLEAN,
 }
 
@@ -157,13 +160,16 @@ def _session_result_schema(
     required = [
         "status",
         "session_id",
+        "created_at",
+        "started_at",
+        "finished_at",
         "paths",
         "truncated",
         "denied",
         "permissions_clamp",
     ]
     if foreground_only:
-        required[2:2] = ["stop_reason", "cost", "answer"]
+        required[5:5] = ["stop_reason", "cost", "answer"]
     if changed:
         required.append("changed")
     return _object(properties, required)
@@ -344,12 +350,8 @@ _STATUS_DETAIL = _object(
     ),
 )
 _STATUS = _object(
-    {
-        "items": _array(_STATUS_LIST_ITEM),
-        "has_more": _BOOLEAN,
-        **_STATUS_DETAIL["properties"],
-    },
-    (),
+    {"items": _array(_STATUS_LIST_ITEM), "has_more": _BOOLEAN},
+    ("items", "has_more"),
 )
 _LOG_EVENT = _object(
     {
@@ -495,7 +497,8 @@ _OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
         },
         ("items", "has_more"),
     ),
-    "status": _STATUS,
+    "list": _STATUS,
+    "status": _STATUS_DETAIL,
     "steer": _session_result_schema(changed=True),
     "wait": _session_result_schema(
         changed=False, foreground_only=True, status=_SESSION_SUCCEEDED_STATUS
@@ -838,7 +841,7 @@ def index(root: click.Group) -> dict[str, Any]:
         "conformance": {
             "name": STANDARD_NAME,
             "standard": STANDARD_VERSION,
-            "extensions": [],
+            "extensions": ["managed"],
         },
         "commands": [
             {

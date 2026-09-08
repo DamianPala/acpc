@@ -83,6 +83,9 @@ def result_envelope(
         envelope = {
             "session_id": meta.session_id,
             "status": vocab.normalize_session_state(meta.state),
+            "created_at": _timestamp_or_none(meta.created_at),
+            "started_at": _timestamp_or_none(meta.started_at),
+            "finished_at": _timestamp_or_none(meta.finished_at),
             "paths": sessions.session_paths(meta.session_id),
             "truncated": False,
             "denied": _denial_payload(meta),
@@ -98,6 +101,9 @@ def result_envelope(
     envelope: dict[str, Any] = {
         "status": vocab.normalize_session_state(meta.state),
         "session_id": meta.session_id,
+        "created_at": _timestamp_or_none(meta.created_at),
+        "started_at": _timestamp_or_none(meta.started_at),
+        "finished_at": _timestamp_or_none(meta.finished_at),
         "stop_reason": meta.stop_reason,
         "paths": sessions.session_paths(meta.session_id),
         "cost": meta.cost,
@@ -114,6 +120,10 @@ def result_envelope(
     if changed is not None:
         envelope["changed"] = changed
     return envelope
+
+
+def _timestamp_or_none(value: float | None) -> str | None:
+    return sessions.format_timestamp(value) if value is not None else None
 
 
 def _json_text(value: object) -> str:

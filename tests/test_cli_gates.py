@@ -122,6 +122,7 @@ DECLARED_EFFECTS = {
     "daemon stop": effects.IDEMPOTENT,
     "install": effects.NON_IDEMPOTENT,
     "log": effects.READ_ONLY,
+    "list": effects.READ_ONLY,
     "probe": effects.READ_ONLY,
     "prune": effects.NON_IDEMPOTENT,
     "delete": effects.NON_IDEMPOTENT,

@@ -104,11 +104,10 @@ def transcript_events(session_id: str) -> list[dict]:
     [
         ("done", vocab.EXIT_OK),
         ("failed", vocab.EXIT_AGENT_ERROR),
-        ("timeout", vocab.EXIT_TIMEOUT),
         ("cancelled", vocab.EXIT_CANCELLED),
         ("detached", vocab.EXIT_SIGTERM),
         ("terminated", vocab.EXIT_SIGTERM),
-        ("orphaned", vocab.EXIT_AGENT_ERROR),
+        ("unknown", vocab.EXIT_AGENT_ERROR),
     ],
 )
 def test_each_final_state_maps_to_its_fixed_exit_code(state: str, expected: int) -> None:

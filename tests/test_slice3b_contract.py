@@ -41,6 +41,7 @@ COMMANDS_WITH_OUTPUT = {
     "daemon stop",
     "delete",
     "install",
+    "list",
     "log",
     "probe",
     "prune",
@@ -63,6 +64,9 @@ EXPECTED_REQUIRED: dict[str, tuple[str, ...]] = {
     "continue": (
         "status",
         "session_id",
+        "created_at",
+        "started_at",
+        "finished_at",
         "paths",
         "truncated",
         "denied",
@@ -99,13 +103,48 @@ EXPECTED_REQUIRED: dict[str, tuple[str, ...]] = {
         "env_passthrough",
         "resolved",
     ),
-    "run": ("status", "session_id", "paths", "truncated", "denied", "permissions_clamp", "changed"),
+    "run": (
+        "status",
+        "session_id",
+        "created_at",
+        "started_at",
+        "finished_at",
+        "paths",
+        "truncated",
+        "denied",
+        "permissions_clamp",
+        "changed",
+    ),
     "skills get": ("name", "description", "path", "body"),
     "skills list": ("items", "has_more"),
-    "status": (),
+    "list": ("items", "has_more"),
+    "status": (
+        "session_id",
+        "status",
+        "pid",
+        "turns",
+        "entry",
+        "base_adapter",
+        "model",
+        "name",
+        "runtime_seconds",
+        "idle_seconds",
+        "tokens",
+        "cost",
+        "exit_code",
+        "stop_reason",
+        "failure",
+        "paths",
+        "created_at",
+        "started_at",
+        "finished_at",
+    ),
     "steer": (
         "status",
         "session_id",
+        "created_at",
+        "started_at",
+        "finished_at",
         "paths",
         "truncated",
         "denied",
@@ -115,6 +154,9 @@ EXPECTED_REQUIRED: dict[str, tuple[str, ...]] = {
     "wait": (
         "status",
         "session_id",
+        "created_at",
+        "started_at",
+        "finished_at",
         "stop_reason",
         "cost",
         "answer",
@@ -127,7 +169,17 @@ EXPECTED_REQUIRED: dict[str, tuple[str, ...]] = {
 
 EXPECTED_ENUMS: dict[str, dict[str, tuple[str, ...]]] = {
     "agents list": {"$.items[].kind": ("adapter", "variant")},
-    "cancel": {"$.status": tuple(vocab.SESSION_STATES)},
+    "cancel": {
+        "$.status": (
+            "starting",
+            "running",
+            "preparing",
+            "succeeded",
+            "failed",
+            "canceled",
+            "unknown",
+        )
+    },
     "continue": {"$.status": ("starting", "running", "succeeded")},
     "log": {
         "$.type": tuple(sorted(("error", "msg", "permission", "state", "thought", "tool", "usage")))
@@ -136,9 +188,27 @@ EXPECTED_ENUMS: dict[str, dict[str, tuple[str, ...]]] = {
         "$.diff[].status": ("advertised-missing", "entry-missing"),
     },
     "run": {"$.status": ("starting", "running", "succeeded")},
+    "list": {
+        "$.items[].status": (
+            "starting",
+            "running",
+            "preparing",
+            "succeeded",
+            "failed",
+            "canceled",
+            "unknown",
+        )
+    },
     "status": {
-        "$.items[].status": tuple(vocab.SESSION_STATES),
-        "$.status": tuple(vocab.SESSION_STATES),
+        "$.status": (
+            "starting",
+            "running",
+            "preparing",
+            "succeeded",
+            "failed",
+            "canceled",
+            "unknown",
+        )
     },
     "steer": {"$.status": ("starting", "running", "succeeded")},
     "wait": {"$.status": ("succeeded",)},
@@ -250,6 +320,17 @@ def test_every_command_publishes_an_o4_output_schema(cli: CliRunner) -> None:
         _assert_o4_schema(detail["output"], name)
 
 
+def test_status_and_list_have_separate_non_empty_contracts(cli: CliRunner) -> None:
+    status = schema_for(cli, "status")
+    listing = schema_for(cli, "list")
+    assert status["required"][:2] == ["session_id", "status"]
+    assert listing["required"] == ["items", "has_more"]
+
+    old_spelling = invoke(cli, "status", "--json")
+    assert old_spelling.exit_code == vocab.EXIT_USAGE
+    assert "acpc list" in old_spelling.stderr
+
+
 def test_output_required_fields_are_independent_contract_expectations(cli: CliRunner) -> None:
     for command, required in EXPECTED_REQUIRED.items():
         assert schema_for(cli, command)["required"] == list(required), command
@@ -262,6 +343,11 @@ def test_output_enums_are_independent_reachable_value_expectations(cli: CliRunne
             path: tuple(node["enum"]) for path, node in _schema_nodes(contract) if "enum" in node
         }
         assert found == EXPECTED_ENUMS.get(command, {}), command
+
+
+def test_session_states_are_partitioned_for_status_selection() -> None:
+    assert set(vocab.SESSION_STATES) == vocab.ACTIVE_STATES | vocab.FINISHED_STATES
+    assert "timeout" not in vocab.SESSION_STATES
 
 
 def test_next_is_declared_as_an_optional_breadcrumb(cli: CliRunner) -> None:
@@ -306,7 +392,7 @@ def test_real_collection_payloads_match_their_published_schemas(cli: CliRunner) 
     for command in (
         ("agents", "list"),
         ("skills", "list"),
-        ("status",),
+        ("list",),
         ("daemon", "status"),
         ("agents", "check"),
     ):
@@ -420,8 +506,8 @@ def test_real_document_payloads_match_their_published_schemas(
 
 
 def test_real_payload_validation_catches_a_removed_schema_property(cli: CliRunner) -> None:
-    payload = json.loads(invoke(cli, "status", "--json").stdout)
-    contract = schema_for(cli, "status")
+    payload = json.loads(invoke(cli, "list", "--json").stdout)
+    contract = schema_for(cli, "list")
     contract["properties"].pop("has_more")
     with pytest.raises(AssertionError):
         validate_json(payload, contract)

@@ -61,7 +61,10 @@ def test_non_tty_defaults_match_schema_and_explicit_text_is_available(cli: CliRu
     status_schema = json.loads(invoke(cli, "schema", "status").stdout)
     status_format = next(flag for flag in status_schema["flags"] if flag["name"] == "format")
     assert index["format_defaults"]["non_tty"] in status_format["enum"]
-    status_default = invoke(cli, "status")
+    list_schema = json.loads(invoke(cli, "schema", "list").stdout)
+    list_format = next(flag for flag in list_schema["flags"] if flag["name"] == "format")
+    assert "plain" in list_format["enum"]
+    status_default = invoke(cli, "list")
     assert json.loads(status_default.stdout) == {"items": [], "has_more": False}
     assert isinstance(json.loads(invoke(cli, "agents", "list").stdout)["items"], list)
     assert isinstance(json.loads(invoke(cli, "skills", "list").stdout)["items"], list)
@@ -72,7 +75,7 @@ def test_non_tty_defaults_match_schema_and_explicit_text_is_available(cli: CliRu
 
     log_detail = json.loads(invoke(cli, "schema", "log").stdout)
     assert log_detail["format_defaults"] == {"tty": "text", "non_tty": "text"}
-    text = invoke(cli, "status", "--format", "text")
+    text = invoke(cli, "list", "--format", "text")
     assert text.stdout.endswith("-- 0 of 0\n")
 
 
@@ -81,7 +84,7 @@ def test_tty_uses_the_schema_tty_default(tmp_path: Path) -> None:
     environment = os.environ.copy()
     environment["ACPC_HOME"] = str(tmp_path / "state")
     process = subprocess.Popen(
-        [sys.executable, "-c", "from acpc.cli import main; main()", "status"],
+        [sys.executable, "-c", "from acpc.cli import main; main()", "list"],
         stdin=subprocess.DEVNULL,
         stdout=slave,
         stderr=subprocess.PIPE,
@@ -105,16 +108,16 @@ def test_tty_uses_the_schema_tty_default(tmp_path: Path) -> None:
 
 
 def test_empty_collection_and_bounded_collection_have_the_pinned_shape(cli: CliRunner) -> None:
-    empty = json.loads(invoke(cli, "status", "--json").stdout)
+    empty = json.loads(invoke(cli, "list", "--json").stdout)
     assert empty == {"items": [], "has_more": False}
 
     for index in range(21):
         create_finished(f"prompt-{index}")
-    bounded = json.loads(invoke(cli, "status", "--json").stdout)
+    bounded = json.loads(invoke(cli, "list", "--json").stdout)
     assert len(bounded["items"]) == 20
     assert bounded["has_more"] is True
 
-    human = invoke(cli, "status", "--format", "text")
+    human = invoke(cli, "list", "--format", "text")
     assert "-- 20 of 21 — use --limit to change" in human.stdout
 
 
@@ -125,11 +128,11 @@ def test_plain_requires_an_explicit_limit_and_emits_one_identifier_per_line(
     second = create_finished("second")
     identifiers = {first.session_id, second.session_id}
 
-    rejected = invoke(cli, "status", "--format", "plain")
+    rejected = invoke(cli, "list", "--format", "plain")
     assert rejected.exit_code == vocab.EXIT_USAGE
     assert "--limit" in rejected.stderr
 
-    result = invoke(cli, "status", "--format", "plain", "--limit", "1")
+    result = invoke(cli, "list", "--format", "plain", "--limit", "1")
     assert result.exit_code == vocab.EXIT_OK
     assert result.stdout.endswith("\n")
     assert result.stdout.count("\n") == 1
@@ -157,7 +160,7 @@ def test_schema_publishes_closed_format_choices_locally_and_color_globally(
     assert "format" not in globals_by_name
     assert globals_by_name["color"]["enum"] == ["auto", "always", "never"]
 
-    status = json.loads(invoke(cli, "schema", "status").stdout)
+    status = json.loads(invoke(cli, "schema", "list").stdout)
     log = json.loads(invoke(cli, "schema", "log").stdout)
     status_format = next(flag for flag in status["flags"] if flag["name"] == "format")
     log_format = next(flag for flag in log["flags"] if flag["name"] == "format")
@@ -166,7 +169,7 @@ def test_schema_publishes_closed_format_choices_locally_and_color_globally(
 
 
 def test_help_states_the_applicable_format_default(cli: CliRunner) -> None:
-    collection_help = invoke(cli, "status", "--help").stdout
+    collection_help = invoke(cli, "list", "--help").stdout
     native_help = invoke(cli, "run", "--help").stdout
     stream_help = invoke(cli, "log", "--help").stdout
 
@@ -493,6 +496,6 @@ def test_color_policy_obeys_explicit_and_environment_precedence(
     assert cli_module.color_policy(stdout_tty=True) == "never"
     monkeypatch.setenv("TERM", "dumb")
     assert cli_module.color_policy(stdout_tty=True) == "never"
-    result = invoke(cli, "status", "--format", "text", "--color", "always")
+    result = invoke(cli, "list", "--format", "text", "--color", "always")
     assert result.exit_code == vocab.EXIT_OK
     assert cli_module.color_policy(stdout_tty=False) == "always"

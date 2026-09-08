@@ -28,20 +28,25 @@ SESSION_STATES = (
     "succeeded",
     "failed",
     "canceled",
-    "timeout",
-    "orphaned",
+    "unknown",
 )
 
 # States that count as finished: `continue` accepts them, `delete`/`prune` delete
-# them, `wait` returns immediately. `orphaned` is finished by definition.
-FINISHED_STATES = frozenset({"succeeded", "failed", "canceled", "timeout", "orphaned"})
-ACTIVE_STATES = frozenset({"starting", "running"})
+# them, and `wait` returns immediately. `unknown` means liveness was observed
+# to be lost before acpc could observe the operation's terminal result.
+FINISHED_STATES = frozenset({"succeeded", "failed", "canceled", "unknown"})
+ACTIVE_STATES = frozenset({"starting", "running", "preparing"})
 
-LEGACY_SESSION_STATES = {"done": "succeeded", "cancelled": "canceled"}
+LEGACY_SESSION_STATES = {
+    "done": "succeeded",
+    "cancelled": "canceled",
+    "orphaned": "unknown",
+    "timeout": "failed",
+}
 
 
 def normalize_session_state(value: str) -> str:
-    """Map the two pre-1.0 state spellings to the published vocabulary."""
+    """Map pre-1.0 state spellings to the published vocabulary."""
     return LEGACY_SESSION_STATES.get(value, value)
 
 

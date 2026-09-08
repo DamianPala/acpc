@@ -24,7 +24,7 @@ export SCRIPT_DIR
 # ==============================================================================
 declare -A SECTION_READY=(
     [S06-run]=ready         # sync run, session dir layout, --output-file/--quiet/--max-output/--json
-    [S07-daemon-bg]=ready # --bg, wait, SIGTERM detach, daemon status/stop, concurrency, orphans
+    [S07-daemon-bg]=ready # --bg, wait, SIGTERM detach, daemon status/stop, concurrency, unknown outcomes
     [S08-views]=ready       # status views, log views + footers + cursors
     [S09-continue]=ready  # continue: context, rotation, cross-turn cursor space, errors
     [S10-agents]=ready      # agents list/get/check/create, advertised data, install
@@ -280,20 +280,20 @@ effort = "low"
 permissions = "read"
 EOF
 
-# loner: same adapter, different home => different daemon target. The orphan
+# loner: same adapter, different home => different daemon target. The unknown outcome
 # test kill -9s the process behind its session; on the daemon path that is the
 # daemon serving the whole target, so the victim must not share a target with
 # the other long-lived sessions.
 cat >"${ACPC_HOME}/agents/loner.toml" <<EOF
 extends = "mock"
-description = "Isolated target for the orphan test."
+description = "Isolated target for the unknown outcome test."
 home = "~/.mock-loner"
 EOF
 
 # stopper: the same reasoning as loner, for the `daemon stop` probe. That verb
 # is target-wide by definition, so running it against `mock` would take SLOW1
 # and SLOW2 down with it and S08 would later poll a session this section
-# killed. It cannot share `loner` either, because the orphan test kills that
+# killed. It cannot share `loner` either, because the unknown outcome test kills that
 # target at roughly the same point.
 cat >"${ACPC_HOME}/agents/stopper.toml" <<EOF
 extends = "mock"
@@ -364,10 +364,10 @@ if section_ready S07-daemon-bg && section_ready S08-views \
     run_acpc run loner "run the slow scenario for SLOW3" --bg --name smoke-slow3 --quiet
     SLOW3_ID="$(head -n1 <<<"$LAST_OUT")"
 
-    # --- SLOW3: orphaned detection (kill -9 the process behind the session).
+    # --- SLOW3: unknown detection (kill -9 the process behind the session).
     # SLOW3 runs on the isolated `loner` target so the kill cannot take the
     # daemon serving SLOW1/SLOW2 with it. -------------------------------------
-    progress "SLOW3: orphaned detection (kill -9 the recorded pid)"
+    progress "SLOW3: unknown detection (kill -9 the recorded pid)"
     sleep 2
     run_acpc status "$SLOW3_ID" --json
     assert_eq "SLOW3 is running before kill" "running" "$(json_field "$LAST_OUT" '.status')"
@@ -376,18 +376,18 @@ if section_ready S07-daemon-bg && section_ready S08-views \
     sleep 1
 
     run_acpc status "$SLOW3_ID" --json
-    assert_eq "status <id> verifies liveness: orphaned after kill -9" "orphaned" \
+    assert_eq "status <id> verifies liveness: unknown after kill -9" "unknown" \
         "$(json_field "$LAST_OUT" '.status')"
     SLOW3_META_STATE="$(jq -r '.status' "${ACPC_HOME}/sessions/${SLOW3_ID}/meta.json")"
-    assert_eq "detected orphaned state is persisted back to meta.json" "orphaned" \
+    assert_eq "detected unknown state is persisted back to meta.json" "unknown" \
         "$SLOW3_META_STATE"
 
     run_acpc log "$SLOW3_ID"
-    assert_contains "log footer (stderr) reports orphaned" "$LAST_ERR" "orphaned"
+    assert_contains "log footer (stderr) reports unknown" "$LAST_ERR" "unknown"
 
     run_acpc wait "$SLOW3_ID"
-    assert_eq "wait on orphaned session exits 1" "1" "$LAST_RC"
-    assert_file "orphaned session still has an answer.md placeholder" \
+    assert_eq "wait on unknown session exits 1" "1" "$LAST_RC"
+    assert_file "unknown session still has an answer.md placeholder" \
         "${ACPC_HOME}/sessions/${SLOW3_ID}/answer.md"
 
     # --- SLOW2: gates while running, wait --timeout, cancel ------------------
@@ -684,7 +684,7 @@ ${BG1_DIR}" "$LAST_OUT"
     run_acpc daemon stop stopper --force
     assert_eq "daemon stop exits 0" "0" "$LAST_RC"
     run_acpc status "$DSTOP_ID" --json
-    assert_eq "daemon stop fails its active sessions, never orphans" "failed" \
+    assert_eq "daemon stop fails its active sessions, never unknown outcomes" "failed" \
         "$(json_field "$LAST_OUT" '.status')"
     RECORDED_REASON="$(jq -r '.status' "${ACPC_HOME}/sessions/${DSTOP_ID}/meta.json")"
     assert_eq "the failure is recorded in meta" "failed" "$RECORDED_REASON"
@@ -711,12 +711,12 @@ ${BG1_DIR}" "$LAST_OUT"
     assert_eq "daemon status JSON has idle_seconds" "true" \
         "$(jq 'all(.items[]; has("idle_seconds"))' <<<"$LAST_OUT")"
 
-    # Concurrency: parallel bg dispatches, clean transcripts, no false orphans
+    # Concurrency: parallel bg dispatches, clean transcripts, no false unknown outcomes
     for i in 1 2 3 4 5 6; do
         run_acpc run mock "concurrent smoke task ${i}" --bg --quiet &
     done
     wait
-    run_acpc status --json
+    run_acpc list --json
     mapfile -t CONC_IDS < <(json_field "$LAST_OUT" \
         '.items[] | select(.prompt_snippet | startswith("concurrent smoke task")) | .session_id')
     assert_true "all 6 concurrent dispatches registered" "$(( ${#CONC_IDS[@]} == 6 ? 0 : 1 ))"
@@ -730,8 +730,8 @@ ${BG1_DIR}" "$LAST_OUT"
     done
     for id in "${CONC_IDS[@]}"; do
         state="$(session_state "$id")"
-        if [[ "$state" == "orphaned" ]]; then
-            fail "concurrency: session $id wrongly reported orphaned"
+        if [[ "$state" == "unknown" ]]; then
+            fail "concurrency: session $id wrongly reported unknown"
         else
             pass
         fi
@@ -752,8 +752,8 @@ poll_slow1
 # ==============================================================================
 if begin_section S08-views "status list/detail, log default/--since/--limit/--prose/--wait-new/--follow"; then
     # status list: defaults to running + 5 most recent finished; footer in view
-    run_acpc status --format text
-    assert_eq "status exits 0" "0" "$LAST_RC"
+    run_acpc list --format text
+    assert_eq "list exits 0" "0" "$LAST_RC"
     assert_eq "status list opens with a column header" "ID ENTRY MODEL STATUS RUNTIME IDLE NAME PROMPT" \
         "$(awk 'NR == 1 {$1 = $1; print}' <<<"$LAST_OUT")"
     # The list command includes running sessions and the most recent finished
@@ -762,12 +762,12 @@ if begin_section S08-views "status list/detail, log default/--since/--limit/--pr
     run_acpc status "$UTIL_ID" --format text
     assert_contains "status <id> shows the session dir" "$LAST_OUT" \
         "${ACPC_HOME}/sessions/${UTIL_ID}"
-    run_acpc status --json
+    run_acpc list --json
     assert_json_valid "status --json is valid" "$LAST_OUT"
     run_acpc status "$UTIL_ID" --json
     assert_json_valid "status <id> --json is valid" "$LAST_OUT"
     assert_eq "finished status detail has null idle age" "null" "$(json_field "$LAST_OUT" '.idle_seconds')"
-    run_acpc status --json
+    run_acpc list --json
     assert_json_valid "status list JSON carries idle age" "$LAST_OUT"
     assert_eq "finished status list has null idle age" "true" \
         "$(jq 'any(.items[]; .status == "succeeded" and .idle_seconds == null)' <<<"$LAST_OUT")"
@@ -778,7 +778,7 @@ if begin_section S08-views "status list/detail, log default/--since/--limit/--pr
         "$(json_field "$LAST_OUT" '.model')"
     run_acpc status "$UTIL_ID" --format text
     assert_contains "status <id> text names the resolved model" "$LAST_OUT" "model: mock-sonnet-5"
-    run_acpc status --format text
+    run_acpc list --format text
     assert_contains "status list text names the resolved model" "$LAST_OUT" "mock-sonnet-5"
 
     # log: default view, footer on stderr, cursor there too
@@ -1386,7 +1386,7 @@ PYEOF
 
     # Hostile inputs
     NESTED_HOME="${SCRATCH}/nested/does/not/exist/yet"
-    ACPC_HOME="$NESTED_HOME" run_acpc status
+    ACPC_HOME="$NESTED_HOME" run_acpc list
     assert_eq "a fresh nested ACPC_HOME yields a clean empty list" "0" "$LAST_RC"
 
     run_acpc run mock "hostile: corrupt meta" --quiet --json
@@ -1443,9 +1443,9 @@ PYEOF
         assert_eq "'$daemon_args' is one line" "1" "$(wc -l <<<"$LAST_ERR")"
         assert_not_contains "'$daemon_args' has no traceback" "$LAST_ERR" "Traceback"
     done
-    run_acpc list
-    assert_eq "top-level list stays outside daemon hints" "2" "$LAST_RC"
-    assert_not_contains "top-level list does not mention daemon status" "$LAST_ERR" "daemon status"
+    run_acpc status
+    assert_eq "status without an id names the collection command" "2" "$LAST_RC"
+    assert_contains "status without an id names acpc list" "$LAST_ERR" "acpc list"
 
     end_section S12-cli
 fi

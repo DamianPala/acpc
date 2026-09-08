@@ -663,7 +663,7 @@ def test_continue_waits_for_cancelled_restore_to_settle_before_preparing(
             first.wait(timeout=10)
 
 
-def test_daemon_death_during_resume_is_orphaned_without_a_preparation_marker(
+def test_daemon_death_during_resume_is_unknown_without_a_preparation_marker(
     cli: CliRunner, live_daemon: None, state_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     session_id = start_session(cli, "turn one")
@@ -706,7 +706,7 @@ def test_daemon_death_during_resume_is_orphaned_without_a_preparation_marker(
         assert daemon_meta.state == "running"
 
         # Remove the client that is awaiting the preparation before killing
-        # the daemon; otherwise it can race orphan detection to finalize the
+        # the daemon; otherwise it can race unknown outcome detection to finalize the
         # session as failed after its connection breaks.
         process.kill()
         process.wait(timeout=10)
@@ -714,7 +714,7 @@ def test_daemon_death_during_resume_is_orphaned_without_a_preparation_marker(
 
         os.kill(pid, signal.SIGKILL)
         wait_for_process_dead(pid, daemon_meta.process_start_time)
-        assert sessions.load(session_id).state == "orphaned"
+        assert sessions.load(session_id).state == "unknown"
         assert "preparing" not in sessions.read_meta(session_id).to_dict()
     finally:
         if process.poll() is None:
@@ -1690,7 +1690,7 @@ def test_a_stored_but_undelivered_prompt_is_not_required_on_later_resume(
     assert "later prompt" in sessions.answer_path(session_id).read_text(encoding="utf-8")
 
 
-def test_process_death_after_claim_is_orphaned_and_can_be_cold_resumed(
+def test_process_death_after_claim_is_unknown_and_can_be_cold_resumed(
     cli: CliRunner, state_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     session_id = start_session(cli, "turn one")
@@ -1733,11 +1733,11 @@ def test_process_death_after_claim_is_orphaned_and_can_be_cold_resumed(
     assert process.returncode == -9
 
     deadline = time.monotonic() + 5
-    orphaned = sessions.load(session_id)
-    while orphaned.state == "running" and time.monotonic() < deadline:
+    unknown = sessions.load(session_id)
+    while unknown.state == "running" and time.monotonic() < deadline:
         time.sleep(0.05)
-        orphaned = sessions.load(session_id)
-    assert orphaned.state == "orphaned"
+        unknown = sessions.load(session_id)
+    assert unknown.state == "unknown"
     monkeypatch.delenv("ACPC_MOCK_BLOCK_BEFORE_PROMPT")
     monkeypatch.delenv("ACPC_MOCK_BLOCK_BEFORE_PROMPT_READY")
 

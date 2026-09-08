@@ -532,8 +532,6 @@ def exit_code_for(state: str, stop_reason: str | None = None) -> int:
     state = vocab.normalize_session_state(state)
     if state == "succeeded":
         return vocab.EXIT_OK
-    if state == "timeout":
-        return vocab.EXIT_TIMEOUT
     if state == "canceled":
         return vocab.EXIT_AGENT_ERROR if stop_reason == "cancel_after" else vocab.EXIT_CANCELLED
     # Detached (daemon path) and terminated (direct path) are both "SIGTERM
@@ -542,7 +540,7 @@ def exit_code_for(state: str, stop_reason: str | None = None) -> int:
         return vocab.EXIT_SIGTERM
     if stop_reason == "permission_denied":
         return vocab.EXIT_USAGE
-    # failed and orphaned both mean the agent did not deliver an answer.
+    # failed and unknown both mean the agent did not deliver an answer.
     return vocab.EXIT_AGENT_ERROR
 
 

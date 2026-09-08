@@ -11,7 +11,7 @@ Two invariants drive the shape of this module:
   `cancel` on one session never interleave.
 - **State is verified, not trusted.** A stored `running` means nothing on its
   own: `load` re-checks the host process through the frozen `proc` identity
-  token and persists `orphaned` when it is gone, so every reader agrees
+  token and persists `unknown` when it is gone, so every reader agrees
   without re-probing. The 30 s startup grace covers only the window before a
   host process has been recorded — once `pid` is in `meta.json`, liveness
   decides immediately.
@@ -65,8 +65,8 @@ _ID_ALLOCATION_ATTEMPTS = 64
 # SPEC.md *Session states*. Finished states are terminal for the current turn;
 # a new turn re-opens the session through `rotate_turn`.
 _ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
-    "starting": frozenset({"running", "succeeded", "failed", "canceled", "timeout", "orphaned"}),
-    "running": frozenset({"succeeded", "failed", "canceled", "timeout", "orphaned"}),
+    "starting": frozenset({"running", "succeeded", "failed", "canceled", "unknown"}),
+    "running": frozenset({"succeeded", "failed", "canceled", "unknown"}),
 }
 
 _TIMESTAMP_FIELDS = frozenset({"created_at", "started_at", "finished_at"})
@@ -546,7 +546,7 @@ def write_meta(meta: SessionMeta) -> None:
 def load(session_id: str, *, clock: Clock | None = None) -> SessionMeta:
     """Read a session and verify the process behind an active state.
 
-    A dead host process is persisted as `orphaned` (atomic, under the session
+    A dead host process is persisted as `unknown` (atomic, under the session
     lock) together with the placeholder `answer.md`, so later readers agree
     without re-probing.
     """
@@ -570,36 +570,36 @@ def _verify_liveness(meta: SessionMeta, *, clock: Clock) -> SessionMeta:
         reason = f"the process hosting it (pid {meta.pid}) is gone"
     else:
         return meta
-    return _persist_orphaned(meta.session_id, reason, clock=clock)
+    return _persist_unknown(meta.session_id, reason, clock=clock)
 
 
-def _persist_orphaned(session_id: str, reason: str, *, clock: Clock) -> SessionMeta:
+def _persist_unknown(session_id: str, reason: str, *, clock: Clock) -> SessionMeta:
     with session_lock(session_id):
         current = read_meta(session_id)
         if not current.is_active:
             return current
-        current.state = "orphaned"
-        current.stop_reason = "orphaned"
+        current.state = "unknown"
+        current.stop_reason = "unknown"
         current.exit_code = vocab.EXIT_AGENT_ERROR
         if current.finished_at is None:
             current.finished_at = clock()
         write_meta(current)
-        _write_orphan_placeholder(current, reason)
+        _write_unknown_placeholder(current, reason)
     return current
 
 
-def _write_orphan_placeholder(meta: SessionMeta, reason: str) -> None:
+def _write_unknown_placeholder(meta: SessionMeta, reason: str) -> None:
     """Guarantee the advertised `answer.md` exists and explains itself.
 
-    SPEC.md *State on disk*: for `orphaned` the dead process wrote nothing, so
-    detection leaves a one-line placeholder naming what died.
+    SPEC.md *State on disk*: when the dead process wrote nothing, detection
+    leaves a one-line placeholder naming what died.
     """
     path = answer_path(meta.session_id)
     if path.exists():
         return
     paths.atomic_write(
         path,
-        f"Session {meta.session_id} was orphaned: {reason}; this turn produced no answer.\n",
+        f"Session {meta.session_id} is unknown: {reason}; this turn produced no answer.\n",
     )
 
 

@@ -308,7 +308,7 @@ def test_daemon_stop_help_describes_force(cli: CliRunner) -> None:
     assert result.exit_code == vocab.EXIT_OK
     assert "--force" in result.stdout
     assert (
-        "Stop even when the target has running or starting sessions; they are failed, not orphaned."
+        "Stop even when the target has running or starting sessions; they are failed, not unknown."
         in " ".join(result.stdout.split())
     )
 
@@ -374,7 +374,7 @@ def test_idle_daemon_stop_keeps_its_existing_output(cli: CliRunner, live_daemon:
     assert result.stderr == "-- stopped 1 daemon(s)\n"
 
 
-def test_orphaned_session_does_not_block_daemon_stop(cli: CliRunner, live_daemon: None) -> None:
+def test_unknown_session_does_not_block_daemon_stop(cli: CliRunner, live_daemon: None) -> None:
     target = _target()
     _start_daemon(target)
     session = sessions.create_session(
@@ -391,12 +391,12 @@ def test_orphaned_session_does_not_block_daemon_stop(cli: CliRunner, live_daemon
         child.terminate()
         child.wait(timeout=5)
 
-    assert sessions.load(session.session_id).state == "orphaned"
+    assert sessions.load(session.session_id).state == "unknown"
     result = invoke(cli, "daemon", "stop", "mock")
 
     assert result.exit_code == vocab.EXIT_OK
     assert result.stderr == "-- stopped 1 daemon(s)\n"
-    assert sessions.read_meta(session.session_id).state == "orphaned"
+    assert sessions.read_meta(session.session_id).state == "unknown"
 
 
 def test_multi_target_daemon_stop_refuses_before_stopping_any_target(
@@ -445,13 +445,36 @@ def test_cancel_running_session_cancels_daemon_and_preserves_artifacts(
     session_id = result.stdout.strip().splitlines()[0]
     _wait_until_running(cli, session_id)
 
-    stopped = invoke(cli, "cancel", session_id)
+    stopped = invoke(cli, "cancel", session_id, "--json")
 
     assert stopped.exit_code == vocab.EXIT_OK
+    assert json.loads(stopped.stdout)["changed"] is True
     assert sessions.read_meta(session_id).state == "canceled"
     assert sessions.transcript_path(session_id).exists()
     answer = sessions.answer_path(session_id)
     assert answer.exists()
+
+
+def test_cancel_reports_the_observed_terminal_state_before_cancellation(
+    cli: CliRunner,
+) -> None:
+    meta = sessions.create_session(entry="mock", base_adapter="mock", prompt="race")
+    sessions.mark_running(
+        meta.session_id,
+        pid=os.getpid(),
+        process_start_time=proc.process_start_time(),
+    )
+    sessions.transition(meta.session_id, "succeeded", exit_code=0, stop_reason="test")
+
+    result = invoke(cli, "cancel", meta.session_id, "--json")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert json.loads(result.stdout) == {
+        "session_id": meta.session_id,
+        "status": "succeeded",
+        "stop_reason": "test",
+        "changed": False,
+    }
 
 
 def test_cancel_json_is_one_object_on_stdout(cli: CliRunner) -> None:

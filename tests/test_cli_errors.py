@@ -122,6 +122,42 @@ def test_json_forces_the_envelope_even_when_stderr_is_a_terminal(
     assert result.stdout == ""
 
 
+def test_wait_not_found_carries_a_null_observed_status(cli: CliRunner) -> None:
+    result = invoke(cli, "wait", "does-not-exist", "--json")
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    error = envelope(result)
+    assert error["kind"] == "not_found"
+    assert error["context"] == {"session_id": "does-not-exist", "status": None}
+
+
+def test_wait_pruned_session_is_not_found_without_a_status(
+    cli: CliRunner,
+) -> None:
+    meta = sessions.create_session(entry="mock", base_adapter="mock", prompt="expired")
+    sessions.mark_running(
+        meta.session_id,
+        pid=os.getpid(),
+        process_start_time=proc.process_start_time(),
+    )
+    sessions.transition(meta.session_id, "succeeded", exit_code=0, stop_reason="test")
+    path = sessions.meta_path(meta.session_id)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    finished_at = sessions.parse_timestamp(payload["finished_at"], "finished_at", path)
+    assert finished_at is not None
+    payload["finished_at"] = sessions.format_timestamp(finished_at - 200 * 86400)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    prune = invoke(cli, "prune", "--older-than", "100d", "--yes")
+    result = invoke(cli, "wait", meta.session_id, "--json")
+
+    assert prune.exit_code == vocab.EXIT_OK
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    error = envelope(result)
+    assert error["kind"] == "not_found"
+    assert error["context"] == {"session_id": meta.session_id, "status": None}
+
+
 def test_a_person_at_a_terminal_gets_the_line_and_its_hint_instead(
     cli: CliRunner, terminal_stderr: None
 ) -> None:
@@ -137,10 +173,10 @@ def test_a_person_at_a_terminal_gets_the_line_and_its_hint_instead(
 def test_a_terminal_failure_without_a_hint_is_one_line(
     cli: CliRunner, terminal_stderr: None
 ) -> None:
-    result = invoke(cli, "status", "some-id", "--plain", "--limit", "1")
+    result = invoke(cli, "status", "some-id", "--bogus")
 
     assert result.exit_code == vocab.EXIT_USAGE
-    assert result.stderr == "Error: --plain is available only for the status collection\n"
+    assert result.stderr == "Error: No such option '--bogus'.\n"
 
 
 # --- failures raised before the format was resolved -------------------------
@@ -150,7 +186,7 @@ def test_json_before_a_bare_dash_dash_arms_the_envelope_for_parse_failures(
     cli: CliRunner, terminal_stderr: None
 ) -> None:
     """The flag never reaches a command here — Click rejects the call first."""
-    result = invoke(cli, "status", "--json", "--no-such-flag")
+    result = invoke(cli, "list", "--json", "--no-such-flag")
 
     assert result.exit_code == vocab.EXIT_USAGE
     error = envelope(result)
@@ -188,12 +224,12 @@ def test_a_command_that_parses_json_itself_refines_the_argument_scan(
 
 
 def test_optional_fields_are_absent_rather_than_null(cli: CliRunner) -> None:
-    result = invoke(cli, "status", "some-id", "--plain", "--limit", "1")
+    result = invoke(cli, "status", "some-id", "--bogus")
 
     assert result.exit_code == vocab.EXIT_USAGE
     assert envelope(result) == {
         "kind": "invalid_input",
-        "message": "--plain is available only for the status collection",
+        "message": "No such option '--bogus'.",
     }
 
 
