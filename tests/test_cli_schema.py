@@ -430,7 +430,7 @@ def test_confirm_marks_every_command_that_accepts_yes(runner: CliRunner) -> None
         assert detail["confirm"] == accepts_yes, entry["name"]
         if accepts_yes:
             gated.add(entry["name"])
-    assert gated == {"delete", "prune", "install", "daemon stop"}
+    assert gated == {"agents delete", "delete", "prune", "install", "daemon stop"}
 
 
 def test_effects_match_the_declaration_on_the_command(runner: CliRunner) -> None:

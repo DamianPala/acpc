@@ -30,7 +30,7 @@ import re
 import sys
 import threading
 import time
-from collections.abc import AsyncIterator, Callable, Iterator, Mapping
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, fields
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1085,30 +1085,45 @@ def delete_session(session_id: str, *, clock: Clock | None = None) -> None:
     _write_tombstone(directory, resolved_clock())
 
 
-def prune_sessions(
-    *,
-    older_than: float,
-    dry_run: bool = False,
-    clock: Clock | None = None,
-) -> list[SessionMeta]:
-    """Delete finished sessions older than `older_than` seconds.
-
-    Age is measured from `finished_at` (SPEC.md `prune`), falling back to
-    `created_at` for a session that never recorded one. Active sessions are
-    never touched, and liveness is verified first so orphans do get collected.
-    """
+def prune_candidates(*, older_than: float, clock: Clock | None = None) -> list[SessionMeta]:
+    """Resolve the finished sessions older than `older_than` seconds."""
     resolved_clock = _resolve_clock(clock)
     now = resolved_clock()
-    removed: list[SessionMeta] = []
+    candidates: list[SessionMeta] = []
     for meta in list_sessions(clock=resolved_clock):
         if meta.is_active:
             continue
         reference = meta.finished_at if meta.finished_at is not None else meta.created_at
         if reference is None or now - reference < older_than:
             continue
-        if not dry_run:
-            directory = session_dir(meta.session_id)
-            _clear_directory(directory)
-            _write_tombstone(directory, now)
-        removed.append(meta)
-    return removed
+        candidates.append(meta)
+    return candidates
+
+
+def prune_sessions(
+    *,
+    older_than: float,
+    dry_run: bool = False,
+    clock: Clock | None = None,
+    candidates: Sequence[SessionMeta] | None = None,
+) -> list[SessionMeta]:
+    """Delete resolved finished sessions older than `older_than` seconds.
+
+    When `candidates` is supplied, it is the target set already resolved by a
+    caller before a confirmation gate. Age is measured from `finished_at`,
+    falling back to `created_at`; active sessions are never selected.
+    """
+    resolved_clock = _resolve_clock(clock)
+    selected = (
+        list(candidates)
+        if candidates is not None
+        else prune_candidates(older_than=older_than, clock=resolved_clock)
+    )
+    if dry_run:
+        return selected
+    now = resolved_clock()
+    for meta in selected:
+        directory = session_dir(meta.session_id)
+        _clear_directory(directory)
+        _write_tombstone(directory, now)
+    return selected

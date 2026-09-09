@@ -1,6 +1,7 @@
 """Behavioral tests for log and status rendering."""
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -430,6 +431,42 @@ def test_status_keeps_the_last_finished_session_even_if_it_started_first() -> No
 
     assert "long run" in text
     assert "short run 0" not in text  # finished first, so it is the one cut
+
+
+def test_status_list_uses_stable_active_then_finished_order() -> None:
+    active = [make_session(session_id_hint=f"active {index}") for index in range(2)]
+    for meta in active:
+        sessions.mark_running(meta.session_id, pid=os.getpid(), clock=lambda: 100.0)
+    finished = [make_session(session_id_hint=f"finished {index}") for index in range(3)]
+    for index, meta in enumerate(finished):
+        sessions.transition(
+            meta.session_id,
+            "succeeded",
+            clock=lambda index=index: 200.0 + index,
+            exit_code=0,
+        )
+
+    source = sessions.list_sessions(clock=lambda: 300.0)
+    expected_active = sorted(
+        (meta for meta in source if meta.is_active),
+        key=lambda meta: (meta.created_at or 0.0, meta.session_id),
+        reverse=True,
+    )
+    expected_finished = sorted(
+        (meta for meta in source if meta.is_finished),
+        key=lambda meta: (
+            meta.finished_at if meta.finished_at is not None else (meta.created_at or 0.0),
+            meta.session_id,
+        ),
+        reverse=True,
+    )
+    expected = [meta.session_id for meta in [*expected_active, *expected_finished]]
+
+    first = render.status_list_json(source, limit=100, clock=lambda: 300.0)
+    second = render.status_list_json(source, limit=100, clock=lambda: 300.0)
+
+    assert [item["session_id"] for item in first["items"]] == expected
+    assert first == second
 
 
 def test_status_list_has_one_lowercase_header_and_aligns_long_columns() -> None:

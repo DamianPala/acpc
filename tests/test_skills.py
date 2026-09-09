@@ -133,6 +133,12 @@ def test_list_has_header_alignment_sorting_and_bounded_rendered_description(
     assert "full: acpc skills get alpha-name-longer-than-header" in alpha
     assert "repeated whitespace and" in alpha
 
+    listed = json.loads(invoke(cli, "skills", "list", "--json").stdout)
+    assert [item["name"] for item in listed["items"]] == sorted(
+        item["name"] for item in listed["items"]
+    )
+    assert len(listed["items"]) <= 20
+
 
 def test_detail_preserves_body_and_places_directory_metadata_on_stderr(
     cli: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

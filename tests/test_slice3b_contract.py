@@ -422,7 +422,7 @@ def test_real_document_payloads_match_their_published_schemas(
     assert single_check["has_more"] is False
     assert len(single_check["items"]) == 1
     assert_json_payload(cli, "agents create", "work", "--extends", "mock")
-    assert_json_payload(cli, "agents delete", "work")
+    assert_json_payload(cli, "agents delete", "work", "--yes")
     assert_json_payload(cli, "install", "mock", "--yes")
     assert_json_payload(cli, "probe", "mock", "--discover")
     assert_json_payload(cli, "skills get", "adapter-bringup")

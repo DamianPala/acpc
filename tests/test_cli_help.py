@@ -9,7 +9,7 @@ import click
 import pytest
 from click.testing import CliRunner
 
-from acpc import __version__, interaction, vocab
+from acpc import __version__, interaction, schema, vocab
 from acpc.cli import main
 
 MOCK_AGENT_SCRIPT = str(Path(__file__).with_name("mock_agent.py"))
@@ -88,6 +88,20 @@ def test_root_help_is_a_compact_cheat_sheet(runner: CliRunner) -> None:
         "cancel <id>       cancel a running session; it stays resumable with continue"
         in result.stdout
     )
+
+
+def test_root_help_describes_every_group_and_command(runner: CliRunner) -> None:
+    result = invoke(runner, "--help")
+
+    assert result.exit_code == vocab.EXIT_OK
+    lines = result.stdout.splitlines()
+    for group in ("agents", "daemon", "skills"):
+        line = next(line for line in lines if line.startswith(f"  {group} "))
+        assert len(line.split()) > 1
+    for entry in schema.index(main)["commands"]:
+        prefix = f"  {entry['name']}"
+        line = next(line for line in lines if line.startswith(prefix))
+        assert len(line.split()) > len(entry["name"].split())
 
 
 def test_permission_help_names_the_tier_gloss(runner: CliRunner) -> None:
@@ -273,17 +287,11 @@ def test_no_command_redirects_to_root_help_and_root_keeps_verb_one_liners(
     [
         (
             ("--follow",),
-            (
-                "Error: --follow is not a flag on this command — following a session "
-                "is: acpc log <id> --follow [--timeout S]"
-            ),
+            ("Error: --follow is a log flag; use: acpc log <id> --follow [--timeout S]"),
         ),
         (
             ("-f",),
-            (
-                "Error: --follow is not a flag on this command — following a session "
-                "is: acpc log <id> --follow [--timeout S]"
-            ),
+            ("Error: -f is not accepted; use --follow: acpc log <id> --follow [--timeout S]"),
         ),
         (
             ("status", "--detach"),
@@ -361,6 +369,46 @@ def test_status_without_an_id_names_the_collection_command(runner: CliRunner) ->
 
     assert result.exit_code == vocab.EXIT_USAGE
     assert "acpc list" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("agents",),
+        ("skills",),
+        ("daemon",),
+        ("probe",),
+        ("probe", "mock"),
+        ("agents", "create"),
+        ("agents", "get"),
+        ("agents", "delete"),
+        ("skills", "get"),
+        ("cancel",),
+        ("continue",),
+        ("continue", "abcd"),
+        ("delete",),
+        ("install",),
+        ("log",),
+        ("resolve",),
+        ("run",),
+        ("status",),
+        ("steer",),
+        ("steer", "abcd"),
+        ("wait",),
+    ],
+)
+def test_missing_required_input_is_one_enveloped_error_with_a_hint(
+    runner: CliRunner, args: tuple[str, ...]
+) -> None:
+    result = invoke(runner, *args)
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert len(result.stderr.splitlines()) == 1
+    error = json.loads(result.stderr)["error"]
+    assert error["kind"] == "invalid_input"
+    assert error["message"]
+    assert error["hint"]
+    assert "Usage:" not in error["message"]
 
 
 @pytest.mark.parametrize(

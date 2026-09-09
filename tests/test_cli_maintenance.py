@@ -159,6 +159,19 @@ def test_daemon_status_with_no_daemons_is_a_successful_empty_report(cli: CliRunn
     assert "no daemons running" in result.stderr
 
 
+def test_daemon_targets_are_sorted_and_repeatable(state_root: Path) -> None:
+    daemon_dir = state_root / "daemon"
+    daemon_dir.mkdir()
+    (daemon_dir / "zeta.lock").write_text("", encoding="utf-8")
+    (daemon_dir / "alpha.lock").write_text("", encoding="utf-8")
+
+    first = runner.all_daemon_targets()
+    second = runner.all_daemon_targets()
+
+    assert first == ["alpha", "zeta"]
+    assert second == first
+
+
 def _finished_target_session(target: str, *, finished_at: float = 110.0) -> str:
     meta = sessions.create_session(
         entry="mock",
@@ -821,6 +834,8 @@ def test_prune_json_is_one_object_on_stdout(cli: CliRunner, state_root: Path) ->
 def test_prune_removal_failure_is_reported_as_an_operation_error(
     cli: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    _finished_session()
+
     def refuse_removal(**kwargs: Any) -> list[Any]:
         del kwargs
         raise OSError("read-only session directory")

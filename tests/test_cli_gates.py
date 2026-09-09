@@ -18,7 +18,7 @@ import pytest
 from click.testing import CliRunner
 
 from acpc import cli as cli_module
-from acpc import daemon_client, effects, proc, sessions, vocab
+from acpc import daemon_client, effects, interaction, proc, sessions, vocab
 from acpc.cli import main
 
 MOCK_AGENT_SCRIPT = str(Path(__file__).with_name("mock_agent.py"))
@@ -258,19 +258,51 @@ def test_prune_that_selects_nothing_reports_no_change(cli: CliRunner) -> None:
     assert json.loads(result.stdout) == {
         "targets": [],
         "changed": False,
-        "requires_confirmation": True,
+        "requires_confirmation": False,
     }
+
+
+def test_empty_prune_without_yes_is_an_unchanged_success(cli: CliRunner) -> None:
+    result = invoke(cli, "prune", "--older-than", "100d", "--json")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert json.loads(result.stdout) == {
+        "targets": [],
+        "changed": False,
+        "requires_confirmation": False,
+    }
+
+
+def test_prune_candidate_read_error_is_not_an_empty_success(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse_read(**kwargs: object) -> list[object]:
+        del kwargs
+        raise OSError("cannot read session candidates")
+
+    monkeypatch.setattr(sessions, "prune_candidates", refuse_read)
+
+    result = invoke(cli, "prune", "--older-than", "0d", "--json")
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    assert result.stdout == ""
+    error = envelope(result)
+    assert error["kind"] == "operation_failed"
+    assert "cannot read session candidates" in error["message"]
 
 
 # --- daemon stop ------------------------------------------------------------
 
 
-def test_bare_daemon_stop_without_yes_stops_before_touching_a_daemon(cli: CliRunner) -> None:
+def test_bare_daemon_stop_with_no_targets_is_an_unchanged_success(cli: CliRunner) -> None:
     result = invoke(cli, "daemon", "stop")
 
-    assert result.exit_code != vocab.EXIT_OK
-    assert envelope(result)["kind"] == "confirmation_required"
-    assert "--yes" in envelope(result)["hint"]
+    assert result.exit_code == vocab.EXIT_OK
+    assert json.loads(result.stdout) == {
+        "targets": [],
+        "changed": False,
+        "requires_confirmation": False,
+    }
 
 
 def test_a_named_daemon_stop_needs_no_confirmation(cli: CliRunner) -> None:
@@ -291,7 +323,7 @@ def test_bare_daemon_stop_dry_run_needs_no_yes(cli: CliRunner) -> None:
     assert json.loads(result.stdout) == {
         "targets": [],
         "changed": False,
-        "requires_confirmation": True,
+        "requires_confirmation": False,
     }
 
 
@@ -347,7 +379,8 @@ def test_force_does_not_confirm_and_confirming_does_not_force(
     """`--force` overrides a precondition; `--yes` answers a question."""
     forced = invoke(cli, "daemon", "stop", "--force")
 
-    assert envelope(forced)["kind"] == "confirmation_required"
+    assert forced.exit_code == vocab.EXIT_OK
+    assert json.loads(forced.stdout)["requires_confirmation"] is False
 
     # A target is known once its lock file exists; nothing answers on it.
     (state_root / "daemon").mkdir(parents=True, exist_ok=True)
@@ -531,7 +564,7 @@ def test_agents_delete_removes_the_entry_agents_create_wrote(
     target = state_root / "agents" / "work.toml"
     assert target.exists()
 
-    result = invoke(cli, "agents", "delete", "work", "--json")
+    result = invoke(cli, "agents", "delete", "work", "--yes", "--json")
 
     assert result.exit_code == vocab.EXIT_OK
     assert json.loads(result.stdout) == {
@@ -540,6 +573,35 @@ def test_agents_delete_removes_the_entry_agents_create_wrote(
         "changed": True,
     }
     assert not target.exists()
+
+
+def test_agents_delete_without_yes_leaves_the_entry_in_place(
+    cli: CliRunner, state_root: Path
+) -> None:
+    target = state_root / "agents" / "hand-written.toml"
+    target.write_text(MOCK_ENTRY, encoding="utf-8")
+
+    result = invoke(cli, "agents", "delete", "hand-written")
+
+    assert result.exit_code != vocab.EXIT_OK
+    assert envelope(result)["kind"] == "confirmation_required"
+    assert "--yes" in envelope(result)["hint"]
+    assert target.exists()
+
+
+def test_agents_delete_declined_on_a_terminal_leaves_the_entry_in_place(
+    cli: CliRunner, state_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = state_root / "agents" / "declined.toml"
+    target.write_text(MOCK_ENTRY, encoding="utf-8")
+    monkeypatch.setattr(interaction, "interactive_context", lambda: True)
+    monkeypatch.setattr(interaction, "ask_yes_no", lambda _prompt, default: False)
+
+    result = invoke(cli, "agents", "delete", "declined")
+
+    assert result.exit_code != vocab.EXIT_OK
+    assert envelope(result)["kind"] == "confirmation_required"
+    assert target.exists()
 
 
 def test_agents_delete_refuses_an_adapter_acpc_ships(cli: CliRunner) -> None:
@@ -556,7 +618,7 @@ def test_agents_delete_takes_back_an_override_of_a_shipped_adapter(
     target = state_root / "agents" / "codex.toml"
     assert target.exists()
 
-    result = invoke(cli, "agents", "delete", "codex", "--json")
+    result = invoke(cli, "agents", "delete", "codex", "--yes", "--json")
 
     assert result.exit_code == vocab.EXIT_OK
     assert json.loads(result.stdout)["changed"] is True

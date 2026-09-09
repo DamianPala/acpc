@@ -11,6 +11,7 @@ import os
 import signal
 import subprocess
 import sys
+import textwrap
 import time
 from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
@@ -429,72 +430,38 @@ class TimeoutParamType(click.ParamType):
 
 _ROOT_HELP = """acpc — dispatch coding agents over ACP.
 
-Quick reference
+Usage:
+  acpc COMMAND [ARGS] [OPTIONS]
+  acpc --help
+Root arguments: none.
 
-Short task (fits your tool-call window — blocks, answer on stdout):
-  acpc run <agent> "Explain this code"
-  acpc run <agent> "Implement the fix" --permissions execute
-  execute permits read, edit and execute; edit permits read and edit only
-  Dispatch prints `-- session <id> | dir <path>` on stderr right away:
-  the id works mid-run with log / cancel / steer.
+Global flags:
+__GLOBAL_FLAGS__
 
-Long or uncertain task (background):
-  acpc run <agent> "Run the tests" --background --json  # {"session_id": ..., "paths": ...}
-  acpc wait <id> --quiet                          # block until done, prints the answer
+Short task: acpc run <agent> "Explain this code" --permissions execute
+Long or uncertain task: acpc run <agent> "Run the tests" --background --json; acpc wait <id> --quiet block until done, prints the answer.
+Checking on a run: acpc log <id> --tail 10 --follow --timeout 60
+Steering a running session: acpc steer <id> "Stop editing; diagnose only"
+Context care: log is condensed by default; use --prose for the full answer.
+Maintenance and setup: delete, prune and bare daemon stop explain their gates; --dry-run previews.
+Common commands: run, resolve, continue, steer, wait, status, list, log, agents, skills, daemon.
   Truncated or huge answer? Read <dir>/answer.md selectively — always complete.
-  In a shell that can background calls, `wait` becomes a completion push.
-
-Checking on a run:
-  acpc log <id>                    # the default: instant snapshot, condensed
-  Need only the result? wait <id>. Don't block on a run you won't act on.
-
-Supervising a risky run you intend to steer/cancel mid-flight:
-  acpc log <id> --tail 10 --follow --timeout 60 --max-output 16384
-  Ends at session end (exit 0), the timeout (124) or the cap (4); resume
-  with --since <cursor> from the footer.
-
-Steering a running session:
-  acpc steer <id> "Stop editing; diagnose only"   # cancel + redirect, history kept
-
-Continue (next turn on a finished session):
+  SIGINT cancels the turn owned by this command. SIGTERM detaches work already taken over by the daemon.
   acpc continue <id> "Now fix what you found"
-
-Heredoc prompt:
   acpc run <agent> - --permissions execute <<'PROMPT'
   Review the implementation and make the required edits.
   PROMPT
 
-Context care (agent callers):
-  log's default view is condensed one-liners, last 20 events; full via --prose.
-  --json = this command's output as a machine envelope, any command. On
-  run/wait it embeds the answer; add --output-file FILE to keep the answer out of it.
-  Content reads best as markdown: answer.md, log --prose.
-  Tight context: lower the cap, e.g. --max-output 16384.
-  Every --timeout takes seconds (90) or a duration (90s, 5m, 1h).
+Command groups:
+__COMMAND_GROUPS__
 
-Maintenance and setup:
-  status <id>       liveness-verified metadata for one session
-  list              running + the 20 most recent sessions (--limit N to change)
-  cancel <id>       cancel a running session; it stays resumable with continue
-  delete <id> --yes delete a finished session's on-disk state
-  prune --yes       delete finished sessions older than retention (--older-than D)
-  install <agent>   install the agent's adapter (--yes unless you are at a terminal)
-  skills list       list bundled how-to skills; skills get <name> prints the body
-  SIGINT cancels the turn owned by this command. SIGTERM detaches work already
-  taken over by the daemon and ends a direct-worker turn.
-  Deleting needs --yes; --dry-run previews prune and bare daemon stop, and
-  never needs it. --force is separate: it overrides a documented refusal.
-
-Common commands:
-  run, resolve, continue, steer, wait, status, list, log, agents, skills, daemon,
-  probe, cancel, delete, prune, install
-  Use `acpc <command> --help` for the command's full reference.
+Commands:
+__COMMANDS__
+  Use `acpc <command> --help` for a command's full reference.
 
 Machine-readable interface:
-  acpc schema           the whole command surface as JSON: every command with
-                        its description and effects
+  acpc schema           the whole command surface as JSON
   acpc schema run       one command's arguments, flags, effects and gates
-                        (path segments are separate words: acpc schema agents create)
   --json on a command emits that command's own result as JSON.
 
 Flag → ACP
@@ -506,12 +473,72 @@ Flag → ACP
   --model        → session/new (model)
   --effort       → session/new (effort)"""
 
+_ROOT_COMMAND_LABELS = {
+    "status": "status <id>",
+    "cancel": "cancel <id>",
+    "delete": "delete <id> --yes",
+    "prune": "prune --yes",
+    "install": "install <agent>",
+}
+
+_ROOT_COMMAND_DESCRIPTIONS = {
+    "status": "liveness-verified metadata for one session",
+    "list": "running + the 20 most recent sessions (--limit N to change)",
+    "cancel": "cancel a running session; it stays resumable with continue",
+}
+
+
+def _root_description(command: click.Command) -> str:
+    text = command.short_help or command.help or ""
+    return " ".join(text.split("\n\n", 1)[0].replace("\b", " ").split())
+
+
+def _root_help_row(label: str, description: str) -> list[str]:
+    wrapped = textwrap.wrap(description, width=78) or [""]
+    rows = [f"  {label:<17} {wrapped[0]}"]
+    rows.extend(f"  {'':17} {line}" for line in wrapped[1:])
+    return rows
+
+
+def _root_help(group: click.Group) -> str:
+    index = schema.index(group)
+    flag_rows: list[str] = []
+    for flag in index["global_flags"]:
+        flag_name = flag["name"]
+        flag_description = flag["description"]
+        if not isinstance(flag_name, str) or not isinstance(flag_description, str):
+            raise TypeError("schema global flags must have string names and descriptions")
+        default = json.dumps(flag["default"], ensure_ascii=False)
+        description = f"{flag_description} [default: {default}]"
+        flag_rows.extend(_root_help_row(f"--{flag_name}", description))
+
+    group_rows: list[str] = []
+    for name, command in sorted(group.commands.items()):
+        if isinstance(command, click.Group):
+            group_rows.extend(_root_help_row(name, _root_description(command)))
+
+    descriptions = {entry["name"]: entry["description"] for entry in index["commands"]}
+    command_rows: list[str] = []
+    for name, description in descriptions.items():
+        if not isinstance(name, str) or not isinstance(description, str):
+            raise TypeError("schema commands must have string names and descriptions")
+        label = _ROOT_COMMAND_LABELS.get(name, name)
+        command_description = _ROOT_COMMAND_DESCRIPTIONS.get(name) or description
+        command_rows.extend(_root_help_row(label, command_description))
+
+    return (
+        _ROOT_HELP.replace("__GLOBAL_FLAGS__", "\n".join(flag_rows))
+        .replace("__COMMAND_GROUPS__", "\n".join(group_rows))
+        .replace("__COMMANDS__", "\n".join(command_rows))
+        + "\n"
+    )
+
 
 class _CheatSheetGroup(click.Group):
     """Use the compact first-contact page for the root command."""
 
     def get_help(self, ctx: click.Context) -> str:
-        return _ROOT_HELP
+        return _root_help(self)
 
     def main(self, *args: Any, **kwargs: Any) -> Any:
         """Report every failure once, in one place, in one shape.
@@ -532,15 +559,13 @@ class _CheatSheetGroup(click.Group):
             return super().main(*args, **kwargs)
         except click.UsageError as error:
             command_path = error.ctx.command_path if error.ctx is not None else None
-            message = _friendly_usage_message(error.format_message(), command_path=command_path)
-            _fail(UsageProblem(message, exit_code=error.exit_code))
+            _fail(_friendly_usage_problem(error.format_message(), command_path, error.exit_code))
         except AcpcError as error:
             _fail(error)
         except click.ClickException as error:
             error_context = getattr(error, "ctx", None)
             command_path = getattr(error_context, "command_path", None)
-            message = _friendly_usage_message(error.format_message(), command_path=command_path)
-            _fail(AcpcError(message, exit_code=error.exit_code))
+            _fail(_friendly_usage_problem(error.format_message(), command_path, error.exit_code))
         except (click.Abort, KeyboardInterrupt):
             # Click turns Ctrl-C into Abort; a stack trace here would say the
             # tool broke, when the caller simply stopped it.
@@ -687,10 +712,8 @@ def _continue_option_hint(message: str) -> str | None:
 
 
 def _friendly_option_hint(message: str, command_parts: list[str]) -> str | None:
-    follow_hint = (
-        "--follow is not a flag on this command — following a session is: "
-        "acpc log <id> --follow [--timeout S]"
-    )
+    follow_hint = "--follow is a log flag; use: acpc log <id> --follow [--timeout S]"
+    short_follow_hint = "-f is not accepted; use --follow: acpc log <id> --follow [--timeout S]"
     detach_hint = (
         "--detach is not an acpc flag — background dispatch is: "
         'acpc run <agent> "<prompt>" --background'
@@ -730,7 +753,7 @@ def _friendly_option_hint(message: str, command_parts: list[str]) -> str | None:
             return "--resolve moved to: acpc resolve <agent>"
     aliases = {
         "--follow": follow_hint,
-        "-f": follow_hint,
+        "-f": short_follow_hint,
         "--detach": detach_hint,
         "-d": detach_hint,
         "-C": "-C is not an acpc flag — the working-directory flag is --cwd DIR",
@@ -797,11 +820,55 @@ def _friendly_usage_message(message: str, *, command_path: str | None = None) ->
     if command_parts[-1:] == ["status"] and (
         "Missing argument" in message or "Missing parameter" in message
     ):
-        return "status requires a session id — use acpc list to list sessions"
+        return "status requires a session id"
     return (
         _friendly_option_hint(message, command_parts)
         or _friendly_command_hint(message, command_parts)
         or message
+    )
+
+
+_MISSING_ARGUMENT_RECOVERY = {
+    "agents create": (
+        "agents create requires NAME and --extends",
+        "Run: acpc agents create NAME --extends AGENT",
+    ),
+    "agents get": ("agents get requires NAME", "Run: acpc agents get NAME"),
+    "agents delete": (
+        "agents delete requires NAME",
+        "Run: acpc agents list, then repeat with NAME",
+    ),
+    "cancel": ("cancel requires a session selector", "Run: acpc cancel SESSION_ID"),
+    "continue": ("continue requires a session selector", "Run: acpc continue SESSION_ID PROMPT"),
+    "delete": ("delete requires a session selector", "Run: acpc delete SESSION_ID --yes"),
+    "install": ("install requires AGENT", "Run: acpc agents list, then repeat with AGENT"),
+    "log": ("log requires a session selector", "Run: acpc log SESSION_ID"),
+    "probe": ("probe requires ENTRY", "Run: acpc probe ENTRY --discover"),
+    "resolve": ("resolve requires AGENT", "Run: acpc resolve AGENT"),
+    "run": ("run requires AGENT", "Run: acpc run AGENT PROMPT"),
+    "status": ("status requires a session id", "Run: acpc list to choose a session id"),
+    "steer": ("steer requires a session selector", "Run: acpc steer SESSION_ID INSTRUCTION"),
+    "wait": ("wait requires a session selector", "Run: acpc wait SESSION_ID"),
+    "skills get": ("skills get requires NAME", "Run: acpc skills list, then repeat with NAME"),
+}
+
+
+def _friendly_usage_problem(message: str, command_path: str | None, exit_code: int) -> UsageProblem:
+    command_parts = (command_path or "").split()
+    command_name = " ".join(command_parts[-2:])
+    recovery = _MISSING_ARGUMENT_RECOVERY.get(command_name)
+    if recovery is None:
+        recovery = _MISSING_ARGUMENT_RECOVERY.get(command_parts[-1])
+    if recovery is not None and (
+        "Missing argument" in message
+        or "Missing parameter" in message
+        or "Missing option" in message
+    ):
+        friendly_message, hint = recovery
+        return UsageProblem(friendly_message, hint=hint, exit_code=exit_code)
+    return UsageProblem(
+        _friendly_usage_message(message, command_path=command_path),
+        exit_code=exit_code,
     )
 
 
@@ -940,7 +1007,13 @@ def _read_prompt_file(prompt_file: str) -> str:
     return _checked_prompt(text, "--prompt-file", exact=False)
 
 
-def _read_prompt(prompt_text: str | None, prompt_file: str | None) -> str:
+def _read_prompt(
+    prompt_text: str | None,
+    prompt_file: str | None,
+    *,
+    operation: str,
+    hint: str,
+) -> str:
     """Resolve the single prompt source, or fail naming the options.
 
     The size limit is enforced here, which is before any caller has created a
@@ -958,8 +1031,9 @@ def _read_prompt(prompt_text: str | None, prompt_file: str | None) -> str:
     ]
     if len(sources) != 1:
         raise UsageProblem(
-            "give exactly one prompt source: a prompt argument, - for stdin, or --prompt-file "
-            f"(got {len(sources)})"
+            f"{operation}: give exactly one prompt source: a prompt argument, - for stdin, "
+            f"or --prompt-file (got {len(sources)})",
+            hint=hint,
         )
     if prompt_text == "-":
         return _read_stdin_prompt()
@@ -1783,7 +1857,7 @@ def _run_agents_list(selected_format: str, limit: int, plain: bool) -> None:
 def agents_group(ctx: click.Context) -> None:
     """Manage adapter and variant entries with explicit list/get verbs."""
     if ctx.invoked_subcommand is None:
-        raise UsageProblem("agents needs a subcommand; use `acpc agents list`")
+        raise UsageProblem("agents requires a subcommand", hint="Run: acpc agents list")
 
 
 @effects.read_only
@@ -1817,7 +1891,12 @@ def agents_group(ctx: click.Context) -> None:
 def agents_list_command(
     ctx: click.Context, limit: int, plain: bool, format_name: str | None, json_mode: bool
 ) -> None:
-    """List adapters and variants; default is 20 entries."""
+    """List adapters and variants.
+    Entries are ordered by adapter name, ascending; each adapter is followed by its variants in
+    name order, and the default window is the first 20 of that order.
+
+    The collection is grouped by adapter so a variant is shown with its base adapter.
+    """
     selected_format = _select_format(format_name, json_mode, plain=plain)
     if (
         selected_format == "plain"
@@ -2021,6 +2100,7 @@ def agents_check_command(
     json_mode: bool,
 ) -> None:
     """Check registered adapters and variants, then report advertised data.
+    Entries are ordered by name, ascending, and the default window is the first 20 of that order.
 
     With NAME, check one registered entry, including one whose adapter is not
     installed. Without NAME, check every registered adapter and variant.
@@ -2087,7 +2167,8 @@ def probe_command(entry: str, discover: bool, format_name: str | None, json_mode
     if not discover:
         raise UsageProblem(
             "probe needs --discover: reading the advertised mode catalogue is what this "
-            "release measures. Measuring what a mode actually permits is not in it"
+            "release measures. Measuring what a mode actually permits is not in it",
+            hint="Run: acpc probe ENTRY --discover",
         )
     try:
         report = probe_engine.run(entry)
@@ -2265,6 +2346,7 @@ def agents_create_command(
 )
 @agents_group.command(name="delete")
 @click.argument("name")
+@click.option("--yes", "-y", "assume_yes", is_flag=True, help="Delete without being asked.")
 @click.option(
     "--format",
     "format_name",
@@ -2274,13 +2356,14 @@ def agents_create_command(
 @_json_option("Emit the deleted entry as JSON.")
 @_color_option()
 @click.help_option("-h", "--help")
-def agents_delete_command(name: str, format_name: str | None, json_mode: bool) -> None:
+def agents_delete_command(
+    name: str, assume_yes: bool, format_name: str | None, json_mode: bool
+) -> None:
     """Delete one entry this machine owns, under ``$ACPC_HOME/agents``.
 
-    The counterpart to ``agents create``: it takes back exactly what that wrote,
-    which is why creating an entry needs no confirmation — including the entry
-    that overrides an adapter acpc ships. The shipped adapter itself is not
-    this machine's, so a name with no file under ``agents`` is refused.
+    The file is usually hand-written and acpc has no operation that restores it,
+    so deletion requires confirmation. The shipped adapter itself is not this
+    machine's, so a name with no file under ``agents`` is refused.
 
     Example: ``acpc agents delete work``
     """
@@ -2299,6 +2382,13 @@ def agents_delete_command(name: str, format_name: str | None, json_mode: bool) -
                 hint="Run: acpc agents list",
             )
         raise _not_found(f"unknown agent entry '{name}'", hint="Run: acpc agents list")
+    interaction.require_confirmation(
+        assume_yes,
+        message=f"agents delete {name}: deleting the local entry needs confirmation",
+        hint=f"Run: acpc agents delete {name} --yes",
+        prompt=f"Delete local agent entry {name}? [y/N] ",
+        default=False,
+    )
     try:
         target.unlink()
     except OSError as error:
@@ -2352,7 +2442,7 @@ def _run_skill_get(name: str, selected_format: str) -> None:
 def skills_group(ctx: click.Context) -> None:
     """Browse bundled skills with explicit list and get verbs."""
     if ctx.invoked_subcommand is None:
-        raise UsageProblem("skills needs a subcommand; use `acpc skills list`")
+        raise UsageProblem("skills requires a subcommand", hint="Run: acpc skills list")
 
 
 @effects.read_only
@@ -2386,7 +2476,9 @@ def skills_group(ctx: click.Context) -> None:
 def skills_list_command(
     ctx: click.Context, limit: int, plain: bool, format_name: str | None, json_mode: bool
 ) -> None:
-    """List bundled skills; default is 20 entries."""
+    """List bundled skills.
+    Entries are ordered by name, ascending, and the default window is the first 20 of that order.
+    """
     selected_format = _select_format(format_name, json_mode, plain=plain)
     if (
         selected_format == "plain"
@@ -2817,8 +2909,9 @@ def prune_command(
     Identifier tombstones are permanent: pruning releases session data, never an
     identifier reservation.
 
-    It decides what to delete as it runs, so deleting needs ``--yes``;
-    ``--dry-run`` lists the same targets and never does.
+    It resolves the target set before confirmation. An empty set is an unchanged
+    success without confirmation; a non-empty set needs ``--yes``. ``--dry-run``
+    lists the same targets and never does.
 
     Example: ``acpc prune --older-than 7d --dry-run``
     """
@@ -2832,15 +2925,18 @@ def prune_command(
                 f"config retention '{settings.retention}' resolves to zero — bare prune would "
                 "delete every finished session; pass --older-than 0d to do that explicitly"
             )
-        if not dry_run:
-            # After the threshold resolved, so a bad --older-than fails as one;
-            # before anything is read for deletion, so a refusal costs nothing.
+        candidates = sessions.prune_candidates(older_than=duration)
+        if candidates and not dry_run:
             interaction.require_confirmation(
                 assume_yes,
                 message="prune: deleting the sessions it selects needs confirmation",
                 hint="Run: acpc prune --dry-run to see them, then repeat with --yes",
             )
-        candidates = sessions.prune_sessions(older_than=duration, dry_run=dry_run)
+            candidates = sessions.prune_sessions(
+                older_than=duration,
+                dry_run=False,
+                candidates=candidates,
+            )
     except AcpcError:
         raise
     except sessions.SessionError as error:
@@ -2858,7 +2954,7 @@ def prune_command(
     payload = {
         "targets": session_ids,
         "changed": bool(session_ids) and not dry_run,
-        "requires_confirmation": True,
+        "requires_confirmation": bool(session_ids),
     }
     if selected_format == "json":
         _maintenance_json(payload)
@@ -3091,6 +3187,9 @@ def list_command(
     json_mode: bool,
 ) -> None:
     """List liveness-verified sessions as a bounded collection.
+    The window is the first N of this order: active sessions first, newest by creation time, then
+    finished sessions, newest by finish time, falling back to creation time when a session has
+    none; ties are broken by session id, descending in both groups.
 
     The collection includes active sessions and the most recent finished
     sessions. A daemon-owned continuation in its pre-prompt window is shown as
@@ -3934,7 +4033,12 @@ def run_command(
     )
     defaulted_permissions = permissions is None and resolution.permissions is None
     resolved_cwd = str(Path(cwd).expanduser().resolve()) if cwd else os.getcwd()
-    prompt = _read_prompt(prompt_text, prompt_file)
+    prompt = _read_prompt(
+        prompt_text,
+        prompt_file,
+        operation="run",
+        hint="Run: acpc run AGENT PROMPT",
+    )
     try:
         runner.adapter_command(resolution)
     except runner.RunnerError as error:
@@ -4235,7 +4339,12 @@ def continue_command(
         raise UsageProblem("--timeout only bounds waiting; use --cancel-after with --background")
     permissions = _normalize_permission(permissions)
 
-    prompt = _read_prompt(prompt_text, prompt_file)
+    prompt = _read_prompt(
+        prompt_text,
+        prompt_file,
+        operation="continue",
+        hint="Run: acpc continue SESSION_ID PROMPT",
+    )
     meta = _load_view_session(selector)
     if meta.is_active:
         raise AcpcError(
@@ -4536,7 +4645,12 @@ def steer_command(
     selected_format = _select_format(format_name, json_mode, native_text=True)
     if background and timeout is not None:
         raise UsageProblem("--timeout only bounds waiting; use --cancel-after with --background")
-    instruction = _read_prompt(instruction_text, prompt_file)
+    instruction = _read_prompt(
+        instruction_text,
+        prompt_file,
+        operation="steer",
+        hint="Run: acpc steer SESSION_ID INSTRUCTION",
+    )
     meta = _load_view_session(selector)
     if not meta.is_active:
         meta = _status_view_meta(meta)
@@ -4717,13 +4831,16 @@ def _daemon_idle_column(idle_seconds: float | None) -> str:
 
 
 @effects.read_only
-@main.group(name="daemon", invoke_without_command=False)
+@main.group(name="daemon", invoke_without_command=True)
 @click.help_option("-h", "--help")
-def daemon_group() -> None:
+@click.pass_context
+def daemon_group(ctx: click.Context) -> None:
     """Inspect and stop the per-target daemons.
 
     Example: ``acpc daemon status``
     """
+    if ctx.invoked_subcommand is None:
+        raise UsageProblem("daemon requires a subcommand", hint="Run: acpc daemon status")
 
 
 @effects.read_only
@@ -4766,6 +4883,8 @@ def daemon_status_command(
     json_mode: bool,
 ) -> None:
     """Report each live daemon with its acpc version, pid, uptime, idle age and log path.
+    Entries are ordered by target name, ascending, and the default window is the first 20 of that
+    order.
 
     Example: ``acpc daemon status --json``
     """
@@ -4894,7 +5013,7 @@ def daemon_stop_command(
     targets = runner.daemon_targets_for(agent) if agent else runner.all_daemon_targets()
     if not force:
         _refuse_stop_over_active_sessions(agent, targets)
-    if agent is None and not dry_run:
+    if agent is None and targets and not dry_run:
         # Last, after the precondition: a refusal caused by active sessions is
         # not something confirming the stop would resolve.
         interaction.require_confirmation(
@@ -4912,7 +5031,7 @@ def daemon_stop_command(
     payload = {
         "targets": stopped,
         "changed": bool(stopped) and not dry_run,
-        "requires_confirmation": agent is None,
+        "requires_confirmation": agent is None and bool(targets),
     }
     if selected_format == "json":
         _maintenance_json(payload)

@@ -48,6 +48,7 @@ cancel <id>
 delete <id> --yes | prune [--older-than D] [--dry-run] [--yes]
 agents list|get|check|create|delete          # adapters + variants
 agents create <name> --extends <agent>       # scaffold a variant
+agents delete <name> [--yes]                 # remove one local entry
 probe <entry> --discover [--json]             # read the adapter's advertised modes; report only
 skills list|get                               # bundled how-to skills; get prints body + dir on stderr
 install <agent>
@@ -55,6 +56,12 @@ daemon status|stop [target] [--force]   # plumbing escape hatch — never needed
 ```
 
 `acpc --help` is a self-contained cheat sheet; `acpc <cmd> --help` is that command's full reference. `<id>` accepts a session id or a `--name` alias; `last` works on a TTY only.
+
+`list` uses this order for its first N entries: active sessions first, newest by creation time, then finished sessions, newest by finish time, falling back to creation time when a session has none; ties are broken by session id, descending in both groups.
+`agents list` orders adapter names ascending, followed by each adapter's variants in name order; its default window is the first 20 entries in that order.
+`agents check` orders entries by name, ascending, with the default window being the first 20 entries in that order.
+`skills list` orders entries by name, ascending, with the default window being the first 20 entries in that order.
+`daemon status` orders entries by target name, ascending, with the default window being the first 20 entries in that order.
 
 For one-time changes from earlier releases, see [MIGRATION.md](MIGRATION.md).
 

@@ -137,6 +137,37 @@ def test_agents_list_shows_variant_delta(cli: CliRunner) -> None:
     assert "mock-opus-5" in result.stdout
 
 
+def test_agents_list_uses_stable_adapter_then_variant_order(cli: CliRunner) -> None:
+    first = json.loads(invoke(cli, "agents", "list", "--limit", "100", "--json").stdout)
+    second = json.loads(invoke(cli, "agents", "list", "--limit", "100", "--json").stdout)
+
+    assert first == second
+    items = first["items"]
+    registry = AgentRegistry()
+    expected: list[str] = []
+    for adapter in registry.adapters:
+        expected.append(adapter.entry)
+        expected.extend(
+            variant.entry for variant in registry.variants if variant.base_adapter == adapter.entry
+        )
+    assert [item["name"] for item in items] == expected
+
+
+def test_agents_check_uses_name_order_for_its_collection(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def advertised(_resolution: object) -> dict[str, list[object]]:
+        return {"models": []}
+
+    monkeypatch.setattr(cache, "probe_advertised", advertised)
+    first = json.loads(invoke(cli, "agents", "check", "--limit", "100", "--json").stdout)
+    second = json.loads(invoke(cli, "agents", "check", "--limit", "100", "--json").stdout)
+
+    first_names = [item["agent"] for item in first["items"]]
+    assert first == second
+    assert first_names == sorted(first_names)
+
+
 def test_agents_list_labels_variant_columns_and_adapts_to_long_values(
     cli: CliRunner, state_root: Path
 ) -> None:

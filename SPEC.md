@@ -65,21 +65,21 @@ agents list [--limit N] [--plain] [--format text|json|plain]
 agents get NAME [--models] [--commands] [--format text|json]
 agents check [NAME] [--limit N] [--plain] [--timeout S] [--format text|json|plain]
 agents create NAME --extends AGENT [--model M] [--effort E] [--mode MODE] [--permissions P] [--home DIR] [--format text|json]
-agents delete NAME [--format text|json]
+agents delete NAME [--yes] [--format text|json]
 ```
 
-`agents list` returns a bounded collection with `items` and `has_more`, defaulting to 20 entries. `--plain` prints one adapter or variant name per line and requires an explicit `--limit`.
+`agents list` returns a bounded collection with `items` and `has_more`, defaulting to 20 entries. Entries are ordered by adapter name, ascending; each adapter is followed by its variants in name order, and the default window is the first 20 of that order. `--plain` prints one adapter or variant name per line and requires an explicit `--limit`.
 
 `agents get` renders one adapter or variant.
 The detail contains resolved values with provenance, environment declarations, and the adapter's advertised modes, models and slash commands.
 `--models` and `--commands` select the corresponding advertised view, and they are mutually exclusive.
 A variant points at its base adapter rather than duplicating the catalog.
 
-`agents check` runs the adapter connection check without sending a prompt. Without `NAME` it checks every registered adapter and variant, bounded by the default limit of 20. With `NAME` it checks exactly one entry and returns a one-item collection with `has_more: false`; `NAME` cannot be combined with `--limit` or `--plain`. The default connection timeout is 30 seconds. A check that reaches the adapter and reports `ok: false` is still a successful command with exit code 0; failed checks are summarized on stderr.
+`agents check` runs the adapter connection check without sending a prompt. Without `NAME` it checks every registered adapter and variant, bounded by the default limit of 20. Entries are ordered by name, ascending, and the default window is the first 20 of that order. With `NAME` it checks exactly one entry and returns a one-item collection with `has_more: false`; `NAME` cannot be combined with `--limit` or `--plain`. The default connection timeout is 30 seconds. A check that reaches the adapter and reports `ok: false` is still a successful command with exit code 0; failed checks are summarized on stderr.
 
 `agents create` writes a strict local variant under `ACPC_HOME/agents`. Existing names are a `conflict`, and names that are path-like or collide with an `agents` subcommand are invalid. It requires `--extends` and does not ask for confirmation.
 
-`agents delete` removes only a local file under `ACPC_HOME/agents`, including a local override of a shipped adapter. It never removes a shipped adapter. It does not require confirmation because it is the exact counterpart of local variant creation.
+`agents delete` removes only a local file under `ACPC_HOME/agents`, including a local override of a shipped adapter. It never removes a shipped adapter. The file is usually hand-written and acpc has no operation that restores it, so deletion is a narrow irreversible mutation and requires confirmation: a terminal caller is asked, and every other caller must pass `--yes`. An unknown name fails as `not_found` before the gate and does not require `--yes`.
 
 ### `cancel`
 
@@ -116,9 +116,9 @@ daemon status [AGENT] [--limit N] [--plain] [--format text|json|plain]
 daemon stop [AGENT] [--force] [--dry-run] [--yes] [--format text|json]
 ```
 
-`daemon status` reports bounded items with `target`, `version`, `pid`, `uptime_seconds`, `log`, `sessions`, `preparing`, `restoring`, `max_concurrent` and `idle_seconds`. It connects only to the addressed daemon and does not restart it.
+`daemon status` reports bounded items with `target`, `version`, `pid`, `uptime_seconds`, `log`, `sessions`, `preparing`, `restoring`, `max_concurrent` and `idle_seconds`. Entries are ordered by target name, ascending, and the default window is the first 20 of that order. It connects only to the addressed daemon and does not restart it.
 
-Named `daemon stop AGENT` stops the targeted daemon without a confirmation gate. Bare `daemon stop` addresses every daemon and requires `--yes`; `--dry-run` lists the targets and never asks. Active `starting` or `running` sessions refuse the stop with `precondition_failed` unless `--force` is supplied. `--yes` confirms the action and `--force` overrides that precondition; neither substitutes for the other. A forced stop finalizes affected sessions as `failed`.
+Named `daemon stop AGENT` stops the targeted daemon without a confirmation gate. Bare `daemon stop` resolves every daemon before confirmation; an empty target set succeeds unchanged without confirmation, while a non-empty set requires `--yes`. `--dry-run` lists the targets and requires confirmation exactly when that set is non-empty. Active `starting` or `running` sessions refuse the stop with `precondition_failed` unless `--force` is supplied. `--yes` confirms the action and `--force` overrides that precondition; neither substitutes for the other. A forced stop finalizes affected sessions as `failed`.
 
 ### `delete`
 
@@ -142,7 +142,7 @@ install AGENT [--yes] [--format text|json]
 list [--limit N] [--plain] [--format text|json|plain]
 ```
 
-`list` returns liveness-verified sessions, active first and then the most recent finished sessions, bounded by 20 by default. The collection has `items` and `has_more`. Each item contains `session_id`, `entry`, `model`, `status`, `name`, `prompt_snippet`, `runtime_seconds`, `idle_seconds`, `created_at`, `started_at` and `finished_at`. A daemon-owned continuation preparation appears as `preparing`. `--plain` emits one session id per line and requires an explicit `--limit`.
+`list` returns liveness-verified sessions, active first and then the most recent finished sessions, bounded by 20 by default. The window is the first N of this order: active sessions first, newest by creation time, then finished sessions, newest by finish time, falling back to creation time when a session has none; ties are broken by session id, descending in both groups. The collection has `items` and `has_more`. Each item contains `session_id`, `entry`, `model`, `status`, `name`, `prompt_snippet`, `runtime_seconds`, `idle_seconds`, `created_at`, `started_at` and `finished_at`. A daemon-owned continuation preparation appears as `preparing`. `--plain` emits one session id per line and requires an explicit `--limit`.
 
 ### `log`
 
@@ -187,7 +187,7 @@ probe ENTRY --discover [--format text|json]
 prune [--older-than D] [--dry-run] [--yes] [--format text|json]
 ```
 
-`prune` clears only finished sessions whose age from `finished_at` exceeds the threshold and leaves a permanent identifier tombstone in each selected directory. Without `--older-than`, the session threshold is `config.toml`'s `retention`, default `90d`. A zero retention value requires an explicit `--older-than 0d`; active sessions are never candidates. Removing session data never releases its identifier. `--dry-run` reports the same `targets` and `requires_confirmation: true` without deleting, and does not require `--yes`. A mutating call requires confirmation. The result uses `targets`, `changed` and `requires_confirmation`, not a collection envelope.
+`prune` clears only finished sessions whose age from `finished_at` exceeds the threshold and leaves a permanent identifier tombstone in each selected directory. Without `--older-than`, the session threshold is `config.toml`'s `retention`, default `90d`. A zero retention value requires an explicit `--older-than 0d`; active sessions are never candidates. Removing session data never releases its identifier. `prune` resolves its target set before the confirmation gate. When the set is empty it succeeds with `changed: false` and `requires_confirmation: false` without asking, because no protected effect remains; a failure to read the candidates still reports its own error rather than an empty success. When the set is not empty, the mutating call requires confirmation. `--dry-run` reports the same `targets`, `changed` and `requires_confirmation` without deleting and does not require `--yes`; `requires_confirmation` is `true` exactly when the target set is not empty. The result uses `targets`, `changed` and `requires_confirmation`, not a collection envelope.
 
 ### `resolve`
 
@@ -223,7 +223,7 @@ skills list [--limit N] [--plain] [--format text|json|plain]
 skills get NAME [--format text|json]
 ```
 
-`skills list` returns a bounded collection of bundled skills with `name`, `description` and `path`. `--plain` prints one name per line and requires an explicit limit. `skills get` prints the skill body in text mode and writes its source directory to stderr; its machine result contains `name`, `description`, `path` and `body`. Bundled skills are read-only package data.
+`skills list` returns a bounded collection of bundled skills with `name`, `description` and `path`. Entries are ordered by name, ascending, and the default window is the first 20 of that order. `--plain` prints one name per line and requires an explicit limit. `skills get` prints the skill body in text mode and writes its source directory to stderr; its machine result contains `name`, `description`, `path` and `body`. Bundled skills are read-only package data.
 
 ### `status`
 
@@ -409,7 +409,7 @@ Historical metadata is normalized when read. The former terminal deadline state 
 
 Retention is measured from `finished_at`.
 Auto-prune runs opportunistically after a run according to `retention`.
-Explicit delete always needs confirmation, while prune uses `--dry-run` to preview and `--yes` for the mutation.
+Explicit delete always needs confirmation, while prune uses `--dry-run` to preview and `--yes` for the mutation. A prune that resolves an empty target set needs neither.
 Once allocated, a session id is never assigned to another session. The allocator reserves ids by creating their directories; delete and every prune path release session data but never the identifier reservation. If the finite id space is exhausted, allocation fails with `unavailable` and does not suggest that pruning will free an id.
 
 ## Agent variants

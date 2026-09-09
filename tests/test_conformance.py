@@ -886,7 +886,7 @@ def _success_call(
         )
     if name == "agents delete":
         invoke(cli, "agents", "create", f"delete-{label}", "--extends", "mock", "--json")
-        return invoke(cli, "agents", "delete", f"delete-{label}", *output_flags)
+        return invoke(cli, "agents", "delete", f"delete-{label}", "--yes", *output_flags)
     if name == "agents get":
         return invoke(cli, "agents", "get", "mock", *output_flags)
     if name == "agents list":
@@ -1037,7 +1037,7 @@ def test_R1_R5_every_mutating_command_has_a_semantic_oracle(
     assert json.loads(created.stdout)["changed"] is (before != after)
 
     before = _snapshot_tree(registry)
-    deleted = invoke(cli, "agents", "delete", "stage-r", "--json")
+    deleted = invoke(cli, "agents", "delete", "stage-r", "--yes", "--json")
     after = _snapshot_tree(registry)
     assert deleted.exit_code == vocab.EXIT_OK, deleted.stderr
     assert json.loads(deleted.stdout)["changed"] is (before != after)
