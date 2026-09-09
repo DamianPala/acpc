@@ -63,12 +63,15 @@ def test_json_envelope_has_pinned_fields_and_truncates_answer_only() -> None:
         "cost",
         "answer",
         "truncated",
+        "partial",
         "denied",
         "permissions_clamp",
         "next",
         "output_file",
     }
     assert payload["truncated"] is True
+    # The fixture session never left `starting`, so no answer landed yet.
+    assert payload["partial"] is True
     assert payload["denied"] == []
     assert payload["permissions_clamp"] is None
     assert "full answer:" in payload["answer"]
@@ -94,8 +97,10 @@ def test_background_and_output_file_shapes_are_separate(tmp_path: Path) -> None:
         "denied",
         "permissions_clamp",
         "truncated",
+        "partial",
         "next",
     }
+    assert background["partial"] is False
     assert background["denied"] == []
     assert background["permissions_clamp"] is None
     assert background["next"] == ["acpc", "wait", meta.session_id]

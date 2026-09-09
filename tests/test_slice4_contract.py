@@ -304,7 +304,7 @@ def test_output_file_mirrors_text_and_json_wait_output_byte_for_byte(
     assert json_file.read_bytes() == direct_json.stdout.encode()
 
 
-def test_failed_turn_output_file_is_created_and_mirrors_selected_stream(
+def test_failed_turn_output_file_mirrors_the_result_that_is_returned(
     cli: CliRunner, tmp_path: Path
 ) -> None:
     text_file = tmp_path / "failed.txt"
@@ -336,7 +336,10 @@ def test_failed_turn_output_file_is_created_and_mirrors_selected_stream(
     )
     assert machine.exit_code == vocab.EXIT_AGENT_ERROR
     assert machine.stdout == ""
-    assert json_file.read_bytes() == b""
+    document = json.loads(json_file.read_text(encoding="utf-8"))
+    assert document["status"] == "failed"
+    assert document["partial"] is False
+    assert "Unable to complete" in document["answer"]
 
 
 def test_meta_status_and_transcript_timestamps_are_rfc3339(cli: CliRunner) -> None:

@@ -633,7 +633,8 @@ def test_a_daemon_routed_failure_still_reports_the_result(
     """A turn that ran and failed is a result, not an aborted command.
 
     The daemon has already finalized it on disk, so the failure is reported by
-    the shared error envelope on stderr; machine stdout remains empty.
+    the shared error envelope on stderr and by the result document on stdout:
+    a refusal is a complete answer for the call, so `partial` stays false.
     """
     result = invoke(cli, "run", "mock", "auth:vendor rejected the request", "--json")
 
@@ -641,7 +642,10 @@ def test_a_daemon_routed_failure_still_reports_the_result(
     payload = error_envelope(result)
     assert payload["kind"] == "operation_failed"
     assert payload["context"]["status"] == "failed"
-    assert result.stdout == ""
+    document = json.loads(result.stdout)
+    assert document["status"] == "failed"
+    assert document["partial"] is False
+    assert document["answer"] != ""
     assert "-- failed" in result.stderr
 
 

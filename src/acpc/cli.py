@@ -81,11 +81,26 @@ _DURATION_SYNTAX = (
 )
 
 _OUTPUT_FILE_HELP = (
-    "Write exactly what stdout would receive to a file; on success stdout stays empty, and "
-    "a failed machine-format turn writes an empty file. A relative path resolves against the "
-    "directory acpc was invoked from, and the file is overwritten. The session's full "
-    "answer.md lives in its session directory and follows its retention and prune policy "
-    "(90 days by default)."
+    "Write exactly what stdout would receive to a file; stdout stays empty, on success and "
+    "on a failure that returns a result. A call that returns no result creates no file. A "
+    "relative path resolves against the directory acpc was invoked from, and the file is "
+    "overwritten. The session's full answer.md lives in its session directory and follows "
+    "its retention and prune policy (90 days by default)."
+)
+
+# What the answer schema cannot express: when a failure still answers, and
+# which fields only one kind of call carries (D7 `output_description`, O4d/O5a).
+_ANSWER_OUTPUT_DESCRIPTION = (
+    "Returns the answer result for a turn this call observed — including a failed, canceled "
+    "or lost turn, and one whose session had not finished when a --timeout deadline or a "
+    "detach ended this client's watch — and returns no result for a call that observed no "
+    "turn. `stop_reason`, `cost` and `answer` are present on every foreground result and "
+    "omitted by `--background`."
+)
+_WAIT_OUTPUT_DESCRIPTION = (
+    "Returns the answer result for a session this call observed — including a failed, "
+    "canceled or lost session, and one still unfinished when a --timeout deadline expired — "
+    "and returns no result for a call that observed no session."
 )
 
 # The same file, said in full for the schema: `--help` has no room for it.
@@ -263,22 +278,37 @@ def _emit_turn_result(
     *,
     output_file: str | None,
     json_mode: bool,
-    success: bool,
 ) -> None:
-    # A failed machine-format document must leave stdout empty; still create
-    # the requested mirror file so callers can read it after every exit code.
+    """Write the result of a call that observed the turn.
+
+    Every caller reaches here with a result in hand, so the document is
+    written whatever the exit code will be: a failed, canceled or timed-out
+    turn still answers with the session's observed result (O5a).  A call that
+    observed no turn never gets this far and writes nothing.
+    """
     if output_file is not None:
-        file_result = result if success or not json_mode else output.OutputResult("", False, 0)
-        _write_rendered_file(output_file, file_result)
+        _write_rendered_file(output_file, result)
         return
-    if success or not json_mode:
-        _write_stdout(result.text)
+    _write_stdout(result.text)
 
 
-def _raise_wait_timeout(session_id: str, output_file: str | None) -> NoReturn:
-    """Fail after a wait deadline without changing the accepted session."""
-    if output_file is not None:
-        output.write_output_file(output_file, "")
+def _emit_wait_timeout(
+    session_id: str,
+    output_file: str | None,
+    *,
+    json_mode: bool,
+    max_output: int,
+    expected_turn: int | None = None,
+) -> NoReturn:
+    """Answer with the observed session, then fail on the deadline.
+
+    The deadline stops this client from waiting; it neither cancels the work
+    nor observes its end.  The result says exactly that: the observed status
+    and `partial: true`, because the answer this call was waiting for has not
+    landed (O5a).  A session whose state cannot be read yields no result, and
+    so does a follow-up whose turn had not rotated in yet: the record still
+    describes the previous turn, which is not this call's result.
+    """
     try:
         observed = sessions.read_meta(session_id)
     except (sessions.SessionError, OSError):
@@ -289,6 +319,15 @@ def _raise_wait_timeout(session_id: str, output_file: str | None) -> NoReturn:
             context={"session_id": session_id, "status": None},
             exit_code=vocab.EXIT_AGENT_ERROR,
         ) from None
+    if expected_turn is None or observed.turns >= expected_turn:
+        result = output.render_result(
+            observed,
+            json_mode=json_mode,
+            max_output=max_output,
+            changed=True,
+            partial=True,
+        )
+        _emit_turn_result(result, output_file=output_file, json_mode=json_mode)
     raise AcpcError(
         f"session {session_id} timed out while still {observed.state}",
         kind=errors.TIMEOUT,
@@ -3904,7 +3943,12 @@ def _run_foreground(
     except runner.RunnerError as error:
         raise _runner_problem(error).with_context(session_id=meta.session_id) from None
     if outcome.wait_timed_out:
-        _raise_wait_timeout(meta.session_id, output_file)
+        _emit_wait_timeout(
+            meta.session_id,
+            output_file,
+            json_mode=selected_format == "json",
+            max_output=max_output,
+        )
     final = sessions.read_meta(meta.session_id)
     result = output.render_result(
         final,
@@ -3917,7 +3961,6 @@ def _run_foreground(
         result,
         output_file=output_file,
         json_mode=selected_format == "json",
-        success=outcome.exit_code == vocab.EXIT_OK,
     )
     if outcome.state == "detached":
         _echo_metadata(
@@ -3932,6 +3975,7 @@ def _run_foreground(
 
 @effects.non_idempotent
 @schema.format_defaults(tty="text", non_tty="text")
+@schema.output_description(_ANSWER_OUTPUT_DESCRIPTION)
 @schema.reads_stdin("prompt_text")
 @schema.describes(
     agent=(
@@ -4228,9 +4272,9 @@ def _dispatch_background(
     problem = asyncio.run(runner.dispatch_background(session_id, request))
     if problem is not None:
         # The session exists by now: the caller has to be able to reach it
-        # even though the dispatch that would have run it failed (R7a).
-        if output_file is not None:
-            output.write_output_file(output_file, "")
+        # even though the dispatch that would have run it failed (R7a).  No
+        # turn was observed, so this call has no result to write anywhere and
+        # `--output-file` creates nothing (O2e).
         raise AgentProblem(problem, context={"session_id": session_id})
     meta = sessions.read_meta(session_id)
     result = output.render_result(
@@ -4246,6 +4290,7 @@ def _dispatch_background(
 
 @effects.non_idempotent
 @schema.format_defaults(tty="text", non_tty="text")
+@schema.output_description(_ANSWER_OUTPUT_DESCRIPTION)
 @schema.reads_stdin("prompt_text")
 @schema.describes(
     selector=_SELECTOR_HELP,
@@ -4523,7 +4568,13 @@ def _dispatch_follow_up(
         raise _runner_problem(error).with_context(session_id=meta.session_id) from None
 
     if outcome.wait_timed_out:
-        _raise_wait_timeout(meta.session_id, output_file)
+        _emit_wait_timeout(
+            meta.session_id,
+            output_file,
+            json_mode=json_mode,
+            max_output=max_output,
+            expected_turn=current.turns + 1,
+        )
 
     final = sessions.read_meta(meta.session_id)
 
@@ -4538,7 +4589,6 @@ def _dispatch_follow_up(
         result,
         output_file=output_file,
         json_mode=json_mode,
-        success=outcome.exit_code == vocab.EXIT_OK,
     )
     if outcome.state == "detached":
         _echo_metadata(
@@ -4564,6 +4614,7 @@ def _steer_prompt(instruction: str) -> str:
 
 @effects.non_idempotent
 @schema.format_defaults(tty="text", non_tty="text")
+@schema.output_description(_ANSWER_OUTPUT_DESCRIPTION)
 @schema.reads_stdin("instruction_text")
 @schema.describes(
     selector=_SELECTOR_HELP,
@@ -4707,6 +4758,7 @@ def steer_command(
 
 @effects.read_only
 @schema.format_defaults(tty="text", non_tty="text")
+@schema.output_description(_WAIT_OUTPUT_DESCRIPTION)
 @schema.describes(selector=_SELECTOR_HELP, output_file=_OUTPUT_FILE_DESCRIPTION)
 @main.command(name="wait")
 @click.argument("selector")
@@ -4770,7 +4822,7 @@ def wait_command(
             if not quiet:
                 _echo_metadata(_still_running_note(meta.session_id, timeout))
             try:
-                observed_status = sessions.read_meta(meta.session_id).state
+                observed = sessions.read_meta(meta.session_id)
             except (sessions.SessionError, OSError):
                 raise AcpcError(
                     f"gave up waiting for session {meta.session_id}; its state is unknown",
@@ -4778,6 +4830,21 @@ def wait_command(
                     retryable=False,
                     context={"session_id": meta.session_id, "status": None},
                 ) from None
+            observed_status = observed.state
+            # The deadline observed a session, so the call answers with it:
+            # the last status and `partial: true`, since the answer this call
+            # waited for is exactly what did not arrive (O5a).
+            _emit_turn_result(
+                output.render_result(
+                    observed,
+                    _answer_text(meta.session_id),
+                    json_mode=selected_format == "json",
+                    max_output=max_output,
+                    partial=True,
+                ),
+                output_file=output_file,
+                json_mode=selected_format == "json",
+            )
             raise AcpcError(
                 f"gave up waiting for session {meta.session_id}; it is still running",
                 kind=errors.TIMEOUT,
@@ -4807,7 +4874,6 @@ def wait_command(
             result,
             output_file=output_file,
             json_mode=selected_format == "json",
-            success=exit_code == vocab.EXIT_OK,
         )
         if not quiet:
             summary = output.format_summary(final)

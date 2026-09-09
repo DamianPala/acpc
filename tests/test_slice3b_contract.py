@@ -69,6 +69,7 @@ EXPECTED_REQUIRED: dict[str, tuple[str, ...]] = {
         "finished_at",
         "paths",
         "truncated",
+        "partial",
         "denied",
         "permissions_clamp",
         "changed",
@@ -111,6 +112,7 @@ EXPECTED_REQUIRED: dict[str, tuple[str, ...]] = {
         "finished_at",
         "paths",
         "truncated",
+        "partial",
         "denied",
         "permissions_clamp",
         "changed",
@@ -147,6 +149,7 @@ EXPECTED_REQUIRED: dict[str, tuple[str, ...]] = {
         "finished_at",
         "paths",
         "truncated",
+        "partial",
         "denied",
         "permissions_clamp",
         "changed",
@@ -162,6 +165,7 @@ EXPECTED_REQUIRED: dict[str, tuple[str, ...]] = {
         "answer",
         "paths",
         "truncated",
+        "partial",
         "denied",
         "permissions_clamp",
     ),
@@ -178,14 +182,14 @@ EXPECTED_ENUMS: dict[str, dict[str, tuple[str, ...]]] = {
             "unknown",
         )
     },
-    "continue": {"$.status": ("running", "succeeded")},
+    "continue": {"$.status": ("running", "succeeded", "failed", "canceled", "unknown")},
     "log": {
         "$.type": tuple(sorted(("error", "msg", "permission", "state", "thought", "tool", "usage")))
     },
     "probe": {
         "$.diff[].status": ("advertised-missing", "entry-missing"),
     },
-    "run": {"$.status": ("running", "succeeded")},
+    "run": {"$.status": ("starting", "running", "succeeded", "failed", "canceled", "unknown")},
     "list": {
         "$.items[].status": (
             "starting",
@@ -208,8 +212,8 @@ EXPECTED_ENUMS: dict[str, dict[str, tuple[str, ...]]] = {
             "unknown",
         )
     },
-    "steer": {"$.status": ("running", "succeeded")},
-    "wait": {"$.status": ("succeeded",)},
+    "steer": {"$.status": ("running", "succeeded", "failed", "canceled", "unknown")},
+    "wait": {"$.status": ("starting", "running", "succeeded", "failed", "canceled", "unknown")},
 }
 
 

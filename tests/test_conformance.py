@@ -19,8 +19,10 @@ import select
 import signal
 import subprocess
 import sys
+import threading
 import time
 import warnings
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -105,6 +107,7 @@ EXPECTED_REQUIRED_FIELDS = {
         "finished_at",
         "paths",
         "truncated",
+        "partial",
         "denied",
         "permissions_clamp",
         "changed",
@@ -140,6 +143,7 @@ EXPECTED_REQUIRED_FIELDS = {
         "finished_at",
         "paths",
         "truncated",
+        "partial",
         "denied",
         "permissions_clamp",
         "changed",
@@ -175,6 +179,7 @@ EXPECTED_REQUIRED_FIELDS = {
         "finished_at",
         "paths",
         "truncated",
+        "partial",
         "denied",
         "permissions_clamp",
         "changed",
@@ -190,14 +195,20 @@ EXPECTED_REQUIRED_FIELDS = {
         "answer",
         "paths",
         "truncated",
+        "partial",
         "denied",
         "permissions_clamp",
     },
 }
+# The commands that print an answer, and therefore share one result shape
+# covering success and failure, one `partial` marker and one
+# `output_description` stating when a failure still answers.
+ANSWER_COMMANDS = frozenset({"run", "continue", "steer", "wait"})
+
 EXPECTED_OUTPUT_ENUMS = {
     "agents list.output.items[].kind": {"adapter", "variant"},
     "cancel.output.status": {"running", "succeeded", "failed", "canceled", "unknown"},
-    "continue.output.status": {"running", "succeeded"},
+    "continue.output.status": {"running", "succeeded", "failed", "canceled", "unknown"},
     "list.output.items[].status": {
         "starting",
         "running",
@@ -209,7 +220,14 @@ EXPECTED_OUTPUT_ENUMS = {
     },
     "log.output.type": {"error", "msg", "permission", "state", "thought", "tool", "usage"},
     "probe.output.diff[].status": {"advertised-missing", "entry-missing"},
-    "run.output.status": {"running", "succeeded"},
+    "run.output.status": {
+        "starting",
+        "running",
+        "succeeded",
+        "failed",
+        "canceled",
+        "unknown",
+    },
     "status.output.status": {
         "starting",
         "running",
@@ -219,8 +237,15 @@ EXPECTED_OUTPUT_ENUMS = {
         "canceled",
         "unknown",
     },
-    "steer.output.status": {"running", "succeeded"},
-    "wait.output.status": {"succeeded"},
+    "steer.output.status": {"running", "succeeded", "failed", "canceled", "unknown"},
+    "wait.output.status": {
+        "starting",
+        "running",
+        "succeeded",
+        "failed",
+        "canceled",
+        "unknown",
+    },
 }
 
 EXPECTED_EFFECTS = {
@@ -270,6 +295,7 @@ _SESSION_OUTPUT_PROPERTIES = frozenset(
         "cost",
         "answer",
         "truncated",
+        "partial",
         "output_file",
         "denied",
         "permissions_clamp",
@@ -1315,8 +1341,18 @@ def test_D6d_routing_D7b_flat_entries_and_D7c_shape(cli: CliRunner) -> None:
         if "next" in output.get("properties", {}):
             assert "next" not in output.get("required", [])
         assert set(output.get("required", [])) == EXPECTED_REQUIRED_FIELDS[entry["name"]]
+        # D7: the result behavior a schema cannot state.  Only the commands
+        # that return results on failure and carry foreground-only fields
+        # declare it; every other command's schema already says everything.
+        description = detail.get("output_description")
+        if entry["name"] in ANSWER_COMMANDS:
+            assert isinstance(description, str) and description, entry["name"]
+        else:
+            assert description is None, entry["name"]
         if entry["name"] in {"run", "continue", "steer"}:
             assert {"truncated", "output_file"} <= set(output["properties"])
+        if entry["name"] in ANSWER_COMMANDS:
+            assert "partial" in output["properties"] and "partial" in output["required"]
 
     prefixes = {parts[0] for parts in (name.split() for name in names) if len(parts) > 1}
     for prefix in prefixes:
@@ -1660,12 +1696,17 @@ def test_M1_wait_failure_reports_the_observed_terminal_meaning(cli: CliRunner) -
 
     result = invoke(cli, "wait", session_id, "--json", "--quiet")
 
-    error = _assert_error_location(
-        result,
-        expected_kind=errors.OPERATION_FAILED,
-        expected_exit_code=vocab.EXIT_AGENT_ERROR,
-    )
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    document = json.loads(result.stdout)
+    lines = [line for line in result.stderr.splitlines() if line.strip()]
+    error = json.loads(lines[-1])["error"]
+    assert error["kind"] == errors.OPERATION_FAILED
     assert error["context"] == {"session_id": session_id, "status": "failed"}
+    # M1c: the status a failure result carries is the same observation the
+    # error's context reports — one value, not two spellings of it.
+    assert document["status"] == error["context"]["status"]
+    assert document["session_id"] == session_id
+    assert document["partial"] is False
 
 
 def test_H5b_plain_alias_is_byte_identical_for_every_plain_collection(cli: CliRunner) -> None:
@@ -2092,44 +2133,233 @@ def _observe_session_statuses(
     monkeypatch.setattr(cli_module, "_wait_for_cancel", real_wait_for_cancel)
 
 
-def _observe_work_statuses(cli: CliRunner, observed: dict[str, set[Any]]) -> None:
-    foreground = {
-        "run": ("run", "mock", "echo:enum foreground"),
-        "continue": ("continue", "PLACEHOLDER", "echo:enum foreground"),
-        "steer": ("steer", "PLACEHOLDER", "echo:enum foreground"),
-    }
-    for name, args in (
-        ("run", ("run", "mock", "slow:1 enum run")),
-        ("continue", ("continue", "PLACEHOLDER", "slow:1 enum continue")),
-        ("steer", ("steer", "PLACEHOLDER", "slow:1 enum steer")),
-    ):
-        if name == "continue":
-            started = invoke(cli, "run", "mock", "echo:enum base", "--json", "--quiet")
-            assert started.exit_code == vocab.EXIT_OK, started.stderr
-            args = ("continue", json.loads(started.stdout)["session_id"], *args[2:])
-        elif name == "steer":
-            started_id = _background_session(cli, "slow:30 enum steer base")
-            args = ("steer", started_id, *args[2:])
-        foreground_args = foreground[name]
-        if name != "run":
-            foreground_args = (foreground_args[0], args[1], *foreground_args[2:])
-        foreground_result = invoke(cli, *foreground_args, "--json", "--quiet")
-        assert foreground_result.exit_code == vocab.EXIT_OK, (name, foreground_result.stderr)
-        observed.setdefault(f"{name}.output.status", set()).add(
-            json.loads(foreground_result.stdout)["status"]
+@contextlib.contextmanager
+def _direct_child_route() -> Iterator[None]:
+    """Force the direct-child route so no shared daemon owns the turn."""
+
+    async def unavailable(target: str) -> daemon_client.DaemonUnavailable:
+        return daemon_client.DaemonUnavailable(f"forced direct child ({target})")
+
+    original = daemon_client.ensure_daemon
+    daemon_client.ensure_daemon = unavailable
+    try:
+        yield
+    finally:
+        daemon_client.ensure_daemon = original
+
+
+def _await_alias(alias: str, timeout: float = 30.0) -> str:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            return sessions.resolve_selector(alias)
+        except sessions.SessionError:
+            time.sleep(0.05)
+    pytest.fail(f"no session was named {alias!r}")
+
+
+def _wait_for_meta(
+    session_id: str,
+    ready: Callable[[sessions.SessionMeta], bool],
+    timeout: float = 30.0,
+) -> sessions.SessionMeta:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        meta = sessions.load(session_id)
+        if ready(meta):
+            return meta
+        time.sleep(0.05)
+    pytest.fail(f"session {session_id} never reached the turn under test")
+
+
+def _kill_turn_worker(
+    cli: CliRunner,
+    args: Sequence[str],
+    session_id: Callable[[], str],
+    ready: Callable[[sessions.SessionMeta], bool],
+) -> Any:
+    """Run a foreground call and kill the process hosting its turn mid-wait.
+
+    The client observes the loss of its host and reports the `unknown`
+    outcome, which is the only way that status reaches an answer document.
+    `ready` selects the turn under test, so a follow-up call never kills the
+    process that served the turn before it.
+    """
+    holder: dict[str, Any] = {}
+
+    def call() -> None:
+        try:
+            holder["result"] = invoke(cli, *args)
+        except BaseException as error:  # noqa: BLE001 - re-raised on this thread
+            holder["error"] = error
+
+    thread = threading.Thread(target=call, daemon=True)
+    thread.start()
+    try:
+        found = session_id()
+        meta = _wait_for_meta(found, ready)
+        pid = meta.pid
+        assert pid is not None and pid != os.getpid(), found
+        os.kill(pid, signal.SIGKILL)
+    finally:
+        thread.join(timeout=30)
+    assert not thread.is_alive(), holder
+    assert "error" not in holder, holder
+    return holder["result"]
+
+
+def _observe_work_statuses(
+    cli: CliRunner, observed: dict[str, set[Any]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Observe every `status` the four answer commands declare (O4c).
+
+    Each member is produced by a real call: a foreground success, a refused
+    turn, a `--cancel-after` cancellation, a background dispatch, a `--timeout`
+    deadline that expires on the direct route, and a turn whose host process is
+    killed.  The direct route is forced for the last two so the deadline can
+    land before `run`'s worker records itself as running, and so the killed
+    process is a per-call worker rather than a shared daemon.
+    """
+
+    def record(name: str, result: Any, *, exit_code: int | None = None) -> None:
+        if exit_code is not None:
+            assert result.exit_code == exit_code, (name, result.stdout, result.stderr)
+        document = json.loads(result.stdout)
+        observed.setdefault(f"{name}.output.status", set()).add(document["status"])
+
+    def call(*args: str) -> Any:
+        return invoke(cli, *args, "--json", "--quiet")
+
+    def finished_base() -> str:
+        result = call("run", "mock", "echo:enum base")
+        assert result.exit_code == vocab.EXIT_OK, result.stderr
+        return json.loads(result.stdout)["session_id"]
+
+    base_id = finished_base()
+
+    record("run", call("run", "mock", "echo:enum run"), exit_code=vocab.EXIT_OK)
+    record("run", call("run", "mock", "fail enum run"), exit_code=vocab.EXIT_AGENT_ERROR)
+    record("run", call("run", "mock", "chunkslow:5 enum run", "--cancel-after", "0.5"))
+    record(
+        "run",
+        call("run", "mock", "slow:1 enum run", "--background", "--permissions", "read"),
+        exit_code=vocab.EXIT_OK,
+    )
+
+    record("continue", call("continue", base_id, "echo:enum continue"), exit_code=vocab.EXIT_OK)
+    record("continue", call("continue", base_id, "fail enum continue"))
+    record(
+        "continue", call("continue", base_id, "chunkslow:5 enum continue", "--cancel-after", "0.5")
+    )
+    record(
+        "continue",
+        call("continue", base_id, "slow:1 enum continue", "--background", "--permissions", "read"),
+        exit_code=vocab.EXIT_OK,
+    )
+
+    def steer(prompt: str, *extra: str) -> Any:
+        steer_id = _background_session(cli, "slow:30 enum steer base")
+        return call("steer", steer_id, prompt, *extra)
+
+    record("steer", steer("echo:enum steer"), exit_code=vocab.EXIT_OK)
+    record("steer", steer("fail enum steer"))
+    record("steer", steer("chunkslow:5 enum steer", "--cancel-after", "0.5"))
+
+    # `--background` needs the daemon, so the sessions steered on the direct
+    # route are opened before the route is forced.
+    steer_timeout_id = _background_session(cli, "slow:30 enum steer base")
+    steer_unknown_id = _background_session(cli, "slow:30 enum steer base")
+
+    with _direct_child_route():
+        record(
+            "run",
+            call("run", "mock", "slow:5 enum run", "--timeout", "0.001"),
+            exit_code=vocab.EXIT_TIMEOUT,
         )
-        if name == "steer":
-            args = ("steer", _background_session(cli, "slow:30 enum steer background"), *args[2:])
-        background_args = ["--background", "--json", "--quiet"]
-        if name != "steer":
-            background_args[1:1] = ["--permissions", "read"]
-        result = invoke(cli, *args, *background_args)
-        assert result.exit_code == vocab.EXIT_OK, (name, result.stderr)
-        observed.setdefault(f"{name}.output.status", set()).add(json.loads(result.stdout)["status"])
+        record(
+            "continue",
+            call("continue", finished_base(), "slow:30 enum continue", "--timeout", "3"),
+            exit_code=vocab.EXIT_TIMEOUT,
+        )
+        record(
+            "steer",
+            call("steer", steer_timeout_id, "slow:30 enum steer", "--timeout", "3"),
+            exit_code=vocab.EXIT_TIMEOUT,
+        )
+        record(
+            "run",
+            _kill_turn_worker(
+                cli,
+                (
+                    "run",
+                    "mock",
+                    "slow:30 enum run",
+                    "--timeout",
+                    "20",
+                    "--name",
+                    "enum-run-unknown",
+                    "--json",
+                    "--quiet",
+                ),
+                lambda: _await_alias("enum-run-unknown"),
+                lambda meta: meta.state == "running",
+            ),
+            exit_code=vocab.EXIT_AGENT_ERROR,
+        )
+        unknown_base = finished_base()
+        base_turn = sessions.read_meta(unknown_base).turns
+        record(
+            "continue",
+            _kill_turn_worker(
+                cli,
+                (
+                    "continue",
+                    unknown_base,
+                    "slow:30 enum continue",
+                    "--timeout",
+                    "20",
+                    "--json",
+                    "--quiet",
+                ),
+                lambda: unknown_base,
+                lambda meta: meta.turns > base_turn and meta.state == "running",
+            ),
+            exit_code=vocab.EXIT_AGENT_ERROR,
+        )
+        steer_turn = sessions.read_meta(steer_unknown_id).turns
+        record(
+            "steer",
+            _kill_turn_worker(
+                cli,
+                (
+                    "steer",
+                    steer_unknown_id,
+                    "slow:30 enum steer",
+                    "--timeout",
+                    "20",
+                    "--json",
+                    "--quiet",
+                ),
+                lambda: steer_unknown_id,
+                lambda meta: meta.turns > steer_turn and meta.state == "running",
+            ),
+            exit_code=vocab.EXIT_AGENT_ERROR,
+        )
+
     waited_id = _background_session(cli, "slow:1 enum wait")
-    waited = invoke(cli, "wait", waited_id, "--json", "--quiet")
-    assert waited.exit_code == vocab.EXIT_OK, waited.stderr
-    observed["wait.output.status"] = {json.loads(waited.stdout)["status"]}
+    record("wait", call("wait", waited_id), exit_code=vocab.EXIT_OK)
+    record("wait", call("wait", _finished_session("failed")), exit_code=vocab.EXIT_AGENT_ERROR)
+    record("wait", call("wait", _finished_session("canceled")), exit_code=vocab.EXIT_CANCELLED)
+    record("wait", call("wait", _finished_session("unknown")), exit_code=vocab.EXIT_AGENT_ERROR)
+    record(
+        "wait",
+        call("wait", _active_session(pid=os.getpid()), "--timeout", "0"),
+        exit_code=vocab.EXIT_TIMEOUT,
+    )
+    starting = sessions.create_session(entry="mock", base_adapter="mock", prompt="enum starting")
+    record(
+        "wait", call("wait", starting.session_id, "--timeout", "0"), exit_code=vocab.EXIT_TIMEOUT
+    )
 
 
 def _observe_log_types(cli: CliRunner, observed: dict[str, set[Any]]) -> None:
@@ -2199,7 +2429,7 @@ def test_O4c_declared_enums_have_reachable_values(
     observed: dict[str, set[Any]] = {}
     _observe_flag_enums(cli, index, state_root, observed)
     _observe_session_statuses(cli, observed, monkeypatch)
-    _observe_work_statuses(cli, observed)
+    _observe_work_statuses(cli, observed, monkeypatch)
     _observe_log_types(cli, observed)
     _observe_discovery_enums(cli, state_root, observed)
     _assert_reachable_output_enums(cli, index, observed)

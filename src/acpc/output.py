@@ -16,6 +16,12 @@ from acpc import paths, permissions, sessions, vocab
 
 DEFAULT_MAX_OUTPUT = 128 * 1024
 
+# Session states whose answer file holds the complete answer for the call.
+# A refusal or an adapter error is a finished turn and a full report about it
+# (O5a), so it is complete data; every other state means the turn ended — or
+# was still running — before the answer did.
+_COMPLETE_ANSWER_STATES = frozenset({"succeeded", "failed"})
+
 
 @dataclass(frozen=True, slots=True)
 class OutputResult:
@@ -77,6 +83,7 @@ def result_envelope(
     truncated: bool = False,
     background: bool = False,
     changed: bool | None = None,
+    partial: bool = False,
 ) -> dict[str, Any]:
     """Build the pinned JSON shape for an answer-printing command."""
     if background:
@@ -88,6 +95,7 @@ def result_envelope(
             "finished_at": _timestamp_or_none(meta.finished_at),
             "paths": sessions.session_paths(meta.session_id),
             "truncated": False,
+            "partial": False,
             "denied": _denial_payload(meta),
             "permissions_clamp": _permissions_clamp(meta),
             "next": ["acpc", "wait", meta.session_id],
@@ -109,6 +117,7 @@ def result_envelope(
         "cost": meta.cost,
         "answer": answer,
         "truncated": truncated,
+        "partial": partial,
         "denied": _denial_payload(meta),
         "permissions_clamp": _permissions_clamp(meta),
         "next": ["acpc", "continue", meta.session_id],
@@ -137,15 +146,18 @@ def _json_answer(
     max_output: int,
     answer_path: Path | str,
     changed: bool | None,
+    partial: bool,
 ) -> OutputResult:
-    complete = _json_text(result_envelope(meta, answer, changed=changed))
+    complete = _json_text(result_envelope(meta, answer, changed=changed, partial=partial))
     if max_output == 0 or len(complete.encode("utf-8")) <= max_output:
         return OutputResult(complete, False, len(complete.encode("utf-8")))
 
     marker = _marker(answer_path, kind="answer")
 
     def candidate(prefix: str) -> str:
-        return _json_text(result_envelope(meta, prefix + marker, truncated=True, changed=changed))
+        return _json_text(
+            result_envelope(meta, prefix + marker, truncated=True, changed=changed, partial=partial)
+        )
 
     # JSON escaping adds a fixed envelope overhead and escapes the marker's
     # line breaks.  Binary-search the largest code-point prefix that keeps the
@@ -180,10 +192,18 @@ def render_result(
     background: bool = False,
     max_output: int = DEFAULT_MAX_OUTPUT,
     changed: bool | None = None,
+    partial: bool | None = None,
 ) -> OutputResult:
-    """Render one answer command's stdout payload without writing it."""
+    """Render one answer command's stdout payload without writing it.
+
+    `partial` defaults to what the session's state says about the answer: a
+    turn that finished carries complete data, a turn still running or cut
+    short does not.  A caller that knows better passes it explicitly.
+    """
     _validate_max_output(max_output)
     answer_path = sessions.answer_path(meta.session_id)
+    if partial is None:
+        partial = vocab.normalize_session_state(meta.state) not in _COMPLETE_ANSWER_STATES
 
     if background:
         if json_mode:
@@ -199,6 +219,7 @@ def render_result(
             max_output=max_output,
             answer_path=answer_path,
             changed=changed,
+            partial=partial,
         )
     return truncate_answer(answer, max_output=max_output, answer_path=answer_path)
 
@@ -212,6 +233,7 @@ def emit_result(
     background: bool = False,
     max_output: int = DEFAULT_MAX_OUTPUT,
     changed: bool | None = None,
+    partial: bool | None = None,
 ) -> OutputResult:
     """Render and write one stdout payload; return its truncation metadata."""
     result = render_result(
@@ -221,6 +243,7 @@ def emit_result(
         background=background,
         max_output=max_output,
         changed=changed,
+        partial=partial,
     )
     (sys.stdout if stream is None else stream).write(result.text)
     return result

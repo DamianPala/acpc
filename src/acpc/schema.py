@@ -59,9 +59,24 @@ _NULLABLE_STRING = {"type": ["string", "null"]}
 _NULLABLE_NUMBER = {"type": ["number", "null"]}
 _NULLABLE_INTEGER = {"type": ["integer", "null"]}
 _SESSION_STATUS = {"type": "string", "enum": list(vocab.SESSION_STATES)}
-_SESSION_WORK_STATUS = {"type": "string", "enum": ["running", "succeeded"]}
-_SESSION_FOLLOW_UP_STATUS = {"type": "string", "enum": ["running", "succeeded"]}
-_SESSION_SUCCEEDED_STATUS = {"type": "string", "enum": ["succeeded"]}
+# `status` in an answer result.  One schema covers the success and the failure
+# documents of a command (O4a), so the enum lists every state a result can
+# carry: the finished ones, plus `running` and `starting` when a `--timeout`
+# deadline expires or a SIGTERM detaches the client before the turn ends.
+# `preparing` is a daemon turn phase that is never written to `meta.json`, so
+# no result document can report it.
+_ANSWER_STATUS = {
+    "type": "string",
+    "enum": [state for state in vocab.SESSION_STATES if state != "preparing"],
+}
+# A follow-up turn rotates a finished session straight to `running` under the
+# session lock, so `continue` and `steer` can observe `running` but never
+# `starting`; listing `starting` for them would name a value the command
+# cannot return (O4c).
+_FOLLOW_UP_STATUS = {
+    "type": "string",
+    "enum": [state for state in _ANSWER_STATUS["enum"] if state != "starting"],
+}
 _CANCEL_STATUS = {
     "type": "string",
     "enum": ["running", "succeeded", "failed", "canceled", "unknown"],
@@ -94,6 +109,7 @@ _SESSION_RESULT_PROPERTIES = {
     "cost": _NULLABLE_NUMBER,
     "answer": _STRING,
     "truncated": _BOOLEAN,
+    "partial": _BOOLEAN,
     "output_file": _STRING,
     "denied": _array(_DENIAL),
     "permissions_clamp": {
@@ -156,7 +172,7 @@ def _session_result_schema(
     *,
     changed: bool,
     foreground_only: bool = False,
-    status: dict[str, Any] = _SESSION_WORK_STATUS,
+    status: dict[str, Any] = _ANSWER_STATUS,
 ) -> dict[str, Any]:
     properties = dict(_SESSION_RESULT_PROPERTIES)
     properties["status"] = status
@@ -170,6 +186,7 @@ def _session_result_schema(
         "finished_at",
         "paths",
         "truncated",
+        "partial",
         "denied",
         "permissions_clamp",
     ]
@@ -465,7 +482,7 @@ _OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
         },
         ("session_id", "status", "stop_reason", "changed"),
     ),
-    "continue": _session_result_schema(changed=True, status=_SESSION_FOLLOW_UP_STATUS),
+    "continue": _session_result_schema(changed=True, status=_FOLLOW_UP_STATUS),
     "daemon status": _DAEMON_STATUS,
     "daemon stop": _TARGET_MUTATION,
     "delete": _object(
@@ -504,10 +521,8 @@ _OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
     ),
     "list": _STATUS,
     "status": _STATUS_DETAIL,
-    "steer": _session_result_schema(changed=True, status=_SESSION_FOLLOW_UP_STATUS),
-    "wait": _session_result_schema(
-        changed=False, foreground_only=True, status=_SESSION_SUCCEEDED_STATUS
-    ),
+    "steer": _session_result_schema(changed=True, status=_FOLLOW_UP_STATUS),
+    "wait": _session_result_schema(changed=False, foreground_only=True),
 }
 
 # Flags accepted by *every* command entry, and therefore not repeated in any
@@ -548,6 +563,7 @@ _DESCRIPTIONS = "_acpc_schema_descriptions"
 _STDIN = "_acpc_schema_stdin"
 _STREAM = "_acpc_schema_stream"
 _FORMAT_DEFAULTS = "_acpc_schema_format_defaults"
+_OUTPUT_DESCRIPTION = "_acpc_schema_output_description"
 _DISPATCHES_WITHOUT_COMMAND = "_acpc_schema_dispatches_without_command"
 
 
@@ -613,6 +629,22 @@ def dispatches_without_command[C: click.Group](command: C) -> C:
     """
     setattr(command, _DISPATCHES_WITHOUT_COMMAND, True)
     return command
+
+
+def output_description[C: click.Command](text: str) -> Callable[[C], C]:
+    """Declare the result behavior the output schema cannot express.
+
+    The schema says which fields a result document has; it cannot say when a
+    failure returns one, or which fields are present only in one situation.
+    That is what this string is for, and a command that returns results on
+    failure or has success-only presence requirements must carry it (D7).
+    """
+
+    def apply(command: C) -> C:
+        setattr(command, _OUTPUT_DESCRIPTION, _one_line(text))
+        return command
+
+    return apply
 
 
 def format_defaults[C: click.Command](**defaults: str) -> Callable[[C], C]:
@@ -828,6 +860,9 @@ def detail(name: str, command: click.Command) -> dict[str, Any]:
         "interactive": INTERACTIVE,
         "output": _output_schema(name),
     }
+    description = getattr(command, _OUTPUT_DESCRIPTION, None)
+    if description is not None:
+        document["output_description"] = description
     if getattr(command, _STREAM, False):
         document["stream"] = True
     defaults = getattr(command, _FORMAT_DEFAULTS, None)

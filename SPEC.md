@@ -210,11 +210,11 @@ run AGENT [PROMPT | -] [--prompt-file FILE] [--cwd DIR] [--model M]
 
 `run` resolves an adapter or variant, creates a session, dispatches one turn and blocks by default. `--background` and its alias `--bg` dispatch and return the session id and directory without waiting. A blocking call prints an early session line to stderr before the turn starts so the caller can inspect or cancel it mid-run.
 
-`--timeout` bounds only how long this client waits. It never cancels or changes accepted work. After the deadline the session remains alive under the daemon, or under a detached direct worker when the daemon fallback was used; the client exits 124 with `kind: timeout`, the observed status and a hint to wait. `--cancel-after` bounds the work itself. When it expires, ACP cancellation is sent and the observing command reports `operation_failed` with the observed `canceled` status.
+`--timeout` bounds only how long this client waits. It never cancels or changes accepted work. After the deadline the session remains alive under the daemon, or under a detached direct worker when the daemon fallback was used; the client exits 124 with `kind: timeout`, the observed status and a hint to wait, and the result document on stdout carries that observed status with `partial: true`. `--cancel-after` bounds the work itself. When it expires, ACP cancellation is sent and the observing command reports `operation_failed` with the observed `canceled` status.
 
 `--timeout` is invalid with `--background`, because a background call does not wait. `--cancel-after` remains valid with `--background`. `--permissions` selects a ceiling and the adapter mode; absent, its value comes from the registry or the TTY rules below. Deprecated permission spellings remain accepted as aliases and are reported as such.
 
-`--output-file` writes exactly what stdout would have received and leaves stdout empty. It expands a leading `~`, creates a missing parent directory and overwrites the target. The complete `answer.md` remains in the session directory. `--max-output` caps stdout bytes at 131 072 by default, preserves a UTF-8 boundary, sets `truncated: true` in a machine result and names the complete answer path.
+`--output-file` writes exactly what stdout would have received and leaves stdout empty, on success and on a failure that returns a result; a call that returns no result creates no file. It expands a leading `~`, creates a missing parent directory and overwrites the target. The complete `answer.md` remains in the session directory. `--max-output` caps stdout bytes at 131 072 by default, preserves a UTF-8 boundary, sets `truncated: true` in a machine result and names the complete answer path.
 
 ### `skills`
 
@@ -250,13 +250,13 @@ wait SELECTOR [--timeout S] [--output-file FILE]
     [--format text|json] [--max-output BYTES] [--quiet]
 ```
 
-`wait` observes a background session and prints its answer when the session reaches `succeeded`. A finished session is returned immediately. Any other finished state produces `operation_failed` with the session id and observed status. `--timeout` stops waiting only, leaves the session unchanged and exits 124; if the status cannot be observed, the result is `outcome_unknown` with `status: null`.
+`wait` observes a background session and prints its answer when the session reaches `succeeded`. A finished session is returned immediately, and its answer is returned on stdout whatever the terminal state was. Any other finished state produces `operation_failed` with the session id and observed status. `--timeout` stops waiting only, leaves the session unchanged and exits 124, returning the observed status on stdout with `partial: true`; if the status cannot be observed, the result is `outcome_unknown` with `status: null` and no result document.
 
 ### `acpc schema`
 
-`schema` is the introspection interface. Bare `acpc schema` emits an index containing `schema_version`, `tool_version`, `global_flags`, `format_defaults`, `exit_codes`, `conformance` and sorted command entries. `acpc schema PATH` emits `name`, `description`, `args`, `flags`, `effects`, `confirm`, `interactive` and `output`; `log` also has `stream: true`, and commands whose format differs from the index include `format_defaults`.
+`schema` is the introspection interface. Bare `acpc schema` emits an index containing `schema_version`, `tool_version`, `global_flags`, `format_defaults`, `exit_codes`, `conformance` and sorted command entries. `acpc schema PATH` emits `name`, `description`, `args`, `flags`, `effects`, `confirm`, `interactive` and `output`, plus `output_description` for a command that returns results on failure or has success-only fields; `log` also has `stream: true`, and commands whose format differs from the index include `format_defaults`.
 
-The output field is a JSON Schema subset using only `type`, `enum`, `properties`, `required` and `items`. It describes the JSON success document, or one record for `log`. The generator walks the Click tree that actually parses the command. A group is indexed only when explicitly marked as dispatching useful work without a subcommand. An unknown schema path is an exit-2 usage error naming the nearest valid paths. Path segments are separate arguments.
+The output field is a JSON Schema subset using only `type`, `enum`, `properties`, `required` and `items`. It describes one result document shared by the success and failure results, or one record for `log`. The generator walks the Click tree that actually parses the command. A group is indexed only when explicitly marked as dispatching useful work without a subcommand. An unknown schema path is an exit-2 usage error naming the nearest valid paths. Path segments are separate arguments.
 
 The installed binary currently publishes schema version `1`, tool version `0.7.1`, format defaults `{"tty": "text", "non_tty": "json"}`, and conformance name `cli-design-standard` at `0.1.0-draft.7` with extension `managed`. `tests/test_conformance.py` verifies the claim against the standard header and the behavior of every indexed command.
 
@@ -269,7 +269,7 @@ The output format is selected by `--format` or the `--json` alias. The tool-wide
 The global `--color auto|always|never` policy affects human text only. The precedence is the explicit flag, `NO_COLOR`, `TERM=dumb`, then whether stdout is a terminal. Machine formats never contain ANSI or control bytes.
 
 stdout carries only the selected result: the answer, a machine document, a record stream, or the id and directory from `--background`.
-On success, `--output-file` leaves stdout empty and writes the exact payload of the selected format to the file.
+`--output-file` leaves stdout empty and writes the exact payload of the selected format to the file, on success and on a failure that returns a result. A call that returns no result creates no file.
 stderr carries acpc metadata, summaries, footers, diagnostics and adapter noise according to the command.
 A log footer never contaminates a prose or NDJSON stdout stream.
 
@@ -281,9 +281,9 @@ Machine success documents are the shapes published by `acpc schema`. Collections
 
 `prune` and `daemon stop` return `targets`, `changed` and `requires_confirmation`; the same shape covers preview and mutation. `delete` returns `session_id`, `removed`, `changed` and `paths`. `resolve` returns its full resolution document. `probe` returns its discovery report. `log` returns one record at a time with required `i`, `ts` and `type`, plus event-specific fields.
 
-The shared answer result for `run`, `continue` and `steer` has required `status`, `session_id`, `created_at`, `started_at`, `finished_at`, `paths`, `truncated`, `denied`, `permissions_clamp` and `changed`. Foreground success adds `stop_reason`, `cost` and `answer`; background success omits them and points `next` at `wait`. `resume`, `next` and `output_file` are optional. `wait` is read-only, so its foreground result has no `changed` field and requires successful `status`, `stop_reason`, `cost` and `answer`.
+The shared answer result for `run`, `continue` and `steer` has required `status`, `session_id`, `created_at`, `started_at`, `finished_at`, `paths`, `truncated`, `partial`, `denied`, `permissions_clamp` and `changed`. Foreground success adds `stop_reason`, `cost` and `answer`; background success omits them and points `next` at `wait`. `resume`, `next` and `output_file` are optional. `wait` is read-only, so its result has no `changed` field. Each schema entry declares one `output` shared by the success and failure results of that command, and states in `output_description` which failures return a result and which fields are required only on success.
 
-`paths` contains `dir`, `prompt`, `transcript` and `answer`. `denied` records permission denials by category, and `permissions_clamp` records a requested policy, the entry ceiling and the effective policy when a clamp occurred. A failed machine-format call writes no partial result document to stdout. If `--output-file` was requested, the file is created empty for that failed machine-format call.
+`paths` contains `dir`, `prompt`, `transcript` and `answer`. `denied` records permission denials by category, and `permissions_clamp` records a requested policy, the entry ceiling and the effective policy when a clamp occurred. `run`, `continue`, `steer` and `wait` return their result document on stdout when acpc observed the turn and holds its content, including when the turn failed, was canceled, or the wait deadline expired. `partial` is `false` when the content is the complete answer for that call, a refusal included, and `true` when the turn ended before the answer did; a result carrying `partial: true` always exits non-zero. A call that never observed a turn — an unknown agent, a rejected flag combination, a session that does not exist, a start that failed — writes nothing to stdout. The structured error stays on stderr in every case.
 
 ### Failures
 
