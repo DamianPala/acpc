@@ -1,8 +1,8 @@
 """Behavioral tests for effect metadata, confirmation gates and the prompt limit.
 
 Every gate here is exercised from a non-interactive context — `CliRunner` gives
-the command a pipe for stdin — except the `install` prompt, which needs a real
-controlling terminal and gets one through `pty.fork`.
+the command a pipe for stdin — except prompts that need a real controlling
+terminal and get one through `pty.fork`.
 """
 
 import json
@@ -18,7 +18,7 @@ import pytest
 from click.testing import CliRunner
 
 from acpc import cli as cli_module
-from acpc import daemon_client, effects, interaction, proc, sessions, vocab
+from acpc import daemon_client, effects, interaction, paths, proc, sessions, vocab
 from acpc.cli import main
 
 MOCK_AGENT_SCRIPT = str(Path(__file__).with_name("mock_agent.py"))
@@ -276,19 +276,45 @@ def test_empty_prune_without_yes_is_an_unchanged_success(cli: CliRunner) -> None
 def test_prune_candidate_read_error_is_not_an_empty_success(
     cli: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    def refuse_read(**kwargs: object) -> list[object]:
-        del kwargs
-        raise OSError("cannot read session candidates")
+    sessions_root = paths.sessions_dir()
+    sessions_root.mkdir(parents=True)
+    real_iterdir = Path.iterdir
 
-    monkeypatch.setattr(sessions, "prune_candidates", refuse_read)
+    def refuse_read(directory: Path) -> Iterator[Path]:
+        if directory == sessions_root:
+            raise OSError("cannot read session candidates")
+        yield from real_iterdir(directory)
+
+    monkeypatch.setattr(Path, "iterdir", refuse_read)
 
     result = invoke(cli, "prune", "--older-than", "0d", "--json")
 
     assert result.exit_code == vocab.EXIT_AGENT_ERROR
     assert result.stdout == ""
     error = envelope(result)
-    assert error["kind"] == "operation_failed"
+    assert error["kind"] == "unavailable"
     assert "cannot read session candidates" in error["message"]
+
+
+def test_prune_yes_rechecks_the_snapshot_before_any_session_is_removed(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = finished_session()
+    second = finished_session()
+
+    def confirm_then_start(approved: bool, **kwargs: object) -> None:
+        del kwargs
+        assert approved
+        sessions.rotate_turn(second)
+
+    monkeypatch.setattr(interaction, "require_confirmation", confirm_then_start)
+
+    result = invoke(cli, "prune", "--older-than", "0d", "--yes", "--json")
+
+    assert envelope(result)["kind"] == "conflict"
+    for session_id in (first, second):
+        assert sessions.meta_path(session_id).exists()
+        assert not sessions.tombstone_path(session_id).exists()
 
 
 # --- daemon stop ------------------------------------------------------------
@@ -325,6 +351,23 @@ def test_bare_daemon_stop_dry_run_needs_no_yes(cli: CliRunner) -> None:
         "changed": False,
         "requires_confirmation": False,
     }
+
+
+def test_daemon_stop_rechecks_active_sessions_after_confirmation(
+    cli: CliRunner, state_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _known_daemon_target(state_root)
+
+    def confirm_then_start(approved: bool, **kwargs: object) -> None:
+        del approved, kwargs
+        running_session("mock")
+
+    monkeypatch.setattr(interaction, "require_confirmation", confirm_then_start)
+
+    result = invoke(cli, "daemon", "stop", "--json")
+
+    assert envelope(result)["kind"] == "precondition_failed"
+    assert sessions.list_sessions()[0].is_active
 
 
 def _known_daemon_target(state_root: Path, name: str = "mock") -> str:
@@ -462,8 +505,8 @@ def test_nothing_acpc_ships_tells_a_caller_to_install_without_yes() -> None:
     assert offenders == []
 
 
-def _install_under_a_pty(answer: str | None) -> tuple[int, str, str]:
-    """Run `install` in a child that owns a real controlling terminal.
+def _command_under_a_pty(args: tuple[str, ...], answer: str | None) -> tuple[int, str, str]:
+    """Run a command in a child that owns a real controlling terminal.
 
     `pty.fork` is the only way to exercise the `/dev/tty` branch: the prompt
     deliberately ignores stdin.  `answer=None` writes nothing and closes the
@@ -474,7 +517,7 @@ def _install_under_a_pty(answer: str | None) -> tuple[int, str, str]:
     terminal and the prompt still happens.  Returns the wait status, what the
     terminal saw, and what stderr carried.
     """
-    child = "from acpc.cli import main; main(['install', 'mock'])"
+    child = f"from acpc.cli import main; main({list(args)!r})"
     reading, writing = os.pipe()
     pid, fd = pty.fork()
     if pid == 0:  # pragma: no cover - replaced by execv in the child
@@ -503,6 +546,10 @@ def _install_under_a_pty(answer: str | None) -> tuple[int, str, str]:
         asked.decode(errors="replace"),
         failure.decode(errors="replace"),
     )
+
+
+def _install_under_a_pty(answer: str | None) -> tuple[int, str, str]:
+    return _command_under_a_pty(("install", "mock"), answer)
 
 
 # forkpty warns about threads (xdist runs us multi-threaded); the child execs at once.
@@ -589,19 +636,22 @@ def test_agents_delete_without_yes_leaves_the_entry_in_place(
     assert target.exists()
 
 
-def test_agents_delete_declined_on_a_terminal_leaves_the_entry_in_place(
-    cli: CliRunner, state_root: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
+@pytest.mark.parametrize(("answer", "should_exist"), [("n\n", True), ("y\n", False)])
+def test_agents_delete_asks_on_a_terminal_and_obeys_the_answer(
+    state_root: Path, answer: str, should_exist: bool
 ) -> None:
     target = state_root / "agents" / "declined.toml"
     target.write_text(MOCK_ENTRY, encoding="utf-8")
-    monkeypatch.setattr(interaction, "interactive_context", lambda: True)
-    monkeypatch.setattr(interaction, "ask_yes_no", lambda _prompt, default: False)
 
-    result = invoke(cli, "agents", "delete", "declined")
+    status, asked, _ = _command_under_a_pty(("agents", "delete", "declined"), answer)
 
-    assert result.exit_code != vocab.EXIT_OK
-    assert envelope(result)["kind"] == "confirmation_required"
-    assert target.exists()
+    if should_exist:
+        assert status != 0
+    else:
+        assert status == 0
+    assert "Delete local agent entry declined?" in asked
+    assert target.exists() is should_exist
 
 
 def test_agents_delete_refuses_an_adapter_acpc_ships(cli: CliRunner) -> None:

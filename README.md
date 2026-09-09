@@ -62,6 +62,7 @@ daemon status|stop [target] [--force]   # plumbing escape hatch — never needed
 `agents check` orders entries by name, ascending, with the default window being the first 20 entries in that order.
 `skills list` orders entries by name, ascending, with the default window being the first 20 entries in that order.
 `daemon status` orders entries by target name, ascending, with the default window being the first 20 entries in that order.
+`prune` fixes its target set before confirmation, then locks and rechecks every target before clearing any session; a target that changed meanwhile fails with `conflict` and leaves the set intact.
 
 For one-time changes from earlier releases, see [MIGRATION.md](MIGRATION.md).
 

@@ -444,7 +444,6 @@ Checking on a run: acpc log <id> --tail 10 --follow --timeout 60
 Steering a running session: acpc steer <id> "Stop editing; diagnose only"
 Context care: log is condensed by default; use --prose for the full answer.
 Maintenance and setup: delete, prune and bare daemon stop explain their gates; --dry-run previews.
-Common commands: run, resolve, continue, steer, wait, status, list, log, agents, skills, daemon.
   Truncated or huge answer? Read <dir>/answer.md selectively — always complete.
   SIGINT cancels the turn owned by this command. SIGTERM detaches work already taken over by the daemon.
   acpc continue <id> "Now fix what you found"
@@ -2925,26 +2924,40 @@ def prune_command(
                 f"config retention '{settings.retention}' resolves to zero — bare prune would "
                 "delete every finished session; pass --older-than 0d to do that explicitly"
             )
-        candidates = sessions.prune_candidates(older_than=duration)
+        try:
+            candidates = sessions.prune_candidates(older_than=duration)
+        except OSError as error:
+            raise AgentProblem(
+                f"prune could not read session state: {error}",
+                kind=errors.UNAVAILABLE,
+                context={"operation": "prune"},
+            ) from None
         if candidates and not dry_run:
             interaction.require_confirmation(
                 assume_yes,
                 message="prune: deleting the sessions it selects needs confirmation",
                 hint="Run: acpc prune --dry-run to see them, then repeat with --yes",
             )
-            candidates = sessions.prune_sessions(
-                older_than=duration,
-                dry_run=False,
-                candidates=candidates,
-            )
+            try:
+                candidates = sessions.prune_sessions(
+                    older_than=duration,
+                    dry_run=False,
+                    candidates=candidates,
+                )
+            except OSError as error:
+                raise AgentProblem(
+                    f"prune could not remove session state: {error}",
+                    kind=errors.OPERATION_FAILED,
+                    context={"operation": "prune"},
+                ) from None
     except AcpcError:
         raise
     except sessions.SessionError as error:
         raise _session_problem(error) from None
     except OSError as error:
         raise AgentProblem(
-            f"prune could not remove session state: {error}",
-            kind=errors.OPERATION_FAILED,
+            f"prune could not read session state: {error}",
+            kind=errors.UNAVAILABLE,
             context={"operation": "prune"},
         ) from None
     except (config.ConfigError, ValueError) as error:
@@ -5021,6 +5034,10 @@ def daemon_stop_command(
             message="daemon stop: stopping every daemon on this machine needs confirmation",
             hint="Run: acpc daemon stop --dry-run to see them, then repeat with --yes",
         )
+    if not force and not dry_run:
+        # The confirmation prompt may leave enough time for a new turn to
+        # appear. Recheck the precondition on the mutation side of the gate.
+        _refuse_stop_over_active_sessions(agent, targets)
     if dry_run:
         # The preview talks to nothing. The lock files already name every
         # daemon the mutating call would address, and greeting one is itself

@@ -660,6 +660,8 @@ def _is_tombstone(directory: Path) -> bool:
 
 def _clear_directory(directory: Path) -> None:
     for child in sorted(directory.iterdir(), reverse=True):
+        if child.name == LOCK_NAME:
+            continue
         if child.is_dir() and not child.is_symlink():
             _remove_tree(child)
         else:
@@ -1079,10 +1081,11 @@ def delete_session(session_id: str, *, clock: Clock | None = None) -> None:
     Liveness is verified first, so a session whose process died is deletable.
     """
     resolved_clock = _resolve_clock(clock)
-    ensure_deletable(load(session_id, clock=resolved_clock))
-    directory = session_dir(session_id)
-    _clear_directory(directory)
-    _write_tombstone(directory, resolved_clock())
+    with session_lock(session_id):
+        ensure_deletable(load(session_id, clock=resolved_clock))
+        directory = session_dir(session_id)
+        _clear_directory(directory)
+        _write_tombstone(directory, resolved_clock())
 
 
 def prune_candidates(*, older_than: float, clock: Clock | None = None) -> list[SessionMeta]:
@@ -1111,7 +1114,9 @@ def prune_sessions(
 
     When `candidates` is supplied, it is the target set already resolved by a
     caller before a confirmation gate. Age is measured from `finished_at`,
-    falling back to `created_at`; active sessions are never selected.
+    falling back to `created_at`; active sessions are never selected. Before
+    the first deletion, every target is locked in session-id order and read
+    back; a changed target aborts the whole mutation.
     """
     resolved_clock = _resolve_clock(clock)
     selected = (
@@ -1121,9 +1126,33 @@ def prune_sessions(
     )
     if dry_run:
         return selected
+    if not selected:
+        return selected
+
     now = resolved_clock()
-    for meta in selected:
-        directory = session_dir(meta.session_id)
-        _clear_directory(directory)
-        _write_tombstone(directory, now)
+    with contextlib.ExitStack() as locks:
+        for session_id in sorted({meta.session_id for meta in selected}):
+            locks.enter_context(session_lock(session_id))
+
+        verified: list[SessionMeta] = []
+        for candidate in selected:
+            try:
+                current = load(candidate.session_id, clock=resolved_clock)
+            except SessionError as error:
+                raise SessionStateError(
+                    f"session {candidate.session_id} changed while pruning; retry"
+                ) from error
+            reference = (
+                current.finished_at if current.finished_at is not None else current.created_at
+            )
+            if current.is_active or reference is None or now - reference < older_than:
+                raise SessionStateError(
+                    f"session {candidate.session_id} changed while pruning; retry"
+                )
+            verified.append(current)
+
+        for meta in verified:
+            directory = session_dir(meta.session_id)
+            _clear_directory(directory)
+            _write_tombstone(directory, now)
     return selected

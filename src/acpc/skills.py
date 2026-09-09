@@ -147,7 +147,7 @@ def _load_skill(resource: Any) -> Skill | None:
 def _bundled_resources() -> Iterator[Any]:
     root = files("acpc").joinpath("data", "skills")
     try:
-        resources = sorted(root.iterdir(), key=lambda item: item.name)
+        resources = root.iterdir()
     except OSError:
         return
     yield from resources
@@ -155,9 +155,10 @@ def _bundled_resources() -> Iterator[Any]:
 
 def list_skills() -> tuple[Skill, ...]:
     """Return every readable ``SKILL.md`` under the bundled skills directory."""
-    return tuple(
+    found = [
         skill for resource in _bundled_resources() if (skill := _load_skill(resource)) is not None
-    )
+    ]
+    return tuple(sorted(found, key=lambda skill: skill.name))
 
 
 def get_skill(name: str) -> Skill:

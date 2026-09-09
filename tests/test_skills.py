@@ -30,7 +30,7 @@ def invoke(cli: CliRunner, *args: str):
 def _resource_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     root = tmp_path / "bundled"
     root.mkdir()
-    monkeypatch.setattr(skills, "_bundled_resources", lambda: iter(sorted(root.iterdir())))
+    monkeypatch.setattr(skills, "_bundled_resources", lambda: iter(root.iterdir()))
     return root
 
 
@@ -116,6 +116,11 @@ def test_list_has_header_alignment_sorting_and_bounded_rendered_description(
         "  and enough words to exceed the eighty character roster budget safely.\n"
         "---\na\n",
     )
+    monkeypatch.setattr(
+        skills,
+        "_bundled_resources",
+        lambda: iter((root / "zeta", root / "alpha-name-longer-than-header")),
+    )
 
     result = invoke(cli, "skills", "list", "--format", "text")
 
@@ -134,9 +139,10 @@ def test_list_has_header_alignment_sorting_and_bounded_rendered_description(
     assert "repeated whitespace and" in alpha
 
     listed = json.loads(invoke(cli, "skills", "list", "--json").stdout)
-    assert [item["name"] for item in listed["items"]] == sorted(
-        item["name"] for item in listed["items"]
-    )
+    assert [item["name"] for item in listed["items"]] == [
+        "alpha-name-longer-than-header",
+        "zeta",
+    ]
     assert len(listed["items"]) <= 20
 
 

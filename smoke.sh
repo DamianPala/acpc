@@ -1246,9 +1246,13 @@ if begin_section S12-cli "help contract, -V, TTY rules, hostile inputs"; then
     assert_contains "cheat sheet explains execute permissions" \
         "$HELP_MAIN" "execute permits read, edit and execute"
     for group in "Short task" "Long or uncertain task" "Checking on a run" \
-        "Steering a running session" "Context care" "Maintenance and setup" "Common commands"; do
+        "Steering a running session" "Context care" "Maintenance and setup" \
+        "Command groups" "Commands"; do
         assert_contains "cheat sheet groups by task: '$group'" "$HELP_MAIN" "$group"
     done
+    assert_contains "cheat sheet names the agents list command" "$HELP_MAIN" "agents list"
+    assert_contains "cheat sheet names the skills list command" "$HELP_MAIN" "skills list"
+    assert_contains "cheat sheet names the daemon status command" "$HELP_MAIN" "daemon status"
     assert_contains "cheat sheet says wait already prints the answer" \
         "$HELP_MAIN" "block until done, prints the answer"
     assert_contains "cheat sheet frames the file read as the fallback" \

@@ -756,6 +756,25 @@ class TestPrune:
         assert sessions.tombstone_path(old).is_file()
         assert not sessions.meta_path(old).exists()
 
+    def test_rechecks_all_candidates_before_deleting_after_a_race(self) -> None:
+        first = finished_session()
+        second = finished_session()
+        candidates = sessions.prune_candidates(older_than=86_400.0, clock=at(200_000.0))
+
+        sessions.rotate_turn(second, clock=at(200_001.0))
+
+        with pytest.raises(sessions.SessionStateError, match="changed while pruning"):
+            sessions.prune_sessions(
+                older_than=86_400.0,
+                candidates=candidates,
+                clock=at(200_000.0),
+            )
+
+        for session_id in (first, second):
+            assert sessions.meta_path(session_id).exists()
+            assert not sessions.tombstone_path(session_id).exists()
+        assert sessions.read_meta(second).state == "starting"
+
     def test_a_failed_removal_is_not_reported_as_removed(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

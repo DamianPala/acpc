@@ -104,6 +104,22 @@ def test_root_help_describes_every_group_and_command(runner: CliRunner) -> None:
         assert len(line.split()) > len(entry["name"].split())
 
 
+def test_root_help_command_catalog_does_not_present_groups_as_commands(
+    runner: CliRunner,
+) -> None:
+    result = invoke(runner, "--help")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert "Common commands:" not in result.stdout
+    commands = result.stdout.split("Commands:\n", maxsplit=1)[1].split(
+        "  Use `acpc <command> --help`", maxsplit=1
+    )[0]
+    assert "agents list" in commands
+    assert "skills list" in commands
+    assert "daemon status" in commands
+    assert all(line.strip() not in {"agents", "skills", "daemon"} for line in commands.splitlines())
+
+
 def test_permission_help_names_the_tier_gloss(runner: CliRunner) -> None:
     root_help = invoke(runner, "--help")
     run_help = invoke(runner, "run", "--help")

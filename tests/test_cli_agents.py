@@ -143,14 +143,14 @@ def test_agents_list_uses_stable_adapter_then_variant_order(cli: CliRunner) -> N
 
     assert first == second
     items = first["items"]
-    registry = AgentRegistry()
-    expected: list[str] = []
-    for adapter in registry.adapters:
-        expected.append(adapter.entry)
-        expected.extend(
-            variant.entry for variant in registry.variants if variant.base_adapter == adapter.entry
-        )
-    assert [item["name"] for item in items] == expected
+    assert [item["name"] for item in items] == [
+        "claude",
+        "codex",
+        "grok",
+        "mock",
+        "builder",
+        "phantom",
+    ]
 
 
 def test_agents_check_uses_name_order_for_its_collection(
@@ -165,7 +165,7 @@ def test_agents_check_uses_name_order_for_its_collection(
 
     first_names = [item["agent"] for item in first["items"]]
     assert first == second
-    assert first_names == sorted(first_names)
+    assert first_names == ["builder", "claude", "codex", "grok", "mock", "phantom"]
 
 
 def test_agents_list_labels_variant_columns_and_adapts_to_long_values(
