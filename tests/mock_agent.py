@@ -666,6 +666,7 @@ class MockAgent(Agent):
         if prompt_text.startswith("chunkhold:"):
             release_path = Path(prompt_text.split(":", 1)[1])
             await self._send_text(session_id, "holding")
+            await self._send_usage(session_id, used=0)
             deadline = time.monotonic() + HOLD_LIMIT_SECONDS
             while not release_path.exists():
                 if cancel_event.is_set():

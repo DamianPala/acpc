@@ -179,7 +179,6 @@ EXPECTED_REQUIRED_FIELDS = {
         "finished_at",
         "paths",
         "truncated",
-        "partial",
         "denied",
         "permissions_clamp",
         "changed",
@@ -203,7 +202,29 @@ EXPECTED_REQUIRED_FIELDS = {
 # The commands that print an answer, and therefore share one result shape
 # covering success and failure, one `partial` marker and one
 # `output_description` stating when a failure still answers.
-ANSWER_COMMANDS = frozenset({"run", "continue", "steer", "wait"})
+ANSWER_COMMANDS = frozenset({"run", "continue", "wait"})
+
+EXPECTED_OUTPUT_DESCRIPTIONS = {
+    "run": (
+        "Returns the answer result for a turn this call observed — including a failed, canceled "
+        "or lost turn, and one whose session had not finished when a --timeout deadline or a "
+        "detach ended this client's watch — and returns no result for a call that observed no "
+        "turn. `stop_reason`, `cost` and `answer` are present on every foreground result and "
+        "omitted by `--background`."
+    ),
+    "continue": (
+        "Returns the answer result for a turn this call observed — including a failed, canceled "
+        "or lost turn, and one whose session had not finished when a --timeout deadline or a "
+        "detach ended this client's watch — and returns no result for a call that observed no "
+        "turn. `stop_reason`, `cost` and `answer` are present on every foreground result and "
+        "omitted by `--background`."
+    ),
+    "wait": (
+        "Returns the answer result for a session this call observed — including a failed, "
+        "canceled or lost session, and one still unfinished when a --timeout deadline expired — "
+        "and returns no result for a call that observed no session or turn."
+    ),
+}
 
 EXPECTED_OUTPUT_ENUMS = {
     "agents list.output.items[].kind": {"adapter", "variant"},
@@ -221,7 +242,6 @@ EXPECTED_OUTPUT_ENUMS = {
     "log.output.type": {"error", "msg", "permission", "state", "thought", "tool", "usage"},
     "probe.output.diff[].status": {"advertised-missing", "entry-missing"},
     "run.output.status": {
-        "starting",
         "running",
         "succeeded",
         "failed",
@@ -237,9 +257,8 @@ EXPECTED_OUTPUT_ENUMS = {
         "canceled",
         "unknown",
     },
-    "steer.output.status": {"running", "succeeded", "failed", "canceled", "unknown"},
+    "steer.output.status": {"running", "succeeded"},
     "wait.output.status": {
-        "starting",
         "running",
         "succeeded",
         "failed",
@@ -319,11 +338,13 @@ _RESOLUTION_CLAMP_REQUIRED = frozenset({"requested", "ceiling", "effective"})
 
 
 def _session_output_oracle(
-    required: set[str], *, include_changed: bool = True
+    required: set[str], *, include_changed: bool = True, include_partial: bool = True
 ) -> dict[str, tuple[frozenset[str], frozenset[str]]]:
     properties = (
         _SESSION_OUTPUT_PROPERTIES if include_changed else _SESSION_OUTPUT_PROPERTIES - {"changed"}
     )
+    if not include_partial:
+        properties -= {"partial"}
     return {
         "output": (properties, frozenset(required)),
         "output.paths": (_PATHS_PROPERTIES, frozenset(_PATHS_PROPERTIES)),
@@ -680,8 +701,11 @@ EXPECTED_OUTPUT_ORACLES: dict[str, dict[str, tuple[frozenset[str], frozenset[str
     },
 }
 
-for _name in ("continue", "run", "steer"):
+for _name in ("continue", "run"):
     EXPECTED_OUTPUT_ORACLES[_name] = _session_output_oracle(EXPECTED_REQUIRED_FIELDS[_name])
+EXPECTED_OUTPUT_ORACLES["steer"] = _session_output_oracle(
+    EXPECTED_REQUIRED_FIELDS["steer"], include_partial=False
+)
 EXPECTED_OUTPUT_ORACLES["wait"] = _session_output_oracle(
     EXPECTED_REQUIRED_FIELDS["wait"], include_changed=False
 )
@@ -1346,7 +1370,7 @@ def test_D6d_routing_D7b_flat_entries_and_D7c_shape(cli: CliRunner) -> None:
         # declare it; every other command's schema already says everything.
         description = detail.get("output_description")
         if entry["name"] in ANSWER_COMMANDS:
-            assert isinstance(description, str) and description, entry["name"]
+            assert description == EXPECTED_OUTPUT_DESCRIPTIONS[entry["name"]]
         else:
             assert description is None, entry["name"]
         if entry["name"] in {"run", "continue", "steer"}:
@@ -1851,6 +1875,7 @@ def test_R7a_R7b_R7c_background_changes_wait_only_and_keeps_identifier(
 ) -> None:
     detail = read_detail(cli, "run")
     assert "block by default" in detail["description"]
+    assert "print an observed result" in detail["description"]
     started = invoke(
         cli,
         "run",
@@ -2208,24 +2233,37 @@ def _kill_turn_worker(
     return holder["result"]
 
 
-def _observe_work_statuses(
-    cli: CliRunner, observed: dict[str, set[Any]], monkeypatch: pytest.MonkeyPatch
+def _record_observed_status(
+    name: str,
+    result: Any,
+    observed: dict[str, set[Any]],
+    *,
+    exit_code: int,
+    error_kind: str | None = None,
+    has_result: bool = True,
 ) -> None:
-    """Observe every `status` the four answer commands declare (O4c).
-
-    Each member is produced by a real call: a foreground success, a refused
-    turn, a `--cancel-after` cancellation, a background dispatch, a `--timeout`
-    deadline that expires on the direct route, and a turn whose host process is
-    killed.  The direct route is forced for the last two so the deadline can
-    land before `run`'s worker records itself as running, and so the killed
-    process is a per-call worker rather than a shared daemon.
-    """
-
-    def record(name: str, result: Any, *, exit_code: int | None = None) -> None:
-        if exit_code is not None:
-            assert result.exit_code == exit_code, (name, result.stdout, result.stderr)
-        document = json.loads(result.stdout)
+    document: dict[str, Any] | None = None
+    assert result.exit_code == exit_code, (name, result.stdout, result.stderr)
+    if has_result:
+        assert result.stdout, name
+        parsed = json.loads(result.stdout)
+        assert isinstance(parsed, dict), name
+        document = parsed
         observed.setdefault(f"{name}.output.status", set()).add(document["status"])
+    else:
+        assert result.stdout == "", name
+    if error_kind is None:
+        assert result.stderr == "", (name, result.stderr)
+        return
+    error = _error(result)
+    assert error["kind"] == error_kind, (name, error)
+    if has_result:
+        assert document is not None
+        assert error["context"]["status"] == document["status"], (name, error)
+
+
+def _observe_work_statuses(cli: CliRunner, observed: dict[str, set[Any]]) -> None:
+    """Observe every reachable answer-result status with three stream checks."""
 
     def call(*args: str) -> Any:
         return invoke(cli, *args, "--json", "--quiet")
@@ -2236,57 +2274,85 @@ def _observe_work_statuses(
         return json.loads(result.stdout)["session_id"]
 
     base_id = finished_base()
-
-    record("run", call("run", "mock", "echo:enum run"), exit_code=vocab.EXIT_OK)
-    record("run", call("run", "mock", "fail enum run"), exit_code=vocab.EXIT_AGENT_ERROR)
-    record("run", call("run", "mock", "chunkslow:5 enum run", "--cancel-after", "0.5"))
-    record(
+    _record_observed_status(
+        "run", call("run", "mock", "echo:enum run"), observed, exit_code=vocab.EXIT_OK
+    )
+    _record_observed_status(
+        "run",
+        call("run", "mock", "fail enum run"),
+        observed,
+        exit_code=vocab.EXIT_AGENT_ERROR,
+        error_kind=errors.OPERATION_FAILED,
+    )
+    _record_observed_status(
+        "run",
+        call("run", "mock", "chunkslow:5 enum run", "--cancel-after", "0.5"),
+        observed,
+        exit_code=vocab.EXIT_AGENT_ERROR,
+        error_kind=errors.OPERATION_FAILED,
+    )
+    _record_observed_status(
         "run",
         call("run", "mock", "slow:1 enum run", "--background", "--permissions", "read"),
+        observed,
         exit_code=vocab.EXIT_OK,
     )
-
-    record("continue", call("continue", base_id, "echo:enum continue"), exit_code=vocab.EXIT_OK)
-    record("continue", call("continue", base_id, "fail enum continue"))
-    record(
-        "continue", call("continue", base_id, "chunkslow:5 enum continue", "--cancel-after", "0.5")
+    _record_observed_status(
+        "continue",
+        call("continue", base_id, "echo:enum continue"),
+        observed,
+        exit_code=vocab.EXIT_OK,
     )
-    record(
+    _record_observed_status(
+        "continue",
+        call("continue", base_id, "fail enum continue"),
+        observed,
+        exit_code=vocab.EXIT_AGENT_ERROR,
+        error_kind=errors.OPERATION_FAILED,
+    )
+    _record_observed_status(
+        "continue",
+        call("continue", base_id, "chunkslow:5 enum continue", "--cancel-after", "0.5"),
+        observed,
+        exit_code=vocab.EXIT_AGENT_ERROR,
+        error_kind=errors.OPERATION_FAILED,
+    )
+    _record_observed_status(
         "continue",
         call("continue", base_id, "slow:1 enum continue", "--background", "--permissions", "read"),
+        observed,
         exit_code=vocab.EXIT_OK,
     )
 
-    def steer(prompt: str, *extra: str) -> Any:
-        steer_id = _background_session(cli, "slow:30 enum steer base")
-        return call("steer", steer_id, prompt, *extra)
-
-    record("steer", steer("echo:enum steer"), exit_code=vocab.EXIT_OK)
-    record("steer", steer("fail enum steer"))
-    record("steer", steer("chunkslow:5 enum steer", "--cancel-after", "0.5"))
-
-    # `--background` needs the daemon, so the sessions steered on the direct
-    # route are opened before the route is forced.
-    steer_timeout_id = _background_session(cli, "slow:30 enum steer base")
-    steer_unknown_id = _background_session(cli, "slow:30 enum steer base")
+    steer_id = _background_session(cli, "slow:30 enum steer base")
+    _record_observed_status(
+        "steer", call("steer", steer_id, "echo:enum steer"), observed, exit_code=vocab.EXIT_OK
+    )
+    steer_background_id = _background_session(cli, "slow:30 enum steer background")
+    _record_observed_status(
+        "steer",
+        call("steer", steer_background_id, "echo:enum steer background", "--background"),
+        observed,
+        exit_code=vocab.EXIT_OK,
+    )
 
     with _direct_child_route():
-        record(
+        _record_observed_status(
             "run",
             call("run", "mock", "slow:5 enum run", "--timeout", "0.001"),
+            observed,
             exit_code=vocab.EXIT_TIMEOUT,
+            error_kind=errors.TIMEOUT,
+            has_result=False,
         )
-        record(
+        _record_observed_status(
             "continue",
             call("continue", finished_base(), "slow:30 enum continue", "--timeout", "3"),
+            observed,
             exit_code=vocab.EXIT_TIMEOUT,
+            error_kind=errors.TIMEOUT,
         )
-        record(
-            "steer",
-            call("steer", steer_timeout_id, "slow:30 enum steer", "--timeout", "3"),
-            exit_code=vocab.EXIT_TIMEOUT,
-        )
-        record(
+        _record_observed_status(
             "run",
             _kill_turn_worker(
                 cli,
@@ -2304,11 +2370,13 @@ def _observe_work_statuses(
                 lambda: _await_alias("enum-run-unknown"),
                 lambda meta: meta.state == "running",
             ),
+            observed,
             exit_code=vocab.EXIT_AGENT_ERROR,
+            error_kind=errors.OPERATION_FAILED,
         )
         unknown_base = finished_base()
         base_turn = sessions.read_meta(unknown_base).turns
-        record(
+        _record_observed_status(
             "continue",
             _kill_turn_worker(
                 cli,
@@ -2324,42 +2392,44 @@ def _observe_work_statuses(
                 lambda: unknown_base,
                 lambda meta: meta.turns > base_turn and meta.state == "running",
             ),
+            observed,
             exit_code=vocab.EXIT_AGENT_ERROR,
-        )
-        steer_turn = sessions.read_meta(steer_unknown_id).turns
-        record(
-            "steer",
-            _kill_turn_worker(
-                cli,
-                (
-                    "steer",
-                    steer_unknown_id,
-                    "slow:30 enum steer",
-                    "--timeout",
-                    "20",
-                    "--json",
-                    "--quiet",
-                ),
-                lambda: steer_unknown_id,
-                lambda meta: meta.turns > steer_turn and meta.state == "running",
-            ),
-            exit_code=vocab.EXIT_AGENT_ERROR,
+            error_kind=errors.OPERATION_FAILED,
         )
 
     waited_id = _background_session(cli, "slow:1 enum wait")
-    record("wait", call("wait", waited_id), exit_code=vocab.EXIT_OK)
-    record("wait", call("wait", _finished_session("failed")), exit_code=vocab.EXIT_AGENT_ERROR)
-    record("wait", call("wait", _finished_session("canceled")), exit_code=vocab.EXIT_CANCELLED)
-    record("wait", call("wait", _finished_session("unknown")), exit_code=vocab.EXIT_AGENT_ERROR)
-    record(
+    _record_observed_status("wait", call("wait", waited_id), observed, exit_code=vocab.EXIT_OK)
+    for state, exit_code in (
+        ("failed", vocab.EXIT_AGENT_ERROR),
+        ("canceled", vocab.EXIT_CANCELLED),
+    ):
+        _record_observed_status(
+            "wait",
+            call("wait", _finished_session(state)),
+            observed,
+            exit_code=exit_code,
+            error_kind=errors.OPERATION_FAILED,
+        )
+    _record_observed_status(
+        "wait",
+        call("wait", _finished_session("unknown")),
+        observed,
+        exit_code=vocab.EXIT_AGENT_ERROR,
+        error_kind=errors.OPERATION_FAILED,
+    )
+    _record_observed_status(
         "wait",
         call("wait", _active_session(pid=os.getpid()), "--timeout", "0"),
+        observed,
         exit_code=vocab.EXIT_TIMEOUT,
+        error_kind=errors.TIMEOUT,
     )
     starting = sessions.create_session(entry="mock", base_adapter="mock", prompt="enum starting")
-    record(
-        "wait", call("wait", starting.session_id, "--timeout", "0"), exit_code=vocab.EXIT_TIMEOUT
-    )
+    starting_result = call("wait", starting.session_id, "--timeout", "0")
+    assert starting_result.exit_code == vocab.EXIT_TIMEOUT
+    assert starting_result.stdout == ""
+    assert _error(starting_result)["kind"] == errors.TIMEOUT
+    assert _error(starting_result)["context"]["status"] == "starting"
 
 
 def _observe_log_types(cli: CliRunner, observed: dict[str, set[Any]]) -> None:
@@ -2429,7 +2499,7 @@ def test_O4c_declared_enums_have_reachable_values(
     observed: dict[str, set[Any]] = {}
     _observe_flag_enums(cli, index, state_root, observed)
     _observe_session_statuses(cli, observed, monkeypatch)
-    _observe_work_statuses(cli, observed, monkeypatch)
+    _observe_work_statuses(cli, observed)
     _observe_log_types(cli, observed)
     _observe_discovery_enums(cli, state_root, observed)
     _assert_reachable_output_enums(cli, index, observed)

@@ -61,22 +61,31 @@ _NULLABLE_INTEGER = {"type": ["integer", "null"]}
 _SESSION_STATUS = {"type": "string", "enum": list(vocab.SESSION_STATES)}
 # `status` in an answer result.  One schema covers the success and the failure
 # documents of a command (O4a), so the enum lists every state a result can
-# carry: the finished ones, plus `running` and `starting` when a `--timeout`
-# deadline expires or a SIGTERM detaches the client before the turn ends.
+# carry: the finished ones plus `running` when a `--timeout` deadline expires
+# or a SIGTERM detaches the client before the turn ends. A `starting` record
+# has no observed turn and produces no answer document.
 # `preparing` is a daemon turn phase that is never written to `meta.json`, so
 # no result document can report it.
 _ANSWER_STATUS = {
     "type": "string",
-    "enum": [state for state in vocab.SESSION_STATES if state != "preparing"],
+    "enum": [state for state in vocab.SESSION_STATES if state not in {"preparing", "starting"}],
 }
 # A follow-up turn rotates a finished session straight to `running` under the
 # session lock, so `continue` and `steer` can observe `running` but never
-# `starting`; listing `starting` for them would name a value the command
-# cannot return (O4c).
+# `starting`; listing it would name a value the command cannot return (O4c).
 _FOLLOW_UP_STATUS = {
     "type": "string",
-    "enum": [state for state in _ANSWER_STATUS["enum"] if state != "starting"],
+    "enum": list(_ANSWER_STATUS["enum"]),
 }
+# `wait` reports a session that has already entered a turn. A raw `starting`
+# record has no observed turn and therefore cannot produce an answer result.
+_WAIT_STATUS = {
+    "type": "string",
+    "enum": list(_ANSWER_STATUS["enum"]),
+}
+# `steer` keeps its pre-slice result contract: only the states it could
+# publish after redirecting a live turn, without the new partial field.
+_STEER_STATUS = {"type": "string", "enum": ["running", "succeeded"]}
 _CANCEL_STATUS = {
     "type": "string",
     "enum": ["running", "succeeded", "failed", "canceled", "unknown"],
@@ -173,9 +182,12 @@ def _session_result_schema(
     changed: bool,
     foreground_only: bool = False,
     status: dict[str, Any] = _ANSWER_STATUS,
+    include_partial: bool = True,
 ) -> dict[str, Any]:
     properties = dict(_SESSION_RESULT_PROPERTIES)
     properties["status"] = status
+    if not include_partial:
+        properties.pop("partial")
     if not changed:
         properties.pop("changed")
     required = [
@@ -186,10 +198,11 @@ def _session_result_schema(
         "finished_at",
         "paths",
         "truncated",
-        "partial",
         "denied",
         "permissions_clamp",
     ]
+    if include_partial:
+        required.insert(7, "partial")
     if foreground_only:
         required[5:5] = ["stop_reason", "cost", "answer"]
     if changed:
@@ -521,8 +534,8 @@ _OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
     ),
     "list": _STATUS,
     "status": _STATUS_DETAIL,
-    "steer": _session_result_schema(changed=True, status=_FOLLOW_UP_STATUS),
-    "wait": _session_result_schema(changed=False, foreground_only=True),
+    "steer": _session_result_schema(changed=True, status=_STEER_STATUS, include_partial=False),
+    "wait": _session_result_schema(changed=False, foreground_only=True, status=_WAIT_STATUS),
 }
 
 # Flags accepted by *every* command entry, and therefore not repeated in any

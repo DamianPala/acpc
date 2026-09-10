@@ -84,6 +84,7 @@ def result_envelope(
     background: bool = False,
     changed: bool | None = None,
     partial: bool = False,
+    include_partial: bool = True,
 ) -> dict[str, Any]:
     """Build the pinned JSON shape for an answer-printing command."""
     if background:
@@ -117,11 +118,12 @@ def result_envelope(
         "cost": meta.cost,
         "answer": answer,
         "truncated": truncated,
-        "partial": partial,
         "denied": _denial_payload(meta),
         "permissions_clamp": _permissions_clamp(meta),
         "next": ["acpc", "continue", meta.session_id],
     }
+    if include_partial:
+        envelope["partial"] = partial
     if resume := _resume_status(meta):
         envelope["resume"] = resume
     if truncated:
@@ -147,8 +149,17 @@ def _json_answer(
     answer_path: Path | str,
     changed: bool | None,
     partial: bool,
+    include_partial: bool,
 ) -> OutputResult:
-    complete = _json_text(result_envelope(meta, answer, changed=changed, partial=partial))
+    complete = _json_text(
+        result_envelope(
+            meta,
+            answer,
+            changed=changed,
+            partial=partial,
+            include_partial=include_partial,
+        )
+    )
     if max_output == 0 or len(complete.encode("utf-8")) <= max_output:
         return OutputResult(complete, False, len(complete.encode("utf-8")))
 
@@ -156,7 +167,14 @@ def _json_answer(
 
     def candidate(prefix: str) -> str:
         return _json_text(
-            result_envelope(meta, prefix + marker, truncated=True, changed=changed, partial=partial)
+            result_envelope(
+                meta,
+                prefix + marker,
+                truncated=True,
+                changed=changed,
+                partial=partial,
+                include_partial=include_partial,
+            )
         )
 
     # JSON escaping adds a fixed envelope overhead and escapes the marker's
@@ -193,6 +211,7 @@ def render_result(
     max_output: int = DEFAULT_MAX_OUTPUT,
     changed: bool | None = None,
     partial: bool | None = None,
+    include_partial: bool = True,
 ) -> OutputResult:
     """Render one answer command's stdout payload without writing it.
 
@@ -220,6 +239,7 @@ def render_result(
             answer_path=answer_path,
             changed=changed,
             partial=partial,
+            include_partial=include_partial,
         )
     return truncate_answer(answer, max_output=max_output, answer_path=answer_path)
 
