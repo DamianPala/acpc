@@ -226,3 +226,31 @@ def test_concurrent_appends_produce_one_contiguous_cursor(transcript_path: Path)
     assert [event["i"] for event in events] == list(range(1, 65))
     assert [event["type"] for event in events] == ["msg"] * 64
     assert all(event["text"].startswith("event ") for event in events)
+
+
+def test_a_steer_event_carries_the_mode_the_text_and_the_outcome(
+    transcript_path: Path,
+) -> None:
+    """SPEC `steer`: one record per correction, complete enough to read back."""
+    transcript = Transcript(transcript_path)
+
+    appended = transcript.append("steer", mode="in-place", text="diagnose only", outcome="injected")
+
+    assert appended["type"] == "steer"
+    assert transcript.read().events[0] == appended
+
+
+def test_a_steer_event_without_an_outcome_is_rejected(transcript_path: Path) -> None:
+    """An acknowledged correction and a refused one are different records, so a
+    steer event without an outcome is not a steer event."""
+    transcript = Transcript(transcript_path)
+
+    with pytest.raises(TranscriptError, match="outcome"):
+        transcript.append("steer", mode="in-place", text="diagnose only")
+
+
+def test_a_steer_event_without_a_mode_is_rejected(transcript_path: Path) -> None:
+    transcript = Transcript(transcript_path)
+
+    with pytest.raises(TranscriptError, match="mode"):
+        transcript.append("steer", text="diagnose only", outcome="injected")

@@ -198,6 +198,7 @@ class SessionMeta:
     resolution: dict[str, Any] = field(default_factory=dict)
     adapter_session_id: str | None = None
     target: str | None = None
+    steer_modes: list[str] | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -453,6 +454,20 @@ def _coerce_denied(value: Any, key: str, path: Path) -> dict[str, int]:
     return denied
 
 
+def _coerce_steer_modes(value: Any, key: str, path: Path) -> list[str] | None:
+    """Read the recorded steer modes; absent means the session has not reached an adapter."""
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise CorruptSessionError(f"{path}: {key} is not an array")
+    modes: list[str] = []
+    for mode in value:
+        if not isinstance(mode, str) or not mode:
+            raise CorruptSessionError(f"{path}: {key} has an invalid mode")
+        modes.append(mode)
+    return modes
+
+
 def _coerce_denial_details(value: Any, key: str, path: Path) -> dict[str, dict[str, Any]]:
     if value is None:
         return {}
@@ -528,6 +543,7 @@ def meta_from_dict(data: Mapping[str, Any], *, path: Path) -> SessionMeta:
         resolution=dict(resolution),
         adapter_session_id=_coerce_str(known.get("adapter_session_id"), "adapter_session_id", path),
         target=_coerce_str(known.get("target"), "target", path),
+        steer_modes=_coerce_steer_modes(known.get("steer_modes"), "steer_modes", path),
         extra=extra,
     )
 
@@ -858,6 +874,7 @@ def mark_running(
     *,
     pid: int,
     process_start_time: str | None = None,
+    steer_modes: Sequence[str] | None = None,
     clock: Clock | None = None,
 ) -> SessionMeta:
     """Record the process hosting this session's turns and open the turn.
@@ -865,17 +882,18 @@ def mark_running(
     The recorded pid is the daemon on the daemon path and the acpc client on
     the direct path. Recording it ends the startup grace: from here on,
     liveness alone decides whether the session is still alive.
+
+    ``steer_modes`` is what the caller already knows about the turn it is
+    opening; the daemon path learns it from the adapter, so it passes nothing
+    and records the modes once `initialize` has answered.
     """
     token = process_start_time
     if token is None:
         token = proc.process_start_time(pid)
-    return transition(
-        session_id,
-        "running",
-        clock=clock,
-        pid=pid,
-        process_start_time=token,
-    )
+    changes: dict[str, Any] = {"pid": pid, "process_start_time": token}
+    if steer_modes is not None:
+        changes["steer_modes"] = list(steer_modes)
+    return transition(session_id, "running", clock=clock, **changes)
 
 
 def rotate_turn(
@@ -887,6 +905,7 @@ def rotate_turn(
     prompt: str | None = None,
     resume_status: str | None = None,
     pid: int | None = None,
+    steer_modes: Sequence[str] | None = None,
 ) -> SessionMeta:
     """Open the next turn: park the finished turn's artifacts, reset per-turn state.
 
@@ -894,6 +913,11 @@ def rotate_turn(
     and renames each file exactly once, ever — turn numbers are fixed, so
     there is no logrotate-style cascade. A mid-turn session therefore has no
     `answer.md` until the turn produces one.
+
+    Support for in-place steering belongs to the turn, not the session, so it
+    is decided again here: a caller that already knows the answer passes
+    ``steer_modes``, and the daemon records its own once the adapter has
+    answered `initialize`.
     """
     resolved_clock = _resolve_clock(clock)
     with session_lock(session_id):
@@ -928,6 +952,7 @@ def rotate_turn(
         meta.failure = None
         meta.denied = {}
         meta.denial_details = {}
+        meta.steer_modes = None if steer_modes is None else list(steer_modes)
         meta.extra.pop("failure", None)
         meta.extra.pop("resume", None)
         if prompt is not None:

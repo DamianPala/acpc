@@ -5,15 +5,19 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
 from click.testing import CliRunner
 
-from acpc import daemon_client, runner, sessions, vocab
+from acpc import daemon_client, runner, sessions, transcript, vocab
 from acpc.cli import STEER_PREAMBLE, main
+from acpc.permissions import select_mode
+from acpc.registry import AgentRegistry
 
 MOCK_AGENT_SCRIPT = str(Path(__file__).with_name("mock_agent.py"))
 
@@ -96,6 +100,85 @@ def wait_for_running(session_id: str, timeout: float = 5.0) -> None:
             return
         time.sleep(0.05)
     pytest.fail("background session never became running")
+
+
+def wait_for_prompt_in_flight(session_id: str, timeout: float = 30.0) -> None:
+    """Wait until the adapter has the turn's prompt, which is what in-place needs.
+
+    `running` alone is not enough: the daemon writes it when it claims the
+    turn, before the adapter has been told anything, and a steer sent in that
+    window has no prompt to reach.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        meta = sessions.read_meta(session_id)
+        delivered = meta.extra.get("delivered_prompts")
+        if (
+            meta.state == "running"
+            and isinstance(delivered, list)
+            and any(
+                isinstance(entry, dict) and entry.get("turn") == meta.turns for entry in delivered
+            )
+        ):
+            return
+        time.sleep(0.05)
+    pytest.fail("the turn's prompt never reached the adapter")
+
+
+def wait_for_log_line(path: Path, needle: str, timeout: float = 10.0) -> None:
+    """Wait for one line the mock writes outside the protocol."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            lines = path.read_text(encoding="utf-8").splitlines()
+            if any(needle in line for line in lines):
+                return
+        time.sleep(0.02)
+    pytest.fail(f"{path} never recorded {needle!r}")
+
+
+def running_daemon_turn(cli: CliRunner, prompt: str) -> str:
+    """A daemon-owned turn whose prompt has reached the adapter."""
+    dispatched = invoke(cli, "run", "mock", prompt, "--bg", "--json")
+    assert dispatched.exit_code == vocab.EXIT_OK, dispatched.stderr
+    session_id = json.loads(dispatched.stdout)["session_id"]
+    wait_for_prompt_in_flight(session_id)
+    return session_id
+
+
+def steer_error(result: Any) -> dict[str, Any]:
+    return json.loads(result.stderr.splitlines()[-1])["error"]
+
+
+def steer_events(session_id: str) -> list[dict[str, Any]]:
+    events = transcript.Transcript(sessions.transcript_path(session_id)).read().events
+    return [event for event in events if event.get("type") == "steer"]
+
+
+def running_direct_session(prompt: str) -> tuple[str, threading.Thread]:
+    """Start a real direct-child turn in this process, in flight.
+
+    A direct session is the one route that can never steer in place — nothing
+    in this process has a channel to the adapter it spawned — so it is built
+    here rather than borrowed from a daemon.
+    """
+    resolution = AgentRegistry().resolve_call("mock", permissions="read")
+    mode, mode_spec = select_mode(resolution.entry.modes, "read", resolution.mode)
+    resolution = replace(resolution, mode=mode, mode_spec=mode_spec)
+    meta = sessions.create_session(
+        entry="mock",
+        base_adapter="mock",
+        prompt=prompt,
+        resolution=runner.resolution_payload(resolution, cwd=None),
+        target=runner.call_target(resolution),
+    )
+    request = runner.TurnRequest(resolution=resolution, prompt=prompt)
+    thread = threading.Thread(
+        target=lambda: runner.execute_turn(meta.session_id, request), daemon=True
+    )
+    thread.start()
+    wait_for_prompt_in_flight(meta.session_id)
+    return meta.session_id, thread
 
 
 def test_steer_cancels_the_turn_and_runs_the_instruction(cli: CliRunner) -> None:
@@ -441,3 +524,456 @@ def test_steer_before_outgoing_prompt_frame_is_a_plain_follow_up(
         if continue_process.poll() is None:
             continue_process.kill()
             continue_process.wait(timeout=10)
+
+
+# --- in-place steering -------------------------------------------------------
+
+
+def test_steer_in_place_keeps_the_turn_and_queues_the_instruction(
+    cli: CliRunner, live_daemon: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SPEC steer: the correction joins the turn in flight, so the turn keeps
+    its number, its prompt file and its answer file, and the adapter shows it."""
+    monkeypatch.setenv("ACPC_MOCK_STEERING", "1")
+    session_id = running_daemon_turn(cli, "chunkslow:6 hold")
+
+    result = invoke(cli, "steer", session_id, "X", "--bg", "--json")
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    document = json.loads(result.stdout)
+    assert document["status"] == "running"
+    assert document["turn"] == 1
+    assert document["correction_result"] == {
+        "steer_mode": "in-place",
+        "target_turn": 1,
+        "target_status": "running",
+        "message_state": "accepted",
+    }
+    assert document["capabilities"]["steer_modes"] == ["in-place", "cancel-then-start"]
+    assert "partial" not in document
+
+    waited = invoke(cli, "wait", session_id, "--json")
+    assert waited.exit_code == vocab.EXIT_OK, waited.stderr
+    assert "steered: X" in json.loads(waited.stdout)["answer"]
+
+    assert sessions.read_meta(session_id).turns == 1
+    assert not sessions.turn_path(session_id, "prompt", 1).exists()
+    assert not sessions.turn_path(session_id, "answer", 1).exists()
+    events = steer_events(session_id)
+    assert [(event["mode"], event["text"], event["outcome"]) for event in events] == [
+        ("in-place", "X", "injected")
+    ]
+
+
+def test_steer_in_place_blocking_prints_the_observed_turns_answer(
+    cli: CliRunner, live_daemon: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ACPC_MOCK_STEERING", "1")
+    session_id = running_daemon_turn(cli, "chunkslow:6 hold")
+
+    result = invoke(cli, "steer", session_id, "X", "--json", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    document = json.loads(result.stdout)
+    assert document["status"] == "succeeded"
+    assert "steered: X" in document["answer"]
+    assert document["turn"] == 1
+    assert document["correction_result"]["target_status"] == "succeeded"
+    assert document["correction_result"]["message_state"] == "accepted"
+
+
+def test_two_in_place_corrections_arrive_in_the_order_they_were_sent(
+    cli: CliRunner, live_daemon: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ACPC_MOCK_STEERING", "1")
+    session_id = running_daemon_turn(cli, "chunkslow:8 hold")
+
+    first = invoke(cli, "steer", session_id, "X", "--bg", "--json")
+    second = invoke(cli, "steer", session_id, "Y", "--bg", "--json")
+
+    assert first.exit_code == vocab.EXIT_OK, first.stderr
+    assert second.exit_code == vocab.EXIT_OK, second.stderr
+    waited = invoke(cli, "wait", session_id, "--json")
+    assert waited.exit_code == vocab.EXIT_OK, waited.stderr
+    answer = json.loads(waited.stdout)["answer"]
+    assert "steered: X" in answer and "steered: Y" in answer
+    assert answer.index("steered: X") < answer.index("steered: Y")
+    assert [event["outcome"] for event in steer_events(session_id)] == ["injected", "injected"]
+
+
+def test_steer_in_place_preserves_the_turn_context_and_artifacts(
+    cli: CliRunner, live_daemon: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No second prompt is sent: the adapter's history shows one entry, the
+    transcript one turn, and the dispatched prompt file is untouched."""
+    monkeypatch.setenv("ACPC_MOCK_STEERING", "1")
+    prompt = "chunkslow:6 hold"
+    session_id = running_daemon_turn(cli, prompt)
+
+    steered = invoke(cli, "steer", session_id, "X", "--bg", "--json")
+    assert steered.exit_code == vocab.EXIT_OK, steered.stderr
+    waited = invoke(cli, "wait", session_id, "--json")
+    assert waited.exit_code == vocab.EXIT_OK, waited.stderr
+
+    meta = sessions.read_meta(session_id)
+    assert meta.turns == 1
+    assert sessions.prompt_path(session_id).read_text(encoding="utf-8") == prompt
+    answer = json.loads(waited.stdout)["answer"]
+    started = answer.index("started")
+    assert started < answer.index("steered: X") < answer.index("finished")
+    store_path = Path(os.environ["ACPC_HOME"]) / "mock-sessions.json"
+    store = json.loads(store_path.read_text(encoding="utf-8"))
+    assert store[meta.adapter_session_id]["history"] == [prompt]
+
+
+def test_steer_without_in_place_support_still_cancels_and_redirects(
+    cli: CliRunner,
+) -> None:
+    """SPEC steer: no capability means the other mode, chosen without asking."""
+    session_id = mid_turn_session(cli)
+    target_turn = sessions.read_meta(session_id).turns
+
+    result = invoke(cli, "steer", session_id, "diagnose only", "--json", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    document = json.loads(result.stdout)
+    assert document["turn"] == target_turn + 1
+    assert document["correction_result"] == {
+        "steer_mode": "cancel-then-start",
+        "target_turn": target_turn,
+        "target_status": "canceled",
+        "message_state": "accepted",
+    }
+    assert sessions.read_meta(session_id).turns == target_turn + 1
+    assert sessions.prompt_path(session_id).read_text(encoding="utf-8").startswith(STEER_PREAMBLE)
+
+
+def test_an_explicit_in_place_mode_on_a_session_without_it_changes_nothing(
+    cli: CliRunner,
+) -> None:
+    session_id = mid_turn_session(cli)
+    before = sessions.read_meta(session_id)
+
+    result = invoke(cli, "steer", session_id, "diagnose only", "--steer-mode", "in-place")
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    envelope = json.loads(result.stderr.splitlines()[-1])["error"]
+    assert envelope["kind"] == "not_supported"
+    assert envelope["context"]["capabilities"] == {"steer_modes": None}
+    assert envelope["hint"] == (f"Run: acpc steer {session_id} ... --steer-mode cancel-then-start")
+    meta = sessions.load(session_id)
+    assert meta.turns == before.turns
+    assert meta.state == "running"
+
+
+def test_a_daemon_session_without_a_steering_adapter_shows_one_mode(
+    cli: CliRunner, live_daemon: None
+) -> None:
+    """SPEC steer: the modes are published per session, and the daemon records
+    what its adapter actually declared."""
+    session_id = running_daemon_turn(cli, "chunkslow:6 plain")
+
+    detail = json.loads(invoke(cli, "status", session_id, "--json").stdout)
+
+    assert detail["capabilities"] == {"steer_modes": ["cancel-then-start"]}
+    result = invoke(cli, "steer", session_id, "X", "--bg", "--json")
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    assert json.loads(result.stdout)["correction_result"]["steer_mode"] == "cancel-then-start"
+
+
+def test_a_direct_session_supports_only_cancel_then_start(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No channel reaches a direct child's process, so in-place is not offered."""
+    session_id, thread = running_direct_session("chunkslow:6 direct steer")
+    try:
+        detail = json.loads(invoke(cli, "status", session_id, "--json").stdout)
+        assert detail["capabilities"] == {"steer_modes": ["cancel-then-start"]}
+        assert (
+            "steer: cancel-then-start"
+            in invoke(cli, "status", session_id, "--format", "text").stdout
+        )
+
+        result = invoke(cli, "steer", session_id, "X", "--steer-mode", "in-place")
+
+        assert result.exit_code == vocab.EXIT_AGENT_ERROR
+        envelope = steer_error(result)
+        assert envelope["kind"] == "not_supported"
+        assert envelope["context"]["capabilities"] == {"steer_modes": ["cancel-then-start"]}
+        assert sessions.read_meta(session_id).turns == 1
+    finally:
+        thread.join(timeout=30)
+
+
+def test_status_says_unknown_until_a_session_has_reached_an_adapter(
+    cli: CliRunner,
+) -> None:
+    session_id = sessions.create_session(
+        entry="mock", base_adapter="mock", prompt="fresh"
+    ).session_id
+
+    detail = json.loads(invoke(cli, "status", session_id, "--json").stdout)
+
+    assert detail["capabilities"] == {"steer_modes": None}
+    assert "steer: unknown" in invoke(cli, "status", session_id, "--format", "text").stdout
+
+
+def test_an_adapter_that_starts_its_own_turn_is_reported_as_unknown(
+    cli: CliRunner,
+    live_daemon: None,
+    monkeypatch: pytest.MonkeyPatch,
+    state_root: Path,
+) -> None:
+    """SPEC steer: an adapter that starts a turn of its own is cancelled and
+    never presented as an in-place correction."""
+    monkeypatch.setenv("ACPC_MOCK_STEERING", "1")
+    monkeypatch.setenv("ACPC_MOCK_STEERING_RACE", "1")
+    steering_log = state_root / "steering.log"
+    monkeypatch.setenv("ACPC_MOCK_STEERING_LOG", str(steering_log))
+    session_id = running_daemon_turn(cli, "chunkslow:10 race")
+
+    result = invoke(cli, "steer", session_id, "X", "--bg", "--json")
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    envelope = steer_error(result)
+    assert envelope["kind"] == "outcome_unknown"
+    assert envelope["context"]["session_id"] == session_id
+    assert envelope["context"]["correction_result"] == {
+        "steer_mode": "in-place",
+        "target_turn": 1,
+        "target_status": "running",
+        "message_state": "unknown",
+    }
+    assert [event["outcome"] for event in steer_events(session_id)] == ["startedNewTurn"]
+    wait_for_log_line(steering_log, "cancel:")
+
+
+def test_a_correction_the_adapter_refuses_to_place_is_not_delivered(
+    cli: CliRunner,
+    live_daemon: None,
+    monkeypatch: pytest.MonkeyPatch,
+    state_root: Path,
+) -> None:
+    """SPEC steer: `promptRequired` means the turn ended before the instruction
+    arrived, and acpc reports exactly that instead of starting a new turn. It
+    is the answer acpc asked for: every request carries `idleBehavior:
+    promptRequired`, so the adapter never starts a turn of its own on purpose."""
+    monkeypatch.setenv("ACPC_MOCK_STEERING", "1")
+    monkeypatch.setenv("ACPC_MOCK_STEERING_FORCE", "promptRequired")
+    steering_log = state_root / "steering.log"
+    monkeypatch.setenv("ACPC_MOCK_STEERING_LOG", str(steering_log))
+    session_id = running_daemon_turn(cli, "chunkslow:6 forced idle")
+
+    result = invoke(cli, "steer", session_id, "X", "--bg", "--json")
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    envelope = steer_error(result)
+    assert envelope["kind"] == "conflict"
+    assert envelope["context"]["correction_result"]["message_state"] == "not_delivered"
+    assert [event["outcome"] for event in steer_events(session_id)] == ["promptRequired"]
+    assert sessions.read_meta(session_id).turns == 1
+    wait_for_log_line(steering_log, "idle:promptRequired")
+
+
+def test_an_adapter_that_declares_steering_and_denies_it_is_not_supported(
+    cli: CliRunner, live_daemon: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ACPC_MOCK_STEERING", "declared-only")
+    session_id = running_daemon_turn(cli, "chunkslow:6 declared")
+
+    result = invoke(cli, "steer", session_id, "X", "--bg", "--json")
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    envelope = steer_error(result)
+    assert envelope["kind"] == "not_supported"
+    assert envelope["context"]["correction_result"]["message_state"] == "not_delivered"
+    assert sessions.read_meta(session_id).turns == 1
+
+
+def test_a_blocking_in_place_steer_times_out_without_a_document(
+    cli: CliRunner, live_daemon: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SPEC steer: --timeout bounds this client's wait only, and emits nothing."""
+    monkeypatch.setenv("ACPC_MOCK_STEERING", "1")
+    session_id = running_daemon_turn(cli, "chunkslow:8 hold")
+
+    result = invoke(cli, "steer", session_id, "X", "--json", "--timeout", "0.5")
+
+    assert result.exit_code == vocab.EXIT_TIMEOUT
+    assert result.stdout == ""
+    envelope = steer_error(result)
+    assert envelope["kind"] == "timeout"
+    assert envelope["context"]["status"] == "running"
+    assert envelope["context"]["correction_result"]["message_state"] == "accepted"
+    assert sessions.read_meta(session_id).state == "running"
+
+
+def test_cancel_after_needs_an_explicit_cancel_then_start(cli: CliRunner) -> None:
+    """SPEC steer: the rule is static, so it holds on an untouched session too."""
+    for args in (
+        ("steer", "x7k2", "diagnose", "--cancel-after", "5"),
+        ("steer", "x7k2", "diagnose", "--steer-mode", "in-place", "--cancel-after", "5"),
+    ):
+        result = invoke(cli, *args)
+
+        assert result.exit_code == vocab.EXIT_USAGE
+        assert "--steer-mode cancel-then-start" in result.stderr
+        assert "Usage:" not in result.stdout
+
+
+def test_in_place_on_a_session_with_no_prompt_in_flight_is_a_conflict(
+    cli: CliRunner,
+) -> None:
+    """SPEC steer: a starting session has no turn for the adapter to reach."""
+    starting = sessions.create_session(
+        entry="mock", base_adapter="mock", prompt="fresh", target="mock~starting"
+    ).session_id
+    sessions.update_meta(starting, steer_modes=["in-place", "cancel-then-start"])
+
+    result = invoke(cli, "steer", starting, "X", "--steer-mode", "in-place")
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    envelope = steer_error(result)
+    assert envelope["kind"] == "conflict"
+    assert "no prompt is in flight" in envelope["message"]
+    assert f"Run: acpc wait {starting}" in envelope["hint"]
+    assert sessions.read_meta(starting).turns == 1
+
+
+def test_in_place_on_a_finished_session_names_continue(cli: CliRunner) -> None:
+    """The answer is the same in both modes: there is no turn to correct."""
+    session_id = finished_mock_session(cli)
+    sessions.update_meta(session_id, steer_modes=["in-place", "cancel-then-start"])
+
+    result = invoke(cli, "steer", session_id, "X", "--steer-mode", "in-place")
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    envelope = steer_error(result)
+    assert envelope["kind"] == "conflict"
+    assert envelope["hint"] == f"Run: acpc continue {session_id}"
+
+
+def test_log_renders_a_steer_record_without_passing_escape_codes_through(
+    cli: CliRunner,
+) -> None:
+    """SPEC `log`: a correction reads as its mode and its instruction, and an
+    instruction is caller-controlled text, so it is escaped like any other."""
+    session_id = sessions.create_session(
+        entry="mock", base_adapter="mock", prompt="logged"
+    ).session_id
+    transcript.Transcript(sessions.transcript_path(session_id)).append(
+        "steer", mode="in-place", text="stop \x1b[31mediting\x1b[0m now", outcome="injected"
+    )
+
+    result = invoke(cli, "log", session_id)
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    assert "steer  in-place: stop ^[[31mediting^[[0m now" in result.stdout
+    assert "\x1b" not in result.stdout
+
+
+def test_an_unreachable_daemon_is_reported_as_nothing_delivered(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SPEC steer: a daemon that cannot be reached sent nothing, and the result
+    says so rather than leaving the caller to guess."""
+    session_id = mid_turn_session(cli)
+    sessions.update_meta(session_id, steer_modes=["in-place", "cancel-then-start"])
+
+    async def gone(target: str, selector: str, text: str) -> daemon_client.DaemonUnavailable:
+        return daemon_client.DaemonUnavailable("no live daemon")
+
+    monkeypatch.setattr(daemon_client, "steer_turn", gone)
+
+    result = invoke(cli, "steer", session_id, "X", "--steer-mode", "in-place")
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    envelope = steer_error(result)
+    assert envelope["kind"] == "unavailable"
+    assert envelope["context"]["correction_result"]["message_state"] == "not_delivered"
+    assert sessions.load(session_id).state == "running"
+
+
+def test_a_daemon_that_never_answers_is_reported_as_unknown(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SPEC steer: a request that may have crossed is never reported as
+    delivered or as refused."""
+    session_id = mid_turn_session(cli)
+    sessions.update_meta(session_id, steer_modes=["in-place", "cancel-then-start"])
+
+    async def silent(target: str, selector: str, text: str) -> None:
+        return None
+
+    monkeypatch.setattr(daemon_client, "steer_turn", silent)
+
+    result = invoke(cli, "steer", session_id, "X", "--steer-mode", "in-place")
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    envelope = steer_error(result)
+    assert envelope["kind"] == "outcome_unknown"
+    assert envelope["context"]["correction_result"]["message_state"] == "unknown"
+
+
+def test_ctrl_c_during_a_blocking_in_place_steer_leaves_the_turn_running(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SPEC steer: an in-place steer owns no turn, so Ctrl-C behaves like `wait`
+    (exit 130, the turn runs on) and still names the correction it had made."""
+    session_id = mid_turn_session(cli)
+    sessions.update_meta(session_id, steer_modes=["in-place", "cancel-then-start"])
+
+    async def accepted(target: str, selector: str, text: str) -> dict[str, Any]:
+        return {"ok": True, "outcome": "injected", "turn_token": 1}
+
+    def interrupted(*args: Any, **kwargs: Any) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(daemon_client, "steer_turn", accepted)
+    monkeypatch.setattr(runner, "wait_for_session", interrupted)
+
+    result = invoke(cli, "steer", session_id, "X", "--steer-mode", "in-place", "--json")
+
+    assert result.exit_code == vocab.EXIT_CANCELLED
+    assert result.stdout == ""
+    envelope = steer_error(result)
+    assert envelope["kind"] == "interrupted"
+    assert envelope["context"]["session_id"] == session_id
+    assert envelope["context"]["correction_result"]["message_state"] == "accepted"
+    assert sessions.load(session_id).state == "running"
+
+
+def test_a_turn_that_ends_canceled_after_an_accepted_correction_is_a_failure(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SPEC steer: the instruction was accepted; what the turn then did is the
+    session's own result, reported as `operation_failed` with no document."""
+    session_id = mid_turn_session(cli)
+    sessions.update_meta(session_id, steer_modes=["in-place", "cancel-then-start"])
+
+    async def accepted(target: str, selector: str, text: str) -> dict[str, Any]:
+        return {"ok": True, "outcome": "injected", "turn_token": 1}
+
+    def ends_canceled(selector: str, *, timeout: float | None = None) -> str:
+        runner._finalize(
+            session_id,
+            runner.TurnOutcome(state="canceled", stop_reason="cancelled", answer="partial"),
+        )
+        return "canceled"
+
+    monkeypatch.setattr(daemon_client, "steer_turn", accepted)
+    monkeypatch.setattr(runner, "wait_for_session", ends_canceled)
+
+    result = invoke(cli, "steer", session_id, "X", "--steer-mode", "in-place", "--json")
+
+    assert result.exit_code == vocab.EXIT_CANCELLED
+    assert result.stdout == ""
+    envelope = steer_error(result)
+    assert envelope["kind"] == "operation_failed"
+    assert envelope["context"]["status"] == "canceled"
+    assert envelope["context"]["correction_result"] == {
+        "steer_mode": "in-place",
+        "target_turn": 2,
+        "target_status": "canceled",
+        "message_state": "accepted",
+    }

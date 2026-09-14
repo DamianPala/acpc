@@ -166,6 +166,7 @@ EXPECTED_REQUIRED_FIELDS = {
         "exit_code",
         "stop_reason",
         "failure",
+        "capabilities",
         "paths",
         "created_at",
         "started_at",
@@ -182,6 +183,9 @@ EXPECTED_REQUIRED_FIELDS = {
         "denied",
         "permissions_clamp",
         "changed",
+        "turn",
+        "capabilities",
+        "correction_result",
     },
     "wait": {
         "status",
@@ -239,7 +243,16 @@ EXPECTED_OUTPUT_ENUMS = {
         "canceled",
         "unknown",
     },
-    "log.output.type": {"error", "msg", "permission", "state", "thought", "tool", "usage"},
+    "log.output.type": {
+        "error",
+        "msg",
+        "permission",
+        "state",
+        "steer",
+        "thought",
+        "tool",
+        "usage",
+    },
     "probe.output.diff[].status": {"advertised-missing", "entry-missing"},
     "run.output.status": {
         "running",
@@ -335,6 +348,14 @@ _RESOLUTION_FIELD_PROPERTIES = frozenset(
 )
 _RESOLUTION_FIELD_REQUIRED = frozenset({"value", "source"})
 _RESOLUTION_CLAMP_REQUIRED = frozenset({"requested", "ceiling", "effective"})
+
+
+# What `steer` publishes about the correction it made, in both modes.
+_STEER_RESULT_PROPERTIES = frozenset({"turn", "capabilities", "correction_result"})
+_STEER_CAPABILITIES_PROPERTIES = frozenset({"steer_modes"})
+_STEER_CORRECTION_PROPERTIES = frozenset(
+    {"steer_mode", "target_turn", "target_status", "message_state"}
+)
 
 
 def _session_output_oracle(
@@ -555,6 +576,8 @@ EXPECTED_OUTPUT_ORACLES: dict[str, dict[str, tuple[frozenset[str], frozenset[str
                     "kind",
                     "decision",
                     "auto",
+                    "mode",
+                    "outcome",
                     "message",
                     "observation",
                     "next_step",
@@ -689,6 +712,7 @@ EXPECTED_OUTPUT_ORACLES: dict[str, dict[str, tuple[frozenset[str], frozenset[str
                     "exit_code",
                     "stop_reason",
                     "failure",
+                    "capabilities",
                     "paths",
                     "created_at",
                     "started_at",
@@ -697,15 +721,24 @@ EXPECTED_OUTPUT_ORACLES: dict[str, dict[str, tuple[frozenset[str], frozenset[str
             ),
             frozenset(EXPECTED_REQUIRED_FIELDS["status"]),
         ),
+        "output.capabilities": (_STEER_CAPABILITIES_PROPERTIES, _STEER_CAPABILITIES_PROPERTIES),
         "output.paths": (_PATHS_PROPERTIES, _PATHS_PROPERTIES),
     },
 }
 
 for _name in ("continue", "run"):
     EXPECTED_OUTPUT_ORACLES[_name] = _session_output_oracle(EXPECTED_REQUIRED_FIELDS[_name])
-EXPECTED_OUTPUT_ORACLES["steer"] = _session_output_oracle(
-    EXPECTED_REQUIRED_FIELDS["steer"], include_partial=False
-)
+_STEER_ORACLE = _session_output_oracle(EXPECTED_REQUIRED_FIELDS["steer"], include_partial=False)
+_STEER_OUTPUT_PROPERTIES, _STEER_OUTPUT_REQUIRED = _STEER_ORACLE["output"]
+EXPECTED_OUTPUT_ORACLES["steer"] = {
+    **_STEER_ORACLE,
+    "output": (
+        _STEER_OUTPUT_PROPERTIES | _STEER_RESULT_PROPERTIES,
+        _STEER_OUTPUT_REQUIRED,
+    ),
+    "output.capabilities": (_STEER_CAPABILITIES_PROPERTIES, _STEER_CAPABILITIES_PROPERTIES),
+    "output.correction_result": (_STEER_CORRECTION_PROPERTIES, _STEER_CORRECTION_PROPERTIES),
+}
 EXPECTED_OUTPUT_ORACLES["wait"] = _session_output_oracle(
     EXPECTED_REQUIRED_FIELDS["wait"], include_changed=False
 )
@@ -2443,6 +2476,7 @@ def _observe_log_types(cli: CliRunner, observed: dict[str, set[Any]]) -> None:
         "error": {"message": "error"},
         "state": {"from": "running", "to": "succeeded"},
         "usage": {"tokens": 0, "cost": 0.0},
+        "steer": {"mode": "in-place", "text": "steer", "outcome": "injected"},
     }
     for event_type in sorted(transcript.EVENT_TYPES):
         events.append(event_type, **event_fields[event_type])

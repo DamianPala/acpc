@@ -136,6 +136,7 @@ EXPECTED_REQUIRED: dict[str, tuple[str, ...]] = {
         "exit_code",
         "stop_reason",
         "failure",
+        "capabilities",
         "paths",
         "created_at",
         "started_at",
@@ -152,6 +153,9 @@ EXPECTED_REQUIRED: dict[str, tuple[str, ...]] = {
         "denied",
         "permissions_clamp",
         "changed",
+        "turn",
+        "capabilities",
+        "correction_result",
     ),
     "wait": (
         "status",
@@ -183,7 +187,9 @@ EXPECTED_ENUMS: dict[str, dict[str, tuple[str, ...]]] = {
     },
     "continue": {"$.status": ("running", "succeeded", "failed", "canceled", "unknown")},
     "log": {
-        "$.type": tuple(sorted(("error", "msg", "permission", "state", "thought", "tool", "usage")))
+        "$.type": tuple(
+            sorted(("error", "msg", "permission", "state", "steer", "thought", "tool", "usage"))
+        )
     },
     "probe": {
         "$.diff[].status": ("advertised-missing", "entry-missing"),

@@ -234,8 +234,10 @@ def test_help_explains_session_lifecycle_and_retention(runner: CliRunner) -> Non
     assert (
         "``--permissions`` is the one ``run`` resolution flag ``continue`` accepts" in continue_help
     )
-    assert "A finished session is a usage error: there is no turn to interrupt" in steer_help
-    assert "the follow-up verb for it is ``acpc continue``." in steer_help
+    assert (
+        "A finished session is a ``conflict``; the follow-up verb is ``acpc continue``."
+        in steer_help
+    )
     assert (
         "the ``retention`` key in the global config (``~/.acpc/config.toml``, default 90d; ``ACPC_HOME`` moves the root)"
         in prune_help

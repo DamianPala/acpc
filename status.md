@@ -2,6 +2,23 @@
 
 ## Now
 
+**In-place steering lands on `feat/cli-design-conformance` (2026-09-14, slice 13).** `acpc steer`
+has two modes: `in-place` forwards the instruction to the turn in flight through the adapters'
+`_session/steering` extension (codex-acp 1.10.0 and claude-agent-acp 0.75.1 both declare it in
+`initialize._meta.steering.supported`), the turn keeps its number and files; `cancel-then-start` is
+the previous cancel-and-redirect. `--steer-mode` selects, the default is in-place when the session
+supports it. Support is read at daemon turn start and stored as `meta.steer_modes`; `status` and
+every `steer` result publish `capabilities.steer_modes`, and `steer` results carry
+`correction_result` (`steer_mode`, `target_turn`, `target_status`, `message_state`), never
+`delivered`. The Codex idle race (`startedNewTurn`, no `idleBehavior` support in 1.10.0) is
+handled honestly: the daemon cancels the adapter-started turn and reports `outcome_unknown`. Built
+by deepseek-flash-ds (session ry5x), reviewed by Opus (approve, one Ctrl-C context gap fixed in
+review), live-verified on Luna and Haiku: one turn, `corrected.txt` present, `original.txt`
+absent, the nonce from the original prompt in the answer. Gates: 1236 tests, ruff/pyright clean,
+smoke 604/604. Not declared: the standard's `conversational` extension (`--turn`, queued turns).
+Known: `test_slice12_contract.py::test_an_expired_deadline_returns_the_observed_session_as_partial`
+flakes under load (0.5 s first-chunk budget), pre-existing.
+
 **0.7.1 is built, tagged and installed live (2026-08-27): failure ergonomics.** Born from the same
 day's real grok dispatch (session 8rin: a mid-turn xAI inference stall, killed correctly by the 600s
 idle timeout, diagnosed only by digging the transcript). Two slices, both built by `builder-sub`
@@ -362,6 +379,7 @@ Release: bump `0.4.0` → `0.4.1` (the pending `uv.lock` version line rides here
 
 ## Decisions
 
+- 2026-09-14 (slice 13, Damian): **`steer` defaults to in-place where the adapter supports it; cancel-then-start stays as the explicit second mode.** The 2026-08-06 decision that steer is interrupt-based rested on ACP having no mid-turn injection; both installed adapters now ship `_session/steering`, measured live. Mode names and `correction_result` follow the standard's `conversational` vocabulary without declaring the extension, so a later declaration is not a rename. `--cancel-after` requires an explicit `--steer-mode cancel-then-start`, a static rule rather than one that depends on runtime capability. An adapter that starts its own turn (`startedNewTurn`) is cancelled and reported `outcome_unknown`; no outcome ever falls back to cancel-then-start automatically.
 - 2026-08-12 (0.6): **Stage B promises a settled state, not the same state.** The bullet first promised that a `continue` following a cancelled restore "starts from the same state the cancelled one did". Round 1 proved that undeliverable: ACP defines no cancellation for `session/load` or `session/resume`, so the restore completes adapter-side after the cancel and mutates the session, and the only mechanism that reliably prevents it is closing the ACP connection — which destroys the warm adapter and every other session on it. The promise now covers what acpc actually controls, what a turn is allowed to run against, and the limit it does not control is stated in the same bullet rather than omitted. Keeping the old wording would have made the SPEC assert something the tool does not do; nobody later reads the weaker promise as a quiet retreat if the retreat is written down.
 - 2026-08-12 (0.6): **`probe`'s measurement engine descopes to 0.7 under a rule armed in advance.** Any further instance of the derive-a-fact-from-the-wrong-operation class ended the slice, and review 9 returned one: causal membership is append-only while the marker predicate beneath it is not, so a verdict could change with nothing but a frame's arrival order. Two architectural attempts is the budget. `probe --discover` ships alone, and a bare `probe` is a usage error rather than a silent answer to the cheaper question.
 - 2026-08-12 (0.6): **A signal handler records which signal arrived; what it means is resolved where the route is known.** The routing window had been given Ctrl-C's semantics wholesale, so SIGTERM there exited 130 and one arriving as the route resolved killed a daemon-owned turn instead of detaching. The fix is structural rather than careful: the handler is no longer given the route, so it can no longer guess it.

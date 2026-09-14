@@ -545,7 +545,7 @@ __GLOBAL_FLAGS__
 Short task: acpc run <agent> "Explain this code" --permissions execute
 Long or uncertain task: acpc run <agent> "Run the tests" --background --json; acpc wait <id> --quiet block until done, prints the answer.
 Checking on a run: acpc log <id> --tail 10 --follow --timeout 60
-Steering a running session: acpc steer <id> "Stop editing; diagnose only"
+Steering a running session: acpc steer <id> "Stop editing; diagnose only"   in place when the adapter supports it; --steer-mode cancel-then-start to interrupt
 Context care: log is condensed by default; use --prose for the full answer.
 Maintenance and setup: delete, prune and bare daemon stop explain their gates; --dry-run previews.
   Truncated or huge answer? Read <dir>/answer.md selectively — always complete.
@@ -4330,6 +4330,7 @@ def _dispatch_background(
     output_file: str | None = None,
     max_output: int = output.DEFAULT_MAX_OUTPUT,
     emit_failure_result: bool = True,
+    extra: Callable[[sessions.SessionMeta], dict[str, Any]] | None = None,
 ) -> None:
     """Hand the turn to the daemon and print what the caller needs to find it.
 
@@ -4354,6 +4355,8 @@ def _dispatch_background(
         background=True,
         max_output=max_output,
         changed=True,
+        include_partial=emit_failure_result,
+        extra=extra(meta) if extra is not None else None,
     )
     if not _write_rendered_file(output_file, result):
         _write_stdout(result.text)
@@ -4597,8 +4600,14 @@ def _dispatch_follow_up(
     quiet: bool,
     json_mode: bool,
     emit_failure_result: bool = True,
+    extra: Callable[[sessions.SessionMeta], dict[str, Any]] | None = None,
 ) -> None:
-    """Run the next turn on a finished session using shared turn machinery."""
+    """Run the next turn on a finished session using shared turn machinery.
+
+    ``extra`` is for the commands whose result carries fields the shared
+    answer shape does not: it is called with the result's own session record,
+    so `steer` can report the turn the correction landed on.
+    """
     current, request = _follow_up_request(
         meta.session_id,
         prompt,
@@ -4616,6 +4625,7 @@ def _dispatch_follow_up(
             output_file=output_file,
             max_output=max_output,
             emit_failure_result=emit_failure_result,
+            extra=extra,
         )
         return
 
@@ -4657,6 +4667,7 @@ def _dispatch_follow_up(
         max_output=max_output,
         changed=True,
         include_partial=emit_failure_result,
+        extra=extra(final) if extra is not None else None,
     )
     _emit_turn_result(
         result,
@@ -4687,6 +4698,18 @@ def _steer_prompt(instruction: str) -> str:
     return f"{STEER_PREAMBLE}\n\n{instruction}"
 
 
+_STEER_MODE_HELP = (
+    "How the correction reaches the turn: in-place keeps the turn, cancel-then-start interrupts "
+    "it and starts a new one; default: in-place when the session supports it, else "
+    "cancel-then-start."
+)
+
+# The daemon bounds its own `_session/steering` request at 10 s; this is that
+# bound plus room for the request and its reply to cross the socket, so a
+# daemon that answers in time is always heard before this client gives up.
+_STEER_IPC_TIMEOUT = 15.0
+
+
 @effects.non_idempotent
 @schema.format_defaults(tty="text", non_tty="text")
 @schema.reads_stdin("instruction_text")
@@ -4697,6 +4720,7 @@ def _steer_prompt(instruction: str) -> str:
         f"exactly one of the three may be given. At most {_PROMPT_LIMIT_HELP} of UTF-8. "
         "An interrupted turn receives it under a fixed preamble."
     ),
+    steer_mode=_STEER_MODE_HELP,
     output_file=_STEER_OUTPUT_FILE_DESCRIPTION,
 )
 @main.command(name="steer")
@@ -4712,6 +4736,12 @@ def _steer_prompt(instruction: str) -> str:
     ),
 )
 @click.option("--output-file", "output_file", metavar="FILE", help=_STEER_OUTPUT_FILE_HELP)
+@click.option(
+    "--steer-mode",
+    "steer_mode",
+    type=click.Choice(vocab.STEER_MODES),
+    help=_STEER_MODE_HELP,
+)
 @click.option(
     "--format",
     "format_name",
@@ -4759,6 +4789,7 @@ def steer_command(
     instruction_text: str | None,
     prompt_file: str | None,
     output_file: str | None,
+    steer_mode: str | None,
     format_name: str | None,
     background: bool,
     timeout: float | None,
@@ -4767,22 +4798,36 @@ def steer_command(
     quiet: bool,
     json_mode: bool,
 ) -> None:
-    """Redirect the running turn; block and print the answer unless ``--background``.
+    """Correct the running turn: in place when the adapter supports it, else cancel and redirect.
 
-    Interrupts the running turn and redirects the session in one verb: cancels
-    the turn in flight (ACP session/cancel), waits for the ack, then
-    starts the next turn with the instruction under a fixed preamble. If a
-    daemon-owned ``continue`` is still preparing, no prompt has happened: acpc
-    cancels that preparation, reports that nothing was interrupted, and sends
-    the instruction plainly. The interrupted turn's partial answer is kept as
-    that turn's answer file. A finished session is a usage error: there is no
-    turn to interrupt, and the follow-up verb for it is ``acpc continue``.
+    ``in-place`` adds the instruction to the turn in flight through the adapter's
+    steering extension, at the next point the adapter allows (usually after the
+    current tool call). The turn keeps its number, prompt and answer files; the
+    result's ``correction_result`` says ``accepted`` when the adapter took the
+    instruction, which is not proof the model obeyed it.
+
+    ``cancel-then-start`` cancels the turn (ACP session/cancel), waits for the ack,
+    then starts the next turn with the instruction under a fixed preamble. It is
+    the default when the session does not support in-place, and the only mode
+    that accepts ``--cancel-after``. If a daemon-owned ``continue`` is still
+    preparing, nothing was interrupted and the instruction goes plainly.
+
+    A finished session is a ``conflict``; the follow-up verb is ``acpc continue``.
+    Without ``--background`` the command blocks and prints the observed turn's answer.
 
     Example: ``acpc steer x7k2 "Stop editing; diagnose only"``
     """
     selected_format = _select_format(format_name, json_mode, native_text=True)
     if background and timeout is not None:
         raise UsageProblem("--timeout only bounds waiting; use --cancel-after with --background")
+    if cancel_after is not None and steer_mode != vocab.STEER_CANCEL_THEN_START:
+        # SPEC `steer`: only cancel-then-start starts a turn to bound, so the
+        # rule is static. Making it a capability question would give the same
+        # command line two different meanings on two sessions.
+        raise UsageProblem(
+            "--cancel-after is accepted only with --steer-mode cancel-then-start, "
+            "the only mode that starts a turn to bound"
+        )
     instruction = _read_prompt(
         instruction_text,
         prompt_file,
@@ -4800,6 +4845,96 @@ def steer_command(
             context={"session_id": meta.session_id},
         )
 
+    selected_mode = _select_steer_mode(meta, steer_mode)
+    target = meta.target
+    if selected_mode == vocab.STEER_IN_PLACE:
+        if target is None:  # unreachable: the mode is never chosen without a target
+            raise _in_place_unsupported(meta)
+        _steer_in_place(
+            meta,
+            target,
+            instruction,
+            selected_format=selected_format,
+            output_file=output_file,
+            background=background,
+            timeout=timeout,
+            max_output=max_output,
+            quiet=quiet,
+        )
+        return
+    _steer_cancel_then_start(
+        meta,
+        instruction,
+        selected_format=selected_format,
+        output_file=output_file,
+        background=background,
+        timeout=timeout,
+        cancel_after=cancel_after,
+        max_output=max_output,
+        quiet=quiet,
+    )
+
+
+def _steer_capabilities(meta: sessions.SessionMeta) -> dict[str, Any]:
+    """The capability block every `steer` result and every steer failure carries."""
+    return {"steer_modes": list(meta.steer_modes) if meta.steer_modes else None}
+
+
+def _in_place_unsupported(meta: sessions.SessionMeta) -> AcpcError:
+    """The one refusal for a session that has no channel to steer through.
+
+    A direct child owns no socket, and an adapter that never declared the
+    extension has nothing to send to: both are the same answer, and SPEC
+    `steer` says there is never a silent fallback to the other mode.
+    """
+    return AcpcError(
+        f"session {meta.session_id} cannot be corrected in place",
+        kind=errors.NOT_SUPPORTED,
+        retryable=False,
+        hint=f"Run: acpc steer {meta.session_id} ... --steer-mode cancel-then-start",
+        context={"session_id": meta.session_id, "capabilities": _steer_capabilities(meta)},
+    )
+
+
+def _select_steer_mode(meta: sessions.SessionMeta, explicit: str | None) -> str:
+    """Choose the mode before anything has happened, refusing an impossible one.
+
+    SPEC `steer`: an explicitly selected mode the session does not support
+    fails as `not_supported` with no effect, and there is never a silent
+    fallback to the other mode.
+    """
+    supported = meta.steer_modes or []
+    if explicit == vocab.STEER_IN_PLACE and (
+        vocab.STEER_IN_PLACE not in supported or meta.target is None
+    ):
+        raise _in_place_unsupported(meta)
+    if explicit is not None:
+        return explicit
+    if meta.target is not None and vocab.STEER_IN_PLACE in supported:
+        return vocab.STEER_IN_PLACE
+    return vocab.STEER_CANCEL_THEN_START
+
+
+def _steer_cancel_then_start(
+    meta: sessions.SessionMeta,
+    instruction: str,
+    *,
+    selected_format: str,
+    output_file: str | None,
+    background: bool,
+    timeout: float | None,
+    cancel_after: float | None,
+    max_output: int,
+    quiet: bool,
+) -> None:
+    """Interrupt the turn in flight and send the instruction to the next one.
+
+    SPEC `steer`: the correcting call is `cancel` plus `continue` without the
+    race in the middle, and the result says which turn was selected, what it
+    ended as, and that acpc accepted the replacement.
+    """
+    target_turn = meta.turns
+    capabilities = _steer_capabilities(meta)
     meta = _cancel_session(meta).meta
     interrupted = (
         meta.state == "canceled" and meta.stop_reason != runner.PREPARATION_CANCELLED_REASON
@@ -4815,20 +4950,300 @@ def steer_command(
                 "-- the turn finished on its own before the cancel landed; "
                 "continuing as a plain follow-up"
             )
+    correction = {
+        "steer_mode": vocab.STEER_CANCEL_THEN_START,
+        "target_turn": target_turn,
+        "target_status": meta.state,
+        "message_state": "accepted",
+    }
 
-    _dispatch_follow_up(
+    def extra(final: sessions.SessionMeta) -> dict[str, Any]:
+        return {
+            "turn": final.turns,
+            "capabilities": _steer_capabilities(final),
+            "correction_result": correction,
+        }
+
+    try:
+        _dispatch_follow_up(
+            meta,
+            _steer_prompt(instruction) if interrupted else instruction,
+            output_file=output_file,
+            permissions=None,
+            background=background,
+            timeout=timeout,
+            cancel_after=cancel_after,
+            max_output=max_output,
+            quiet=quiet,
+            json_mode=selected_format == "json",
+            emit_failure_result=False,
+            extra=extra,
+        )
+    except AcpcError as error:
+        raise _redirect_failure(
+            error, meta.session_id, target_turn, correction, capabilities
+        ) from None
+
+
+def _redirect_failure(
+    error: AcpcError,
+    session_id: str,
+    target_turn: int,
+    correction: Mapping[str, Any],
+    capabilities: Mapping[str, Any],
+) -> AcpcError:
+    """Attach what acpc knows about the redirect to a failure it ended on.
+
+    Whether the replacement turn exists is read from the session, not assumed
+    from where the failure was raised: a deadline that expired after the turn
+    was accepted is a different fact from a dispatch that never claimed it.
+    """
+    try:
+        current = sessions.read_meta(session_id)
+    except sessions.SessionError:
+        message_state = "unknown"
+    else:
+        message_state = "accepted" if current.turns != target_turn else "not_delivered"
+    return error.with_context(
+        correction_result={**correction, "message_state": message_state},
+        capabilities=dict(capabilities),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _SteerDelivery:
+    """What acpc knows about one attempted in-place correction."""
+
+    message_state: str
+    kind: str | None = None
+    message: str = ""
+
+
+def _in_place_delivery(reply: Any, session_id: str) -> _SteerDelivery:
+    """Read the daemon's answer about one in-place correction.
+
+    SPEC `steer` names one `kind` and one `message_state` per situation acpc
+    can be in, and this is the only place that maps the daemon's wire reply
+    onto them.
+    """
+    if isinstance(reply, daemon_client.DaemonUnavailable):
+        return _SteerDelivery(
+            "not_delivered",
+            errors.UNAVAILABLE,
+            f"the daemon serving session {session_id} could not be reached: {reply.reason}",
+        )
+    if not isinstance(reply, Mapping):
+        return _SteerDelivery(
+            "unknown",
+            errors.OUTCOME_UNKNOWN,
+            f"session {session_id} did not answer the correction request",
+        )
+    if reply.get("ok") is True:
+        return _SteerDelivery("accepted")
+    kind = reply.get("kind")
+    if kind == errors.NOT_SUPPORTED:
+        return _SteerDelivery(
+            "not_delivered",
+            errors.NOT_SUPPORTED,
+            f"the adapter serving session {session_id} rejected in-place steering",
+        )
+    if kind == errors.CONFLICT:
+        return _SteerDelivery(
+            "not_delivered",
+            errors.CONFLICT,
+            f"session {session_id} has no turn in flight; the instruction was not delivered",
+        )
+    if kind == errors.UNAVAILABLE:
+        return _SteerDelivery(
+            "not_delivered",
+            errors.UNAVAILABLE,
+            f"the daemon serving session {session_id} could not take the instruction",
+        )
+    return _SteerDelivery(
+        "unknown",
+        errors.OUTCOME_UNKNOWN,
+        f"session {session_id} did not confirm the in-place correction; it may or may not "
+        "have been applied",
+    )
+
+
+def _steer_extra(meta: sessions.SessionMeta, correction: Mapping[str, Any]) -> dict[str, Any]:
+    """The three fields every `steer` result carries on top of the shared shape."""
+    return {
+        "turn": meta.turns,
+        "capabilities": _steer_capabilities(meta),
+        "correction_result": dict(correction),
+    }
+
+
+def _steer_in_place(
+    meta: sessions.SessionMeta,
+    target: str,
+    instruction: str,
+    *,
+    selected_format: str,
+    output_file: str | None,
+    background: bool,
+    timeout: float | None,
+    max_output: int,
+    quiet: bool,
+) -> None:
+    """Deliver the instruction to the turn in flight and report what is known.
+
+    SPEC `steer`: nothing is cancelled, rotated or re-prompted here, and a
+    delivery acpc cannot confirm never becomes a cancel-then-start.
+    """
+    if meta.state in {"starting", "preparing"}:
+        raise AcpcError(
+            f"session {meta.session_id} is {meta.state} — no prompt is in flight yet",
+            kind=errors.CONFLICT,
+            retryable=True,
+            hint=(
+                f"Run: acpc wait {meta.session_id}, or acpc steer {meta.session_id} ... "
+                "--steer-mode cancel-then-start to cancel the preparation"
+            ),
+            context={"session_id": meta.session_id, "capabilities": _steer_capabilities(meta)},
+        )
+    capabilities = _steer_capabilities(meta)
+    delivery = _in_place_delivery(
+        asyncio.run(_steer_with_daemon(target, meta.session_id, instruction)),
+        meta.session_id,
+    )
+    correction: dict[str, Any] = {
+        "steer_mode": vocab.STEER_IN_PLACE,
+        "target_turn": meta.turns,
+        "target_status": meta.state,
+        "message_state": delivery.message_state,
+    }
+    if delivery.kind is not None:
+        hint = f"Run: acpc wait {meta.session_id}"
+        if delivery.kind == errors.NOT_SUPPORTED:
+            hint = f"Run: acpc steer {meta.session_id} ... --steer-mode cancel-then-start"
+        raise AcpcError(
+            delivery.message,
+            kind=delivery.kind,
+            retryable=False,
+            hint=hint,
+            context={
+                "session_id": meta.session_id,
+                "correction_result": correction,
+                "capabilities": capabilities,
+            },
+        )
+    if background:
+        # The receipt describes the acceptance, so it renders the state the
+        # correction targeted; a re-read here could already show the turn's
+        # end, which the `steer` schema does not publish.
+        result = output.render_result(
+            meta,
+            json_mode=selected_format == "json",
+            background=True,
+            max_output=max_output,
+            changed=True,
+            include_partial=False,
+            extra=_steer_extra(meta, correction),
+        )
+        if not _write_rendered_file(output_file, result):
+            _write_stdout(result.text)
+        if not quiet:
+            _echo_metadata(f"-- steer in-place accepted · session {meta.session_id}")
+        return
+    _observe_steered_turn(
         meta,
-        _steer_prompt(instruction) if interrupted else instruction,
+        correction,
+        capabilities,
+        selected_format=selected_format,
         output_file=output_file,
-        permissions=None,
-        background=background,
         timeout=timeout,
-        cancel_after=cancel_after,
         max_output=max_output,
         quiet=quiet,
-        json_mode=selected_format == "json",
-        emit_failure_result=False,
     )
+
+
+async def _steer_with_daemon(target: str, session_id: str, text: str) -> Any:
+    """Ask the daemon to correct the turn, bounded like the cancel it resembles."""
+    try:
+        return await asyncio.wait_for(
+            daemon_client.steer_turn(target, session_id, text),
+            timeout=_STEER_IPC_TIMEOUT,
+        )
+    except TimeoutError:
+        # The daemon bounds its own request well inside this one, so a reply
+        # that never comes means the socket died with the outcome unknown.
+        return None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _observe_steered_turn(
+    meta: sessions.SessionMeta,
+    correction: Mapping[str, Any],
+    capabilities: Mapping[str, Any],
+    *,
+    selected_format: str,
+    output_file: str | None,
+    timeout: float | None,
+    max_output: int,
+    quiet: bool,
+) -> None:
+    """Block on a corrected turn and print what it produced.
+
+    SPEC `steer`: `--timeout` bounds this client's wait only, and a turn that
+    ends badly is a failure with the correction facts attached — the
+    instruction was accepted, and what the turn did with it is the session's
+    own result.
+    """
+    session_id = meta.session_id
+    observed_status = meta.state
+    if not quiet:
+        _echo_metadata(output.format_session_line(meta))
+    try:
+        state = runner.wait_for_session(session_id, timeout=timeout)
+        if state is None:
+            if not quiet:
+                _echo_metadata(_still_running_note(session_id, timeout))
+            raise AcpcError(
+                f"session {session_id} timed out while still {observed_status}",
+                kind=errors.TIMEOUT,
+                exit_code=vocab.EXIT_TIMEOUT,
+                retryable=True,
+                hint=f"Run: acpc wait {session_id}",
+                context={"session_id": session_id, "status": observed_status},
+            )
+        final = sessions.read_meta(session_id)
+        observed_status = final.state
+        observed_correction = {**correction, "target_status": final.state}
+        if final.state != "succeeded":
+            raise AcpcError(
+                f"session {session_id} {final.state} after the correction",
+                kind=errors.OPERATION_FAILED,
+                exit_code=runner.exit_code_for(final.state, final.stop_reason),
+                hint=f"Run: acpc log {session_id} --since 0",
+                context={
+                    "session_id": session_id,
+                    "status": final.state,
+                    "correction_result": observed_correction,
+                },
+            )
+        result = output.render_result(
+            final,
+            _answer_text(session_id),
+            json_mode=selected_format == "json",
+            max_output=max_output,
+            changed=True,
+            include_partial=False,
+            extra=_steer_extra(final, observed_correction),
+        )
+        _emit_turn_result(result, output_file=output_file, json_mode=selected_format == "json")
+        if not quiet:
+            _echo_metadata(output.format_summary(final))
+    except (click.Abort, KeyboardInterrupt, Exception) as error:  # noqa: BLE001
+        # Everything a blocking observation can fail on, including this call's
+        # own deadline and the caller's Ctrl-C, leaves with the same context.
+        problem = _wait_failure(error, session_id=session_id, observed_status=observed_status)
+        if "correction_result" not in (problem.context or {}):
+            problem = problem.with_context(correction_result=dict(correction))
+        raise problem.with_context(capabilities=dict(capabilities)) from None
 
 
 @effects.read_only

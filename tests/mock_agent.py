@@ -47,6 +47,27 @@ Anything else runs the default scenario: three tool events, a progress msg, a
 usage update, and a markdown answer quoting the prompt — history-aware, so a
 continued session's answer references the previous turn.
 
+Steering extension (``_session/steering``), enabled by ``ACPC_MOCK_STEERING=1``:
+``initialize`` then advertises ``_meta.steering.supported``, and a steering
+request is answered according to what this agent is doing:
+
+- a prompt is in flight -> the text joins that turn's queue and the answer is
+  ``{"outcome": "injected"}``; ``slow:N`` and ``chunkslow:N`` then emit one
+  ``steered: <text>`` message per queued correction, in acceptance order,
+  before their final message, which is what "the same turn" looks like
+- no prompt is in flight -> ``promptRequired`` when the request asked for it
+  (``idleBehavior: promptRequired``), else ``startedNewTurn``
+
+Knobs, all read from the environment at request time:
+``ACPC_MOCK_STEERING=declared-only`` advertises the capability and then
+answers method-not-found; ``ACPC_MOCK_STEERING_RACE=1`` always answers
+``startedNewTurn``; ``ACPC_MOCK_STEERING_FORCE=promptRequired`` always answers
+``promptRequired``, active prompt or not; ``ACPC_MOCK_STEERING_HANG=1`` never
+answers at all. ``ACPC_MOCK_STEERING_LOG`` names a file that receives one line
+per steering request (plus one ``idle:`` line naming the ``idleBehavior`` it
+asked for) and per ``session/cancel`` — the evidence a test uses to see what
+acpc asked for and whether it cancelled the turn the adapter started on its own.
+
 Advertised dataset: modes ``default``/``acceptEdits``/``plan``/``yolo`` (the
 restricted mode), models ``mock-opus-5``/``mock-sonnet-5``/``mock-haiku-4-5``,
 efforts ``low``/``medium``/``high``/``xhigh`` — any other effort value is
@@ -224,6 +245,11 @@ def _leading_delay(prompt: str) -> int:
     return int(prompt.split(":", 1)[1].split()[0])
 
 
+def _steering_setting() -> str:
+    """The mock's steering behaviour: ``""``, ``1`` or ``declared-only``."""
+    return os.environ.get("ACPC_MOCK_STEERING", "")
+
+
 def select_scenario(prompt: str) -> str | None:
     """MVP keyword selection: case-insensitive substring, first match wins."""
     lower = prompt.lower()
@@ -251,6 +277,10 @@ class MockAgent(Agent):
         self._late_calls: dict[str, tuple[str, Path, str]] = {}
         self._last_restored_session: str | None = None
         self._restore_settled = asyncio.Event()
+        # Sessions with a prompt in flight, and the corrections each of those
+        # turns has accepted but not yet acknowledged in its stream.
+        self._prompt_active: set[str] = set()
+        self._steered: dict[str, list[str]] = {}
 
     def on_connect(self, conn: Client) -> None:
         self._conn = conn
@@ -372,10 +402,16 @@ class MockAgent(Agent):
         capabilities = AgentCapabilities(
             load_session=True, session_capabilities=session_capabilities
         )
+        # Vendor-faithful placement: steering is an extension, so its flag
+        # rides top-level `_meta`, never `agentCapabilities`.
+        field_meta: dict[str, Any] | None = None
+        if _steering_setting() in {"1", "declared-only"}:
+            field_meta = {"steering": {"supported": True}}
         return InitializeResponse(
             protocol_version=protocol_version,
             agent_capabilities=capabilities,
             agent_info=Implementation(name="mock-agent", title="Mock Agent", version="0.1.0"),
+            field_meta=field_meta,
         )
 
     def _config_options(
@@ -589,6 +625,21 @@ class MockAgent(Agent):
         cancel_event = self._cancel_events.setdefault(session_id, asyncio.Event())
         cancel_event.clear()
 
+        # In flight for the whole scenario body: a steering request arriving
+        # anywhere in here is a correction to *this* turn.
+        self._prompt_active.add(session_id)
+        try:
+            return await self._run_scenario(session_id, prompt_text, history, cancel_event)
+        finally:
+            self._prompt_active.discard(session_id)
+
+    async def _run_scenario(
+        self,
+        session_id: str,
+        prompt_text: str,
+        history: list[str],
+        cancel_event: asyncio.Event,
+    ) -> PromptResponse:
         prefix_response = await self._prefix_trigger(session_id, prompt_text, cancel_event)
         if prefix_response is not None:
             return prefix_response
@@ -649,6 +700,7 @@ class MockAgent(Agent):
                 return PromptResponse(stop_reason="cancelled")
             except TimeoutError:
                 pass
+            await self._send_steered(session_id)
             await self._send_text(session_id, f"waited {delay}s")
             return PromptResponse(stop_reason="end_turn")
 
@@ -660,6 +712,7 @@ class MockAgent(Agent):
                 return PromptResponse(stop_reason="cancelled")
             except TimeoutError:
                 pass
+            await self._send_steered(session_id)
             await self._send_text(session_id, "finished")
             return PromptResponse(stop_reason="end_turn")
 
@@ -928,6 +981,16 @@ class MockAgent(Agent):
         chunk = update_agent_message(text_block(text))
         await self._conn.session_update(session_id=session_id, update=chunk)
 
+    async def _send_steered(self, session_id: str) -> None:
+        """Acknowledge accepted corrections inside the turn that took them.
+
+        One message per correction, in the order acpc sent them: what the
+        stream shows is that the instruction arrived in the *same* turn, which
+        is the difference in-place claims over cancel-then-start.
+        """
+        for text in self._steered.pop(session_id, []):
+            await self._send_text(session_id, f"steered: {text}")
+
     async def _send_usage(self, session_id: str, used: int, cost: float | None = None) -> None:
         update = UsageUpdate(
             session_update="usage_update",
@@ -994,6 +1057,7 @@ class MockAgent(Agent):
 
     async def cancel(self, session_id: str, **kwargs: Any) -> None:
         self._cancel_events.setdefault(session_id, asyncio.Event()).set()
+        self._record_steering(f"cancel:{session_id}")
 
     async def close_session(self, session_id: str, **kwargs: Any) -> CloseSessionResponse:
         if session_id not in self._sessions:
@@ -1004,6 +1068,7 @@ class MockAgent(Agent):
         self._cancel_events.pop(session_id, None)
         self._models.pop(session_id, None)
         self._modes.pop(session_id, None)
+        self._steered.pop(session_id, None)
         return CloseSessionResponse()
 
     async def list_sessions(
@@ -1126,6 +1191,14 @@ class MockAgent(Agent):
             await asyncio.sleep(float(raw))
 
     @staticmethod
+    def _record_steering(event: str) -> None:
+        """Append one line of steering evidence, when a test asked for it."""
+        path = os.environ.get("ACPC_MOCK_STEERING_LOG")
+        if path:
+            with Path(path).open("a", encoding="utf-8") as handle:
+                handle.write(f"{event}\n")
+
+    @staticmethod
     def _record_session_method(method: str) -> None:
         path = os.environ.get("ACPC_MOCK_SESSION_METHOD_FILE")
         if path:
@@ -1159,7 +1232,42 @@ class MockAgent(Agent):
         return AuthenticateResponse()
 
     async def ext_method(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
-        return {}
+        name = method.removeprefix("_")
+        if name != "session/steering":
+            return {}
+        if _steering_setting() == "1":
+            return await self._steer(params)
+        # `declared-only` advertised the capability in `initialize` and denies
+        # the method here; an unset setting never advertised it at all.
+        raise RequestError.method_not_found(f"_{name}")
+
+    async def _steer(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Answer one steering request according to what this agent is doing."""
+        session_id = params.get("sessionId")
+        blocks = params.get("prompt")
+        text = "".join(
+            block.get("text", "")
+            for block in (blocks if isinstance(blocks, list) else [])
+            if isinstance(block, dict) and isinstance(block.get("text"), str)
+        )
+        meta = params.get("_meta")
+        steering_meta = meta.get("steering") if isinstance(meta, dict) else None
+        idle = steering_meta.get("idleBehavior") if isinstance(steering_meta, dict) else None
+        self._record_steering(f"steer:{session_id}:{text}")
+        self._record_steering(f"idle:{idle}")
+        if os.environ.get("ACPC_MOCK_STEERING_HANG") == "1":
+            # Never answers: the request crossed and the reply never did.
+            await asyncio.sleep(HOLD_LIMIT_SECONDS)
+        if os.environ.get("ACPC_MOCK_STEERING_RACE") == "1":
+            return {"outcome": "startedNewTurn"}
+        if os.environ.get("ACPC_MOCK_STEERING_FORCE") == "promptRequired":
+            return {"outcome": "promptRequired"}
+        if session_id in self._prompt_active:
+            self._steered.setdefault(str(session_id), []).append(text)
+            return {"outcome": "injected"}
+        if idle == "promptRequired":
+            return {"outcome": "promptRequired"}
+        return {"outcome": "startedNewTurn"}
 
     async def ext_notification(self, method: str, params: dict[str, Any]) -> None:
         pass

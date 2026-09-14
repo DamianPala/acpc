@@ -210,6 +210,36 @@ def _session_result_schema(
     return _object(properties, required)
 
 
+_STEER_CAPABILITIES = _object(
+    {"steer_modes": {"type": ["array", "null"], "items": _STRING}},
+    ("steer_modes",),
+)
+_STEER_CORRECTION = _object(
+    {
+        "steer_mode": _STRING,
+        "target_turn": _INTEGER,
+        "target_status": _STRING,
+        "message_state": _STRING,
+    },
+    ("steer_mode", "target_turn", "target_status", "message_state"),
+)
+# Every `steer` result carries these three on top of the shared session
+# result: which turn to observe next, what the session supports, and what
+# acpc knows about the correction it just sent.
+_STEER_RESULT_PROPERTIES = {
+    "turn": _INTEGER,
+    "capabilities": _STEER_CAPABILITIES,
+    "correction_result": _STEER_CORRECTION,
+}
+
+
+def _steer_schema() -> dict[str, Any]:
+    schema = _session_result_schema(changed=True, status=_STEER_STATUS, include_partial=False)
+    schema["properties"].update(_STEER_RESULT_PROPERTIES)
+    schema["required"] = [*schema["required"], *_STEER_RESULT_PROPERTIES]
+    return schema
+
+
 _AGENT_ITEM = _object(
     {
         "name": _STRING,
@@ -357,6 +387,7 @@ _STATUS_DETAIL = _object(
         "exit_code": _NULLABLE_INTEGER,
         "stop_reason": _NULLABLE_STRING,
         "failure": _NULLABLE_STRING,
+        "capabilities": _STEER_CAPABILITIES,
         "paths": _PATHS,
         "created_at": _NULLABLE_STRING,
         "started_at": _NULLABLE_STRING,
@@ -378,6 +409,7 @@ _STATUS_DETAIL = _object(
         "exit_code",
         "stop_reason",
         "failure",
+        "capabilities",
         "paths",
         "created_at",
         "started_at",
@@ -401,6 +433,8 @@ _LOG_EVENT = _object(
         "kind": _STRING,
         "decision": _STRING,
         "auto": _BOOLEAN,
+        "mode": _STRING,
+        "outcome": _STRING,
         "message": _STRING,
         "observation": _STRING,
         "next_step": _STRING,
@@ -534,7 +568,7 @@ _OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
     ),
     "list": _STATUS,
     "status": _STATUS_DETAIL,
-    "steer": _session_result_schema(changed=True, status=_STEER_STATUS, include_partial=False),
+    "steer": _steer_schema(),
     "wait": _session_result_schema(changed=False, foreground_only=True, status=_WAIT_STATUS),
 }
 

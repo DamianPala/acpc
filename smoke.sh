@@ -1275,7 +1275,8 @@ if begin_section S12-cli "help contract, -V, TTY rules, hostile inputs"; then
     assert_contains "log --help documents --follow" "$LAST_OUT" "--follow"
     assert_contains "log --help documents the follow exit codes" "$LAST_OUT" "exit 124"
     run_acpc steer --help
-    assert_contains "steer --help documents the interruption" "$LAST_OUT" "Interrupt"
+    assert_contains "steer --help documents the interruption" "$LAST_OUT" "cancels the turn"
+    assert_contains "steer --help documents the in-place mode" "$LAST_OUT" "--steer-mode"
     assert_contains "steer --help documents --prompt-file" "$LAST_OUT" "--prompt-file"
     for verb in cancel delete install; do
         run_acpc "$verb" --help

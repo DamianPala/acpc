@@ -23,7 +23,9 @@ SCHEMA = "acpc.transcript/2"
 HEADER = {"schema": SCHEMA}
 HEADER_LINE = (json.dumps(HEADER, separators=(", ", ": ")) + "\n").encode("utf-8")
 
-EVENT_TYPES = frozenset({"msg", "thought", "tool", "permission", "error", "state", "usage"})
+EVENT_TYPES = frozenset(
+    {"msg", "thought", "tool", "permission", "error", "state", "usage", "steer"}
+)
 
 _REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "msg": ("text",),
@@ -33,6 +35,9 @@ _REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "error": ("message",),
     "state": ("from", "to"),
     "usage": ("tokens", "cost"),
+    # SPEC.md `steer`: every correction is recorded with what acpc sent and
+    # what the adapter answered, so the transcript says why a mode was chosen.
+    "steer": ("mode", "text", "outcome"),
 }
 
 _TAIL_READ_BYTES = 8192

@@ -2,11 +2,12 @@
 
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
-from acpc import render, sessions, transcript
+from acpc import render, sessions, transcript, vocab
 from acpc.output import format_duration
 
 
@@ -743,4 +744,19 @@ def test_status_detail_text_remains_the_existing_labeled_view() -> None:
         "status   starting · exit · · 0m20s · 0 tok\n"
         "agent    mock (mock) · model: mock-sonnet-5 · name: ·\n"
         f"dir      {sessions.session_dir(meta.session_id)} · answer: answer.md\n"
+        "steer: unknown\n"
     )
+
+
+def test_status_detail_names_the_steer_modes_a_session_supports() -> None:
+    """SPEC `status`: the modes are one line, in preference order."""
+    meta = replace(
+        make_session(), steer_modes=[vocab.STEER_IN_PLACE, vocab.STEER_CANCEL_THEN_START]
+    )
+
+    text = render.render_status_detail(meta, clock=lambda: 120.0)
+    payload = render.status_detail_json(meta, clock=lambda: 120.0)
+
+    assert "steer: in-place, cancel-then-start\n" in text
+    assert payload["capabilities"] == {"steer_modes": ["in-place", "cancel-then-start"]}
+    assert render.status_detail_json(make_session())["capabilities"] == {"steer_modes": None}

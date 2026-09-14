@@ -521,3 +521,32 @@ def test_schema_detail_needs_no_configuration(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["name"] == "run"
     assert not absent.exists()
+
+
+def test_the_steer_result_publishes_the_correction_it_made(
+    runner: CliRunner,
+) -> None:
+    """SPEC `steer`: every result says which turn, what the session supports and
+    what acpc knows about the instruction it sent."""
+    steer = read_detail(runner, "steer")
+
+    for field in ("turn", "capabilities", "correction_result"):
+        assert field in steer["output"]["required"], field
+    assert set(steer["output"]["properties"]["correction_result"]["required"]) == {
+        "steer_mode",
+        "target_turn",
+        "target_status",
+        "message_state",
+    }
+    flags = {flag["name"]: flag for flag in steer["flags"]}
+    assert flags["steer-mode"]["enum"] == ["in-place", "cancel-then-start"]
+    assert flags["steer-mode"]["description"].strip()
+
+    status = read_detail(runner, "status")["output"]
+    assert "capabilities" in status["required"]
+    modes = status["properties"]["capabilities"]["properties"]["steer_modes"]
+    assert modes["type"] == ["array", "null"]
+    assert modes["items"] == {"type": "string"}
+
+    log_types = read_detail(runner, "log")["output"]["properties"]["type"]["enum"]
+    assert "steer" in log_types

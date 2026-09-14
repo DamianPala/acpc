@@ -1570,3 +1570,100 @@ def test_a_daemon_that_loses_the_endpoint_retires(state_root: Path, live_daemon:
             return
         time.sleep(0.25)
     pytest.fail("the displaced daemon kept running")
+
+
+# --- in-place steering -------------------------------------------------------
+
+
+async def _wait_for_delivered_prompt(session_id: str, timeout: float = 30.0) -> None:
+    """Wait on the disk record, which is written after the phase turns running."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        meta = sessions.read_meta(session_id)
+        delivered = meta.extra.get("delivered_prompts")
+        if isinstance(delivered, list) and any(
+            isinstance(entry, dict) and entry.get("turn") == meta.turns for entry in delivered
+        ):
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError("the prompt never reached the adapter")
+
+
+def _steer_during_a_turn(
+    prompt: str,
+    *,
+    monkeypatch: pytest.MonkeyPatch,
+    timeout: float | None = None,
+) -> tuple[dict[str, Any], str]:
+    """Start one daemon turn, let its prompt land, then steer it."""
+    session_id = new_session(prompt)
+    instance = daemon.Daemon(target())
+    if timeout is not None:
+        monkeypatch.setattr(daemon, "STEER_REQUEST_TIMEOUT", timeout)
+
+    async def scenario() -> dict[str, Any]:
+        try:
+            reply = await instance._start(
+                {"session_id": session_id, "payload": dispatch_payload(prompt)}
+            )
+            assert reply["ok"] is True
+            await _wait_for_delivered_prompt(session_id)
+            return await instance._steer({"session_id": session_id, "text": "stop"})
+        finally:
+            await instance._shut_down_sessions("test cleanup")
+            await instance.host.close()
+
+    return asyncio.run(scenario()), session_id
+
+
+def test_steering_a_turn_that_is_not_running_is_a_conflict(state_root: Path) -> None:
+    """SPEC `steer`: only a turn in flight has an adapter session to correct."""
+    session_id = new_session("nothing in flight")
+
+    reply = asyncio.run(daemon.Daemon(target())._steer({"session_id": session_id, "text": "stop"}))
+
+    assert reply["ok"] is False
+    assert reply["kind"] == "conflict"
+
+
+def test_steering_an_adapter_without_the_capability_is_not_supported(
+    state_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The refusal comes from the capability the daemon stored, not a failed send."""
+    reply, session_id = _steer_during_a_turn("chunkslow:30 plain", monkeypatch=monkeypatch)
+
+    assert reply["ok"] is False
+    assert reply["kind"] == "not_supported"
+    assert sessions.read_meta(session_id).turns == 1
+
+
+def test_a_steering_request_that_is_never_answered_is_an_unknown_outcome(
+    state_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SPEC `steer`: the request crossed and the reply never did, so the outcome
+    is unknown — and the daemon answers instead of hanging its client on it."""
+    monkeypatch.setenv("ACPC_MOCK_STEERING", "1")
+    monkeypatch.setenv("ACPC_MOCK_STEERING_HANG", "1")
+
+    reply, session_id = _steer_during_a_turn(
+        "chunkslow:30 hang", monkeypatch=monkeypatch, timeout=0.5
+    )
+
+    assert reply == {"ok": False, "kind": "outcome_unknown", "sent": True}
+    assert sessions.read_meta(session_id).turns == 1
+
+
+def test_steering_a_turn_still_preparing_is_a_conflict(state_root: Path) -> None:
+    """SPEC `steer`: a preparing turn has sent no prompt, so there is nothing
+    for the adapter to add the instruction to — the gate is the phase, not the
+    turn's mere presence."""
+    session_id = new_session("still preparing")
+    instance = daemon.Daemon(target())
+    instance.turns[session_id] = daemon._Turn(
+        session_id=session_id, task=None, cancel=runner._CancelSignal()
+    )
+
+    reply = asyncio.run(instance._steer({"session_id": session_id, "text": "stop"}))
+
+    assert reply["ok"] is False
+    assert reply["kind"] == "conflict"

@@ -720,7 +720,11 @@ async def _drive_turn(
                         raise ResumePreparationError(str(error)) from None
                     raise
                 request = _prepare_resumed_turn(
-                    session_id, request, events, resume_status=resume_status
+                    session_id,
+                    request,
+                    events,
+                    resume_status=resume_status,
+                    steer_modes=[vocab.STEER_CANCEL_THEN_START],
                 )
                 client.permission_level = PermissionLevel(request.resolution.permissions or "read")
                 client.modes = request.resolution.entry.modes
@@ -802,6 +806,7 @@ def _prepare_resumed_turn(
     *,
     resume_status: str | None = None,
     pid: int | None = None,
+    steer_modes: Sequence[str] | None = None,
 ) -> TurnRequest:
     """Atomically claim a verified continuation before it can prompt."""
     if not request.defer_rotation:
@@ -829,6 +834,7 @@ def _prepare_resumed_turn(
             prompt=request.prompt,
             resume_status=resume_status,
             pid=pid if pid is not None else _host_pid(),
+            steer_modes=steer_modes,
         )
     except (RunnerError, sessions.SessionError) as error:
         raise ResumeRotationError(str(error)) from None
@@ -1176,6 +1182,7 @@ async def _cancel_before_route_acceptance(
                     request,
                     events,
                     pid=_host_pid(),
+                    steer_modes=[vocab.STEER_CANCEL_THEN_START],
                 )
         except (ResumeRotationError, sessions.SessionError) as error:
             raise ResumePreparationError(str(error)) from None
@@ -1200,7 +1207,11 @@ async def _execute_direct(
     """Run the direct path after routing and, for continue, reservation."""
     events = transcript.Transcript(sessions.transcript_path(session_id))
     if not request.defer_rotation:
-        sessions.mark_running(session_id, pid=_host_pid())
+        sessions.mark_running(
+            session_id,
+            pid=_host_pid(),
+            steer_modes=[vocab.STEER_CANCEL_THEN_START],
+        )
         events.append("state", **{"from": "starting", "to": "running"})
     outcome = await _drive_turn(session_id, request, events, cancel)
     outcome.route_note = route_note

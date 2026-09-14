@@ -8,6 +8,7 @@ is kept on stderr.
 
 import json
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO
@@ -85,8 +86,15 @@ def result_envelope(
     changed: bool | None = None,
     partial: bool = False,
     include_partial: bool = True,
+    extra: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build the pinned JSON shape for an answer-printing command."""
+    """Build the pinned JSON shape for an answer-printing command.
+
+    ``extra`` carries the fields only one command publishes — `steer`'s
+    `turn`, `capabilities` and `correction_result` — so the shared shape stays
+    the shared shape and the command-specific part stays one dict at the call
+    site that knows it.
+    """
     if background:
         envelope = {
             "session_id": meta.session_id,
@@ -101,10 +109,14 @@ def result_envelope(
             "permissions_clamp": _permissions_clamp(meta),
             "next": ["acpc", "wait", meta.session_id],
         }
+        if not include_partial:
+            envelope.pop("partial")
         if resume := _resume_status(meta):
             envelope["resume"] = resume
         if changed is not None:
             envelope["changed"] = changed
+        if extra:
+            envelope.update(extra)
         return envelope
 
     envelope: dict[str, Any] = {
@@ -130,6 +142,8 @@ def result_envelope(
         envelope["output_file"] = str(sessions.answer_path(meta.session_id))
     if changed is not None:
         envelope["changed"] = changed
+    if extra:
+        envelope.update(extra)
     return envelope
 
 
@@ -150,6 +164,7 @@ def _json_answer(
     changed: bool | None,
     partial: bool,
     include_partial: bool,
+    extra: Mapping[str, Any] | None,
 ) -> OutputResult:
     complete = _json_text(
         result_envelope(
@@ -158,6 +173,7 @@ def _json_answer(
             changed=changed,
             partial=partial,
             include_partial=include_partial,
+            extra=extra,
         )
     )
     if max_output == 0 or len(complete.encode("utf-8")) <= max_output:
@@ -174,6 +190,7 @@ def _json_answer(
                 changed=changed,
                 partial=partial,
                 include_partial=include_partial,
+                extra=extra,
             )
         )
 
@@ -212,6 +229,7 @@ def render_result(
     changed: bool | None = None,
     partial: bool | None = None,
     include_partial: bool = True,
+    extra: Mapping[str, Any] | None = None,
 ) -> OutputResult:
     """Render one answer command's stdout payload without writing it.
 
@@ -226,7 +244,16 @@ def render_result(
 
     if background:
         if json_mode:
-            text = _json_text(result_envelope(meta, "", background=True, changed=changed))
+            text = _json_text(
+                result_envelope(
+                    meta,
+                    "",
+                    background=True,
+                    changed=changed,
+                    include_partial=include_partial,
+                    extra=extra,
+                )
+            )
         else:
             text = f"{meta.session_id}\n{sessions.session_dir(meta.session_id)}\n"
         return OutputResult(text, False, len(text.encode("utf-8")))
@@ -240,6 +267,7 @@ def render_result(
             changed=changed,
             partial=partial,
             include_partial=include_partial,
+            extra=extra,
         )
     return truncate_answer(answer, max_output=max_output, answer_path=answer_path)
 

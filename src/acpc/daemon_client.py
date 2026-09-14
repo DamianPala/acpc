@@ -24,6 +24,7 @@ import os
 import subprocess
 import sys
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Any, Protocol
@@ -60,6 +61,10 @@ class DaemonConnection(Protocol):
 
     async def cancel(self, session_id: str) -> dict[str, Any]:
         """Ask the daemon to cancel a session's in-flight turn."""
+        ...
+
+    async def steer(self, session_id: str, text: str) -> dict[str, Any]:
+        """Ask the daemon to add an instruction to a session's running turn."""
         ...
 
     async def status(self) -> dict[str, Any]:
@@ -105,6 +110,9 @@ class _SocketDaemon:
 
     async def cancel(self, session_id: str) -> dict[str, Any]:
         return await self.call({"op": "cancel", "session_id": session_id})
+
+    async def steer(self, session_id: str, text: str) -> dict[str, Any]:
+        return await self.call({"op": "steer", "session_id": session_id, "text": text})
 
     async def status(self) -> dict[str, Any]:
         return await self.call({"op": "status"})
@@ -288,13 +296,32 @@ async def cancel_turn(target: str, session_id: str) -> dict[str, Any] | DaemonUn
     connection serves one request at a time — sending it down the awaiting
     connection would queue behind the very reply it is meant to prevent.
     """
+    return await _one_shot(target, lambda daemon: daemon.cancel(session_id))
+
+
+async def steer_turn(
+    target: str, session_id: str, text: str
+) -> dict[str, Any] | DaemonUnavailable | None:
+    """Deliver an in-place correction over a connection of its own.
+
+    Same reason as a cancel: the client that dispatched `--background` is not
+    holding the daemon connection at all, and the one that is awaiting the
+    turn must not have this request queued behind its reply. `None` means the
+    request may have crossed and its answer never arrived.
+    """
+    return await _one_shot(target, lambda daemon: daemon.steer(session_id, text))
+
+
+async def _one_shot(
+    target: str, call: Callable[[_SocketDaemon], Awaitable[dict[str, Any]]]
+) -> dict[str, Any] | DaemonUnavailable | None:
+    """Run one request on a connection of its own and close it again."""
     daemon = await connect(target)
     if daemon is None:
         return DaemonUnavailable(f"no live daemon for {target}")
     try:
-        reply = await daemon.cancel(session_id)
+        return await call(daemon)
     except (ConnectionError, OSError):
         return None
     finally:
         await daemon.close()
-    return reply

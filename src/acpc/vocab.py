@@ -50,6 +50,13 @@ def normalize_session_state(value: str) -> str:
     return LEGACY_SESSION_STATES.get(value, value)
 
 
+# Steering modes (SPEC.md `steer`), in preference order. `in-place` needs the
+# adapter's `_session/steering` extension; `cancel-then-start` needs only
+# `session/cancel` and a fresh `session/prompt`, so it is always available.
+STEER_IN_PLACE = "in-place"
+STEER_CANCEL_THEN_START = "cancel-then-start"
+STEER_MODES = (STEER_IN_PLACE, STEER_CANCEL_THEN_START)
+
 # Largest prompt acpc buffers from any single source: the prompt argument, `-`
 # on stdin, or `--prompt-file`.  Counted in UTF-8 bytes and enforced before a
 # session directory exists, so an oversized call leaves nothing behind.  Far

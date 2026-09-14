@@ -231,17 +231,41 @@ skills get NAME [--format text|json]
 status SELECTOR [--format text|json]
 ```
 
-`status` reports one liveness-verified session without reading the transcript. Its detail result contains `session_id`, `status`, `pid`, `turns`, `entry`, `base_adapter`, `model`, `name`, `runtime_seconds`, `idle_seconds`, `tokens`, `cost`, `exit_code`, `stop_reason`, `failure`, `paths`, `created_at`, `started_at` and `finished_at`. Use `list` for the collection view.
+`status` reports one liveness-verified session without reading the transcript. Its detail result contains `session_id`, `status`, `pid`, `turns`, `entry`, `base_adapter`, `model`, `name`, `runtime_seconds`, `idle_seconds`, `tokens`, `cost`, `exit_code`, `stop_reason`, `failure`, `capabilities`, `paths`, `created_at`, `started_at` and `finished_at`. `capabilities` holds `steer_modes` as described under `steer`. Use `list` for the collection view.
 
 ### `steer`
 
 ```text
 steer SELECTOR [INSTRUCTION | -] [--prompt-file FILE]
+    [--steer-mode in-place|cancel-then-start]
     [--output-file FILE] [--format text|json] [--background]
     [--timeout S] [--cancel-after S] [--max-output BYTES] [--quiet]
 ```
 
-`steer` cancels the turn in flight and starts a redirected turn on the same session. The instruction uses a fixed interruption preamble when a prompt was already in flight. During daemon-owned preparation there is no prompt to interrupt; acpc cancels preparation, reports that fact and sends the instruction plainly. A finished session is a `conflict` naming `continue` as the follow-up operation. `--timeout` only bounds this client's wait; `--cancel-after` cancels the redirected work.
+`steer` delivers a correction to the session's active turn in one of two modes. `--steer-mode` selects the mode; without it acpc uses `in-place` when the session supports it and `cancel-then-start` otherwise. The modes a session supports are published as `capabilities.steer_modes` in `status` and in every `steer` result: an array in preference order, `in-place` before `cancel-then-start` when both apply, or `null` for a session that has not yet reached an adapter. An explicitly selected mode the session does not support fails with `not_supported` before any effect; acpc never falls back to the other mode.
+
+`in-place` adds the instruction to the active turn through the adapter's `_session/steering` extension, at the next point the adapter supports, usually after the running tool call ends. The turn keeps its number, its prompt file and its answer file; nothing rotates and no preamble is added. Support is read from the adapter's `initialize` metadata (`_meta.steering.supported`) when a daemon-served turn starts and recorded on the session. A session served by a direct child supports only `cancel-then-start`, because no channel reaches its process. acpc always asks the adapter not to start a turn of its own (`idleBehavior: promptRequired`); an adapter that starts one anyway is reported as such, never presented as in-place. Several in-place corrections queue in the adapter in the order acpc sent them.
+
+`cancel-then-start` cancels the turn in flight, waits for its end and starts the next turn on the same session with the instruction under the fixed interruption preamble. During daemon-owned preparation there is no prompt to interrupt; acpc cancels preparation, reports that fact and sends the instruction plainly. `--cancel-after` bounds the new turn's work and is accepted only with `--steer-mode cancel-then-start`.
+
+A finished session is a `conflict` naming `continue` as the follow-up operation in either mode. A `starting` or `preparing` session is a `conflict` for `in-place`, because no prompt is in flight yet.
+
+Every `steer` result carries `turn`, the turn to observe next, `capabilities`, and `correction_result` with `steer_mode`, `target_turn`, `target_status` and `message_state`. `target_turn` is the turn the correction selected; for `in-place` it equals `turn`, for `cancel-then-start` `turn` is the new turn. `target_status` is the last state observed for the selected turn. `message_state` is `accepted` when the adapter acknowledged the instruction (`injected`) or acpc accepted the new turn, `not_delivered` when the instruction is known not to have reached the selected turn, and `unknown` when acpc cannot tell. acpc never reports `delivered`: an acknowledgement does not show that the model used the instruction. Every in-place correction is appended to the transcript as a `steer` event carrying `mode`, `text` and the adapter's `outcome`; a cancel-then-start correction is recorded by the new turn's prompt file and its state events.
+
+Without `--background`, `steer` blocks until the observed turn ends and prints its answer: the corrected turn's answer for `in-place`, the new turn's for `cancel-then-start`. With `--background` it returns after acceptance. `--timeout` only bounds this client's wait: on expiry `steer` exits 124 with `kind: timeout`, a hint to `wait` and `correction_result` in the error context, and emits no result document. Ctrl-C during an `in-place` steer behaves like `wait`: exit 130 and the turn keeps running. Ctrl-C during `cancel-then-start` cancels the turn it started.
+
+A failure after the target was selected carries `session_id` and `correction_result` in `context`:
+
+| What acpc knows | `kind` | `message_state` |
+| --- | --- | --- |
+| The adapter answered `promptRequired`: the turn ended before the instruction arrived. | `conflict` | `not_delivered` |
+| The adapter answered `startedNewTurn`: it started a turn acpc does not own. acpc sends `session/cancel` for it and reports the outcome as unknown. | `outcome_unknown` | `unknown` |
+| The adapter rejected `_session/steering` despite declaring it. | `not_supported` | `not_delivered` |
+| The daemon serving the session could not be reached; nothing was sent. | `unavailable` | `not_delivered` |
+| The request was sent and no reply arrived within 10 s, or the connection was lost. | `outcome_unknown` | `unknown` |
+| The observed turn ended `failed` or `canceled` while `steer` was blocking after acceptance. | `operation_failed` | `accepted` |
+
+A `not_delivered` or `unknown` outcome never triggers an automatic `cancel-then-start`; repeating the instruction is the caller's decision.
 
 ### `wait`
 
@@ -281,7 +305,7 @@ Machine success documents are the shapes published by `acpc schema`. Collections
 
 `prune` and `daemon stop` return `targets`, `changed` and `requires_confirmation`; the same shape covers preview and mutation. `delete` returns `session_id`, `removed`, `changed` and `paths`. `resolve` returns its full resolution document. `probe` returns its discovery report. `log` returns one record at a time with required `i`, `ts` and `type`, plus event-specific fields.
 
-The shared answer result for `run` and `continue` has required `status`, `session_id`, `created_at`, `started_at`, `finished_at`, `paths`, `truncated`, `partial`, `denied`, `permissions_clamp` and `changed`. Foreground success adds `stop_reason`, `cost` and `answer`; background success omits them and points `next` at `wait`. `resume`, `next` and `output_file` are optional. `steer` keeps its existing result shape. `wait` is read-only, so its result has no `changed` field. Each schema entry declares one `output` shared by the success and failure results of that command, and `run`, `continue` and `wait` state in `output_description` which failures return a result and which fields are required only on success.
+The shared answer result for `run` and `continue` has required `status`, `session_id`, `created_at`, `started_at`, `finished_at`, `paths`, `truncated`, `partial`, `denied`, `permissions_clamp` and `changed`. Foreground success adds `stop_reason`, `cost` and `answer`; background success omits them and points `next` at `wait`. `resume`, `next` and `output_file` are optional. `steer` uses the same document with `status` limited to `running` and `succeeded`, without `partial`, plus required `turn`, `capabilities` and `correction_result`. `wait` is read-only, so its result has no `changed` field. Each schema entry declares one `output` shared by the success and failure results of that command, and `run`, `continue` and `wait` state in `output_description` which failures return a result and which fields are required only on success.
 
 `paths` contains `dir`, `prompt`, `transcript` and `answer`. `denied` records permission denials by category, and `permissions_clamp` records a requested policy, the entry ceiling and the effective policy when a clamp occurred. `run`, `continue` and `wait` return their result document on stdout when acpc observed the turn and holds its content, including when the turn failed, was canceled, or the wait deadline expired. `partial` is `false` when the content is the complete answer for that call, a refusal included, and `true` when the turn ended before the answer did; a result carrying `partial: true` always exits non-zero. A call that never observed a turn — an unknown agent, a rejected flag combination, a session that does not exist, a start that failed — writes nothing to stdout. The structured error stays on stderr in every case.
 
@@ -329,7 +353,7 @@ Missing named resources and session conflicts are exit 1, because the command wa
 
 Ctrl-C always produces exit 130 with `kind: interrupted` for the command that was interrupted.
 Interrupting `wait` or `log` never changes the observed session.
-Interrupting `run`, `continue` or `steer` cancels the owned turn.
+Interrupting `run`, `continue` or a `cancel-then-start` `steer` cancels the owned turn; an `in-place` `steer` owns no turn and leaves it running.
 A SIGTERM from a harness detaches a session already taken over by the daemon and ends a direct-worker turn.
 The client reports the id and the commands that can wait or cancel a detached session.
 
@@ -385,9 +409,9 @@ daemon_max_concurrent = 8
 
 Unknown config keys are hard errors. Relative paths in `--cwd`, `--prompt-file` and `--output-file` resolve against the caller's working directory; a leading `~` is expanded. Directories are mode 0700 and files are mode 0600 where the platform supports those permissions. Metadata and cache writes are atomic, and transcript appends are whole lines.
 
-`meta.json` uses `status`, not a second state field, and stores the resolved invocation, timestamps, turn count, tokens, cost, exit code, stop reason, failure observation, prompt snippet, adapter session id and target. Timestamps are RFC 3339 with a consistent microsecond precision. A per-session lock serializes turns, cleanup and metadata transitions.
+`meta.json` uses `status`, not a second state field, and stores the resolved invocation, timestamps, turn count, tokens, cost, exit code, stop reason, failure observation, prompt snippet, adapter session id, target and the supported steer modes. Timestamps are RFC 3339 with a consistent microsecond precision. A per-session lock serializes turns, cleanup and metadata transitions.
 
-`transcript.ndjson` starts with `{"schema": "acpc.transcript/2"}`. Event records use a global one-based cursor `i`, an RFC 3339 timestamp and one of `msg`, `thought`, `tool`, `permission`, `error`, `state` or `usage`. Unknown fields are preserved. A damaged or unsupported transcript is `corrupt_state`; an older transcript format is not silently upgraded and must be replaced by deleting the incompatible session state.
+`transcript.ndjson` starts with `{"schema": "acpc.transcript/2"}`. Event records use a global one-based cursor `i`, an RFC 3339 timestamp and one of `msg`, `thought`, `tool`, `permission`, `error`, `state`, `usage` or `steer`. Unknown fields are preserved. A damaged or unsupported transcript is `corrupt_state`; an older transcript format is not silently upgraded and must be replaced by deleting the incompatible session state.
 
 Turn files rotate at the start of the next turn. The previous prompt and answer receive their fixed turn suffix once, then the new prompt is written. `answer.md` exists for every finished state. A failed or canceled turn keeps its partial prose; when no prose exists, the recorded failure explains the file. If the host process disappears before the result is observed, acpc writes a placeholder that says the outcome is unknown.
 

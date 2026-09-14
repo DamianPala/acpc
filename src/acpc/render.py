@@ -153,6 +153,7 @@ def format_event(
         "error": "error ",
         "state": "state ",
         "usage": "usage ",
+        "steer": "steer  ",
     }
     label = labels.get(event_type, f"{event_type} ")
     if continued and event_type in {"msg", "thought"}:
@@ -186,6 +187,13 @@ def format_event(
             f"[{timestamp}] {label}{event.get('kind', 'unknown')} "
             f"→ {event.get('decision', 'unknown')}{repeated}"
         )
+    if event_type == "steer":
+        # SPEC.md `steer`: the correction reads as the mode that carried it and
+        # the instruction itself, both through `safe_text` — an instruction is
+        # caller-controlled text and must not reach the terminal as control bytes.
+        mode = safe_text(event.get("mode", "unknown"))
+        text = safe_text(event.get("text", ""))
+        return f"[{timestamp}] {label}{mode}: {text}"
     if event_type == "error":
         return f"[{timestamp}] {label}{_single_line(event.get('message', ''))}"
     if event_type == "state":
@@ -596,12 +604,20 @@ def render_status_detail(
             f"model: {safe_text(model)} · name: {name}"
         ),
         f"dir      {directory} · answer: {Path(sessions.answer_path(meta.session_id)).name}",
+        f"steer: {_steer_modes_text(meta)}",
     ]
     if meta.failure is not None:
         lines.append(
             f"failure  {safe_text(meta.failure)} · continue: acpc continue {meta.session_id}"
         )
     return "\n".join(lines) + "\n"
+
+
+def _steer_modes_text(meta: sessions.SessionMeta) -> str:
+    """Render the modes a session supports, or that acpc has not learned them."""
+    if not meta.steer_modes:
+        return "unknown"
+    return ", ".join(safe_text(mode) for mode in meta.steer_modes)
 
 
 def status_list_json(
@@ -660,6 +676,7 @@ def status_detail_json(
         "exit_code": meta.exit_code,
         "stop_reason": meta.stop_reason,
         "failure": meta.failure,
+        "capabilities": {"steer_modes": list(meta.steer_modes) if meta.steer_modes else None},
         "paths": sessions.session_paths(meta.session_id),
         "created_at": _timestamp_or_none(meta.created_at),
         "started_at": _timestamp_or_none(meta.started_at),

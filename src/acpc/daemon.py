@@ -31,11 +31,12 @@ import os
 import shlex
 import sys
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from acp import PROTOCOL_VERSION, text_block
+from acp import PROTOCOL_VERSION, RequestError, text_block
 
 from acpc import __version__, config, errors, ipc, paths, runner, sessions, transcript, vocab
 from acpc.client import (
@@ -52,8 +53,44 @@ from acpc.spawn import spawn_adapter
 # and still see expiry, long enough to cost nothing over a 30-minute default.
 IDLE_CHECK_INTERVAL = 0.5
 
+# How long one `_session/steering` request may take before its outcome is
+# unknown: the adapter's acknowledgement is a single round trip, and past this
+# bound the instruction may or may not have landed. A test can lower it.
+STEER_REQUEST_TIMEOUT = 10.0
+
 # Frames name their operation under this key.
 OP = "op"
+
+# JSON-RPC's "no such method": an adapter that never implemented the steering
+# extension answers an unknown `_session/steering` with exactly this code.
+_METHOD_NOT_FOUND = -32601
+
+
+@dataclass(frozen=True, slots=True)
+class _NoSteeringOutcome:
+    """A steering reply that reports a failure instead of an adapter outcome."""
+
+    payload: dict[str, Any]
+
+
+async def _steering_request(raw: Any, adapter_session_id: str, text: str) -> Any:
+    """Send one `_session/steering` request down the warm adapter connection.
+
+    A module function rather than a method because it holds nothing but the
+    wire shape: the caller owns the connection's lifetime, and this is the one
+    place the extension's request is written down.
+    """
+    return await raw.send_request(
+        "_session/steering",
+        {
+            "sessionId": adapter_session_id,
+            "prompt": [{"type": "text", "text": text}],
+            # SPEC.md `steer`: acpc asks the adapter never to start a turn of
+            # its own, so an instruction that arrives with nothing in flight
+            # is refused rather than silently becoming a new turn.
+            "_meta": {"steering": {"idleBehavior": "promptRequired"}},
+        },
+    )
 
 
 class DaemonError(Exception):
@@ -67,6 +104,24 @@ class SpawnArgvMismatch(DaemonError):
 def log_path_for_target(target: str) -> Path:
     """Where this target's daemon and adapter stderr go (SPEC.md `daemon`)."""
     return paths.daemon_dir() / f"{target}.log"
+
+
+def steering_supported(initialize: Any) -> bool:
+    """Read the adapter's steering capability off its `initialize` answer.
+
+    SPEC.md `steer` reads support from top-level `_meta.steering.supported`,
+    not from `agentCapabilities`: the extension is not part of the ACP schema,
+    so the flag that carries it is the reserved metadata channel. The value is
+    absent for an adapter that does not implement the extension at all, and
+    only an explicit `true` claims it.
+    """
+    meta = getattr(initialize, "field_meta", None)
+    if not isinstance(meta, Mapping):
+        return False
+    steering = meta.get("steering")
+    if not isinstance(steering, Mapping):
+        return False
+    return steering.get("supported") is True
 
 
 def _refusal_kind(error: BaseException) -> str | None:
@@ -234,6 +289,9 @@ class AdapterHost:
         self._process: Any = None
         self._command: tuple[str, tuple[str, ...]] | None = None
         self.agent_capabilities: Any = None
+        # SPEC.md `steer`: whether this adapter takes `_session/steering`.
+        # Retained per warm process, exactly like the capabilities above.
+        self.steering_supported = False
         self._starting = asyncio.Lock()
         # acpc session id -> the adapter session id it is bound to, for as long
         # as this adapter process lives. Presence here *is* "warm".
@@ -317,6 +375,7 @@ class AdapterHost:
         self._process = process
         self._command = (command, args)
         self.agent_capabilities = getattr(initialize, "agent_capabilities", None)
+        self.steering_supported = steering_supported(initialize)
         return conn
 
     async def close(self) -> None:
@@ -335,6 +394,7 @@ class AdapterHost:
         self._process = None
         self._command = None
         self.agent_capabilities = None
+        self.steering_supported = False
         self.adapter_sessions.clear()
 
     def start_restore(self, adapter_session_id: str, coroutine: Any) -> asyncio.Task[Any]:
@@ -572,6 +632,8 @@ class Daemon:
             return await self._await_preparation(frame)
         if operation == "cancel":
             return self._cancel(frame)
+        if operation == "steer":
+            return await self._steer(frame)
         if operation == "status":
             return self._status()
         if operation == "stop":
@@ -627,6 +689,110 @@ class Daemon:
             # reservation, adapter binding and replay-generation finalizers.
             turn.task.cancel()
         return {"ok": True, "turn_token": turn.turn_token}
+
+    async def _steer(self, frame: dict[str, Any]) -> dict[str, Any]:
+        """Deliver an in-place correction to a turn this daemon is running.
+
+        SPEC.md `steer`: the instruction goes to the adapter's
+        `_session/steering` extension over the connection that already owns
+        the turn. Nothing here rotates, re-prompts or finalizes — the turn
+        keeps its number and its files, and only the adapter's answer says
+        whether the instruction landed. A failed delivery is never retried
+        and never falls back to cancel-then-start: repeating the instruction
+        is the caller's decision.
+        """
+        session_id = frame.get("session_id", "")
+        text = frame.get("text", "")
+        turn = self.turns.get(session_id)
+        if turn is None or turn.phase != "running":
+            return {
+                "ok": False,
+                "kind": errors.CONFLICT,
+                "error": f"session {session_id} has no turn in flight",
+            }
+        adapter_session_id = self.host.adapter_sessions.get(session_id)
+        if adapter_session_id is None or not self.host.steering_supported:
+            return {
+                "ok": False,
+                "kind": errors.NOT_SUPPORTED,
+                "error": "the adapter does not support in-place steering",
+            }
+        raw = getattr(self.host._conn, "_conn", None)
+        if raw is None or not hasattr(raw, "send_request"):
+            # The adapter process is gone, so nothing crossed and nothing can.
+            return {"ok": False, "kind": errors.OUTCOME_UNKNOWN}
+        reply = await self._steering_reply(raw, adapter_session_id, text)
+        if isinstance(reply, _NoSteeringOutcome):
+            return reply.payload
+        return await self._apply_steering(session_id, adapter_session_id, text, turn, reply)
+
+    async def _steering_reply(self, raw: Any, adapter_session_id: str, text: str) -> Any:
+        """Send the request and describe everything that is not an outcome."""
+        try:
+            return await asyncio.wait_for(
+                _steering_request(raw, adapter_session_id, text),
+                timeout=STEER_REQUEST_TIMEOUT,
+            )
+        except TimeoutError:
+            # The request crossed; the answer is the one thing missing.
+            return _NoSteeringOutcome({"ok": False, "kind": errors.OUTCOME_UNKNOWN, "sent": True})
+        except RequestError as error:
+            if error.code == _METHOD_NOT_FOUND:
+                # The adapter declared the extension and then denied it — a
+                # capability lie, not a delivery acpc can report on.
+                return _NoSteeringOutcome({"ok": False, "kind": errors.NOT_SUPPORTED})
+            return _NoSteeringOutcome({"ok": False, "kind": errors.OUTCOME_UNKNOWN, "sent": True})
+        except Exception:  # noqa: BLE001
+            # A transport failure after the frame went out is exactly the
+            # case SPEC calls unknown: the adapter may have taken it.
+            return _NoSteeringOutcome({"ok": False, "kind": errors.OUTCOME_UNKNOWN, "sent": True})
+
+    async def _apply_steering(
+        self,
+        session_id: str,
+        adapter_session_id: str,
+        text: str,
+        turn: _Turn,
+        reply: Any,
+    ) -> dict[str, Any]:
+        """Turn the adapter's own answer into this daemon's reply."""
+        outcome = reply.get("outcome") if isinstance(reply, Mapping) else None
+        if outcome == "injected":
+            self._record_steer(session_id, text, "injected")
+            return {"ok": True, "outcome": "injected", "turn_token": turn.turn_token}
+        if outcome == "promptRequired":
+            self._record_steer(session_id, text, "promptRequired")
+            return {"ok": False, "kind": errors.CONFLICT, "outcome": "promptRequired"}
+        if outcome == "startedNewTurn":
+            # The adapter started a turn of its own. acpc owns neither it nor
+            # its ending, so it is cancelled and the result stays unknown.
+            self._record_steer(session_id, text, "startedNewTurn")
+            await self._cancel_adapter_turn(adapter_session_id)
+            return {"ok": False, "kind": errors.OUTCOME_UNKNOWN, "outcome": "startedNewTurn"}
+        # An answer acpc does not recognize is not a delivery it can describe,
+        # so it is reported the way an unanswered request is.
+        self._record_steer(session_id, text, outcome if isinstance(outcome, str) else "unknown")
+        return {"ok": False, "kind": errors.OUTCOME_UNKNOWN, "sent": True}
+
+    async def _cancel_adapter_turn(self, adapter_session_id: str) -> None:
+        """Cancel a turn the adapter started on its own after a steering request."""
+        raw = getattr(self.host._conn, "_conn", None)
+        if raw is None or not hasattr(raw, "send_notification"):
+            return
+        with contextlib.suppress(Exception):
+            await raw.send_notification("session/cancel", {"sessionId": adapter_session_id})
+
+    def _record_steer(self, session_id: str, text: str, outcome: str) -> None:
+        """Append the correction to the session transcript.
+
+        The steer itself has already happened, so a transcript that cannot be
+        written must not turn into a failed reply: the caller would be told the
+        instruction did not land when it did.
+        """
+        with contextlib.suppress(OSError, sessions.SessionError, transcript.TranscriptError):
+            transcript.Transcript(sessions.transcript_path(session_id)).append(
+                "steer", mode=vocab.STEER_IN_PLACE, text=text, outcome=outcome
+            )
 
     async def _start(self, frame: dict[str, Any]) -> dict[str, Any]:
         session_id = frame.get("session_id", "")
@@ -1274,6 +1440,16 @@ class Daemon:
         """Enter the running phase only after the outgoing prompt was observed."""
         turn.phase = "running"
         self.host.adapter_sessions[session_id] = adapter_session_id
+        # SPEC.md `steer`: support is read from `initialize` and recorded on the
+        # session. This is the moment the record is true — the prompt is in
+        # flight, so an in-place correction has a turn to reach.
+        modes = (
+            list(vocab.STEER_MODES)
+            if self.host.steering_supported
+            else [vocab.STEER_CANCEL_THEN_START]
+        )
+        with contextlib.suppress(OSError, sessions.SessionError):
+            sessions.update_meta(session_id, steer_modes=modes)
 
     def _finish(
         self, session_id: str, outcome: runner.TurnOutcome, *, error: BaseException | None = None
