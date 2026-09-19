@@ -19,7 +19,7 @@ The following table is the machine-readable command index embedded in this docum
 | `agents delete` | `non_idempotent` |
 | `agents get` | `read_only` |
 | `agents list` | `read_only` |
-| `cancel` | `idempotent` |
+| `cancel` | `non_idempotent` |
 | `continue` | `non_idempotent` |
 | `daemon status` | `read_only` |
 | `daemon stop` | `idempotent` |
@@ -87,7 +87,7 @@ A variant points at its base adapter rather than duplicating the catalog.
 cancel SELECTOR [--format text|json]
 ```
 
-`cancel` is idempotent. It sends ACP cancellation for an active turn and reports the state actually observed afterward. A successful cancellation request may therefore report `running` while the adapter is settling. On a finished session it is a successful no-op with `changed: false`; an unknown selector is `not_found`. A daemon-owned continuation preparation can be canceled before its prompt is sent and receives a no-prompt placeholder.
+`cancel` selects the session's active turn when the call starts and requests ACP cancellation of that turn only. It reports the state actually observed afterward: a successful request may report `running` while the adapter is settling, and `changed` is `true` exactly when this call sent the request. If the selected turn ended before the request took effect, the result reports that turn's observed terminal state with `changed: false`, and a newer turn started meanwhile by `continue` or `steer` is left untouched; the next `cancel` selects again and can stop that newer turn, which is why the command is `non_idempotent`. Canceling one session never asks for confirmation. On a finished session it is a successful no-op with `changed: false`; an unknown selector is `not_found`. A daemon-owned continuation preparation can be canceled before its prompt is sent and receives a no-prompt placeholder.
 
 ### `continue`
 
@@ -248,6 +248,8 @@ steer SELECTOR [INSTRUCTION | -] [--prompt-file FILE]
 
 `cancel-then-start` cancels the turn in flight, waits for its end and starts the next turn on the same session with the instruction under the fixed interruption preamble. During daemon-owned preparation there is no prompt to interrupt; acpc cancels preparation, reports that fact and sends the instruction plainly. `--cancel-after` bounds the new turn's work and is accepted only with `--steer-mode cancel-then-start`.
 
+The cancellation step selects the turn active when `steer` started and waits up to 10 s for its end. If that turn is still running at the deadline, `steer` fails with `timeout`, `target_status: running` and `message_state: not_delivered`; the cancellation stays requested and no instruction is sent. If the turn ended on its own before the cancellation took effect, `steer` reports that terminal state as `target_status` and sends the instruction plainly, without the interruption preamble. If another call started a new turn before the instruction could be sent, `steer` fails with `conflict` and leaves that turn untouched. Every failure of the cancellation step carries `session_id`, `capabilities` and `correction_result` in `context`, like a failure after it.
+
 A finished session is a `conflict` naming `continue` as the follow-up operation in either mode. A `starting` or `preparing` session is a `conflict` for `in-place`, because no prompt is in flight yet.
 
 Every `steer` result carries `turn`, the turn to observe next, `capabilities`, and `correction_result` with `steer_mode`, `target_turn`, `target_status` and `message_state`. `target_turn` is the turn the correction selected; for `in-place` it equals `turn`, for `cancel-then-start` `turn` is the new turn. `target_status` is the last state observed for the selected turn. `message_state` is `accepted` when the adapter acknowledged the instruction (`injected`) or acpc accepted the new turn, `not_delivered` when the instruction is known not to have reached the selected turn, and `unknown` when acpc cannot tell. acpc never reports `delivered`: an acknowledgement does not show that the model used the instruction. Every in-place correction is appended to the transcript as a `steer` event carrying `mode`, `text` and the adapter's `outcome`; a cancel-then-start correction is recorded by the new turn's prompt file and its state events.
@@ -264,6 +266,9 @@ A failure after the target was selected carries `session_id` and `correction_res
 | The daemon serving the session could not be reached; nothing was sent. | `unavailable` | `not_delivered` |
 | The request was sent and no reply arrived within 10 s, or the connection was lost. | `outcome_unknown` | `unknown` |
 | The observed turn ended `failed` or `canceled` while `steer` was blocking after acceptance. | `operation_failed` | `accepted` |
+| The cancellation deadline passed with the selected turn still running (`cancel-then-start`); exit 1. | `timeout` | `not_delivered` |
+| The cancellation's effect could not be observed, or the session's process could not be signaled (`cancel-then-start`). | `outcome_unknown` or `unavailable` | `not_delivered` |
+| Another call started a new turn before the corrected turn could start (`cancel-then-start`). | `conflict` | `not_delivered` |
 
 A `not_delivered` or `unknown` outcome never triggers an automatic `cancel-then-start`; repeating the instruction is the caller's decision.
 
@@ -351,7 +356,7 @@ Target validation and documented preconditions happen before the confirmation qu
 | 141 | SIGPIPE because a downstream reader closed the pipe. |
 | 143 | SIGTERM detached from daemon-owned work or ended a direct turn. |
 
-Missing named resources and session conflicts are exit 1, because the command was spelled correctly. Exit 2 is reserved for a call that cannot be accepted in the form given, including an unsupported permission policy for the selected entry.
+A `cancel-then-start` correction whose cancellation deadline passes exits 1, not 124: the deadline belonged to a request that changed the work, not to an observation. Missing named resources and session conflicts are exit 1, because the command was spelled correctly. Exit 2 is reserved for a call that cannot be accepted in the form given, including an unsupported permission policy for the selected entry.
 
 Ctrl-C always produces exit 130 with `kind: interrupted` for the command that was interrupted.
 Interrupting `wait` or `log` never changes the observed session.

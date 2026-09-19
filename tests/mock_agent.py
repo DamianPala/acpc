@@ -68,6 +68,10 @@ per steering request (plus one ``idle:`` line naming the ``idleBehavior`` it
 asked for) and per ``session/cancel`` — the evidence a test uses to see what
 acpc asked for and whether it cancelled the turn the adapter started on its own.
 
+``ACPC_MOCK_IGNORE_CANCEL=1`` drops every ``session/cancel`` notification on
+the floor: the running scenario's own timer is the only thing that ends the
+turn, which is what a cancel-deadline test needs.
+
 Advertised dataset: modes ``default``/``acceptEdits``/``plan``/``yolo`` (the
 restricted mode), models ``mock-opus-5``/``mock-sonnet-5``/``mock-haiku-4-5``,
 efforts ``low``/``medium``/``high``/``xhigh`` — any other effort value is
@@ -1060,8 +1064,13 @@ class MockAgent(Agent):
         return True
 
     async def cancel(self, session_id: str, **kwargs: Any) -> None:
-        self._cancel_events.setdefault(session_id, asyncio.Event()).set()
         self._record_steering(f"cancel:{session_id}")
+        if os.environ.get("ACPC_MOCK_IGNORE_CANCEL") == "1":
+            # A deadline test needs a turn that outlives the 10s cancel wait;
+            # this stands in for an adapter that never acknowledges the
+            # request, so the scenario's own timer is what ends the turn.
+            return
+        self._cancel_events.setdefault(session_id, asyncio.Event()).set()
 
     async def close_session(self, session_id: str, **kwargs: Any) -> CloseSessionResponse:
         if session_id not in self._sessions:

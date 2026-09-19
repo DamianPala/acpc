@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 import json
 import sys
+import threading
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -485,6 +486,49 @@ def test_cancel_before_daemon_acceptance_is_the_no_such_turn_case(
     assert reply["ok"] is False
     assert "not running here" in reply["error"]
     assert sessions.read_meta(session_id).state == "succeeded"
+
+
+def test_cancel_with_a_stale_turn_token_is_a_conflict_that_leaves_the_turn_running(
+    state_root: Path, live_daemon: None
+) -> None:
+    """SPEC.md `cancel`: a request naming an older token than the one this
+    daemon now holds does not touch the turn actually running."""
+    session_id = new_session("slow:1 daemon token race")
+    first = run_turn(session_id, "slow:1 daemon token race")
+    assert first.state == "succeeded"
+    stale_token = sessions.read_meta(session_id).turns
+
+    second_holder: list[runner.TurnOutcome] = []
+    second = threading.Thread(
+        target=lambda: second_holder.append(next_turn(session_id, "slow:2 daemon token race next")),
+        daemon=True,
+    )
+    second.start()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and sessions.load(session_id).state != "running":
+        time.sleep(0.02)
+    assert sessions.load(session_id).state == "running"
+
+    async def cancel_stale() -> dict[str, Any]:
+        connection = await daemon_client.connect(target())
+        assert connection is not None
+        try:
+            return await connection.cancel(session_id, turn_token=stale_token)
+        finally:
+            await connection.close()
+
+    reply = asyncio.run(cancel_stale())
+
+    assert reply == {
+        "ok": False,
+        "kind": errors.CONFLICT,
+        "stale": True,
+        "turn_token": stale_token + 1,
+    }
+    assert sessions.load(session_id).state == "running"
+
+    second.join(timeout=15)
+    assert second_holder and second_holder[0].state == "succeeded"
 
 
 def test_daemon_replay_tag_survives_restore_client_release_and_live_rebind(

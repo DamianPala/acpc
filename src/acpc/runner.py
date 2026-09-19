@@ -40,6 +40,7 @@ from acpc import (
     cache,
     daemon_client,
     environment,
+    errors,
     paths,
     sessions,
     targets,
@@ -1163,7 +1164,9 @@ async def _execute_routed(
             async with sessions.session_reservation(session_id):
                 return await _execute_direct(session_id, request, cancel, route_note=route_note)
         except sessions.SessionStateError as error:
-            raise ResumePreparationError(str(error)) from None
+            # Same classification as the daemon's: a held session is a conflict
+            # the caller can retry, not an adapter failure.
+            raise ResumePreparationError(str(error), kind=errors.CONFLICT) from None
 
     return await _execute_direct(session_id, request, cancel, route_note=route_note)
 

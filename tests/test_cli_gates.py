@@ -134,7 +134,7 @@ DECLARED_EFFECTS = {
     "skills list": effects.READ_ONLY,
     "status": effects.READ_ONLY,
     "steer": effects.NON_IDEMPOTENT,
-    "cancel": effects.IDEMPOTENT,
+    "cancel": effects.NON_IDEMPOTENT,
     "wait": effects.READ_ONLY,
 }
 

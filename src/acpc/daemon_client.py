@@ -59,7 +59,7 @@ class DaemonConnection(Protocol):
         """Block until a deferred continuation has claimed its next turn."""
         ...
 
-    async def cancel(self, session_id: str) -> dict[str, Any]:
+    async def cancel(self, session_id: str, turn_token: int | None = None) -> dict[str, Any]:
         """Ask the daemon to cancel a session's in-flight turn."""
         ...
 
@@ -108,8 +108,11 @@ class _SocketDaemon:
     async def await_preparation(self, session_id: str) -> dict[str, Any]:
         return await self.call({"op": "await_preparation", "session_id": session_id})
 
-    async def cancel(self, session_id: str) -> dict[str, Any]:
-        return await self.call({"op": "cancel", "session_id": session_id})
+    async def cancel(self, session_id: str, turn_token: int | None = None) -> dict[str, Any]:
+        frame: dict[str, Any] = {"op": "cancel", "session_id": session_id}
+        if turn_token is not None:
+            frame["turn_token"] = turn_token
+        return await self.call(frame)
 
     async def steer(self, session_id: str, text: str) -> dict[str, Any]:
         return await self.call({"op": "steer", "session_id": session_id, "text": text})
@@ -289,14 +292,20 @@ def _unlock(handle: IO[bytes]) -> None:
         handle.close()
 
 
-async def cancel_turn(target: str, session_id: str) -> dict[str, Any] | DaemonUnavailable | None:
+async def cancel_turn(
+    target: str, session_id: str, turn_token: int | None = None
+) -> dict[str, Any] | DaemonUnavailable | None:
     """Cancel a turn over a connection of its own.
 
     A cancel has to overtake the `await` it is interrupting, and one
     connection serves one request at a time — sending it down the awaiting
     connection would queue behind the very reply it is meant to prevent.
+
+    ``turn_token`` selects the turn this call means to cancel (SPEC.md
+    `cancel`); omitting it cancels whatever turn the daemon currently holds,
+    which is what a caller with no token to pin does.
     """
-    return await _one_shot(target, lambda daemon: daemon.cancel(session_id))
+    return await _one_shot(target, lambda daemon: daemon.cancel(session_id, turn_token))
 
 
 async def steer_turn(

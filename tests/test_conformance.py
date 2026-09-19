@@ -294,7 +294,7 @@ EXPECTED_EFFECTS = {
     "agents delete": "non_idempotent",
     "agents get": "read_only",
     "agents list": "read_only",
-    "cancel": "idempotent",
+    "cancel": "non_idempotent",
     "continue": "non_idempotent",
     "daemon status": "read_only",
     "daemon stop": "idempotent",
@@ -316,7 +316,7 @@ EXPECTED_EFFECTS = {
 MUTATING_ORACLE_NOTES = {
     "agents create": "file creation changes the registry and reports changed=true",
     "agents delete": "file deletion changes the registry and reports changed=true",
-    "cancel": "finished-session cancellation is an observed idempotent no-op",
+    "cancel": "finished-session cancellation is an observed no-op",
     "continue": "a follow-up changes the session transcript and reports changed=true",
     "daemon stop": "dry-run over an absent target is an observed idempotent no-op",
     "delete": "deletion clears session data and leaves a reservation marker",

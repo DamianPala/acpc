@@ -475,8 +475,10 @@ def test_cancel_acknowledged_while_work_is_pending_reports_changed(
     session_id = _start_slow_session(cli, "slow:30 cancellation pending")
     current_turn = sessions.read_meta(session_id).turns
 
-    async def accepted_without_finishing(target: str, selected: str) -> dict[str, Any]:
-        del target, selected
+    async def accepted_without_finishing(
+        target: str, selected: str, turn_token: int | None = None
+    ) -> dict[str, Any]:
+        del target, selected, turn_token
         return {"ok": True, "turn_token": current_turn}
 
     monkeypatch.setattr(daemon_client, "cancel_turn", accepted_without_finishing)
@@ -495,8 +497,8 @@ def test_cancel_without_rpc_confirmation_fails_without_killing_work(
 ) -> None:
     session_id = _start_slow_session(cli, "slow:30 cancellation unconfirmed")
 
-    async def never_replies(target: str, selected: str) -> bool:
-        del target, selected
+    async def never_replies(target: str, selected: str, turn_token: int | None = None) -> bool:
+        del target, selected, turn_token
         await asyncio.sleep(1)
         return True
 
@@ -521,10 +523,10 @@ def test_cancel_rereads_after_terminal_race_and_preserves_another_session(
     release_rpc = threading.Event()
     real_cancel = daemon_client.cancel_turn
 
-    async def delayed_cancel(target: str, selected: str) -> Any:
+    async def delayed_cancel(target: str, selected: str, turn_token: int | None = None) -> Any:
         entered_rpc.set()
         await asyncio.to_thread(release_rpc.wait, 5)
-        return await real_cancel(target, selected)
+        return await real_cancel(target, selected, turn_token)
 
     monkeypatch.setattr(daemon_client, "cancel_turn", delayed_cancel)
     result_holder: list[Any] = []
@@ -563,9 +565,12 @@ def test_cancel_preparing_waits_for_the_acknowledged_turn_generation(
         current.state = "preparing"
         return current
 
-    async def accepted_cancel(selected_target: str, selected_id: str) -> dict[str, Any]:
+    async def accepted_cancel(
+        selected_target: str, selected_id: str, turn_token: int | None = None
+    ) -> dict[str, Any]:
         assert selected_target == target
         assert selected_id == meta
+        del turn_token
         acknowledged.set()
         return {"ok": True, "turn_token": old_turn + 1}
 
@@ -621,8 +626,10 @@ def test_cancel_status_enum_contains_only_statuses_reached_by_cancel(
     running_id = _start_slow_session(cli, "slow:30 reachable running cancel status")
     turn = sessions.read_meta(running_id).turns
 
-    async def accepted_without_finishing(target: str, selected: str) -> dict[str, Any]:
-        del target, selected
+    async def accepted_without_finishing(
+        target: str, selected: str, turn_token: int | None = None
+    ) -> dict[str, Any]:
+        del target, selected, turn_token
         return {"ok": True, "turn_token": turn}
 
     monkeypatch.setattr(daemon_client, "cancel_turn", accepted_without_finishing)
@@ -634,6 +641,36 @@ def test_cancel_status_enum_contains_only_statuses_reached_by_cancel(
     detail = json.loads(invoke(cli, "schema", "cancel").stdout)
     declared = set(detail["output"]["properties"]["status"]["enum"])
     assert declared == observed
+
+
+def test_cancel_with_a_stale_token_reports_the_selected_turns_ending_only(
+    cli: CliRunner, live_daemon: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SPEC `cancel`: a call selects the turn active when it starts, so a
+    reply naming an older token than the daemon now holds must not reach
+    into whatever turn is running now — it reports that turn's own ending
+    and leaves the newer turn to a repeated `cancel`."""
+    session_id = _start_slow_session(cli, "slow:1 stale cancel target")
+    selected_meta = sessions.read_meta(session_id)
+    assert selected_meta.is_active
+
+    _wait_until_state(session_id, "succeeded")
+    continued = invoke(cli, "continue", session_id, "slow:1 stale cancel next", "--bg", "--quiet")
+    assert continued.exit_code == vocab.EXIT_OK, continued.stderr
+    _wait_until_running(cli, session_id)
+    assert sessions.read_meta(session_id).turns == selected_meta.turns + 1
+
+    monkeypatch.setattr(cli_module, "_load_view_session", lambda selector: selected_meta)
+
+    result = invoke(cli, "cancel", session_id, "--json")
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "succeeded"
+    assert payload["changed"] is False
+    assert sessions.load(session_id).state == "running"
+
+    _wait_until_state(session_id, "succeeded")
 
 
 def test_cancel_reports_the_observed_terminal_state_before_cancellation(

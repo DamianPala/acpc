@@ -2713,23 +2713,33 @@ class _DaemonCancelReply:
 
     accepted: bool
     turn_token: int | None
+    stale: bool = False
 
 
 @dataclass(frozen=True, slots=True)
 class _CancelResult:
-    """The observed state and whether this call caused a cancellation request."""
+    """The observed state and whether this call caused a cancellation request.
+
+    ``stale`` means the daemon held a newer turn than the one this call
+    selected; ``deadline_passed`` means the selected turn was still the
+    active one, and still running, once the wait ran out. Both leave
+    ``changed`` accurate for `cancel`'s own report; `steer` reads them to
+    tell "nothing left to redirect" from "the redirect cannot happen yet".
+    """
 
     meta: sessions.SessionMeta
     changed: bool
+    stale: bool = False
+    deadline_passed: bool = False
 
 
 async def _cancel_with_daemon(
-    target: str, session_id: str
+    target: str, session_id: str, turn_token: int
 ) -> _DaemonCancelReply | daemon_client.DaemonUnavailable | None:
     """Request cancellation without allowing a dead daemon to hang ``cancel``."""
     try:
         reply = await asyncio.wait_for(
-            daemon_client.cancel_turn(target, session_id),
+            daemon_client.cancel_turn(target, session_id, turn_token),
             timeout=runner.CANCEL_ACK_TIMEOUT,
         )
     except TimeoutError:
@@ -2740,30 +2750,83 @@ async def _cancel_with_daemon(
         return reply
     if not isinstance(reply, Mapping):
         return None
-    turn_token = reply.get("turn_token")
+    reply_turn_token = reply.get("turn_token")
     return _DaemonCancelReply(
         accepted=reply.get("ok") is True,
-        turn_token=turn_token
-        if isinstance(turn_token, int) and not isinstance(turn_token, bool)
+        turn_token=reply_turn_token
+        if isinstance(reply_turn_token, int) and not isinstance(reply_turn_token, bool)
         else None,
+        stale=reply.get("stale") is True,
     )
 
 
+class _CancelDeadlinePassed(Exception):
+    """The selected turn was still active, and still running, at the deadline.
+
+    Silently reporting it settled would be false for both callers: `cancel`
+    needs to keep saying `running`/`changed: true` as it does today, and
+    `steer` needs to fail loudly instead of treating it as finished.
+    """
+
+    def __init__(self, meta: sessions.SessionMeta) -> None:
+        super().__init__(meta.session_id)
+        self.meta = meta
+
+
 def _wait_for_cancel(session_id: str, *, expected_turn: int | None = None) -> sessions.SessionMeta:
-    """Give a daemon's cancellation time to finalize the session on disk."""
+    """Give a daemon's cancellation time to finalize the session on disk.
+
+    Raises `_CancelDeadlinePassed` when ``expected_turn`` is still the active
+    turn and still running once the deadline passes, and `outcome_unknown`
+    when a *different* turn is active and the wait never caught up to it.
+    """
     deadline = time.monotonic() + runner.CANCEL_ACK_TIMEOUT
     while True:
         meta = sessions.load(session_id)
         current_generation = expected_turn is None or meta.turns == expected_turn
-        if current_generation and (not meta.is_active or time.monotonic() >= deadline):
+        if current_generation and not meta.is_active:
             return meta
         if time.monotonic() >= deadline:
+            if current_generation:
+                raise _CancelDeadlinePassed(meta)
             raise AcpcError(
                 f"could not observe the canceled turn for session {session_id}",
                 kind=errors.OUTCOME_UNKNOWN,
                 context={"session_id": session_id, "status": None},
             )
         time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
+
+
+def _await_cancel(session_id: str, expected_turn: int) -> _CancelResult:
+    """Wait for a requested cancellation to settle, deadline included."""
+    try:
+        return _CancelResult(_wait_for_cancel(session_id, expected_turn=expected_turn), True)
+    except _CancelDeadlinePassed as passed:
+        return _CancelResult(passed.meta, True, deadline_passed=True)
+
+
+def _turn_terminal_state(session_id: str, turn: int) -> str:
+    """The terminal state the transcript recorded for one past turn.
+
+    Turns are strictly sequential and each finished one contributes exactly
+    one terminal `state` event (SPEC.md *State on disk*), so the turn-th such
+    event in order is that turn's own ending — the newer turn a `stale` reply
+    means is not read here.
+    """
+    events = transcript.Transcript(sessions.transcript_path(session_id)).read().events
+    seen = 0
+    for event in events:
+        if event.get("type") == "state" and event.get("to") in vocab.FINISHED_STATES:
+            seen += 1
+            if seen == turn:
+                return str(event["to"])
+    return "unknown"
+
+
+def _stale_cancel_result(meta: sessions.SessionMeta, expected_turn: int) -> _CancelResult:
+    """Report the selected turn's own ending without touching a newer one."""
+    state = _turn_terminal_state(meta.session_id, expected_turn)
+    return _CancelResult(replace(meta, state=state), False, stale=True)
 
 
 def _cancel_local_session(meta: sessions.SessionMeta) -> _CancelResult:
@@ -2786,6 +2849,8 @@ def _cancel_local_session(meta: sessions.SessionMeta) -> _CancelResult:
             context={"session_id": meta.session_id, "status": meta.state},
         )
     if "acpc.direct_worker" in command_line:
+        if not proc.is_process_alive(meta.pid, meta.process_start_time):
+            return _CancelResult(sessions.load(meta.session_id), False)
         try:
             os.kill(meta.pid, signal.SIGINT)
         except ProcessLookupError:
@@ -2796,10 +2861,7 @@ def _cancel_local_session(meta: sessions.SessionMeta) -> _CancelResult:
                 kind=errors.UNAVAILABLE,
                 context={"session_id": meta.session_id},
             ) from None
-        return _CancelResult(
-            _wait_for_cancel(meta.session_id, expected_turn=meta.turns),
-            True,
-        )
+        return _await_cancel(meta.session_id, meta.turns)
     if command_line is not None and "acpc.daemon" in command_line:
         # Never kill the shared daemon from a one-session cancel: its PID in
         # meta.json is not the target's worker and doing so destroys siblings.
@@ -2819,10 +2881,7 @@ def _cancel_local_session(meta: sessions.SessionMeta) -> _CancelResult:
             kind=errors.UNAVAILABLE,
             context={"session_id": meta.session_id},
         )
-    return _CancelResult(
-        _wait_for_cancel(meta.session_id, expected_turn=meta.turns),
-        True,
-    )
+    return _await_cancel(meta.session_id, meta.turns)
 
 
 def _cancel_session(meta: sessions.SessionMeta) -> _CancelResult:
@@ -2831,22 +2890,23 @@ def _cancel_session(meta: sessions.SessionMeta) -> _CancelResult:
     SPEC `cancel`: graceful `session/cancel` with a bounded wait for the ack,
     torn down anyway if the callee will not wind down in time. `steer` puts
     the same cancel in front of a follow-up turn, so it lives here rather
-    than inside `cancel`.
+    than inside `cancel`. The turn selected is the one active when this call
+    started (``meta.turns``); a daemon that has since moved on to a newer one
+    answers `stale` and neither turn is touched further here.
     """
     expected_turn = meta.turns
     if meta.target is not None:
-        reply = asyncio.run(_cancel_with_daemon(meta.target, meta.session_id))
+        reply = asyncio.run(_cancel_with_daemon(meta.target, meta.session_id, expected_turn))
         if isinstance(reply, daemon_client.DaemonUnavailable):
             current = sessions.load(meta.session_id)
             if not current.is_active:
                 return _CancelResult(current, False)
             return _cancel_local_session(current)
+        if reply is not None and reply.stale:
+            return _stale_cancel_result(meta, expected_turn)
         if reply is not None and reply.accepted:
             turn_token = reply.turn_token if reply.turn_token is not None else expected_turn
-            return _CancelResult(
-                _wait_for_cancel(meta.session_id, expected_turn=turn_token),
-                True,
-            )
+            return _await_cancel(meta.session_id, turn_token)
         current = sessions.load(meta.session_id)
         if not current.is_active:
             return _CancelResult(current, False)
@@ -2864,7 +2924,7 @@ def _maintenance_json(payload: Mapping[str, Any]) -> None:
     _write_stdout(json.dumps(dict(payload), ensure_ascii=False) + "\n")
 
 
-@effects.idempotent
+@effects.non_idempotent
 @schema.describes(selector=_SELECTOR_HELP)
 @main.command(name="cancel")
 @click.argument("selector")
@@ -2878,14 +2938,18 @@ def _maintenance_json(payload: Mapping[str, Any]) -> None:
 @_color_option()
 @click.help_option("-h", "--help")
 def cancel_command(selector: str, format_name: str | None, json_mode: bool) -> None:
-    """Cancel a running session; it stays usable with ``acpc continue``.
+    """Cancel the running turn; the session stays usable with ``acpc continue``.
+    A repeated ``cancel`` can select a newer turn.
 
-    Cancels the turn in flight (ACP ``session/cancel``) and waits up to 10s for the
-    ack; past that the connection is torn down anyway. During a daemon-owned
-    continuation preparation it cancels the preparation and writes a no-prompt
-    placeholder. Transcript, meta and the partial answer stay on disk for
-    post-mortem. Stopping an already-finished session is a successful no-op that
-    reports the state it found; an unknown id is reported as ``not_found``.
+    Selects the turn in flight when the call starts and sends ACP ``session/cancel``
+    for that turn only, then waits up to 10s for the ack; past that the connection
+    is torn down anyway. A turn that ended before the request landed is reported
+    with the state it reached and ``changed: false``; a newer turn started in the
+    meantime is left alone, which is what a repeated ``cancel`` then selects.
+    During a daemon-owned continuation preparation it cancels the preparation and
+    writes a no-prompt placeholder. Transcript, meta and the partial answer stay
+    on disk for post-mortem. A finished session is a successful no-op that reports
+    the state it found; an unknown id is ``not_found``.
 
     Example: ``acpc cancel q7x2``
     """
@@ -4933,11 +4997,19 @@ def _steer_cancel_then_start(
 
     SPEC `steer`: the correcting call is `cancel` plus `continue` without the
     race in the middle, and the result says which turn was selected, what it
-    ended as, and that acpc accepted the replacement.
+    ended as, and that acpc accepted the replacement. Every failure of the
+    cancellation step is reported the same way as a failure after it: with
+    `session_id`, `capabilities` and `correction_result` in `context`.
     """
     target_turn = meta.turns
     capabilities = _steer_capabilities(meta)
-    meta = _cancel_session(meta).meta
+    session_id = meta.session_id
+    try:
+        cancel_result = _cancel_session(meta)
+    except AcpcError as error:
+        raise _cancel_stage_failure(error, session_id, target_turn, capabilities, None) from None
+    _check_cancel_stage(cancel_result, session_id, target_turn, capabilities)
+    meta = cancel_result.meta
     interrupted = (
         meta.state == "canceled" and meta.stop_reason != runner.PREPARATION_CANCELLED_REASON
     )
@@ -4987,6 +5059,76 @@ def _steer_cancel_then_start(
         ) from None
 
 
+def _check_cancel_stage(
+    cancel_result: _CancelResult,
+    session_id: str,
+    target_turn: int,
+    capabilities: Mapping[str, Any],
+) -> None:
+    """Fail loudly when the cancellation step did not select a turn to redirect.
+
+    SPEC `steer`: a deadline with the selected turn still running is a
+    `timeout`, and a daemon that already moved on to a newer turn is a
+    `conflict` — neither leaves anything for this call to redirect.
+    """
+    if cancel_result.deadline_passed:
+        raise _cancel_stage_failure(
+            AcpcError(
+                f"session {session_id} timed out while turn {target_turn} was still running",
+                kind=errors.TIMEOUT,
+                hint=f"Run: acpc status {session_id}",
+            ),
+            session_id,
+            target_turn,
+            capabilities,
+            cancel_result.meta.state,
+        )
+    if cancel_result.stale:
+        raise _cancel_stage_failure(
+            AcpcError(
+                f"session {session_id} started a new turn before it could be corrected",
+                kind=errors.CONFLICT,
+                hint=f"Run: acpc steer {session_id} ...",
+            ),
+            session_id,
+            target_turn,
+            capabilities,
+            cancel_result.meta.state,
+        )
+
+
+def _cancel_stage_failure(
+    error: AcpcError,
+    session_id: str,
+    target_turn: int,
+    capabilities: Mapping[str, Any],
+    target_status: str | None,
+) -> AcpcError:
+    """Attach what acpc knows when the cancellation step itself failed.
+
+    SPEC `steer`: every failure of the cancellation step carries `session_id`,
+    `capabilities` and `correction_result` in `context`; nothing was ever
+    sent, so `message_state` is always `not_delivered`. ``target_status`` is
+    the last state acpc could observe for the selected turn; a caller that
+    has none of its own passes `None` and gets a fresh best-effort read, or
+    `null` when even that fails.
+    """
+    if target_status is None:
+        try:
+            target_status = sessions.load(session_id).state
+        except sessions.SessionError:
+            target_status = None
+    correction = {
+        "steer_mode": vocab.STEER_CANCEL_THEN_START,
+        "target_turn": target_turn,
+        "target_status": target_status,
+        "message_state": "not_delivered",
+    }
+    return error.with_context(
+        session_id=session_id, correction_result=correction, capabilities=dict(capabilities)
+    )
+
+
 def _redirect_failure(
     error: AcpcError,
     session_id: str,
@@ -5005,7 +5147,9 @@ def _redirect_failure(
     except sessions.SessionError:
         message_state = "unknown"
     else:
-        message_state = "accepted" if current.turns != target_turn else "not_delivered"
+        # A conflict means another call's turn moved the session on, not ours.
+        opened = current.turns != target_turn and error.kind != errors.CONFLICT
+        message_state = "accepted" if opened else "not_delivered"
     return error.with_context(
         correction_result={**correction, "message_state": message_state},
         capabilities=dict(capabilities),

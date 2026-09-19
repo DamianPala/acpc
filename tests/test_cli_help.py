@@ -220,9 +220,12 @@ def test_help_explains_session_lifecycle_and_retention(runner: CliRunner) -> Non
     steer_help = normalized(invoke(runner, "steer", "--help").stdout)
     prune_help = normalized(invoke(runner, "prune", "--help").stdout)
 
-    assert "Cancel a running session; it stays usable with ``acpc continue``." in stop_help
-    assert "Cancels the turn in flight (ACP ``session/cancel``)" in stop_help
-    assert "an unknown id is reported as ``not_found``" in stop_help
+    assert "Cancel the running turn; the session stays usable with ``acpc continue``." in stop_help
+    assert (
+        "Selects the turn in flight when the call starts and sends ACP ``session/cancel``"
+        in stop_help
+    )
+    assert "an unknown id is ``not_found``" in stop_help
     assert "List liveness-verified sessions as a bounded collection." in list_help
     assert "Return at most N sessions" in list_help
     assert "Show liveness-verified metadata for one session" in status_help

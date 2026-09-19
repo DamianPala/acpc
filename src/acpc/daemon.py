@@ -696,10 +696,33 @@ class Daemon:
         }
 
     def _cancel(self, frame: dict[str, Any]) -> dict[str, Any]:
+        """Cancel the turn this daemon holds for one session.
+
+        SPEC.md `cancel`: a call selects the turn active when it starts, so a
+        request naming an older ``turn_token`` than the one this daemon has
+        established must not reach into whatever turn is running now — it
+        reports `stale` and lets the caller reselect. A frame with no token,
+        or one that arrives before this turn's own token is established, is
+        never "a different token" and is honored as before.
+        """
         session_id = frame.get("session_id", "")
         turn = self.turns.get(session_id)
         if turn is None:
             return {"ok": False, "error": f"session {session_id} is not running here"}
+        requested_token = frame.get("turn_token")
+        if isinstance(requested_token, bool) or not isinstance(requested_token, int):
+            requested_token = None
+        if (
+            requested_token is not None
+            and turn.turn_token is not None
+            and turn.turn_token != requested_token
+        ):
+            return {
+                "ok": False,
+                "kind": errors.CONFLICT,
+                "stale": True,
+                "turn_token": turn.turn_token,
+            }
         turn.cancel.request("canceled")
         if (
             turn.phase == "preparing"

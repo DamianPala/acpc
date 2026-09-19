@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
@@ -14,6 +15,7 @@ from typing import Any
 import pytest
 from click.testing import CliRunner
 
+import acpc.cli as cli_module
 from acpc import daemon_client, runner, sessions, transcript, vocab
 from acpc.cli import STEER_PREAMBLE, main
 from acpc.permissions import select_mode
@@ -255,9 +257,12 @@ def test_steer_degrades_to_a_plain_continue_when_the_turn_finished_first(
     never interrupted, so the preamble would lie — and the caller is told."""
     session_id = mid_turn_session(cli)
 
-    async def finish_instead_of_cancelling(target: str, selector: str) -> dict[str, Any]:
+    async def finish_instead_of_cancelling(
+        target: str, selector: str, turn_token: int | None = None
+    ) -> dict[str, Any]:
         # Stands in for the daemon — another process — reporting a cancel that
         # reached a turn which had already ended on its own.
+        del turn_token
         sessions.transition(selector, "succeeded", exit_code=0, stop_reason="end_turn")
         return {"ok": True, "turn_token": sessions.read_meta(selector).turns}
 
@@ -268,6 +273,62 @@ def test_steer_degrades_to_a_plain_continue_when_the_turn_finished_first(
     assert result.exit_code == vocab.EXIT_OK, result.stderr
     assert "finished on its own before the cancel landed" in result.stderr
     assert sessions.prompt_path(session_id).read_text(encoding="utf-8") == "diagnose only"
+
+
+def test_steer_reports_the_finished_turns_own_state_in_correction_result(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SPEC `steer`: a turn that finished on its own is reported by its own
+    terminal state, not by whatever the redirect turn later becomes."""
+    session_id = mid_turn_session(cli)
+
+    async def finish_instead_of_cancelling(
+        target: str, selector: str, turn_token: int | None = None
+    ) -> dict[str, Any]:
+        del turn_token
+        sessions.transition(selector, "succeeded", exit_code=0, stop_reason="end_turn")
+        return {"ok": True, "turn_token": sessions.read_meta(selector).turns}
+
+    monkeypatch.setattr(daemon_client, "cancel_turn", finish_instead_of_cancelling)
+
+    result = invoke(cli, "steer", session_id, "diagnose only", "--json")
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["correction_result"]["target_status"] == "succeeded"
+    assert payload["correction_result"]["message_state"] == "accepted"
+
+
+def test_steer_cancel_then_start_is_a_conflict_when_a_continue_wins_the_race(
+    cli: CliRunner, live_daemon: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SPEC `steer`: a `continue` that claims the session between the
+    cancellation and the redirect's own turn leaves that turn untouched and
+    fails the redirect as a `conflict`, with `correction_result` in context.
+
+    Needs a daemon-owned session: on the direct route the same race surfaces
+    as ``ResumePreparationError`` (``agent_error``), not ``ResumeRotationError``
+    (see report, deviation on this test).
+    """
+    session_id = running_daemon_turn(cli, "slow:1 continue race steer")
+    real_cancel_session = cli_module._cancel_session
+
+    def cancel_then_let_a_continue_win(meta: sessions.SessionMeta) -> cli_module._CancelResult:
+        result = real_cancel_session(meta)
+        sessions.rotate_turn(session_id, prompt="a concurrent continue")
+        return result
+
+    monkeypatch.setattr(cli_module, "_cancel_session", cancel_then_let_a_continue_win)
+
+    result = invoke(cli, "steer", session_id, "diagnose only", "--json")
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    error = steer_error(result)
+    assert error["kind"] == "conflict"
+    assert error["context"]["session_id"] == session_id
+    assert error["context"]["correction_result"]["message_state"] == "not_delivered"
+    assert "capabilities" in error["context"]
+    assert sessions.prompt_path(session_id).read_text(encoding="utf-8") == "a concurrent continue"
 
 
 def test_steer_quiet_suppresses_the_stderr_lines(cli: CliRunner) -> None:
@@ -336,6 +397,79 @@ def test_steer_interrupts_a_real_running_turn(cli: CliRunner, live_daemon: None)
     parked = sessions.turn_path(session_id, "answer", 1)
     assert "started" in parked.read_text(encoding="utf-8")
     assert sessions.prompt_path(session_id).read_text(encoding="utf-8").startswith(STEER_PREAMBLE)
+
+
+def test_steer_cancel_then_start_times_out_while_the_turn_still_runs(
+    cli: CliRunner, live_daemon: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SPEC `steer`: a cancellation deadline reached with the selected turn
+    still running is a `timeout`, exit 1, never "finished on its own" — and
+    the cancellation stays requested, so the turn still ends on its own."""
+    monkeypatch.setenv("ACPC_MOCK_IGNORE_CANCEL", "1")
+    monkeypatch.setattr(runner, "CANCEL_ACK_TIMEOUT", 1.0)
+    session_id = running_daemon_turn(cli, "slow:20 cancel deadline")
+
+    result = invoke(cli, "steer", session_id, "diagnose only", "--json")
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    error = steer_error(result)
+    assert error["kind"] == "timeout"
+    assert error["context"]["session_id"] == session_id
+    assert error["context"]["correction_result"] == {
+        "steer_mode": "cancel-then-start",
+        "target_turn": 1,
+        "target_status": "running",
+        "message_state": "not_delivered",
+    }
+    assert "capabilities" in error["context"]
+
+    meta = sessions.read_meta(session_id)
+    assert meta.turns == 1
+    assert not sessions.turn_path(session_id, "prompt", 1).exists()
+    assert "diagnose only" not in sessions.prompt_path(session_id).read_text(encoding="utf-8")
+    assert sessions.load(session_id).state == "running"
+
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline and sessions.load(session_id).state == "running":
+        time.sleep(0.1)
+    assert sessions.load(session_id).state == "canceled"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal semantics")
+def test_steer_cancel_then_start_is_outcome_unknown_when_the_daemon_is_stopped(
+    cli: CliRunner, live_daemon: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SPEC `steer`: the cancellation step failing before it even reaches the
+    daemon still carries `correction_result` and `capabilities` in context —
+    this is the audit's live `SIGSTOP` case (V3b)."""
+    session_id = running_daemon_turn(cli, "slow:5 stopped daemon steer")
+    daemon_pid = sessions.load(session_id).pid
+    assert daemon_pid is not None
+
+    os.kill(daemon_pid, signal.SIGSTOP)
+    try:
+        monkeypatch.setattr(runner, "CANCEL_ACK_TIMEOUT", 0.2)
+        result = invoke(cli, "steer", session_id, "diagnose only", "--json")
+    finally:
+        os.kill(daemon_pid, signal.SIGCONT)
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    error = steer_error(result)
+    assert error["kind"] == "outcome_unknown"
+    assert error["context"]["correction_result"] == {
+        "steer_mode": "cancel-then-start",
+        "target_turn": 1,
+        "target_status": "running",
+        "message_state": "not_delivered",
+    }
+    assert "capabilities" in error["context"]
+
+    deadline = time.monotonic() + 15
+    while (
+        time.monotonic() < deadline and sessions.load(session_id).state not in vocab.FINISHED_STATES
+    ):
+        time.sleep(0.1)
+    assert sessions.load(session_id).state in vocab.FINISHED_STATES
 
 
 def test_steer_interleaved_with_an_in_flight_restore(

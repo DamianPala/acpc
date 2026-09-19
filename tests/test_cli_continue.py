@@ -776,6 +776,21 @@ def test_daemon_reservation_contention_does_not_block_unrelated_sessions(
             blocked.wait(timeout=10)
 
 
+def test_direct_reservation_contention_is_the_same_conflict(cli: CliRunner) -> None:
+    """The direct route classifies a held session like the daemon does: a
+    `conflict`, not an adapter failure — `steer` relies on it after its cancel."""
+    session_id = start_session(cli, "turn one")
+
+    with sessions.session_lock(session_id):
+        result = invoke(cli, "continue", session_id, "turn two", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    envelope = json.loads(result.stderr.splitlines()[-1])["error"]
+    assert envelope["kind"] == "conflict"
+    assert envelope["retryable"] is True
+    assert sessions.read_meta(session_id).state == "succeeded"
+
+
 def test_blocking_continue_emits_the_early_line_before_a_slow_turn_finishes(
     cli: CliRunner, live_daemon: None
 ) -> None:
