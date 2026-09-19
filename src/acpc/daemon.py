@@ -58,6 +58,10 @@ IDLE_CHECK_INTERVAL = 0.5
 # bound the instruction may or may not have landed. A test can lower it.
 STEER_REQUEST_TIMEOUT = 10.0
 
+# The adapter must answer `initialize` before the daemon accepts a turn. A test
+# can lower this bound; a hung adapter must never hold a session in `starting`.
+HOST_START_TIMEOUT = 60.0
+
 # Frames name their operation under this key.
 OP = "op"
 
@@ -101,6 +105,10 @@ class SpawnArgvMismatch(DaemonError):
     """The live entry now requires a different adapter process argv."""
 
 
+class AdapterHandshakeTimeout(DaemonError):
+    """The adapter did not answer the ACP initialize handshake in time."""
+
+
 def log_path_for_target(target: str) -> Path:
     """Where this target's daemon and adapter stderr go (SPEC.md `daemon`)."""
     return paths.daemon_dir() / f"{target}.log"
@@ -138,6 +146,8 @@ def _refusal_kind(error: BaseException) -> str | None:
         return errors.CORRUPT_STATE
     if isinstance(error, sessions.SessionNotFound):
         return errors.NOT_FOUND
+    if isinstance(error, AdapterHandshakeTimeout):
+        return errors.AGENT_ERROR
     return None
 
 
@@ -146,7 +156,7 @@ class _Turn:
     """One in-flight turn owned by this daemon."""
 
     session_id: str
-    task: "asyncio.Task[runner.TurnOutcome] | None"
+    task: "asyncio.Task[Any] | None"
     cancel: runner._CancelSignal
     phase: str = "preparing"
     claim_established: bool = False
@@ -362,7 +372,15 @@ class AdapterHost:
                     drain_stderr=True,
                 )
             )
-            initialize = await conn.initialize(protocol_version=PROTOCOL_VERSION)
+            try:
+                initialize = await asyncio.wait_for(
+                    conn.initialize(protocol_version=PROTOCOL_VERSION),
+                    timeout=HOST_START_TIMEOUT,
+                )
+            except TimeoutError as error:
+                raise AdapterHandshakeTimeout(
+                    f"adapter handshake did not complete within {HOST_START_TIMEOUT:g}s"
+                ) from error
         except BaseException:
             # A cancelled preparation can interrupt initialize after the
             # adapter process and its transport have been entered, before the
@@ -683,10 +701,13 @@ class Daemon:
         if turn is None:
             return {"ok": False, "error": f"session {session_id} is not running here"}
         turn.cancel.request("canceled")
-        if turn.phase == "preparing" and turn.preparation_cancelable and turn.task is not None:
-            # Preparation has no prompt task whose ACP cancellation can wind it
-            # down. Cancelling the daemon-owned preparation task runs its
-            # reservation, adapter binding and replay-generation finalizers.
+        if (
+            turn.phase == "preparing"
+            and turn.task is not None
+            and (not turn.claim_established or turn.preparation_cancelable)
+        ):
+            # During cold start this is the request handler itself; after
+            # acceptance it is the daemon-owned preparation/turn task.
             turn.task.cancel()
         return {"ok": True, "turn_token": turn.turn_token}
 
@@ -829,6 +850,7 @@ class Daemon:
             ),
         )
         self.turns[session_id] = turn
+        turn.task = asyncio.current_task()
         self._last_busy = time.monotonic()
 
         try:
@@ -839,7 +861,10 @@ class Daemon:
                     request = runner._prepare_resumed_turn(
                         session_id, request, events, pid=os.getpid()
                     )
-            else:
+            if not self.host.started or self.host._adapter_died():
+                await self.host.ensure(request.resolution)
+            self._record_steer_mode(session_id)
+            if not preparation:
                 sessions.mark_running(session_id, pid=os.getpid())
                 transcript.Transcript(sessions.transcript_path(session_id)).append(
                     "state", **{"from": "starting", "to": "running"}
@@ -859,8 +884,44 @@ class Daemon:
                 "preserve_session": preparation,
             }
         except BaseException as error:  # noqa: BLE001
-            self._rollback_preparation(session_id, turn)
-            self.turns.pop(session_id, None)
+            canceled = isinstance(error, asyncio.CancelledError) and turn.cancel.state == "canceled"
+            stop_reason = "error"
+            if isinstance(error, asyncio.CancelledError) and turn.cancel.state == "failed":
+                # The daemon is shutting down under this handshake: the session
+                # records that reason, the way a running turn does.
+                stop_reason = turn.cancel.stop_reason or "the daemon was stopped"
+                error = runner.TurnEndedByAcpc(stop_reason)
+            finalized = False
+            if preparation:
+                if canceled and turn.backup is not None:
+                    expected_turn = sessions.read_meta(session_id).turns
+                    outcome = runner.TurnOutcome(
+                        state="canceled",
+                        stop_reason=runner.PREPARATION_CANCELLED_REASON,
+                        answer=runner.preparation_cancelled_answer(session_id),
+                        turn_token=expected_turn,
+                    )
+                    runner._finalize(session_id, outcome, expected_turn=expected_turn)
+                    self._finish(session_id, outcome)
+                    finalized = True
+                else:
+                    self._rollback_preparation(session_id, turn)
+            elif canceled:
+                outcome = runner.TurnOutcome(state="canceled", stop_reason="canceled", answer="")
+                runner._finalize(session_id, outcome)
+                self._finish(session_id, outcome)
+                finalized = True
+            else:
+                with contextlib.suppress(Exception):
+                    sessions.update_meta(session_id, steer_mode=vocab.STEER_CANCEL_THEN_START)
+                with contextlib.suppress(Exception):
+                    runner._finalize(
+                        session_id,
+                        runner.TurnOutcome(state="failed", stop_reason=stop_reason, answer=""),
+                        error=error,
+                    )
+            if not finalized:
+                self.turns.pop(session_id, None)
             return {
                 "ok": False,
                 "error": runner.describe_error(error),
@@ -868,6 +929,7 @@ class Daemon:
                 "preserve_session": preparation,
             }
 
+        turn.task = None
         turn_coro = self._run_accepted_turn(session_id, request, turn)
         try:
             task = asyncio.create_task(turn_coro, name=f"acpc.turn.{session_id}")
@@ -1441,15 +1503,16 @@ class Daemon:
         turn.phase = "running"
         self.host.adapter_sessions[session_id] = adapter_session_id
         # SPEC.md `steer`: support is read from `initialize` and recorded on the
-        # session. This is the moment the record is true — the prompt is in
-        # flight, so an in-place correction has a turn to reach.
-        modes = (
-            list(vocab.STEER_MODES)
-            if self.host.steering_supported
-            else [vocab.STEER_CANCEL_THEN_START]
-        )
+        # session. The start receipt records it earlier; this callback keeps the
+        # record correct for any path that reaches prompt delivery later.
         with contextlib.suppress(OSError, sessions.SessionError):
-            sessions.update_meta(session_id, steer_modes=modes)
+            self._record_steer_mode(session_id)
+
+    def _record_steer_mode(self, session_id: str) -> None:
+        mode = (
+            vocab.STEER_IN_PLACE if self.host.steering_supported else vocab.STEER_CANCEL_THEN_START
+        )
+        sessions.update_meta(session_id, steer_mode=mode)
 
     def _finish(
         self, session_id: str, outcome: runner.TurnOutcome, *, error: BaseException | None = None

@@ -544,9 +544,9 @@ def test_the_steer_result_publishes_the_correction_it_made(
 
     status = read_detail(runner, "status")["output"]
     assert "capabilities" in status["required"]
-    modes = status["properties"]["capabilities"]["properties"]["steer_modes"]
-    assert modes["type"] == ["array", "null"]
-    assert modes["items"] == {"type": "string"}
+    mode = status["properties"]["capabilities"]["properties"]["steer_mode"]
+    assert mode["type"] == "string"
+    assert mode["enum"] == ["in-place", "cancel-then-start"]
 
     log_types = read_detail(runner, "log")["output"]["properties"]["type"]["enum"]
     assert "steer" in log_types

@@ -72,6 +72,7 @@ EXPECTED_REQUIRED: dict[str, tuple[str, ...]] = {
         "partial",
         "denied",
         "permissions_clamp",
+        "capabilities",
         "changed",
     ),
     "daemon status": ("items", "has_more"),
@@ -115,6 +116,7 @@ EXPECTED_REQUIRED: dict[str, tuple[str, ...]] = {
         "partial",
         "denied",
         "permissions_clamp",
+        "capabilities",
         "changed",
     ),
     "skills get": ("name", "description", "path", "body"),
@@ -152,9 +154,9 @@ EXPECTED_REQUIRED: dict[str, tuple[str, ...]] = {
         "truncated",
         "denied",
         "permissions_clamp",
+        "capabilities",
         "changed",
         "turn",
-        "capabilities",
         "correction_result",
     ),
     "wait": (
@@ -171,6 +173,7 @@ EXPECTED_REQUIRED: dict[str, tuple[str, ...]] = {
         "partial",
         "denied",
         "permissions_clamp",
+        "capabilities",
     ),
 }
 
@@ -185,7 +188,10 @@ EXPECTED_ENUMS: dict[str, dict[str, tuple[str, ...]]] = {
             "unknown",
         )
     },
-    "continue": {"$.status": ("running", "succeeded", "failed", "canceled", "unknown")},
+    "continue": {
+        "$.status": ("running", "succeeded", "failed", "canceled", "unknown"),
+        "$.capabilities.steer_mode": ("in-place", "cancel-then-start"),
+    },
     "log": {
         "$.type": tuple(
             sorted(("error", "msg", "permission", "state", "steer", "thought", "tool", "usage"))
@@ -194,7 +200,10 @@ EXPECTED_ENUMS: dict[str, dict[str, tuple[str, ...]]] = {
     "probe": {
         "$.diff[].status": ("advertised-missing", "entry-missing"),
     },
-    "run": {"$.status": ("running", "succeeded", "failed", "canceled", "unknown")},
+    "run": {
+        "$.status": ("running", "succeeded", "failed", "canceled", "unknown"),
+        "$.capabilities.steer_mode": ("in-place", "cancel-then-start"),
+    },
     "list": {
         "$.items[].status": (
             "starting",
@@ -215,10 +224,17 @@ EXPECTED_ENUMS: dict[str, dict[str, tuple[str, ...]]] = {
             "failed",
             "canceled",
             "unknown",
-        )
+        ),
+        "$.capabilities.steer_mode": ("in-place", "cancel-then-start"),
     },
-    "steer": {"$.status": ("running", "succeeded")},
-    "wait": {"$.status": ("running", "succeeded", "failed", "canceled", "unknown")},
+    "steer": {
+        "$.status": ("running", "succeeded"),
+        "$.capabilities.steer_mode": ("in-place", "cancel-then-start"),
+    },
+    "wait": {
+        "$.status": ("running", "succeeded", "failed", "canceled", "unknown"),
+        "$.capabilities.steer_mode": ("in-place", "cancel-then-start"),
+    },
 }
 
 

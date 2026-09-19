@@ -3085,6 +3085,7 @@ def prune_command(
 
 def _load_view_session(selector: str) -> sessions.SessionMeta:
     """Verify liveness before a targeted view reports a session."""
+    session_id = selector
     try:
         # `last` is a convenience for whoever is at the keyboard, so it turns
         # on the same rule as every other question acpc puts to a person.
@@ -3094,7 +3095,12 @@ def _load_view_session(selector: str) -> sessions.SessionMeta:
         )
         return sessions.load(session_id)
     except sessions.SessionError as error:
-        raise _session_problem(error) from None
+        problem = _session_problem(error)
+        if isinstance(error, sessions.SessionNotFound):
+            problem = problem.with_context(session_id=selector, status=None)
+        else:
+            problem = problem.with_context(session_id=session_id)
+        raise problem from None
 
 
 async def _collect_preparing_sessions(targets: Sequence[str]) -> set[str]:
@@ -4700,8 +4706,7 @@ def _steer_prompt(instruction: str) -> str:
 
 _STEER_MODE_HELP = (
     "How the correction reaches the turn: in-place keeps the turn, cancel-then-start interrupts "
-    "it and starts a new one; default: in-place when the session supports it, else "
-    "cancel-then-start."
+    "it and starts a new one; default: the session's capabilities.steer_mode."
 )
 
 # The daemon bounds its own `_session/steering` request at 10 s; this is that
@@ -4842,7 +4847,7 @@ def steer_command(
             f"session {meta.session_id} is {meta.state} — there is no turn to interrupt",
             kind=errors.CONFLICT,
             hint=f"Run: acpc continue {meta.session_id}",
-            context={"session_id": meta.session_id},
+            context={"session_id": meta.session_id, "capabilities": _steer_capabilities(meta)},
         )
 
     selected_mode = _select_steer_mode(meta, steer_mode)
@@ -4877,7 +4882,7 @@ def steer_command(
 
 def _steer_capabilities(meta: sessions.SessionMeta) -> dict[str, Any]:
     """The capability block every `steer` result and every steer failure carries."""
-    return {"steer_modes": list(meta.steer_modes) if meta.steer_modes else None}
+    return {"steer_mode": meta.steer_mode or vocab.STEER_CANCEL_THEN_START}
 
 
 def _in_place_unsupported(meta: sessions.SessionMeta) -> AcpcError:
@@ -4903,16 +4908,13 @@ def _select_steer_mode(meta: sessions.SessionMeta, explicit: str | None) -> str:
     fails as `not_supported` with no effect, and there is never a silent
     fallback to the other mode.
     """
-    supported = meta.steer_modes or []
     if explicit == vocab.STEER_IN_PLACE and (
-        vocab.STEER_IN_PLACE not in supported or meta.target is None
+        meta.steer_mode != vocab.STEER_IN_PLACE or meta.target is None
     ):
         raise _in_place_unsupported(meta)
     if explicit is not None:
         return explicit
-    if meta.target is not None and vocab.STEER_IN_PLACE in supported:
-        return vocab.STEER_IN_PLACE
-    return vocab.STEER_CANCEL_THEN_START
+    return meta.steer_mode or vocab.STEER_CANCEL_THEN_START
 
 
 def _steer_cancel_then_start(

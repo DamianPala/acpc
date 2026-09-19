@@ -110,6 +110,7 @@ EXPECTED_REQUIRED_FIELDS = {
         "partial",
         "denied",
         "permissions_clamp",
+        "capabilities",
         "changed",
     },
     "daemon status": {"items", "has_more"},
@@ -146,6 +147,7 @@ EXPECTED_REQUIRED_FIELDS = {
         "partial",
         "denied",
         "permissions_clamp",
+        "capabilities",
         "changed",
     },
     "skills get": {"name", "description", "path", "body"},
@@ -201,6 +203,7 @@ EXPECTED_REQUIRED_FIELDS = {
         "partial",
         "denied",
         "permissions_clamp",
+        "capabilities",
     },
 }
 # The commands that print an answer, and therefore share one result shape
@@ -234,6 +237,7 @@ EXPECTED_OUTPUT_ENUMS = {
     "agents list.output.items[].kind": {"adapter", "variant"},
     "cancel.output.status": {"running", "succeeded", "failed", "canceled", "unknown"},
     "continue.output.status": {"running", "succeeded", "failed", "canceled", "unknown"},
+    "continue.output.capabilities.steer_mode": {"in-place", "cancel-then-start"},
     "list.output.items[].status": {
         "starting",
         "running",
@@ -261,6 +265,7 @@ EXPECTED_OUTPUT_ENUMS = {
         "canceled",
         "unknown",
     },
+    "run.output.capabilities.steer_mode": {"in-place", "cancel-then-start"},
     "status.output.status": {
         "starting",
         "running",
@@ -270,7 +275,9 @@ EXPECTED_OUTPUT_ENUMS = {
         "canceled",
         "unknown",
     },
+    "status.output.capabilities.steer_mode": {"in-place", "cancel-then-start"},
     "steer.output.status": {"running", "succeeded"},
+    "steer.output.capabilities.steer_mode": {"in-place", "cancel-then-start"},
     "wait.output.status": {
         "running",
         "succeeded",
@@ -278,6 +285,7 @@ EXPECTED_OUTPUT_ENUMS = {
         "canceled",
         "unknown",
     },
+    "wait.output.capabilities.steer_mode": {"in-place", "cancel-then-start"},
 }
 
 EXPECTED_EFFECTS = {
@@ -331,6 +339,7 @@ _SESSION_OUTPUT_PROPERTIES = frozenset(
         "output_file",
         "denied",
         "permissions_clamp",
+        "capabilities",
         "next",
         "resume",
         "created_at",
@@ -352,7 +361,7 @@ _RESOLUTION_CLAMP_REQUIRED = frozenset({"requested", "ceiling", "effective"})
 
 # What `steer` publishes about the correction it made, in both modes.
 _STEER_RESULT_PROPERTIES = frozenset({"turn", "capabilities", "correction_result"})
-_STEER_CAPABILITIES_PROPERTIES = frozenset({"steer_modes"})
+_STEER_CAPABILITIES_PROPERTIES = frozenset({"steer_mode"})
 _STEER_CORRECTION_PROPERTIES = frozenset(
     {"steer_mode", "target_turn", "target_status", "message_state"}
 )
@@ -368,6 +377,7 @@ def _session_output_oracle(
         properties -= {"partial"}
     return {
         "output": (properties, frozenset(required)),
+        "output.capabilities": (_STEER_CAPABILITIES_PROPERTIES, _STEER_CAPABILITIES_PROPERTIES),
         "output.paths": (_PATHS_PROPERTIES, frozenset(_PATHS_PROPERTIES)),
         "output.denied[]": (_DENIAL_PROPERTIES, frozenset(_DENIAL_PROPERTIES - {"target"})),
         "output.permissions_clamp": (
@@ -2152,8 +2162,12 @@ def _observe_session_statuses(
             sessions.transition(session_id, state, exit_code=0, stop_reason="test")
         result = invoke(cli, "status", session_id, "--json")
         assert result.exit_code == vocab.EXIT_OK
-        status = json.loads(result.stdout)["status"]
+        document = json.loads(result.stdout)
+        status = document["status"]
         observed["status.output.status"] = observed.get("status.output.status", set()) | {status}
+        observed.setdefault("status.output.capabilities.steer_mode", set()).add(
+            document["capabilities"]["steer_mode"]
+        )
     listed = invoke(cli, "list", "--json")
     assert listed.exit_code == vocab.EXIT_OK, listed.stderr
     observed["list.output.items[].status"] = {
@@ -2283,6 +2297,11 @@ def _record_observed_status(
         assert isinstance(parsed, dict), name
         document = parsed
         observed.setdefault(f"{name}.output.status", set()).add(document["status"])
+        capabilities = document.get("capabilities")
+        if isinstance(capabilities, dict):
+            observed.setdefault(f"{name}.output.capabilities.steer_mode", set()).add(
+                capabilities["steer_mode"]
+            )
     else:
         assert result.stdout == "", name
     if error_kind is None:
@@ -2307,6 +2326,11 @@ def _observe_work_statuses(cli: CliRunner, observed: dict[str, set[Any]]) -> Non
         return json.loads(result.stdout)["session_id"]
 
     base_id = finished_base()
+    base_status = invoke(cli, "status", base_id, "--json")
+    assert base_status.exit_code == vocab.EXIT_OK, base_status.stderr
+    observed.setdefault("status.output.capabilities.steer_mode", set()).add(
+        json.loads(base_status.stdout)["capabilities"]["steer_mode"]
+    )
     _record_observed_status(
         "run", call("run", "mock", "echo:enum run"), observed, exit_code=vocab.EXIT_OK
     )
@@ -2358,15 +2382,15 @@ def _observe_work_statuses(cli: CliRunner, observed: dict[str, set[Any]]) -> Non
     )
 
     steer_id = _background_session(cli, "slow:30 enum steer base")
+    _wait_for_meta(
+        steer_id,
+        lambda meta: any(
+            isinstance(entry, dict) and entry.get("turn") == meta.turns
+            for entry in meta.extra.get("delivered_prompts", [])
+        ),
+    )
     _record_observed_status(
         "steer", call("steer", steer_id, "echo:enum steer"), observed, exit_code=vocab.EXIT_OK
-    )
-    steer_background_id = _background_session(cli, "slow:30 enum steer background")
-    _record_observed_status(
-        "steer",
-        call("steer", steer_background_id, "echo:enum steer background", "--background"),
-        observed,
-        exit_code=vocab.EXIT_OK,
     )
 
     with _direct_child_route():
@@ -2465,6 +2489,44 @@ def _observe_work_statuses(cli: CliRunner, observed: dict[str, set[Any]]) -> Non
     assert _error(starting_result)["context"]["status"] == "starting"
 
 
+def _observe_cancel_steer(
+    cli: CliRunner,
+    state_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    observed: dict[str, set[Any]],
+) -> None:
+    """Observe the cancel-then-start steer enum on a separate cold target."""
+    (state_root / "agents" / "plain.toml").write_text('extends = "mock"\n', encoding="utf-8")
+    monkeypatch.delenv("ACPC_MOCK_STEERING", raising=False)
+    result = invoke(cli, "run", "plain", "slow:30 enum cancel steer", "--bg", "--json")
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    session_id = json.loads(result.stdout)["session_id"]
+    _wait_for_meta(
+        session_id,
+        lambda meta: (
+            meta.state == "running"
+            and any(
+                isinstance(entry, dict) and entry.get("turn") == meta.turns
+                for entry in meta.extra.get("delivered_prompts", [])
+            )
+        ),
+    )
+    _record_observed_status(
+        "steer",
+        invoke(
+            cli,
+            "steer",
+            session_id,
+            "echo:cancel steer",
+            "--background",
+            "--json",
+            "--quiet",
+        ),
+        observed,
+        exit_code=vocab.EXIT_OK,
+    )
+
+
 def _observe_log_types(cli: CliRunner, observed: dict[str, set[Any]]) -> None:
     log_id = sessions.create_session(entry="mock", base_adapter="mock", prompt="events").session_id
     events = transcript.Transcript(sessions.transcript_path(log_id))
@@ -2532,11 +2594,38 @@ def test_O4c_declared_enums_have_reachable_values(
     index = read_index(cli)
     observed: dict[str, set[Any]] = {}
     _observe_flag_enums(cli, index, state_root, observed)
+    _stop_all_started_daemons()
+    monkeypatch.setenv("ACPC_MOCK_STEERING", "1")
     _observe_session_statuses(cli, observed, monkeypatch)
     _observe_work_statuses(cli, observed)
+    _observe_cancel_steer(cli, state_root, monkeypatch, observed)
     _observe_log_types(cli, observed)
     _observe_discovery_enums(cli, state_root, observed)
     _assert_reachable_output_enums(cli, index, observed)
+
+
+def _stop_all_started_daemons() -> None:
+    async def stop() -> None:
+        pids: list[int] = []
+        for target in runner.all_daemon_targets():
+            daemon = await daemon_client.connect(target)
+            if daemon is None:
+                continue
+            try:
+                pid = (await daemon.status()).get("pid")
+                if isinstance(pid, int):
+                    pids.append(pid)
+                await daemon.stop()
+            finally:
+                await daemon.close()
+        deadline = time.monotonic() + 10
+        while pids and time.monotonic() < deadline:
+            pids = [pid for pid in pids if proc.process_cmdline(pid)]
+            if pids:
+                await asyncio.sleep(0.02)
+        assert not pids, f"daemons did not exit: {pids}"
+
+    asyncio.run(stop())
 
 
 def _start_daemon_pair(cli: CliRunner) -> tuple[str, str, int]:

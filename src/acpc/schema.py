@@ -121,6 +121,16 @@ _SESSION_RESULT_PROPERTIES = {
     "partial": _BOOLEAN,
     "output_file": _STRING,
     "denied": _array(_DENIAL),
+    "capabilities": {
+        "type": "object",
+        "properties": {
+            "steer_mode": {
+                "type": "string",
+                "enum": ["in-place", "cancel-then-start"],
+            }
+        },
+        "required": ["steer_mode"],
+    },
     "permissions_clamp": {
         "type": ["object", "null"],
         "properties": _PERMISSIONS_CLAMP["properties"],
@@ -200,6 +210,7 @@ def _session_result_schema(
         "truncated",
         "denied",
         "permissions_clamp",
+        "capabilities",
     ]
     if include_partial:
         required.insert(7, "partial")
@@ -211,8 +222,8 @@ def _session_result_schema(
 
 
 _STEER_CAPABILITIES = _object(
-    {"steer_modes": {"type": ["array", "null"], "items": _STRING}},
-    ("steer_modes",),
+    {"steer_mode": {"type": "string", "enum": ["in-place", "cancel-then-start"]}},
+    ("steer_mode",),
 )
 _STEER_CORRECTION = _object(
     {
@@ -223,9 +234,9 @@ _STEER_CORRECTION = _object(
     },
     ("steer_mode", "target_turn", "target_status", "message_state"),
 )
-# Every `steer` result carries these three on top of the shared session
-# result: which turn to observe next, what the session supports, and what
-# acpc knows about the correction it just sent.
+# Every `steer` result carries these two fields on top of the shared session
+# result: which turn to observe next and what acpc knows about the correction
+# it just sent. The capability block belongs to the shared result shape.
 _STEER_RESULT_PROPERTIES = {
     "turn": _INTEGER,
     "capabilities": _STEER_CAPABILITIES,
@@ -236,7 +247,10 @@ _STEER_RESULT_PROPERTIES = {
 def _steer_schema() -> dict[str, Any]:
     schema = _session_result_schema(changed=True, status=_STEER_STATUS, include_partial=False)
     schema["properties"].update(_STEER_RESULT_PROPERTIES)
-    schema["required"] = [*schema["required"], *_STEER_RESULT_PROPERTIES]
+    schema["required"] = [
+        *schema["required"],
+        *[name for name in _STEER_RESULT_PROPERTIES if name not in schema["required"]],
+    ]
     return schema
 
 

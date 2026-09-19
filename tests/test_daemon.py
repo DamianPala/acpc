@@ -24,7 +24,18 @@ from acp.client import ClientSideConnection
 from acp.schema import AgentMessageChunk
 from click.testing import CliRunner
 
-from acpc import __version__, daemon, daemon_client, ipc, output, proc, runner, sessions, vocab
+from acpc import (
+    __version__,
+    daemon,
+    daemon_client,
+    errors,
+    ipc,
+    output,
+    proc,
+    runner,
+    sessions,
+    vocab,
+)
 from acpc.cli import main
 from acpc.client import REPLAY_GENERATION_KEY, AcpcClient
 from acpc.permissions import PermissionLevel, select_mode
@@ -124,6 +135,101 @@ def dispatch_payload(prompt: str = "x") -> dict:
 
 def rebuild(payload: dict) -> runner.TurnRequest:
     return daemon.Daemon(target())._rebuild_request(payload)
+
+
+def test_hung_initialize_fails_the_session_with_a_handshake_diagnosis(
+    state_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    del state_root
+    monkeypatch.setenv("ACPC_MOCK_INIT_HANG", "1")
+    monkeypatch.setattr(daemon, "HOST_START_TIMEOUT", 0.2)
+    session_id = new_session("handshake timeout")
+    instance = daemon.Daemon(target())
+
+    async def start() -> dict[str, Any]:
+        try:
+            return await instance._start(
+                {"session_id": session_id, "payload": dispatch_payload("handshake timeout")}
+            )
+        finally:
+            await instance.host.close()
+
+    async def start_with_test_deadline() -> dict[str, Any]:
+        return await asyncio.wait_for(start(), timeout=2)
+
+    started_at = time.monotonic()
+    reply = asyncio.run(start_with_test_deadline())
+    elapsed = time.monotonic() - started_at
+    meta = sessions.read_meta(session_id)
+
+    assert elapsed < 2
+    assert reply["ok"] is False
+    assert reply["kind"] == errors.AGENT_ERROR
+    assert "handshake" in reply["error"]
+    assert meta.state == "failed"
+    assert meta.stop_reason == "error"
+    assert "handshake" in (meta.failure or "")
+    assert meta.steer_mode == vocab.STEER_CANCEL_THEN_START
+
+
+def test_handshake_failure_still_finalizes_when_mode_metadata_fails(
+    state_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    del state_root
+    monkeypatch.setenv("ACPC_MOCK_INIT_HANG", "1")
+    monkeypatch.setattr(daemon, "HOST_START_TIMEOUT", 0.2)
+    session_id = new_session("metadata write failure")
+    instance = daemon.Daemon(target())
+
+    def fail_mode_write(session: str, **changes: Any) -> Any:
+        del session, changes
+        raise OSError("metadata write failed")
+
+    monkeypatch.setattr(sessions, "update_meta", fail_mode_write)
+
+    async def start() -> dict[str, Any]:
+        try:
+            return await instance._start(
+                {"session_id": session_id, "payload": dispatch_payload("metadata write failure")}
+            )
+        finally:
+            await instance.host.close()
+
+    asyncio.run(start())
+
+    assert sessions.read_meta(session_id).state == "failed"
+
+
+def test_a_stop_during_the_handshake_records_the_stop_reason(
+    state_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    del state_root
+    monkeypatch.setenv("ACPC_MOCK_INIT_HANG", "1")
+    session_id = new_session("stopped during handshake")
+    instance = daemon.Daemon(target())
+
+    async def start_then_stop() -> dict[str, Any]:
+        starting = asyncio.create_task(
+            instance._start(
+                {"session_id": session_id, "payload": dispatch_payload("stopped during handshake")}
+            )
+        )
+        try:
+            while session_id not in instance.turns or not instance.host._starting.locked():
+                await asyncio.sleep(0.02)
+            await instance._shut_down_sessions("the daemon was stopped")
+            return await asyncio.wait_for(starting, timeout=2)
+        finally:
+            await instance.host.close()
+
+    reply = asyncio.run(start_then_stop())
+    meta = sessions.read_meta(session_id)
+
+    assert reply["ok"] is False
+    assert reply["error"] == "the daemon was stopped"
+    assert meta.state == "failed"
+    assert meta.stop_reason == "the daemon was stopped"
+    assert "the daemon was stopped" in (meta.failure or "")
 
 
 @asynccontextmanager

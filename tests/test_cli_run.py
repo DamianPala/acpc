@@ -645,6 +645,7 @@ def test_a_daemon_routed_failure_still_reports_the_result(
     document = json.loads(result.stdout)
     assert document["status"] == "failed"
     assert document["partial"] is False
+    assert document["capabilities"] == {"steer_mode": "cancel-then-start"}
     assert document["answer"] != ""
     assert "-- failed" in result.stderr
 
@@ -742,6 +743,86 @@ def test_background_run_does_not_emit_the_early_line(cli: CliRunner, live_daemon
 
     assert result.exit_code == vocab.EXIT_OK
     assert "-- session " not in result.stderr
+
+
+def test_cold_background_receipt_waits_for_initialize(
+    cli: CliRunner, live_daemon: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ACPC_MOCK_STEERING", "1")
+    monkeypatch.setenv("ACPC_MOCK_INIT_DELAY", "1")
+
+    started_at = time.monotonic()
+    result = invoke(cli, "run", "mock", "echo:delayed receipt", "--bg", "--json")
+    elapsed = time.monotonic() - started_at
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    # Only the lower bound proves the receipt waited for `initialize`; the
+    # cold daemon and adapter start on a loaded host are not under test.
+    assert elapsed >= 0.9
+    document = json.loads(result.stdout)
+    assert document["capabilities"] == {"steer_mode": "in-place"}
+    status = json.loads(invoke(cli, "status", document["session_id"], "--json").stdout)
+    assert status["capabilities"] == document["capabilities"]
+
+
+def test_cold_timeout_covers_initialize_and_leaves_turn_running(
+    cli: CliRunner, live_daemon: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ACPC_MOCK_INIT_DELAY", "8")
+
+    started_at = time.monotonic()
+    result = invoke(cli, "run", "mock", "echo:cold timeout", "--timeout", "2", "--json")
+    elapsed = time.monotonic() - started_at
+
+    assert result.exit_code == vocab.EXIT_TIMEOUT, result.stderr
+    assert elapsed < 5
+    assert result.stdout == ""
+    error = error_envelope(result)
+    assert error["kind"] == "timeout"
+    session_id = error["context"]["session_id"]
+    assert error["context"]["status"] in {"starting", "preparing"}
+
+    waited = invoke(cli, "wait", session_id, "--json")
+
+    assert waited.exit_code == vocab.EXIT_OK, waited.stderr
+    assert "cold timeout" in json.loads(waited.stdout)["answer"]
+
+
+def test_background_receipt_and_immediate_status_share_capabilities(
+    cli: CliRunner, live_daemon: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ACPC_MOCK_STEERING", "1")
+
+    result = invoke(cli, "run", "mock", "echo:matching capability", "--bg", "--json")
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    document = json.loads(result.stdout)
+    status = json.loads(invoke(cli, "status", document["session_id"], "--json").stdout)
+    assert document["capabilities"] == {"steer_mode": "in-place"}
+    assert status["capabilities"] == document["capabilities"]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ("status", "missing", "--json"),
+        ("wait", "missing", "--json"),
+        ("cancel", "missing", "--json"),
+        ("steer", "missing", "x", "--json"),
+        ("continue", "missing", "x", "--json"),
+        ("log", "missing", "--json"),
+        ("delete", "missing", "--yes", "--json"),
+    ],
+)
+def test_missing_session_errors_identify_the_supplied_selector(
+    cli: CliRunner, command: tuple[str, ...]
+) -> None:
+    result = invoke(cli, *command)
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    error = error_envelope(result)
+    assert error["kind"] == "not_found"
+    assert error["context"] == {"session_id": "missing", "status": None}
 
 
 def test_quiet_suppresses_the_stderr_summary(cli: CliRunner) -> None:
@@ -872,6 +953,7 @@ def test_json_output_carries_the_session_id_and_paths(cli: CliRunner) -> None:
     payload = json.loads(result.stdout)
     assert payload["session_id"]
     assert payload["paths"]["answer"].endswith("answer.md")
+    assert payload["capabilities"] == {"steer_mode": "cancel-then-start"}
     assert "as json" in payload["answer"]
 
 

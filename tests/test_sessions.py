@@ -372,6 +372,50 @@ class TestLivenessAndOrphans:
         assert sessions.load(meta.session_id, clock=at(2.0)).state == "unknown"
 
 
+class TestSteerModeMetadata:
+    @pytest.mark.parametrize(
+        ("legacy", "expected"),
+        [
+            (["in-place", "cancel-then-start"], "in-place"),
+            (["cancel-then-start"], "cancel-then-start"),
+        ],
+    )
+    def test_legacy_mode_lists_are_read_as_one_mode(self, legacy: list[str], expected: str) -> None:
+        meta = make_session()
+        path = sessions.meta_path(meta.session_id)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data.pop("steer_mode", None)
+        data["steer_modes"] = legacy
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+        loaded = sessions.read_meta(meta.session_id)
+
+        assert loaded.steer_mode == expected
+        sessions.write_meta(loaded)
+        written = json.loads(path.read_text(encoding="utf-8"))
+        assert written["steer_mode"] == expected
+        assert "steer_modes" not in written
+
+    def test_missing_mode_is_read_as_none_and_published_as_legacy_default(self) -> None:
+        meta = make_session()
+
+        assert meta.steer_mode is None
+        assert "steer_mode" in json.loads(
+            sessions.meta_path(meta.session_id).read_text(encoding="utf-8")
+        )
+
+    def test_unknown_string_mode_is_read_as_the_safe_default(self) -> None:
+        meta = make_session()
+        path = sessions.meta_path(meta.session_id)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["steer_mode"] = "bogus"
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+        loaded = sessions.read_meta(meta.session_id)
+
+        assert loaded.steer_mode == vocab.STEER_CANCEL_THEN_START
+
+
 class TestTurnRotation:
     def test_rotation_parks_both_artifacts_and_counts_the_turn(self) -> None:
         session_id = finished_session()

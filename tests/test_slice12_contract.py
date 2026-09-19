@@ -185,6 +185,10 @@ def test_a_canceled_follow_up_returns_what_was_produced_as_partial(cli: CliRunne
 def test_an_expired_deadline_returns_the_observed_session_as_partial(
     cli: CliRunner, tmp_path: Path, live_daemon: None
 ) -> None:
+    # The deadline now includes cold-daemon startup. Warm the target so this
+    # test isolates the partial-result contract after the turn is observed.
+    warm = invoke(cli, "run", "mock", "echo:warm timeout target", "--json", "--quiet")
+    assert warm.exit_code == vocab.EXIT_OK, warm.stderr
     release = tmp_path / "release-run"
     thread, holder = run_in_thread(
         lambda: invoke(

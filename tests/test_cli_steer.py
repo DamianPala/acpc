@@ -245,6 +245,7 @@ def test_steer_on_a_finished_session_names_continue(cli: CliRunner) -> None:
     assert envelope["kind"] == "conflict"
     assert "there is no turn to interrupt" in envelope["message"]
     assert envelope["hint"] == f"Run: acpc continue {session_id}"
+    assert envelope["context"]["capabilities"] == {"steer_mode": "cancel-then-start"}
 
 
 def test_steer_degrades_to_a_plain_continue_when_the_turn_finished_first(
@@ -549,7 +550,7 @@ def test_steer_in_place_keeps_the_turn_and_queues_the_instruction(
         "target_status": "running",
         "message_state": "accepted",
     }
-    assert document["capabilities"]["steer_modes"] == ["in-place", "cancel-then-start"]
+    assert document["capabilities"] == {"steer_mode": "in-place"}
     assert "partial" not in document
 
     waited = invoke(cli, "wait", session_id, "--json")
@@ -659,7 +660,7 @@ def test_an_explicit_in_place_mode_on_a_session_without_it_changes_nothing(
     assert result.exit_code == vocab.EXIT_AGENT_ERROR
     envelope = json.loads(result.stderr.splitlines()[-1])["error"]
     assert envelope["kind"] == "not_supported"
-    assert envelope["context"]["capabilities"] == {"steer_modes": None}
+    assert envelope["context"]["capabilities"] == {"steer_mode": "cancel-then-start"}
     assert envelope["hint"] == (f"Run: acpc steer {session_id} ... --steer-mode cancel-then-start")
     meta = sessions.load(session_id)
     assert meta.turns == before.turns
@@ -675,7 +676,7 @@ def test_a_daemon_session_without_a_steering_adapter_shows_one_mode(
 
     detail = json.loads(invoke(cli, "status", session_id, "--json").stdout)
 
-    assert detail["capabilities"] == {"steer_modes": ["cancel-then-start"]}
+    assert detail["capabilities"] == {"steer_mode": "cancel-then-start"}
     result = invoke(cli, "steer", session_id, "X", "--bg", "--json")
     assert result.exit_code == vocab.EXIT_OK, result.stderr
     assert json.loads(result.stdout)["correction_result"]["steer_mode"] == "cancel-then-start"
@@ -688,7 +689,7 @@ def test_a_direct_session_supports_only_cancel_then_start(
     session_id, thread = running_direct_session("chunkslow:6 direct steer")
     try:
         detail = json.loads(invoke(cli, "status", session_id, "--json").stdout)
-        assert detail["capabilities"] == {"steer_modes": ["cancel-then-start"]}
+        assert detail["capabilities"] == {"steer_mode": "cancel-then-start"}
         assert (
             "steer: cancel-then-start"
             in invoke(cli, "status", session_id, "--format", "text").stdout
@@ -699,7 +700,7 @@ def test_a_direct_session_supports_only_cancel_then_start(
         assert result.exit_code == vocab.EXIT_AGENT_ERROR
         envelope = steer_error(result)
         assert envelope["kind"] == "not_supported"
-        assert envelope["context"]["capabilities"] == {"steer_modes": ["cancel-then-start"]}
+        assert envelope["context"]["capabilities"] == {"steer_mode": "cancel-then-start"}
         assert sessions.read_meta(session_id).turns == 1
     finally:
         thread.join(timeout=30)
@@ -714,8 +715,10 @@ def test_status_says_unknown_until_a_session_has_reached_an_adapter(
 
     detail = json.loads(invoke(cli, "status", session_id, "--json").stdout)
 
-    assert detail["capabilities"] == {"steer_modes": None}
-    assert "steer: unknown" in invoke(cli, "status", session_id, "--format", "text").stdout
+    assert detail["capabilities"] == {"steer_mode": "cancel-then-start"}
+    assert (
+        "steer: cancel-then-start" in invoke(cli, "status", session_id, "--format", "text").stdout
+    )
 
 
 def test_an_adapter_that_starts_its_own_turn_is_reported_as_unknown(
@@ -828,7 +831,7 @@ def test_in_place_on_a_session_with_no_prompt_in_flight_is_a_conflict(
     starting = sessions.create_session(
         entry="mock", base_adapter="mock", prompt="fresh", target="mock~starting"
     ).session_id
-    sessions.update_meta(starting, steer_modes=["in-place", "cancel-then-start"])
+    sessions.update_meta(starting, steer_mode="in-place")
 
     result = invoke(cli, "steer", starting, "X", "--steer-mode", "in-place")
 
@@ -843,7 +846,7 @@ def test_in_place_on_a_session_with_no_prompt_in_flight_is_a_conflict(
 def test_in_place_on_a_finished_session_names_continue(cli: CliRunner) -> None:
     """The answer is the same in both modes: there is no turn to correct."""
     session_id = finished_mock_session(cli)
-    sessions.update_meta(session_id, steer_modes=["in-place", "cancel-then-start"])
+    sessions.update_meta(session_id, steer_mode="in-place")
 
     result = invoke(cli, "steer", session_id, "X", "--steer-mode", "in-place")
 
@@ -878,7 +881,7 @@ def test_an_unreachable_daemon_is_reported_as_nothing_delivered(
     """SPEC steer: a daemon that cannot be reached sent nothing, and the result
     says so rather than leaving the caller to guess."""
     session_id = mid_turn_session(cli)
-    sessions.update_meta(session_id, steer_modes=["in-place", "cancel-then-start"])
+    sessions.update_meta(session_id, steer_mode="in-place")
 
     async def gone(target: str, selector: str, text: str) -> daemon_client.DaemonUnavailable:
         return daemon_client.DaemonUnavailable("no live daemon")
@@ -900,7 +903,7 @@ def test_a_daemon_that_never_answers_is_reported_as_unknown(
     """SPEC steer: a request that may have crossed is never reported as
     delivered or as refused."""
     session_id = mid_turn_session(cli)
-    sessions.update_meta(session_id, steer_modes=["in-place", "cancel-then-start"])
+    sessions.update_meta(session_id, steer_mode="in-place")
 
     async def silent(target: str, selector: str, text: str) -> None:
         return None
@@ -921,7 +924,7 @@ def test_ctrl_c_during_a_blocking_in_place_steer_leaves_the_turn_running(
     """SPEC steer: an in-place steer owns no turn, so Ctrl-C behaves like `wait`
     (exit 130, the turn runs on) and still names the correction it had made."""
     session_id = mid_turn_session(cli)
-    sessions.update_meta(session_id, steer_modes=["in-place", "cancel-then-start"])
+    sessions.update_meta(session_id, steer_mode="in-place")
 
     async def accepted(target: str, selector: str, text: str) -> dict[str, Any]:
         return {"ok": True, "outcome": "injected", "turn_token": 1}
@@ -949,7 +952,7 @@ def test_a_turn_that_ends_canceled_after_an_accepted_correction_is_a_failure(
     """SPEC steer: the instruction was accepted; what the turn then did is the
     session's own result, reported as `operation_failed` with no document."""
     session_id = mid_turn_session(cli)
-    sessions.update_meta(session_id, steer_modes=["in-place", "cancel-then-start"])
+    sessions.update_meta(session_id, steer_mode="in-place")
 
     async def accepted(target: str, selector: str, text: str) -> dict[str, Any]:
         return {"ok": True, "outcome": "injected", "turn_token": 1}

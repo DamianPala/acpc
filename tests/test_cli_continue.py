@@ -1172,6 +1172,28 @@ def test_continue_post_rotation_failure_finalizes_the_new_turn(
     assert failed.stop_reason == "error"
 
 
+def test_continue_failure_result_contains_capabilities(
+    cli: CliRunner,
+) -> None:
+    session_id = start_session(cli)
+
+    result = invoke(
+        cli,
+        "continue",
+        session_id,
+        "chunkslow:5 partial follow-up",
+        "--cancel-after",
+        "0.1",
+        "--json",
+        "--quiet",
+    )
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    document = json.loads(result.stdout)
+    assert document["partial"] is True
+    assert document["capabilities"] == {"steer_mode": "cancel-then-start"}
+
+
 def test_fault_after_claim_before_owner_finalizes_the_turn(
     cli: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2432,6 +2454,21 @@ def test_a_warm_continue_keeps_the_adapter_history(cli: CliRunner, live_daemon: 
 
     assert result.exit_code == vocab.EXIT_OK
     assert "turn one of the conversation" in result.stdout
+
+
+def test_background_continue_receipt_publishes_the_session_capability(
+    cli: CliRunner, live_daemon: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ACPC_MOCK_STEERING", "1")
+    session_id = start_session(cli)
+
+    result = invoke(cli, "continue", session_id, "echo:background follow-up", "--bg", "--json")
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    document = json.loads(result.stdout)
+    status = json.loads(invoke(cli, "status", session_id, "--json").stdout)
+    assert document["capabilities"] == {"steer_mode": "in-place"}
+    assert status["capabilities"] == document["capabilities"]
 
 
 def test_background_policy_change_updates_wait_and_stop_target(

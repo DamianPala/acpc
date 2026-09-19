@@ -90,10 +90,9 @@ def result_envelope(
 ) -> dict[str, Any]:
     """Build the pinned JSON shape for an answer-printing command.
 
-    ``extra`` carries the fields only one command publishes — `steer`'s
-    `turn`, `capabilities` and `correction_result` — so the shared shape stays
-    the shared shape and the command-specific part stays one dict at the call
-    site that knows it.
+    ``extra`` carries the fields only one command publishes, `steer`'s `turn`
+    and `correction_result`, so the shared shape stays shared and the
+    command-specific part stays one dict at the call site that knows it.
     """
     if background:
         envelope = {
@@ -107,6 +106,7 @@ def result_envelope(
             "partial": False,
             "denied": _denial_payload(meta),
             "permissions_clamp": _permissions_clamp(meta),
+            "capabilities": _capabilities(meta),
             "next": ["acpc", "wait", meta.session_id],
         }
         if not include_partial:
@@ -132,6 +132,7 @@ def result_envelope(
         "truncated": truncated,
         "denied": _denial_payload(meta),
         "permissions_clamp": _permissions_clamp(meta),
+        "capabilities": _capabilities(meta),
         "next": ["acpc", "continue", meta.session_id],
     }
     if include_partial:
@@ -149,6 +150,10 @@ def result_envelope(
 
 def _timestamp_or_none(value: float | None) -> str | None:
     return sessions.format_timestamp(value) if value is not None else None
+
+
+def _capabilities(meta: sessions.SessionMeta) -> dict[str, str]:
+    return {"steer_mode": meta.steer_mode or vocab.STEER_CANCEL_THEN_START}
 
 
 def _json_text(value: object) -> str:

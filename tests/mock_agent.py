@@ -389,7 +389,11 @@ class MockAgent(Agent):
         client_info: Any = None,
         **kwargs: Any,
     ) -> InitializeResponse:
-        raw_delay = os.environ.get("ACPC_MOCK_INITIALIZE_DELAY")
+        if os.environ.get("ACPC_MOCK_INIT_HANG") == "1":
+            await asyncio.Event().wait()
+        raw_delay = os.environ.get("ACPC_MOCK_INIT_DELAY") or os.environ.get(
+            "ACPC_MOCK_INITIALIZE_DELAY"
+        )
         if raw_delay:
             await asyncio.sleep(float(raw_delay))
         self._initialized = True

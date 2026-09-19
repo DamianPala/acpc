@@ -66,6 +66,7 @@ def test_json_envelope_has_pinned_fields_and_truncates_answer_only() -> None:
         "partial",
         "denied",
         "permissions_clamp",
+        "capabilities",
         "next",
         "output_file",
     }
@@ -98,6 +99,7 @@ def test_background_and_output_file_shapes_are_separate(tmp_path: Path) -> None:
         "permissions_clamp",
         "truncated",
         "partial",
+        "capabilities",
         "next",
     }
     assert background["partial"] is False

@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from acpc import sessions, transcript
+from acpc import sessions, transcript, vocab
 from acpc.output import format_duration, format_tokens
 
 Clock = Callable[[], float]
@@ -604,7 +604,7 @@ def render_status_detail(
             f"model: {safe_text(model)} · name: {name}"
         ),
         f"dir      {directory} · answer: {Path(sessions.answer_path(meta.session_id)).name}",
-        f"steer: {_steer_modes_text(meta)}",
+        f"steer: {_steer_mode_text(meta)}",
     ]
     if meta.failure is not None:
         lines.append(
@@ -613,11 +613,9 @@ def render_status_detail(
     return "\n".join(lines) + "\n"
 
 
-def _steer_modes_text(meta: sessions.SessionMeta) -> str:
-    """Render the modes a session supports, or that acpc has not learned them."""
-    if not meta.steer_modes:
-        return "unknown"
-    return ", ".join(safe_text(mode) for mode in meta.steer_modes)
+def _steer_mode_text(meta: sessions.SessionMeta) -> str:
+    """Render the session's default correction mode."""
+    return safe_text(meta.steer_mode or vocab.STEER_CANCEL_THEN_START)
 
 
 def status_list_json(
@@ -676,7 +674,7 @@ def status_detail_json(
         "exit_code": meta.exit_code,
         "stop_reason": meta.stop_reason,
         "failure": meta.failure,
-        "capabilities": {"steer_modes": list(meta.steer_modes) if meta.steer_modes else None},
+        "capabilities": {"steer_mode": meta.steer_mode or vocab.STEER_CANCEL_THEN_START},
         "paths": sessions.session_paths(meta.session_id),
         "created_at": _timestamp_or_none(meta.created_at),
         "started_at": _timestamp_or_none(meta.started_at),

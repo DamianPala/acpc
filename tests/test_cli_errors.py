@@ -266,7 +266,7 @@ def test_the_document_has_exactly_one_top_level_field(cli: CliRunner) -> None:
     assert list(document) == ["error"]
     # Which fields are there, not what order they came in: key order in a JSON
     # object is not part of the contract, and unset fields are absent.
-    assert set(document["error"]) == {"kind", "message"}
+    assert set(document["error"]) == {"kind", "message", "context"}
 
 
 def test_a_failure_after_the_session_exists_carries_its_id(cli: CliRunner) -> None:

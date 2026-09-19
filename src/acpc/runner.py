@@ -724,7 +724,7 @@ async def _drive_turn(
                     request,
                     events,
                     resume_status=resume_status,
-                    steer_modes=[vocab.STEER_CANCEL_THEN_START],
+                    steer_mode=vocab.STEER_CANCEL_THEN_START,
                 )
                 client.permission_level = PermissionLevel(request.resolution.permissions or "read")
                 client.modes = request.resolution.entry.modes
@@ -806,7 +806,7 @@ def _prepare_resumed_turn(
     *,
     resume_status: str | None = None,
     pid: int | None = None,
-    steer_modes: Sequence[str] | None = None,
+    steer_mode: str | None = None,
 ) -> TurnRequest:
     """Atomically claim a verified continuation before it can prompt."""
     if not request.defer_rotation:
@@ -834,7 +834,7 @@ def _prepare_resumed_turn(
             prompt=request.prompt,
             resume_status=resume_status,
             pid=pid if pid is not None else _host_pid(),
-            steer_modes=steer_modes,
+            steer_mode=steer_mode,
         )
     except (RunnerError, sessions.SessionError) as error:
         raise ResumeRotationError(str(error)) from None
@@ -1182,7 +1182,7 @@ async def _cancel_before_route_acceptance(
                     request,
                     events,
                     pid=_host_pid(),
-                    steer_modes=[vocab.STEER_CANCEL_THEN_START],
+                    steer_mode=vocab.STEER_CANCEL_THEN_START,
                 )
         except (ResumeRotationError, sessions.SessionError) as error:
             raise ResumePreparationError(str(error)) from None
@@ -1210,7 +1210,7 @@ async def _execute_direct(
         sessions.mark_running(
             session_id,
             pid=_host_pid(),
-            steer_modes=[vocab.STEER_CANCEL_THEN_START],
+            steer_mode=vocab.STEER_CANCEL_THEN_START,
         )
         events.append("state", **{"from": "starting", "to": "running"})
     outcome = await _drive_turn(session_id, request, events, cancel)
@@ -1308,8 +1308,52 @@ async def _execute_via_daemon(
     finalizes `meta.json`, so this side must not finalize again. A SIGTERM
     detaches — the client stops watching and the turn carries on.
     """
+    deadline = (
+        None
+        if request.wait_timeout is None
+        else asyncio.get_running_loop().time() + request.wait_timeout
+    )
+    starting = asyncio.ensure_future(daemon.start_turn(session_id, daemon_payload(request)))
+    signalled = asyncio.ensure_future(cancel.requested.wait())
     try:
-        started = await daemon.start_turn(session_id, daemon_payload(request))
+        done, _pending = await asyncio.wait(
+            {starting, signalled},
+            timeout=_remaining_wait(deadline),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if starting not in done:
+            if signalled in done and cancel.state == "detached":
+                try:
+                    await asyncio.wait_for(asyncio.shield(starting), timeout=CANCEL_ACK_TIMEOUT)
+                except TimeoutError:
+                    starting.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await starting
+                return TurnOutcome(
+                    state="detached",
+                    stop_reason=None,
+                    answer="",
+                    finalized_elsewhere=True,
+                )
+            starting.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await starting
+            if signalled in done and cancel.state != "detached":
+                await _cancel_daemon_turn(target, session_id)
+                return TurnOutcome(
+                    state="canceled",
+                    stop_reason=cancel.stop_reason or "canceled",
+                    answer="",
+                    finalized_elsewhere=True,
+                )
+            return TurnOutcome(
+                state=cancel.state or "running",
+                stop_reason=cancel.stop_reason,
+                answer="",
+                finalized_elsewhere=True,
+                wait_timed_out=signalled not in done,
+            )
+        started = starting.result()
         if not started.get("ok"):
             reason = str(started.get("error", "the daemon refused the turn"))
             refused_as = started.get("kind")
@@ -1318,12 +1362,21 @@ async def _execute_via_daemon(
                 raise ResumePreparationError(reason, kind=kind)
             raise RunnerError(reason, kind=kind)
         queued = bool(started.get("queued"))
+        remaining = _remaining_wait(deadline)
+        if remaining is not None and remaining <= 0:
+            return TurnOutcome(
+                state="starting",
+                stop_reason=None,
+                answer="",
+                finalized_elsewhere=True,
+                queued=queued,
+                wait_timed_out=True,
+            )
 
         waiting = asyncio.ensure_future(daemon.await_turn(session_id))
-        signalled = asyncio.ensure_future(cancel.requested.wait())
         done, _pending = await asyncio.wait(
             {waiting, signalled},
-            timeout=request.wait_timeout,
+            timeout=remaining,
             return_when=asyncio.FIRST_COMPLETED,
         )
 
@@ -1350,8 +1403,7 @@ async def _execute_via_daemon(
                     queued=queued,
                     wait_timed_out=True,
                 )
-            await daemon_client.cancel_turn(target, session_id)
-        signalled.cancel()
+            await _cancel_daemon_turn(target, session_id)
         reply = await waiting
         outcome = reply.get("outcome") or {}
         if error := outcome.get("error"):
@@ -1364,8 +1416,35 @@ async def _execute_via_daemon(
             queued=queued,
         )
     finally:
+        signalled.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await signalled
         with contextlib.suppress(Exception):
             await daemon.close()
+
+
+def _remaining_wait(deadline: float | None) -> float | None:
+    """Return the remaining client wait, or ``None`` for an unbounded wait."""
+    if deadline is None:
+        return None
+    return deadline - asyncio.get_running_loop().time()
+
+
+async def _cancel_daemon_turn(target: str, session_id: str) -> sessions.SessionMeta | None:
+    """Cancel a daemon turn without using the connection stuck in ``start``."""
+    with contextlib.suppress(TimeoutError, Exception):
+        await asyncio.wait_for(
+            daemon_client.cancel_turn(target, session_id), timeout=CANCEL_ACK_TIMEOUT
+        )
+    deadline = asyncio.get_running_loop().time() + CANCEL_ACK_TIMEOUT
+    while True:
+        try:
+            current = sessions.load(session_id)
+        except sessions.SessionError:
+            return None
+        if not current.is_active or asyncio.get_running_loop().time() >= deadline:
+            return current
+        await asyncio.sleep(0.02)
 
 
 def _daemon_log_note(target: str) -> str:
