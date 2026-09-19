@@ -77,11 +77,12 @@ _FOLLOW_UP_STATUS = {
     "type": "string",
     "enum": list(_ANSWER_STATUS["enum"]),
 }
-# `wait` reports a session that has already entered a turn. A raw `starting`
-# record has no observed turn and therefore cannot produce an answer result.
+# `wait` always describes a turn it observed end (V5a): a client deadline
+# returns no document at all, so the only statuses a `wait` result can carry
+# are the terminal ones.
 _WAIT_STATUS = {
     "type": "string",
-    "enum": list(_ANSWER_STATUS["enum"]),
+    "enum": [state for state in vocab.SESSION_STATES if state in vocab.FINISHED_STATES],
 }
 # `steer` keeps its pre-slice result contract: only the states it could
 # publish after redirecting a live turn, without the new partial field.
@@ -112,6 +113,7 @@ _PERMISSIONS_CLAMP = _object(
 
 _SESSION_RESULT_PROPERTIES = {
     "session_id": _STRING,
+    "turn": _INTEGER,
     "status": _SESSION_STATUS,
     "stop_reason": _NULLABLE_STRING,
     "paths": _PATHS,
@@ -200,22 +202,13 @@ def _session_result_schema(
         properties.pop("partial")
     if not changed:
         properties.pop("changed")
-    required = [
-        "status",
-        "session_id",
-        "created_at",
-        "started_at",
-        "finished_at",
-        "paths",
-        "truncated",
-        "denied",
-        "permissions_clamp",
-        "capabilities",
-    ]
-    if include_partial:
-        required.insert(7, "partial")
+    required = ["status", "session_id", "turn", "created_at", "started_at", "finished_at"]
     if foreground_only:
-        required[5:5] = ["stop_reason", "cost", "answer"]
+        required += ["stop_reason", "cost", "answer"]
+    required += ["paths", "truncated"]
+    if include_partial:
+        required.append("partial")
+    required += ["denied", "permissions_clamp", "capabilities"]
     if changed:
         required.append("changed")
     return _object(properties, required)
@@ -234,11 +227,10 @@ _STEER_CORRECTION = _object(
     },
     ("steer_mode", "target_turn", "target_status", "message_state"),
 )
-# Every `steer` result carries these two fields on top of the shared session
-# result: which turn to observe next and what acpc knows about the correction
-# it just sent. The capability block belongs to the shared result shape.
+# `steer` carries `correction_result` on top of the shared session result;
+# `turn` is the same field every answer result carries, holding the turn to
+# observe next, and `capabilities` belongs to the shared result shape too.
 _STEER_RESULT_PROPERTIES = {
-    "turn": _INTEGER,
     "capabilities": _STEER_CAPABILITIES,
     "correction_result": _STEER_CORRECTION,
 }

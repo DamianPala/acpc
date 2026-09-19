@@ -102,6 +102,7 @@ EXPECTED_REQUIRED_FIELDS = {
     "continue": {
         "status",
         "session_id",
+        "turn",
         "created_at",
         "started_at",
         "finished_at",
@@ -139,6 +140,7 @@ EXPECTED_REQUIRED_FIELDS = {
     "run": {
         "status",
         "session_id",
+        "turn",
         "created_at",
         "started_at",
         "finished_at",
@@ -192,6 +194,7 @@ EXPECTED_REQUIRED_FIELDS = {
     "wait": {
         "status",
         "session_id",
+        "turn",
         "created_at",
         "started_at",
         "finished_at",
@@ -213,23 +216,28 @@ ANSWER_COMMANDS = frozenset({"run", "continue", "wait"})
 
 EXPECTED_OUTPUT_DESCRIPTIONS = {
     "run": (
-        "Returns the answer result for a turn this call observed — including a failed, canceled "
-        "or lost turn, and one whose session had not finished when a --timeout deadline or a "
-        "detach ended this client's watch — and returns no result for a call that observed no "
-        "turn. `stop_reason`, `cost` and `answer` are present on every foreground result and "
+        "Returns the answer result for a turn this call observed the end of — including a "
+        "failed or canceled turn — and returns no result for a call that observed no turn, "
+        "including one whose --timeout deadline expired or whose watch ended in a detach. "
+        "`stop_reason`, `cost` and `answer` are present on every foreground result and "
         "omitted by `--background`."
     ),
     "continue": (
-        "Returns the answer result for a turn this call observed — including a failed, canceled "
-        "or lost turn, and one whose session had not finished when a --timeout deadline or a "
-        "detach ended this client's watch — and returns no result for a call that observed no "
-        "turn. `stop_reason`, `cost` and `answer` are present on every foreground result and "
+        "Returns the answer result for a turn this call observed the end of — including a "
+        "failed or canceled turn — and returns no result for a call that observed no turn, "
+        "including one whose --timeout deadline expired or whose watch ended in a detach. "
+        "`stop_reason`, `cost` and `answer` are present on every foreground result and "
         "omitted by `--background`."
     ),
     "wait": (
-        "Returns the answer result for a session this call observed — including a failed, "
-        "canceled or lost session, and one still unfinished when a --timeout deadline expired — "
-        "and returns no result for a call that observed no session or turn."
+        "Selects the session's current turn when the call starts and keeps observing that "
+        "turn even if the session rotates to a newer one meanwhile; returns the answer "
+        "result once that turn has ended — including a failed or canceled turn — and "
+        "returns no result when a --timeout deadline expires first."
+    ),
+    "status": (
+        "Follows the selector: reports the session's current turn at the time of the call, "
+        "so a session that rotated to a newer turn since is reported as that newer turn."
     ),
 }
 
@@ -279,7 +287,6 @@ EXPECTED_OUTPUT_ENUMS = {
     "steer.output.status": {"running", "succeeded"},
     "steer.output.capabilities.steer_mode": {"in-place", "cancel-then-start"},
     "wait.output.status": {
-        "running",
         "succeeded",
         "failed",
         "canceled",
@@ -329,6 +336,7 @@ MUTATING_ORACLE_NOTES = {
 _SESSION_OUTPUT_PROPERTIES = frozenset(
     {
         "session_id",
+        "turn",
         "status",
         "stop_reason",
         "paths",
@@ -1412,7 +1420,7 @@ def test_D6d_routing_D7b_flat_entries_and_D7c_shape(cli: CliRunner) -> None:
         # that return results on failure and carry foreground-only fields
         # declare it; every other command's schema already says everything.
         description = detail.get("output_description")
-        if entry["name"] in ANSWER_COMMANDS:
+        if entry["name"] in ANSWER_COMMANDS or entry["name"] == "status":
             assert description == EXPECTED_OUTPUT_DESCRIPTIONS[entry["name"]]
         else:
             assert description is None, entry["name"]
@@ -2408,6 +2416,7 @@ def _observe_work_statuses(cli: CliRunner, observed: dict[str, set[Any]]) -> Non
             observed,
             exit_code=vocab.EXIT_TIMEOUT,
             error_kind=errors.TIMEOUT,
+            has_result=False,
         )
         _record_observed_status(
             "run",
@@ -2480,6 +2489,7 @@ def _observe_work_statuses(cli: CliRunner, observed: dict[str, set[Any]]) -> Non
         observed,
         exit_code=vocab.EXIT_TIMEOUT,
         error_kind=errors.TIMEOUT,
+        has_result=False,
     )
     starting = sessions.create_session(entry="mock", base_adapter="mock", prompt="enum starting")
     starting_result = call("wait", starting.session_id, "--timeout", "0")

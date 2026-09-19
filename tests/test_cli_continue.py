@@ -2372,6 +2372,9 @@ def test_continue_on_a_running_session_is_a_usage_error(cli: CliRunner, live_dae
     assert envelope["kind"] == "conflict"
     assert envelope["retryable"] is True
     assert "running" in envelope["message"]
+    # V2c/M1d: the hint names the running turn's own correction and wait verbs.
+    assert f"acpc steer {session_id}" in envelope["hint"]
+    assert f"acpc wait {session_id}" in envelope["hint"]
 
 
 def test_continue_preserves_the_global_transcript_cursor(cli: CliRunner) -> None:

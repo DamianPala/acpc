@@ -80,6 +80,18 @@ _DURATION_SYNTAX = (
     "seconds, such as 90, or a value suffixed s, m, h, d or w, such as 90s, 5m, 1h30m"
 )
 
+# I8b: `--timeout`'s own descriptor carries no `default`, so its `description`
+# says the wait is unbounded by default (`run`, `continue` and `steer` share
+# the same wording; `wait` also accepts 0 and drops the --cancel-after note).
+_TIMEOUT_HELP = (
+    f"Stop waiting after this duration ({_DURATION_SYNTAX}) and exit 124 with no result; the "
+    "session keeps running. Unbounded by default. Use --cancel-after to bound the work itself."
+)
+_WAIT_TIMEOUT_HELP = (
+    f"Stop waiting after this duration ({_DURATION_SYNTAX}, or 0) and exit 124 with no result; "
+    "the session keeps running. Unbounded by default."
+)
+
 _OUTPUT_FILE_HELP = (
     "Write exactly what stdout would receive to a file; stdout stays empty, on success and "
     "on a failure that returns a result. A call that returns no result creates no file. A "
@@ -99,16 +111,21 @@ _STEER_OUTPUT_FILE_HELP = (
 # What the answer schema cannot express: when a failure still answers, and
 # which fields only one kind of call carries (D7 `output_description`, O4d/O5a).
 _ANSWER_OUTPUT_DESCRIPTION = (
-    "Returns the answer result for a turn this call observed — including a failed, canceled "
-    "or lost turn, and one whose session had not finished when a --timeout deadline or a "
-    "detach ended this client's watch — and returns no result for a call that observed no "
-    "turn. `stop_reason`, `cost` and `answer` are present on every foreground result and "
+    "Returns the answer result for a turn this call observed the end of — including a "
+    "failed or canceled turn — and returns no result for a call that observed no turn, "
+    "including one whose --timeout deadline expired or whose watch ended in a detach. "
+    "`stop_reason`, `cost` and `answer` are present on every foreground result and "
     "omitted by `--background`."
 )
 _WAIT_OUTPUT_DESCRIPTION = (
-    "Returns the answer result for a session this call observed — including a failed, "
-    "canceled or lost session, and one still unfinished when a --timeout deadline expired — "
-    "and returns no result for a call that observed no session or turn."
+    "Selects the session's current turn when the call starts and keeps observing that "
+    "turn even if the session rotates to a newer one meanwhile; returns the answer "
+    "result once that turn has ended — including a failed or canceled turn — and "
+    "returns no result when a --timeout deadline expires first."
+)
+_STATUS_OUTPUT_DESCRIPTION = (
+    "Follows the selector: reports the session's current turn at the time of the call, "
+    "so a session that rotated to a newer turn since is reported as that newer turn."
 )
 
 # The same file, said in full for the schema: `--help` has no room for it.
@@ -293,12 +310,13 @@ def _emit_turn_result(
     emit_failure_result: bool = True,
     success: bool = True,
 ) -> None:
-    """Write the result of a call that observed the turn.
+    """Write the result of a call that observed the turn end.
 
     Every caller reaches here with a result in hand, so the document is
-    written whatever the exit code will be: a failed, canceled or timed-out
-    turn still answers with the session's observed result (O5a).  A call that
-    observed no turn never gets this far and writes nothing.
+    written whatever the exit code will be: a failed or canceled turn still
+    answers with the session's observed result (O5a). A client deadline never
+    reaches this function at all (V5a); a call that observed no turn never
+    gets this far either, and writes nothing.
     """
     if not emit_failure_result and not success:
         if output_file is not None:
@@ -312,26 +330,40 @@ def _emit_turn_result(
     _write_stdout(result.text)
 
 
-def _emit_wait_timeout(
-    session_id: str,
-    output_file: str | None,
-    *,
-    json_mode: bool,
-    max_output: int,
-    expected_turn: int | None = None,
-    emit_failure_result: bool = True,
-) -> NoReturn:
-    """Answer with the observed session, then fail on the deadline.
+def _timeout_failure(
+    session_id: str, *, turn: int, status: str | None, retryable: bool
+) -> AcpcError:
+    """The V5a/M1e timeout failure every observing command raises alike.
 
-    The deadline stops this client from waiting; it neither cancels the work
-    nor observes its end.  The result says exactly that: the observed status
-    and `partial: true`, because the answer this call was waiting for has not
-    landed (O5a).  A session whose state cannot be read yields no result, and
-    so does a follow-up whose turn had not rotated in yet: the record still
-    describes the previous turn, which is not this call's result.
+    No result document ever accompanies it: the deadline stops this client's
+    wait, not the work, so it neither cancels nor observes the turn's end,
+    even when a partial answer was already recorded — `log --tail` reads that
+    instead (V5a). `retryable` is `true` only for `wait`, whose repetition
+    re-observes the same turn; `run`, `continue` and `steer` would start new
+    work, so theirs is `false`.
     """
-    if not emit_failure_result and output_file is not None:
-        output.write_output_file(output_file, "")
+    context: dict[str, Any] = {"session_id": session_id, "turn": turn, "status": status}
+    if retryable:
+        context["retry_after_ms"] = int(runner.WAIT_POLL_INTERVAL * 1000)
+    return AcpcError(
+        f"session {session_id} timed out while turn {turn} was still {status}",
+        kind=errors.TIMEOUT,
+        exit_code=vocab.EXIT_TIMEOUT,
+        retryable=retryable,
+        hint=f"Run: acpc log {session_id} --tail 20, then acpc status {session_id}",
+        next=["acpc", "status", session_id],
+        context=context,
+    )
+
+
+def _emit_wait_timeout(session_id: str, output_file: str | None, *, turn: int) -> NoReturn:
+    """Fail on the client deadline; the deadline itself never emits a result.
+
+    `--output-file` gets no file at all: the call it was going to receive
+    from never happened, and SPEC's "a call that returns no result creates
+    no file" rule applies to that flag the same way it does to stdout (V5a).
+    """
+    del output_file
     try:
         observed = sessions.read_meta(session_id)
     except (sessions.SessionError, OSError):
@@ -342,65 +374,11 @@ def _emit_wait_timeout(
             context={"session_id": session_id, "status": None},
             exit_code=vocab.EXIT_AGENT_ERROR,
         ) from None
-    if (
-        emit_failure_result
-        and (expected_turn is None or observed.turns >= expected_turn)
-        and (answer := _observed_answer(observed)) is not None
-    ):
-        result = output.render_result(
-            observed,
-            answer,
-            json_mode=json_mode,
-            max_output=max_output,
-            changed=True,
-            partial=True,
-        )
-        _emit_turn_result(result, output_file=output_file, json_mode=json_mode)
-    raise AcpcError(
-        f"session {session_id} timed out while still {observed.state}",
-        kind=errors.TIMEOUT,
-        retryable=True,
-        hint=f"Run: acpc wait {session_id}",
-        context={"session_id": session_id, "status": observed.state},
-        exit_code=vocab.EXIT_TIMEOUT,
-    )
-
-
-def _observed_answer(meta: sessions.SessionMeta) -> str | None:
-    """Return the message text observed for the current turn.
-
-    ``answer.md`` is finalized only after the turn ends, so a deadline must
-    reconstruct the answer from the transcript that is visible at that point.
-    ``None`` means that the session has not produced a turn for this call.
-    """
-    if meta.state == "starting":
-        return None
-    try:
-        events = transcript.Transcript(sessions.transcript_path(meta.session_id)).read().events
-    except (OSError, transcript.TranscriptError):
-        return ""
-
-    running_index: int | None = None
-    for index, event in enumerate(events):
-        if event.get("type") == "state" and event.get("to") == "running":
-            running_index = index
-    start_index = 0 if running_index is None else running_index + 1
-
-    parts: list[str] = []
-    boundary_pending = False
-    for event in events[start_index:]:
-        if event.get("type") == "msg":
-            text = event.get("text")
-            if not isinstance(text, str):
-                continue
-            answer = "".join(parts)
-            if boundary_pending and answer and not answer.endswith("\n\n"):
-                parts.append("\n\n")
-            parts.append(text)
-            boundary_pending = False
-        else:
-            boundary_pending = True
-    return "".join(parts)
+    # SPEC `continue`: a deadline that expires before the follow-up rotated in
+    # has not observed the new turn; the record still describes the previous
+    # one, whose terminal state is not this turn's status.
+    status = "starting" if observed.turns < turn else observed.state
+    raise _timeout_failure(session_id, turn=turn, status=status, retryable=False)
 
 
 def _not_found(message: str, *, hint: str | None = None) -> AcpcError:
@@ -3275,6 +3253,7 @@ def _latest_failure_message(session_id: str) -> str | None:
 
 
 @effects.read_only
+@schema.output_description(_STATUS_OUTPUT_DESCRIPTION)
 @schema.describes(selector=_SELECTOR_HELP)
 @main.command(name="status")
 @click.argument("selector")
@@ -3484,7 +3463,7 @@ def list_command(
     metavar="S",
     help=(
         f"Give up waiting after this duration ({_DURATION_SYNTAX}, or 0) and exit 124; "
-        "absent, it blocks indefinitely; "
+        "unbounded by default; "
         "requires --wait-new or --follow."
     ),
 )
@@ -4078,12 +4057,7 @@ def _run_foreground(
     except runner.RunnerError as error:
         raise _runner_problem(error).with_context(session_id=meta.session_id) from None
     if outcome.wait_timed_out:
-        _emit_wait_timeout(
-            meta.session_id,
-            output_file,
-            json_mode=selected_format == "json",
-            max_output=max_output,
-        )
+        _emit_wait_timeout(meta.session_id, output_file, turn=meta.turns)
     final = sessions.read_meta(meta.session_id)
     result = output.render_result(
         final,
@@ -4143,11 +4117,7 @@ def _run_foreground(
     "--timeout",
     type=TimeoutParamType(),
     metavar="S",
-    help=(
-        f"Stop waiting after this duration ({_DURATION_SYNTAX}); the session keeps running. "
-        "When a turn was observed, the timeout also prints its partial result. Use --cancel-after "
-        "to cancel the session."
-    ),
+    help=_TIMEOUT_HELP,
 )
 @click.option(
     "--cancel-after",
@@ -4487,11 +4457,7 @@ def _dispatch_background(
     "--timeout",
     type=TimeoutParamType(),
     metavar="S",
-    help=(
-        f"Stop waiting after this duration ({_DURATION_SYNTAX}); the session keeps running. "
-        "When a turn was observed, the timeout also prints its partial result. Use --cancel-after "
-        "to cancel the session."
-    ),
+    help=_TIMEOUT_HELP,
 )
 @click.option(
     "--cancel-after",
@@ -4552,10 +4518,13 @@ def continue_command(
     meta = _load_view_session(selector)
     if meta.is_active:
         raise AcpcError(
-            f"session {meta.session_id} is {meta.state} — wait for the current turn to finish",
+            f"session {meta.session_id} is {meta.state} — it cannot be continued",
             kind=errors.CONFLICT,
             retryable=True,
-            hint=f"Run: acpc wait {meta.session_id}",
+            hint=(
+                f'Run: acpc steer {meta.session_id} "<instruction>" to correct the running '
+                f"turn, or acpc wait {meta.session_id} to wait for it"
+            ),
             context={"session_id": meta.session_id},
         )
     _dispatch_follow_up(
@@ -4719,14 +4688,7 @@ def _dispatch_follow_up(
         raise _runner_problem(error).with_context(session_id=meta.session_id) from None
 
     if outcome.wait_timed_out:
-        _emit_wait_timeout(
-            meta.session_id,
-            output_file,
-            json_mode=json_mode,
-            max_output=max_output,
-            expected_turn=current.turns + 1,
-            emit_failure_result=emit_failure_result,
-        )
+        _emit_wait_timeout(meta.session_id, output_file, turn=current.turns + 1)
 
     final = sessions.read_meta(meta.session_id)
 
@@ -4828,10 +4790,7 @@ _STEER_IPC_TIMEOUT = 15.0
     "--timeout",
     type=TimeoutParamType(),
     metavar="S",
-    help=(
-        f"Stop waiting after this duration ({_DURATION_SYNTAX}); the session keeps running. "
-        "Use --cancel-after to cancel the session."
-    ),
+    help=_TIMEOUT_HELP,
 )
 @click.option(
     "--cancel-after",
@@ -5344,18 +5303,12 @@ def _observe_steered_turn(
     if not quiet:
         _echo_metadata(output.format_session_line(meta))
     try:
-        state = runner.wait_for_session(session_id, timeout=timeout)
+        turn, state = runner.wait_for_session(session_id, timeout=timeout)
         if state is None:
             if not quiet:
                 _echo_metadata(_still_running_note(session_id, timeout))
-            raise AcpcError(
-                f"session {session_id} timed out while still {observed_status}",
-                kind=errors.TIMEOUT,
-                exit_code=vocab.EXIT_TIMEOUT,
-                retryable=True,
-                hint=f"Run: acpc wait {session_id}",
-                context={"session_id": session_id, "status": observed_status},
-            )
+            observed_status = sessions.read_meta(session_id).state
+            raise _timeout_failure(session_id, turn=turn, status=observed_status, retryable=False)
         final = sessions.read_meta(session_id)
         observed_status = final.state
         observed_correction = {**correction, "target_status": final.state}
@@ -5403,11 +5356,7 @@ def _observe_steered_turn(
     type=TimeoutParamType(allow_zero=True),
     default=None,
     metavar="S",
-    help=(
-        f"Stop waiting after this duration ({_DURATION_SYNTAX}, or 0) and exit 124; the "
-        "session keeps running; when a turn was observed, its partial result is printed; absent, "
-        "it blocks indefinitely."
-    ),
+    help=_WAIT_TIMEOUT_HELP,
 )
 @click.option("--output-file", "output_file", metavar="FILE", help=_OUTPUT_FILE_HELP)
 @click.option(
@@ -5436,14 +5385,17 @@ def wait_command(
     quiet: bool,
     json_mode: bool,
 ) -> None:
-    """Block until a background session finishes, then print its observed result.
+    """Block until the session's current turn ends, then print its observed result.
 
-    The exit code mirrors the session result. On an already-finished session it
-    returns immediately — the free way to reprint an answer. ``--timeout`` stops
-    the waiting only and exits 124: the session keeps running, and prints a
-    partial result when a turn was observed. A call that observed no turn prints
-    no result. A session that failed adds a ``failure:`` segment to the stderr
-    summary, naming what acpc observed and the next step to take.
+    The turn observed is the one active when this call starts (M1g): a later
+    ``continue`` or ``steer`` that opens a newer turn does not change what this
+    call reports. The exit code mirrors the turn's result. A turn already
+    finished is returned immediately — the free way to reprint an answer.
+    ``--timeout`` stops the waiting only and exits 124: the session keeps
+    running, and no result is printed, even when a partial answer was recorded
+    (``log --tail`` reads that instead). A session that failed adds a
+    ``failure:`` segment to the stderr summary, naming what acpc observed and
+    the next step to take.
 
     Example: ``acpc wait <session-id> --timeout 120``
     """
@@ -5454,13 +5406,15 @@ def wait_command(
         meta = _load_view_session(selector)
         session_id = meta.session_id
         observed_status = meta.state
-        state = runner.wait_for_session(meta.session_id, timeout=timeout)
+        turn, state = runner.wait_for_session(meta.session_id, timeout=timeout)
         if state is None:
-            # SPEC `wait`: the timeout stops waiting only — the session runs on.
+            # SPEC `wait`: the timeout stops waiting only — the session runs on,
+            # and no result is written, even for a turn already observed
+            # in-flight (V5a).
             if not quiet:
                 _echo_metadata(_still_running_note(meta.session_id, timeout))
             try:
-                observed = sessions.read_meta(meta.session_id)
+                observed_status = sessions.read_meta(meta.session_id).state
             except (sessions.SessionError, OSError):
                 raise AcpcError(
                     f"gave up waiting for session {meta.session_id}; its state is unknown",
@@ -5468,43 +5422,20 @@ def wait_command(
                     retryable=False,
                     context={"session_id": meta.session_id, "status": None},
                 ) from None
-            observed_status = observed.state
-            answer = _observed_answer(observed)
-            if answer is not None:
-                _emit_turn_result(
-                    output.render_result(
-                        observed,
-                        answer,
-                        json_mode=selected_format == "json",
-                        max_output=max_output,
-                        partial=True,
-                    ),
-                    output_file=output_file,
-                    json_mode=selected_format == "json",
-                )
-            raise AcpcError(
-                f"gave up waiting for session {meta.session_id}; it is still running",
-                kind=errors.TIMEOUT,
-                exit_code=vocab.EXIT_TIMEOUT,
-                retryable=True,
-                hint=f"Run: acpc wait {meta.session_id}",
-                context={
-                    "session_id": meta.session_id,
-                    "status": observed_status,
-                    "retry_after_ms": int(runner.WAIT_POLL_INTERVAL * 1000),
-                },
+            raise _timeout_failure(
+                meta.session_id, turn=turn, status=observed_status, retryable=True
             )
 
         observed_status = state
-        final = sessions.read_meta(meta.session_id)
+        final, answer, is_current = _turn_result_source(meta.session_id, turn)
         observed_status = final.state
-        answer = _answer_text(meta.session_id)
 
         result = output.render_result(
             final,
             answer,
             json_mode=selected_format == "json",
             max_output=max_output,
+            turn=(None if is_current else turn),
         )
         exit_code = runner.exit_code_for(final.state, final.stop_reason)
         _emit_turn_result(
@@ -5514,8 +5445,10 @@ def wait_command(
         )
         if not quiet:
             summary = output.format_summary(final)
-            if final.state == "failed" and (
-                failure_message := _latest_failure_message(final.session_id)
+            if (
+                is_current
+                and final.state == "failed"
+                and (failure_message := _latest_failure_message(final.session_id))
             ):
                 summary += f" | failure: {failure_message}"
             _echo_metadata(summary)
@@ -5537,6 +5470,29 @@ def _answer_text(session_id: str) -> str:
         return sessions.answer_path(session_id).read_text(encoding="utf-8")
     except OSError:
         return ""
+
+
+def _turn_answer_text(session_id: str, turn: int) -> str:
+    try:
+        return sessions.turn_path(session_id, "answer", turn).read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def _turn_result_source(session_id: str, turn: int) -> tuple[sessions.SessionMeta, str, bool]:
+    """The finished turn's metadata and answer, wherever rotation left them.
+
+    SPEC.md *State on disk*: once the session has rotated past `turn`, its
+    record and answer are parked as `meta.<turn>.json` and `answer.<turn>.md`;
+    while it has not, they are still the session's current files (M1g, V5a).
+    The third value says which: `wait`'s stderr summary reads only the
+    transcript's tail when it is true, since a parked turn's own errors are
+    not reliably separable from a newer turn's in the shared transcript.
+    """
+    current = sessions.read_meta(session_id)
+    if current.turns == turn:
+        return current, _answer_text(session_id), True
+    return sessions.read_turn_meta(session_id, turn), _turn_answer_text(session_id, turn), False
 
 
 def _daemon_idle_column(idle_seconds: float | None) -> str:

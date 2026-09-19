@@ -12,6 +12,7 @@ command layer.
 """
 
 import json
+import shlex
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Literal, TypeVar
@@ -100,6 +101,7 @@ class AcpcError(click.ClickException):
         retryable: bool | None = None,
         action: Action | None = None,
         hint: str | None = None,
+        next: list[str] | None = None,
         context: Mapping[str, Any] | None = None,
         exit_code: int | None = None,
     ) -> None:
@@ -112,6 +114,7 @@ class AcpcError(click.ClickException):
         self.retryable = retryable
         self.action = action
         self.hint = hint
+        self.next = next
         self.context: dict[str, Any] | None = dict(context) if context is not None else None
 
     @property
@@ -147,6 +150,8 @@ class AcpcError(click.ClickException):
             error["action"] = self.action
         if self.hint is not None:
             error["hint"] = self.hint
+        if self.next is not None:
+            error["next"] = list(self.next)
         if self.context:
             error["context"] = dict(self.context)
         return {"error": error}
@@ -238,6 +243,8 @@ def emit(error: AcpcError) -> None:
     click.echo(f"Error: {error.format_message()}", err=True)
     if error.hint:
         click.echo(error.hint, err=True)
+    if error.next:
+        click.echo(f"Next: {shlex.join(error.next)}", err=True)
 
 
 _FC = TypeVar("_FC", bound=Callable[..., Any])

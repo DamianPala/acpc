@@ -1291,11 +1291,11 @@ if begin_section S12-cli "help contract, -V, TTY rules, hostile inputs"; then
         assert_contains "agents $help_flag documents its options" "$LAST_OUT" "--limit"
     done
     run_acpc wait --help
-    assert_contains "wait help explains an absent timeout" "$LAST_OUT" "indefinitely"
+    assert_contains "wait help explains an absent timeout" "$LAST_OUT" "Unbounded"
     assert_contains "wait help shows the max-output default" "$LAST_OUT" "131072"
     run_acpc log --help
     assert_contains "log help explains its last-20 default" "$LAST_OUT" "last 20 events"
-    assert_contains "log help explains an absent timeout" "$LAST_OUT" "indefinitely"
+    assert_contains "log help explains an absent timeout" "$LAST_OUT" "unbounded by default"
     assert_contains "log help shows the max-output default" "$LAST_OUT" "131072"
 
     run_acpc -V

@@ -465,6 +465,45 @@ class TestTurnRotation:
 
         assert sessions.turn_path(session_id, "answer", 1).read_text() == "already parked"
 
+    def test_rotation_parks_a_snapshot_of_the_finished_turns_meta(self) -> None:
+        # SPEC.md *State on disk*: `wait` reports a rotated-past turn from this
+        # snapshot, so it has to describe turn 1 exactly as it stood right
+        # before the fields below were reset for turn 2.
+        session_id = finished_session()
+        before = sessions.read_meta(session_id)
+
+        rotated = sessions.rotate_turn(
+            session_id, clock=at(100.0), target_from_meta=lambda _meta: "next~target"
+        )
+
+        parked = sessions.read_turn_meta(session_id, 1)
+        assert parked.turns == 1
+        assert parked.state == "succeeded"
+        assert parked.session_id == session_id
+        # The next turn's own values (here its target) never leak into the
+        # finished turn's snapshot.
+        assert parked.target == before.target
+        assert rotated.turns == 2
+        assert rotated.state == "starting"
+        assert rotated.target == "next~target"
+
+    def test_rotation_never_overwrites_an_earlier_turns_parked_meta(self) -> None:
+        session_id = finished_session()
+        sessions.turn_path(session_id, "meta", 1, ext="json").write_text(
+            json.dumps({"already": "parked"}), encoding="utf-8"
+        )
+
+        sessions.rotate_turn(session_id, clock=at(100.0))
+
+        raw = sessions.turn_path(session_id, "meta", 1, ext="json").read_text(encoding="utf-8")
+        assert json.loads(raw) == {"already": "parked"}
+
+    def test_read_turn_meta_raises_session_not_found_for_a_turn_never_parked(self) -> None:
+        session_id = finished_session()
+
+        with pytest.raises(sessions.SessionNotFound):
+            sessions.read_turn_meta(session_id, 1)
+
     def test_rotation_is_refused_while_the_session_is_active(self) -> None:
         meta = make_session()
         sessions.mark_running(

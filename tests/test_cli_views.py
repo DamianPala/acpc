@@ -724,6 +724,7 @@ def test_wait_timeout_on_a_running_session_says_it_still_runs(cli: CliRunner) ->
     error = json.loads(result.stderr.splitlines()[-1])["error"]
     assert error["context"] == {
         "session_id": meta.session_id,
+        "turn": 1,
         "status": "running",
         "retry_after_ms": 100,
     }

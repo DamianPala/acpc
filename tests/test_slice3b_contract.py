@@ -64,6 +64,7 @@ EXPECTED_REQUIRED: dict[str, tuple[str, ...]] = {
     "continue": (
         "status",
         "session_id",
+        "turn",
         "created_at",
         "started_at",
         "finished_at",
@@ -108,6 +109,7 @@ EXPECTED_REQUIRED: dict[str, tuple[str, ...]] = {
     "run": (
         "status",
         "session_id",
+        "turn",
         "created_at",
         "started_at",
         "finished_at",
@@ -147,6 +149,7 @@ EXPECTED_REQUIRED: dict[str, tuple[str, ...]] = {
     "steer": (
         "status",
         "session_id",
+        "turn",
         "created_at",
         "started_at",
         "finished_at",
@@ -156,12 +159,12 @@ EXPECTED_REQUIRED: dict[str, tuple[str, ...]] = {
         "permissions_clamp",
         "capabilities",
         "changed",
-        "turn",
         "correction_result",
     ),
     "wait": (
         "status",
         "session_id",
+        "turn",
         "created_at",
         "started_at",
         "finished_at",
@@ -232,7 +235,7 @@ EXPECTED_ENUMS: dict[str, dict[str, tuple[str, ...]]] = {
         "$.capabilities.steer_mode": ("in-place", "cancel-then-start"),
     },
     "wait": {
-        "$.status": ("running", "succeeded", "failed", "canceled", "unknown"),
+        "$.status": ("succeeded", "failed", "canceled", "unknown"),
         "$.capabilities.steer_mode": ("in-place", "cancel-then-start"),
     },
 }

@@ -940,9 +940,81 @@ def test_a_blocking_in_place_steer_times_out_without_a_document(
     assert result.stdout == ""
     envelope = steer_error(result)
     assert envelope["kind"] == "timeout"
+    assert envelope["retryable"] is False
+    assert envelope["context"]["turn"] == 1
     assert envelope["context"]["status"] == "running"
     assert envelope["context"]["correction_result"]["message_state"] == "accepted"
+    assert envelope["context"]["capabilities"] == {"steer_mode": "in-place"}
+    assert envelope["next"] == ["acpc", "status", session_id]
     assert sessions.read_meta(session_id).state == "running"
+
+
+def test_wait_pinned_to_turn_one_survives_a_concurrent_cancel_then_start(
+    cli: CliRunner, live_daemon: None
+) -> None:
+    """M1g/V5a: a `wait` observing turn 1 reports that turn's own outcome even
+    though a concurrent `steer --steer-mode cancel-then-start` cancels it and
+    opens turn 2 while the wait is still in flight.
+
+    The observer runs as a real subprocess: two concurrent `CliRunner.invoke`
+    calls in the same process would fight over its redirected stdout/stderr.
+    """
+    session_id = running_daemon_turn(cli, "slow:8")
+
+    wait_process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "from acpc.cli import main; raise SystemExit(main())",
+            "wait",
+            session_id,
+            "--json",
+        ],
+        env=os.environ.copy(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        time.sleep(1.0)
+
+        steered = invoke(
+            cli,
+            "steer",
+            session_id,
+            "x",
+            "--steer-mode",
+            "cancel-then-start",
+            "--bg",
+            "--json",
+        )
+        assert steered.exit_code == vocab.EXIT_OK, steered.stderr
+
+        wait_stdout, wait_stderr = wait_process.communicate(timeout=30)
+    finally:
+        if wait_process.poll() is None:
+            wait_process.kill()
+            wait_process.wait(timeout=10)
+
+    assert wait_process.returncode == vocab.EXIT_CANCELLED
+    payload = json.loads(wait_stdout)
+    assert payload["status"] == "canceled"
+    assert payload["turn"] == 1
+    assert payload["partial"] is True
+    envelope = json.loads(wait_stderr.splitlines()[-1])["error"]
+    assert envelope["kind"] == "operation_failed"
+    assert envelope["context"]["status"] == "canceled"
+    # The stderr summary describes turn 1, the turn `wait` observed, not
+    # turn 2, which the concurrent steer already opened by the time it prints.
+    assert "-- canceled" in wait_stderr
+
+    # Turn 2's own prompt is fast, so only its count is deterministic here;
+    # SPEC `status`: it follows the selector to whatever turn is current.
+    status = json.loads(invoke(cli, "status", session_id, "--json").stdout)
+    assert status["turns"] == 2
+
+    parked = sessions.read_turn_meta(session_id, 1)
+    assert parked.state == "canceled"
 
 
 def test_cancel_after_needs_an_explicit_cancel_then_start(cli: CliRunner) -> None:
@@ -1091,12 +1163,12 @@ def test_a_turn_that_ends_canceled_after_an_accepted_correction_is_a_failure(
     async def accepted(target: str, selector: str, text: str) -> dict[str, Any]:
         return {"ok": True, "outcome": "injected", "turn_token": 1}
 
-    def ends_canceled(selector: str, *, timeout: float | None = None) -> str:
+    def ends_canceled(selector: str, *, timeout: float | None = None) -> tuple[int, str]:
         runner._finalize(
             session_id,
             runner.TurnOutcome(state="canceled", stop_reason="cancelled", answer="partial"),
         )
-        return "canceled"
+        return 2, "canceled"
 
     monkeypatch.setattr(daemon_client, "steer_turn", accepted)
     monkeypatch.setattr(runner, "wait_for_session", ends_canceled)

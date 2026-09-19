@@ -77,6 +77,20 @@ def truncate_answer(
     return OutputResult(text, True, len(text.encode("utf-8")))
 
 
+def _paths_for(meta: sessions.SessionMeta, *, turn: int | None) -> dict[str, str]:
+    """The `paths` object, pinned to a parked turn's own files when given one.
+
+    SPEC.md *State on disk*: a document reporting on a turn the session has
+    since rotated past names that turn's parked `prompt.<n>.md` and
+    `answer.<n>.md`, never the current session's files.
+    """
+    result = sessions.session_paths(meta.session_id)
+    if turn is not None:
+        result["answer"] = str(sessions.turn_path(meta.session_id, "answer", turn))
+        result["prompt"] = str(sessions.turn_path(meta.session_id, "prompt", turn))
+    return result
+
+
 def result_envelope(
     meta: sessions.SessionMeta,
     answer: str,
@@ -87,21 +101,29 @@ def result_envelope(
     partial: bool = False,
     include_partial: bool = True,
     extra: Mapping[str, Any] | None = None,
+    turn: int | None = None,
 ) -> dict[str, Any]:
     """Build the pinned JSON shape for an answer-printing command.
 
     ``extra`` carries the fields only one command publishes, `steer`'s `turn`
     and `correction_result`, so the shared shape stays shared and the
     command-specific part stays one dict at the call site that knows it.
+
+    ``turn`` names the parked turn a report describes when it is not the
+    session's current one; `paths.answer`, `paths.prompt`, and, once
+    truncated, `output_file` then all name that turn's own files instead of
+    the session's current ones.
     """
+    paths_for_turn = _paths_for(meta, turn=turn)
     if background:
         envelope = {
             "session_id": meta.session_id,
+            "turn": meta.turns,
             "status": vocab.normalize_session_state(meta.state),
             "created_at": _timestamp_or_none(meta.created_at),
             "started_at": _timestamp_or_none(meta.started_at),
             "finished_at": _timestamp_or_none(meta.finished_at),
-            "paths": sessions.session_paths(meta.session_id),
+            "paths": paths_for_turn,
             "truncated": False,
             "partial": False,
             "denied": _denial_payload(meta),
@@ -122,11 +144,12 @@ def result_envelope(
     envelope: dict[str, Any] = {
         "status": vocab.normalize_session_state(meta.state),
         "session_id": meta.session_id,
+        "turn": meta.turns,
         "created_at": _timestamp_or_none(meta.created_at),
         "started_at": _timestamp_or_none(meta.started_at),
         "finished_at": _timestamp_or_none(meta.finished_at),
         "stop_reason": meta.stop_reason,
-        "paths": sessions.session_paths(meta.session_id),
+        "paths": paths_for_turn,
         "cost": meta.cost,
         "answer": answer,
         "truncated": truncated,
@@ -140,7 +163,7 @@ def result_envelope(
     if resume := _resume_status(meta):
         envelope["resume"] = resume
     if truncated:
-        envelope["output_file"] = str(sessions.answer_path(meta.session_id))
+        envelope["output_file"] = paths_for_turn["answer"]
     if changed is not None:
         envelope["changed"] = changed
     if extra:
@@ -170,6 +193,7 @@ def _json_answer(
     partial: bool,
     include_partial: bool,
     extra: Mapping[str, Any] | None,
+    turn: int | None = None,
 ) -> OutputResult:
     complete = _json_text(
         result_envelope(
@@ -179,6 +203,7 @@ def _json_answer(
             partial=partial,
             include_partial=include_partial,
             extra=extra,
+            turn=turn,
         )
     )
     if max_output == 0 or len(complete.encode("utf-8")) <= max_output:
@@ -196,6 +221,7 @@ def _json_answer(
                 partial=partial,
                 include_partial=include_partial,
                 extra=extra,
+                turn=turn,
             )
         )
 
@@ -235,15 +261,27 @@ def render_result(
     partial: bool | None = None,
     include_partial: bool = True,
     extra: Mapping[str, Any] | None = None,
+    turn: int | None = None,
 ) -> OutputResult:
     """Render one answer command's stdout payload without writing it.
 
     `partial` defaults to what the session's state says about the answer: a
     turn that finished carries complete data, a turn still running or cut
     short does not.  A caller that knows better passes it explicitly.
+
+    `turn` is the turn this call actually observed. Leave it `None` when
+    that is the session's current turn; `wait` reporting on a turn the
+    session has since rotated past passes that turn's number instead, so
+    the truncation marker, `paths.answer`, `paths.prompt`, and `output_file`
+    all name that turn's own parked files (`answer.<n>.md`, `prompt.<n>.md`)
+    rather than the session's current ones (SPEC.md *State on disk*).
     """
     _validate_max_output(max_output)
-    answer_path = sessions.answer_path(meta.session_id)
+    answer_path = (
+        sessions.answer_path(meta.session_id)
+        if turn is None
+        else sessions.turn_path(meta.session_id, "answer", turn)
+    )
     if partial is None:
         partial = vocab.normalize_session_state(meta.state) not in _COMPLETE_ANSWER_STATES
 
@@ -257,6 +295,7 @@ def render_result(
                     changed=changed,
                     include_partial=include_partial,
                     extra=extra,
+                    turn=turn,
                 )
             )
         else:
@@ -273,6 +312,7 @@ def render_result(
             partial=partial,
             include_partial=include_partial,
             extra=extra,
+            turn=turn,
         )
     return truncate_answer(answer, max_output=max_output, answer_path=answer_path)
 

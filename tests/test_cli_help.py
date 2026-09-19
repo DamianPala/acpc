@@ -192,8 +192,8 @@ def test_help_names_behavioral_defaults_and_global_output_default(runner: CliRun
     assert "--cancel-after" in run_help
     assert "--cancel-after" in continue_help
     assert "--cancel-after" in steer_help
-    assert "absent, it blocks indefinitely" in wait_help
-    assert "absent, it blocks indefinitely" in log_help
+    assert "Unbounded by default" in wait_help
+    assert "unbounded by default" in log_help
     assert "Without --since, --limit, or --tail this shows the last 20 events" in log_help
     assert "emit selected records in transcript order" in log_help
     assert "Conflicts with --tail" in log_help
@@ -230,8 +230,8 @@ def test_help_explains_session_lifecycle_and_retention(runner: CliRunner) -> Non
     assert "Return at most N sessions" in list_help
     assert "Show liveness-verified metadata for one session" in status_help
     assert "absent, text on a TTY and JSON on non-TTY" in status_help
-    assert "and exit 124; the session keeps running" in wait_help
-    assert "The exit code mirrors the session result." in wait_help
+    assert "exits 124: the session keeps running" in wait_help
+    assert "The exit code mirrors the turn's result." in wait_help
     assert "the free way to reprint an answer." in wait_help
     assert "editing an entry never changes a session mid-conversation." in continue_help
     assert (

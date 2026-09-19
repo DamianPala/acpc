@@ -51,8 +51,16 @@ class DaemonConnection(Protocol):
         """Hand a turn to the daemon and return as soon as it is accepted."""
         ...
 
-    async def await_turn(self, session_id: str) -> dict[str, Any]:
-        """Block until the turn finishes and return its outcome."""
+    async def await_turn(self, session_id: str, *, turn: int | None = None) -> dict[str, Any]:
+        """Block until the turn finishes and return its outcome.
+
+        ``turn`` pins the call to the turn active when the caller started
+        observing it; a daemon that has since moved the session onto a newer
+        turn answers `{"ok": true, "stale": true, "turn": <current>}` instead
+        of waiting, so the caller can read that turn's parked outcome. Omit it
+        to await whatever turn the daemon currently holds, as a call that just
+        started that turn itself does.
+        """
         ...
 
     async def await_preparation(self, session_id: str) -> dict[str, Any]:
@@ -102,8 +110,11 @@ class _SocketDaemon:
     async def start_turn(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         return await self.call({"op": "start", "session_id": session_id, "payload": payload})
 
-    async def await_turn(self, session_id: str) -> dict[str, Any]:
-        return await self.call({"op": "await", "session_id": session_id})
+    async def await_turn(self, session_id: str, *, turn: int | None = None) -> dict[str, Any]:
+        frame: dict[str, Any] = {"op": "await", "session_id": session_id}
+        if turn is not None:
+            frame["turn"] = turn
+        return await self.call(frame)
 
     async def await_preparation(self, session_id: str) -> dict[str, Any]:
         return await self.call({"op": "await_preparation", "session_id": session_id})

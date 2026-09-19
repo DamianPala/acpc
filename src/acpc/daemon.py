@@ -1065,15 +1065,50 @@ class Daemon:
             raise
 
     async def _await(self, frame: dict[str, Any]) -> dict[str, Any]:
+        """Block until the session's turn ends, or say so at once if it already has.
+
+        ``turn`` (optional) pins the call to one turn (M1g): a caller that
+        started observing turn N before it lost the race to a rotation gets
+        `stale` immediately rather than waiting on a turn that is not the one
+        it asked about, and reads that turn's own parked outcome instead. A
+        frame with no `turn` is served as it always was — the same leniency
+        `_cancel` gives an untokened request. One that arrives before this
+        daemon's own turn has a token yet (`_start` assigns it only once
+        backend initialization clears, up to the full `--timeout` on a cold
+        start) is checked against the on-disk turn count instead, the same
+        source `_start` itself falls back to once the token is available.
+        """
         session_id = frame.get("session_id", "")
-        turn = self.turns.get(session_id)
-        if turn is None:
-            return {"ok": True, "outcome": self._outcome_from_disk(session_id)}
-        if turn.result is not None:
-            return {"ok": True, "outcome": turn.result}
-        waiter: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
-        turn.waiters.append(waiter)
-        return {"ok": True, "outcome": await waiter}
+        requested_turn = frame.get("turn")
+        if isinstance(requested_turn, bool) or not isinstance(requested_turn, int):
+            requested_turn = None
+        in_flight = self.turns.get(session_id)
+        if in_flight is not None:
+            if requested_turn is not None:
+                current_token = (
+                    in_flight.turn_token
+                    if in_flight.turn_token is not None
+                    else self._current_turns(session_id)
+                )
+                if current_token is not None and current_token != requested_turn:
+                    return {"ok": True, "stale": True, "turn": current_token}
+            if in_flight.result is not None:
+                return {"ok": True, "outcome": in_flight.result}
+            waiter: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+            in_flight.waiters.append(waiter)
+            return {"ok": True, "outcome": await waiter}
+        if requested_turn is not None:
+            current_turn = self._current_turns(session_id)
+            if current_turn is not None and current_turn != requested_turn:
+                return {"ok": True, "stale": True, "turn": current_turn}
+        return {"ok": True, "outcome": self._outcome_from_disk(session_id)}
+
+    @staticmethod
+    def _current_turns(session_id: str) -> int | None:
+        try:
+            return sessions.read_meta(session_id).turns
+        except sessions.SessionError:
+            return None
 
     async def _await_preparation(self, frame: dict[str, Any]) -> dict[str, Any]:
         """Wait only for deferred resume preparation, not for the prompt."""

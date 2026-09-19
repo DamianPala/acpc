@@ -2151,12 +2151,18 @@ def _source_label(source: Any) -> str:
 WAIT_POLL_INTERVAL = 0.1
 
 
-async def _await_session(session_id: str, target: str | None, timeout: float | None) -> str | None:
-    """Block until the session finishes; None means the wait timed out.
+async def _await_session(
+    session_id: str, target: str | None, timeout: float | None, turn: int
+) -> str | None:
+    """Block until turn `turn` ends; None means the wait timed out.
 
     Asks the owning daemon when there is one, because that returns the moment
     the turn ends. A session with no daemon (direct path, or a daemon that has
-    since gone) is watched through `meta.json` instead.
+    since gone) is watched through `meta.json` instead. Either path can find
+    the session already past `turn` when a `continue` or `steer` rotated it in
+    the meantime (M1g): the daemon then answers `stale` and the fallback sees
+    `meta.turns` ahead of `turn`, and both read the turn's own parked outcome
+    (SPEC.md *State on disk*) rather than the session's current one.
     """
     deadline = None if timeout is None else asyncio.get_running_loop().time() + timeout
     daemon = None
@@ -2167,7 +2173,7 @@ async def _await_session(session_id: str, target: str | None, timeout: float | N
 
     try:
         if daemon is not None:
-            waiting = asyncio.ensure_future(daemon.await_turn(session_id))
+            waiting = asyncio.ensure_future(daemon.await_turn(session_id, turn=turn))
             try:
                 reply = await asyncio.wait_for(asyncio.shield(waiting), timeout=timeout)
             except TimeoutError:
@@ -2175,12 +2181,16 @@ async def _await_session(session_id: str, target: str | None, timeout: float | N
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await waiting
                 return None
+            if reply.get("stale"):
+                return sessions.read_turn_meta(session_id, turn).state
             outcome = reply.get("outcome") or {}
             return str(outcome.get("state", "failed"))
 
         while True:
             meta = sessions.load(session_id)
-            if meta.is_finished:
+            if meta.turns > turn:
+                return sessions.read_turn_meta(session_id, turn).state
+            if meta.turns == turn and meta.is_finished:
                 return meta.state
             if deadline is not None and asyncio.get_running_loop().time() >= deadline:
                 return None
@@ -2196,16 +2206,20 @@ async def _await_session(session_id: str, target: str | None, timeout: float | N
                 await daemon.close()
 
 
-def wait_for_session(session_id: str, *, timeout: float | None = None) -> str | None:
-    """Block until a session finishes, returning its state or None on timeout.
+def wait_for_session(session_id: str, *, timeout: float | None = None) -> tuple[int, str | None]:
+    """Block until the session's turn selected at call start ends.
 
-    SPEC.md `wait`: the timeout stops *waiting* only — as `run --timeout` does,
-    the session is left running.
+    SPEC.md `wait`/M1g: the turn observed is the session's current one when
+    this call starts, kept even if a later `continue` or `steer` opens a newer
+    turn while waiting. Returns the selected turn and its terminal state, or
+    `None` for the state when the timeout stopped waiting — the session is
+    left running either way.
     """
     meta = sessions.load(session_id)
+    turn = meta.turns
     if meta.is_finished:
-        return meta.state
-    return asyncio.run(_await_session(session_id, meta.target, timeout))
+        return turn, meta.state
+    return turn, asyncio.run(_await_session(session_id, meta.target, timeout, turn))
 
 
 def daemon_targets_for(agent: str) -> list[str]:

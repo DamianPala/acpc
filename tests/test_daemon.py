@@ -1097,6 +1097,113 @@ def test_daemon_keeps_a_pre_send_failure_record_complete_on_cold_resume(
     assert asyncio.run(run_cold_resume()) == "verified"
 
 
+def test_await_with_a_stale_turn_returns_the_in_flight_turns_own_token(
+    state_root: Path,
+) -> None:
+    """M1g: a caller pinned to a turn the daemon has already rotated past gets
+    `stale` at once, naming the turn actually in flight, instead of waiting on
+    a turn that will never end from under it."""
+    session_id = new_session("stale in-flight")
+    instance = daemon.Daemon(target())
+    instance.turns[session_id] = daemon._Turn(
+        session_id=session_id,
+        task=None,
+        cancel=runner._CancelSignal(),
+        turn_token=2,
+    )
+
+    reply = asyncio.run(instance._await({"session_id": session_id, "turn": 1}))
+
+    assert reply == {"ok": True, "stale": True, "turn": 2}
+
+
+def test_await_with_a_stale_turn_and_no_in_flight_reads_the_current_turn_from_disk(
+    state_root: Path,
+) -> None:
+    """The daemon has no turn of its own in flight — the session already
+    finished and rotated (direct path, or after this daemon restarted) — so
+    the mismatch is detected from `meta.json` instead."""
+    session_id = new_session("stale on disk")
+    sessions.mark_running(session_id, pid=1, process_start_time="tok")
+    sessions.transition(session_id, "succeeded", exit_code=0)
+    sessions.rotate_turn(session_id)
+    instance = daemon.Daemon(target())
+
+    reply = asyncio.run(instance._await({"session_id": session_id, "turn": 1}))
+
+    assert reply == {"ok": True, "stale": True, "turn": 2}
+
+
+def test_await_with_an_untokened_in_flight_turn_reads_the_current_turn_from_disk(
+    state_root: Path,
+) -> None:
+    """A turn `_start` has claimed but not yet assigned a token to (backend
+    initialization still running) must not silently attach the caller as a
+    waiter on the wrong turn; the on-disk turn count still tells `stale`
+    from current, the same source `_start` itself falls back to once the
+    token becomes available."""
+    session_id = new_session("no token yet")
+    sessions.mark_running(session_id, pid=1, process_start_time="tok")
+    sessions.transition(session_id, "succeeded", exit_code=0)
+    sessions.rotate_turn(session_id)
+    instance = daemon.Daemon(target())
+    instance.turns[session_id] = daemon._Turn(
+        session_id=session_id,
+        task=None,
+        cancel=runner._CancelSignal(),
+    )
+
+    reply = asyncio.run(instance._await({"session_id": session_id, "turn": 1}))
+
+    assert reply == {"ok": True, "stale": True, "turn": 2}
+
+
+def test_await_with_an_untokened_in_flight_turn_still_waits_for_that_same_turn(
+    state_root: Path,
+) -> None:
+    """The other side of the untokened window: the pinned turn is the one in
+    flight (a cold `run --bg` still initializing), so the caller must wait for
+    it and be woken by its outcome, not be told `stale` or left hanging."""
+    session_id = new_session("cold start, no token yet")
+    sessions.mark_running(session_id, pid=1, process_start_time="tok")
+    instance = daemon.Daemon(target())
+    instance.turns[session_id] = daemon._Turn(
+        session_id=session_id,
+        task=None,
+        cancel=runner._CancelSignal(),
+    )
+
+    async def scenario() -> tuple[bool, dict[str, Any]]:
+        pending = asyncio.ensure_future(instance._await({"session_id": session_id, "turn": 1}))
+        await asyncio.sleep(0.2)
+        still_waiting = not pending.done()
+        instance._finish(
+            session_id, runner.TurnOutcome(state="succeeded", stop_reason="end_turn", answer="done")
+        )
+        return still_waiting, await asyncio.wait_for(pending, timeout=5)
+
+    still_waiting, reply = asyncio.run(scenario())
+
+    assert still_waiting
+    assert "stale" not in reply
+    assert reply["outcome"]["state"] == "succeeded"
+
+
+def test_await_with_no_turn_argument_behaves_as_before(state_root: Path) -> None:
+    """Omitting `turn` keeps the pre-M1g leniency: serve whatever this daemon
+    currently holds, or the on-disk outcome when it holds nothing."""
+    session_id = new_session("no turn pin")
+    sessions.mark_running(session_id, pid=1, process_start_time="tok")
+    sessions.transition(session_id, "succeeded", exit_code=0)
+    instance = daemon.Daemon(target())
+
+    reply = asyncio.run(instance._await({"session_id": session_id}))
+
+    assert reply["ok"] is True
+    assert "stale" not in reply
+    assert reply["outcome"]["state"] == "succeeded"
+
+
 def test_one_daemon_serves_several_sessions(state_root: Path, live_daemon: None) -> None:
     first = new_session("first session")
     second = new_session("second session")
@@ -1257,7 +1364,7 @@ def test_authentication_refusal_records_the_remedy_even_with_an_empty_log(
         )
     )
     assert warm_problem is None
-    assert runner.wait_for_session(warm_session, timeout=5) == "succeeded"
+    assert runner.wait_for_session(warm_session, timeout=5) == (1, "succeeded")
 
     # The daemon starts and its adapter initializes before the log is cleared.
     # The test now owns the empty-log precondition for the following auth
@@ -1272,7 +1379,7 @@ def test_authentication_refusal_records_the_remedy_even_with_an_empty_log(
     )
     assert problem is None
 
-    assert runner.wait_for_session(session_id, timeout=5) == "failed"
+    assert runner.wait_for_session(session_id, timeout=5) == (1, "failed")
     meta = sessions.read_meta(session_id)
     assert meta.state == "failed"
     error_events = [event for event in _events(session_id) if event.get("type") == "error"]
@@ -1657,7 +1764,8 @@ def _assert_state(session_id: str, state: str) -> None:
 
 
 def _wait_for_finished(session_id: str, timeout: float = 20.0) -> sessions.SessionMeta:
-    assert runner.wait_for_session(session_id, timeout=timeout) is not None
+    _turn, state = runner.wait_for_session(session_id, timeout=timeout)
+    assert state is not None
     meta = sessions.read_meta(session_id)
     assert meta.is_finished
     return meta

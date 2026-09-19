@@ -282,9 +282,9 @@ def session_paths(session_id: str) -> dict[str, str]:
     }
 
 
-def turn_path(session_id: str, stem: str, turn: int) -> Path:
-    """Path of an earlier turn's artifact, e.g. `prompt.2.md`."""
-    return session_dir(session_id) / f"{stem}.{turn}.md"
+def turn_path(session_id: str, stem: str, turn: int, *, ext: str = "md") -> Path:
+    """Path of an earlier turn's artifact, e.g. `prompt.2.md` or `meta.2.json`."""
+    return session_dir(session_id) / f"{stem}.{turn}.{ext}"
 
 
 # --------------------------------------------------------------------------
@@ -554,16 +554,12 @@ def meta_from_dict(data: Mapping[str, Any], *, path: Path) -> SessionMeta:
     )
 
 
-def read_meta(session_id: str) -> SessionMeta:
-    """Read `meta.json` verbatim, without verifying liveness.
-
-    Use `load` for anything that reports or gates on state.
-    """
-    path = meta_path(session_id)
+def _read_meta_file(path: Path, *, not_found: Callable[[], SessionError]) -> SessionMeta:
+    """Read one metadata file verbatim, with `read_meta`'s normalization."""
     try:
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
-        raise SessionNotFound(f"unknown session {session_id!r}") from None
+        raise not_found() from None
     except OSError as error:
         raise CorruptSessionError(f"{path}: cannot be read ({error.strerror})") from None
     try:
@@ -573,6 +569,30 @@ def read_meta(session_id: str) -> SessionMeta:
     if not isinstance(data, dict):
         raise CorruptSessionError(f"{path}: not a JSON object")
     return meta_from_dict(data, path=path)
+
+
+def read_meta(session_id: str) -> SessionMeta:
+    """Read `meta.json` verbatim, without verifying liveness.
+
+    Use `load` for anything that reports or gates on state.
+    """
+    return _read_meta_file(
+        meta_path(session_id),
+        not_found=lambda: SessionNotFound(f"unknown session {session_id!r}"),
+    )
+
+
+def read_turn_meta(session_id: str, turn: int) -> SessionMeta:
+    """Read a finished turn's parked `meta.<n>.json`, with `read_meta`'s normalization.
+
+    SPEC.md *State on disk*: rotation parks the finished turn's metadata
+    alongside its prompt and answer, so `wait` can still describe a turn the
+    session has since rotated past.
+    """
+    return _read_meta_file(
+        turn_path(session_id, "meta", turn, ext="json"),
+        not_found=lambda: SessionNotFound(f"unknown turn {turn} for session {session_id!r}"),
+    )
 
 
 def write_meta(meta: SessionMeta) -> None:
@@ -932,6 +952,13 @@ def rotate_turn(
             raise SessionBusy(
                 f"session {session_id} is {meta.state} — wait for the current turn to finish"
             )
+        turn = meta.turns
+        # SPEC.md *State on disk*: parked before anything below describes the
+        # next turn (the callbacks included), so the snapshot is exactly what
+        # `wait` reports for turn `turn` once the session has rotated past it.
+        parked_meta = turn_path(session_id, "meta", turn, ext="json")
+        if not parked_meta.exists():
+            paths.atomic_write(parked_meta, meta.to_dict())
         # Any value derived from session state must be a callback. The callback
         # receives this locked re-read, so a caller cannot accidentally compute
         # a snapshot value before the lock and write it after the lock.
@@ -939,7 +966,6 @@ def rotate_turn(
             meta.resolution = dict(resolution_from_meta(meta))
         if target_from_meta is not None:
             meta.target = target_from_meta(meta)
-        turn = meta.turns
         for stem, current in (
             ("prompt", prompt_path(session_id)),
             ("answer", answer_path(session_id)),
