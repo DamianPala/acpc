@@ -2,6 +2,38 @@
 
 ## Now
 
+**Phase 0.2 of the standard alignment is complete on `feat/cli-design-conformance` (2026-09-20,
+slices 14-19, HEAD `279ff97`).** The tool now claims `cli-design-standard` 0.2.0-draft.10 with
+extensions `managed` and `conversational`; the fixture snapshot is pinned to haz-skills `53f4f92`.
+What landed, one commit per slice: 14 `378b277`, 15 `9c93b0d` (cancel with a turn token,
+cancel-then-start), 16 `cece295` (a client deadline returns no result and no `--output-file`,
+`wait` pins the turn it started on and reports parked-turn paths), 17 `6c71a3c` (a vendor usage
+limit is waited out inside the same turn: state `waiting`, `--on-limit wait|fail`, config
+`limit_wait_max`, `limit` object on `status` and results, `limits.py`), 18 `ed573d1` (the `text`
+format has two presentations: a tagged `<result>` document with single-line `<metadata>` JSON off
+a terminal, raw answer on one; counted `<answer-N>` tags when the answer contains a wrapper tag;
+control bytes escaped; `--background` receipt tagged off a terminal; `tokens` on every foreground
+result), 19 `279ff97` (`continue` with no message resumes a canceled/failed/unknown turn with
+acpc's continuation instruction; `status.permissions` and `pending_corrections: null`;
+`capabilities.continue_without_message`; claim bumped). Every slice: Sonnet builder, Opus reviewer
+with mutation testing, live on the mock; 16 and 17 needed two review rounds, 18 and 19 one.
+Gates at HEAD: 1334 tests, ruff/pyright clean, smoke 603/603, D7c green against the checkout.
+**Nothing pushed.** Not done: the tool version bump (O16, Damian's call), live runs on real
+adapters for 16-19, and the debts below.
+
+Debts found in review, none blocking: the TTY `human` presentation still prints the raw answer
+without control-byte escaping (O3d asks for it; a small separate slice); `continue` after
+`unknown` on turn 1 is `corrupt_state` because the daemon stores `adapter_session_id` only at the
+end of the turn (turn 2+ works); `CONTINUATION_INSTRUCTION` says "interrupted by a usage limit",
+which is untrue after cancel/failed/unknown (text change was out of scope, check on a real adapter
+before release); `stop_reason` spells `canceled` after an acpc cancel and `cancelled` after an
+adapter cancel; the `continue` conflict hint omits `--steer-mode cancel-then-start`, so on an
+in-place session the suggested `steer` conflicts; `--max-output` below the wrapper's fixed
+overhead exceeds the budget (same as JSON); the `permissions.source` string carries the clamp
+suffix from provenance and the text view repeats the clamp. After reinstall, anything reading the
+session id from `run --bg | head -1` breaks (MIGRATION covers `--json | jq -r .session_id`);
+skills and wrappers calling the installed `acpc` need a pass before `uv tool install`.
+
 **In-place steering lands on `feat/cli-design-conformance` (2026-09-14, slice 13).** `acpc steer`
 has two modes: `in-place` forwards the instruction to the turn in flight through the adapters'
 `_session/steering` extension (codex-acp 1.10.0 and claude-agent-acp 0.75.1 both declare it in
@@ -379,6 +411,10 @@ Release: bump `0.4.0` → `0.4.1` (the pending `uv.lock` version line rides here
 
 ## Decisions
 
+- 2026-09-20 (phase 0.2, slices 16-19): **A client deadline returns no result and creates no file; `wait` reports the turn it started on.** Before, `--timeout` printed a partial document and could describe a newer turn than the one the caller watched. Both are false reports; the answer so far is in the session files and `log --tail` reads it.
+- 2026-09-20 (slice 17): **A usage limit is waited out inside the same acpc turn.** ACP has no continuation, so the resumption is a second `session/prompt` on the same adapter session; the turn number, answer file and token count stay one turn's, and `cancel` in `waiting` drops the resumption without contacting the adapter.
+- 2026-09-20 (slice 18): **Off a terminal, `text` is a tagged document; the answer is never escaped, only bounded by counted tags.** Escaping the six wrapper tags inside the answer (draft.9) altered the agent's words; draft.10's `<answer-N>` keeps them verbatim and lets a reader validate the boundary by line count. `next` is always the last metadata key so it lands after `truncated`/`output_file`.
+- 2026-09-20 (slice 19): **`continue` with no message is a resumption, not an empty turn.** Accepted after canceled/failed/unknown with acpc's fixed instruction; a usage error after succeeded; the active-session conflict is checked before the message, so a running session never gets `invalid_input`. `pending_corrections` is always `null` because acpc cannot see the adapter's queue and must not report zero.
 - 2026-09-14 (slice 13, Damian): **`steer` defaults to in-place where the adapter supports it; cancel-then-start stays as the explicit second mode.** The 2026-08-06 decision that steer is interrupt-based rested on ACP having no mid-turn injection; both installed adapters now ship `_session/steering`, measured live. Mode names and `correction_result` follow the standard's `conversational` vocabulary without declaring the extension, so a later declaration is not a rename. `--cancel-after` requires an explicit `--steer-mode cancel-then-start`, a static rule rather than one that depends on runtime capability. An adapter that starts its own turn (`startedNewTurn`) is cancelled and reported `outcome_unknown`; no outcome ever falls back to cancel-then-start automatically.
 - 2026-08-12 (0.6): **Stage B promises a settled state, not the same state.** The bullet first promised that a `continue` following a cancelled restore "starts from the same state the cancelled one did". Round 1 proved that undeliverable: ACP defines no cancellation for `session/load` or `session/resume`, so the restore completes adapter-side after the cancel and mutates the session, and the only mechanism that reliably prevents it is closing the ACP connection — which destroys the warm adapter and every other session on it. The promise now covers what acpc actually controls, what a turn is allowed to run against, and the limit it does not control is stated in the same bullet rather than omitted. Keeping the old wording would have made the SPEC assert something the tool does not do; nobody later reads the weaker promise as a quiet retreat if the retreat is written down.
 - 2026-08-12 (0.6): **`probe`'s measurement engine descopes to 0.7 under a rule armed in advance.** Any further instance of the derive-a-fact-from-the-wrong-operation class ended the slice, and review 9 returned one: causal membership is append-only while the marker predicate beneath it is not, so a verdict could change with nothing but a frame's arrival order. Two architectural attempts is the budget. `probe --discover` ships alone, and a bare `probe` is a usage error rather than a silent answer to the cheaper question.
