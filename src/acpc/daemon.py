@@ -36,7 +36,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from acp import PROTOCOL_VERSION, RequestError, text_block
+from acp import PROTOCOL_VERSION, RequestError
 
 from acpc import __version__, config, errors, ipc, paths, runner, sessions, transcript, vocab
 from acpc.client import (
@@ -1239,6 +1239,7 @@ class Daemon:
             rotation_resolution=payload.get("rotation_resolution"),
             resume_prepared=bool(payload.get("resume_prepared", False)),
             turn_token=payload.get("turn_token"),
+            on_limit=payload.get("on_limit", vocab.ON_LIMIT_WAIT),
         )
 
     async def _prepare_turn(
@@ -1441,7 +1442,6 @@ class Daemon:
         )
 
         turn_error: BaseException | None = None
-        prompt_task: asyncio.Task[Any] | None = None
         warm = self.host.adapter_sessions.get(session_id)
         if warm is not None:
             # The adapter still holds this session, so its own history is
@@ -1478,18 +1478,10 @@ class Daemon:
             client.capture_advertised(session)
 
         self.host.mux.bind(adapter_session_id, client)
+        prompt_started = False
         try:
             try:
                 await runner.apply_call_options(conn, adapter_session_id, request)
-                delivery = runner.register_prompt_delivery(
-                    conn,
-                    session_id,
-                    adapter_session_id,
-                    request.prompt,
-                    on_delivered=lambda: self._prompt_delivered(
-                        session_id, adapter_session_id, turn
-                    ),
-                )
                 if cancel.requested.is_set() and request.resume_prepared:
                     return runner.TurnOutcome(
                         state="canceled",
@@ -1498,41 +1490,33 @@ class Daemon:
                         adapter_session_id=adapter_session_id,
                         turn_token=request.turn_token,
                     )
-                prompt_task = asyncio.create_task(
-                    conn.prompt(session_id=adapter_session_id, prompt=[text_block(request.prompt)])
+                prompt_started = True
+                (
+                    stop_reason,
+                    turn_error,
+                    delivery,
+                    limit_record,
+                ) = await runner.run_prompt_with_limits(
+                    conn,
+                    session_id,
+                    adapter_session_id,
+                    request,
+                    cancel,
+                    client,
+                    events,
+                    on_delivered=lambda: self._prompt_delivered(
+                        session_id, adapter_session_id, turn
+                    ),
                 )
             except BaseException as error:
-                if request.turn_token is None:
+                if prompt_started or request.turn_token is None:
                     raise
                 if isinstance(error, asyncio.CancelledError):
                     raise
                 raise runner.ResumeSetupError(
                     runner.describe_error(error), turn_token=request.turn_token
                 ) from None
-            try:
-                stop_reason = await runner._await_prompt(
-                    conn,
-                    adapter_session_id,
-                    prompt_task,
-                    request,
-                    cancel,
-                    usage_client=client,
-                )
-            except Exception as caught:  # noqa: BLE001
-                # Same bargain as the direct path: keep the streamed prose as the
-                # failed session's answer and carry the cause on the outcome.
-                turn_error = caught
-                stop_reason = "error"
-            try:
-                await delivery.ensure_persisted(prompt_completed=turn_error is None)
-            except Exception as caught:  # noqa: BLE001
-                turn_error = caught if turn_error is None else turn_error
-                stop_reason = "error"
         finally:
-            if prompt_task is not None and not prompt_task.done():
-                prompt_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await prompt_task
             self.host.mux.release(adapter_session_id)
             client.flush()
 
@@ -1554,6 +1538,7 @@ class Daemon:
             error=turn_error,
             delivery_record_incomplete=delivery.delivery_record_incomplete,
             turn_token=request.turn_token,
+            limit=limit_record,
         )
 
     def _prompt_delivered(self, session_id: str, adapter_session_id: str, turn: _Turn) -> None:

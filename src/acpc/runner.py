@@ -23,14 +23,17 @@ import asyncio
 import contextlib
 import json
 import os
+import random
 import re
 import shutil
 import signal
 import subprocess
 import sys
+import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -41,6 +44,7 @@ from acpc import (
     daemon_client,
     environment,
     errors,
+    limits,
     paths,
     sessions,
     targets,
@@ -480,6 +484,8 @@ class TurnRequest:
     wait_timeout: float | None = None
     # ``cancel_after`` is the deadline that intentionally cancels this turn.
     cancel_after: float | None = None
+    # SPEC.md `run`: what to do when a usage limit blocks this turn.
+    on_limit: str = vocab.ON_LIMIT_WAIT
     permission_prompt: Callable[[str, str], bool] | None = None
     resume_adapter_session: str | None = None
     defer_rotation: bool = False
@@ -514,6 +520,8 @@ class TurnOutcome:
     turn_token: int | None = None
     # The daemon continues the accepted turn after this client stops waiting.
     wait_timed_out: bool = False
+    # Set when a usage limit touched this turn; carried onto `meta.limit`.
+    limit: dict[str, Any] | None = None
     # True when this process's own Ctrl-C ended the turn. A session that reads
     # `cancelled` says nothing about who cancelled it, and the two answers need
     # different failure kinds: the command was stopped, or it watched an
@@ -736,19 +744,22 @@ async def _drive_turn(
 
             # After the restore, never before it: codex-acp#343 resets model and
             # effort during session/load, so applying them first would be lost.
+            prompt_started = False
             try:
                 await apply_call_options(conn, adapter_session_id, request)
-                delivery = register_prompt_delivery(
-                    conn, session_id, adapter_session_id, request.prompt
-                )
-                prompt_task = asyncio.create_task(
-                    conn.prompt(
-                        session_id=adapter_session_id,
-                        prompt=[text_block(request.prompt)],
-                    )
+                prompt_started = True
+                stop_reason, turn_error, delivery, limit_record = await run_prompt_with_limits(
+                    conn,
+                    session_id,
+                    adapter_session_id,
+                    request,
+                    cancel,
+                    client,
+                    events,
+                    announce_wait=True,
                 )
             except BaseException as error:
-                if request.turn_token is None:
+                if prompt_started or request.turn_token is None:
                     raise
                 _finalize_claimed_setup_failure(
                     session_id, request.turn_token, error, adapter_session_id
@@ -758,26 +769,6 @@ async def _drive_turn(
                 raise ResumeSetupError(
                     describe_error(error), turn_token=request.turn_token
                 ) from None
-            try:
-                stop_reason = await _await_prompt(
-                    conn,
-                    adapter_session_id,
-                    prompt_task,
-                    request,
-                    cancel,
-                    usage_client=client,
-                )
-            except Exception as caught:  # noqa: BLE001
-                # The adapter failed the turn itself. Whatever prose it streamed
-                # first is still the answer SPEC promises for a failed session,
-                # so the cause travels on the outcome instead of unwinding here.
-                turn_error = caught
-                stop_reason = "error"
-            try:
-                await delivery.ensure_persisted(prompt_completed=turn_error is None)
-            except Exception as caught:  # noqa: BLE001
-                turn_error = caught if turn_error is None else turn_error
-                stop_reason = "error"
     finally:
         client.flush()
 
@@ -797,6 +788,7 @@ async def _drive_turn(
         error=turn_error,
         delivery_record_incomplete=delivery.delivery_record_incomplete,
         turn_token=request.turn_token,
+        limit=limit_record,
     )
 
 
@@ -836,6 +828,7 @@ def _prepare_resumed_turn(
             resume_status=resume_status,
             pid=pid if pid is not None else _host_pid(),
             steer_mode=steer_mode,
+            on_limit=request.on_limit,
         )
     except (RunnerError, sessions.SessionError) as error:
         raise ResumeRotationError(str(error)) from None
@@ -1043,6 +1036,207 @@ def _stop_reason_of(
     return getattr(result, "stop_reason", None)
 
 
+# SPEC.md `run`: sent instead of the original prompt when a limit interrupted
+# it after the turn had already recorded progress, so the adapter continues
+# the same task rather than restarting it. Shared with `continue` without a
+# message (slice 19).
+CONTINUATION_INSTRUCTION = (
+    "acpc: the previous request in this turn was interrupted by a usage limit that has now "
+    "reset. Continue the task from where you stopped. Do not repeat work that is already "
+    "done; if the task was already complete, reply with the final answer."
+)
+
+# How long acpc waits past a limit's own reported reset before resuming: a
+# fixed cushion for clock skew against the vendor's clock, plus jitter so
+# several sessions hitting the same reset instant do not all resend at once.
+# Tests monkeypatch the jitter bound to 0 for a deterministic resume time.
+LIMIT_RESUME_FIXED_DELAY_SECONDS = 5.0
+LIMIT_RESUME_JITTER = 25.0
+
+
+def _limit_wait_max_seconds() -> float:
+    from acpc.config import load_config
+
+    return load_config().limit_wait_max_seconds
+
+
+def _limit_record(observation: Any, *, auto_continue: bool) -> dict[str, Any]:
+    resume_at = observation.resume_at
+    return {
+        "reason": observation.reason,
+        "resume_at": sessions.format_timestamp(resume_at.timestamp()) if resume_at else None,
+        "auto_continue": auto_continue,
+        "source": observation.source,
+    }
+
+
+def _limit_action(
+    observation: Any, *, on_limit: str, limit_waited_seconds: float, limit_wait_max: float
+) -> str:
+    """Decide whether to wait through a recognized limit or fail the turn now."""
+    if on_limit == vocab.ON_LIMIT_FAIL or observation.resume_at is None:
+        return "fail"
+    wait_needed = (observation.resume_at - datetime.now(UTC)).total_seconds()
+    if wait_needed > limit_wait_max - limit_waited_seconds:
+        return "fail"
+    return "wait"
+
+
+async def _sleep_through_limit(seconds: float, cancel: "_CancelSignal") -> bool:
+    """Sleep, interruptible by `cancel`. Returns True when canceled first."""
+    sleeper = asyncio.ensure_future(asyncio.sleep(max(0.0, seconds)))
+    waiter = asyncio.ensure_future(cancel.requested.wait())
+    try:
+        done, _pending = await asyncio.wait({sleeper, waiter}, return_when=asyncio.FIRST_COMPLETED)
+        return waiter in done
+    finally:
+        for task in (sleeper, waiter):
+            if not task.done():
+                task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+
+
+async def run_prompt_with_limits(
+    conn: Any,
+    session_id: str,
+    adapter_session_id: str,
+    request: TurnRequest,
+    cancel: "_CancelSignal",
+    client: "AcpcClient",
+    events: transcript.Transcript,
+    *,
+    on_delivered: Callable[[], None] | None = None,
+    announce_wait: bool = False,
+) -> tuple[str | None, BaseException | None, PromptDelivery, dict[str, Any] | None]:
+    """Send the prompt, waiting through recognized usage limits per `--on-limit`.
+
+    Replaces one bare ``_await_prompt`` call with a loop that recognizes a
+    vendor usage limit (SPEC.md `run`), and either fails the turn with
+    ``stop_reason: rate_limit`` or moves the session to ``waiting``, sleeps
+    past the reported reset, and resends on the same adapter session — the
+    original prompt if this turn recorded no progress yet, acpc's fixed
+    continuation instruction otherwise. Returns the same
+    ``(stop_reason, turn_error, delivery)`` shape the two callers previously
+    built inline, plus the final ``limit`` record for ``meta.json`` (``None``
+    when no limit ever touched this turn).
+
+    ``announce_wait`` is the direct path's own concern: the daemon has no
+    terminal to write to, so it leaves this ``False`` and the wait stays
+    silent past the transcript's own ``limit`` event.
+    """
+    limit_wait_max = _limit_wait_max_seconds()
+    limit_waited_seconds = 0.0
+    limit_record: dict[str, Any] | None = None
+    prompt_text = request.prompt
+    delivered_on_first_send = on_delivered
+
+    while True:
+        # A rejection's rate-limit metadata describes that one send; carrying
+        # it into the next send's classification would misread a genuine
+        # success as a repeat of the limit that already resolved.
+        client.clear_rate_limit_info()
+        delivery = register_prompt_delivery(
+            conn, session_id, adapter_session_id, prompt_text, on_delivered=delivered_on_first_send
+        )
+        # Only the very first send in a turn reaches the daemon's "running"
+        # phase callback; a resend after a limit is still the same turn.
+        delivered_on_first_send = None
+        prompt_task = asyncio.create_task(
+            conn.prompt(session_id=adapter_session_id, prompt=[text_block(prompt_text)])
+        )
+        turn_error: BaseException | None = None
+        try:
+            stop_reason = await _await_prompt(
+                conn, adapter_session_id, prompt_task, request, cancel, usage_client=client
+            )
+        except Exception as caught:  # noqa: BLE001
+            turn_error = caught
+            stop_reason = "error"
+        try:
+            await delivery.ensure_persisted(prompt_completed=turn_error is None)
+        except Exception as caught:  # noqa: BLE001
+            turn_error = caught if turn_error is None else turn_error
+            stop_reason = "error"
+
+        # SPEC.md `run`: a limit is recognized on a failed `session/prompt`; a
+        # prompt the adapter completed is never reclassified from metadata.
+        if cancel.requested.is_set() or not isinstance(turn_error, RequestError):
+            return stop_reason, turn_error, delivery, limit_record
+
+        observation = limits.classify_limit(turn_error, client.rate_limit_info, datetime.now(UTC))
+        if observation is None:
+            return stop_reason, turn_error, delivery, limit_record
+
+        action = _limit_action(
+            observation,
+            on_limit=request.on_limit,
+            limit_waited_seconds=limit_waited_seconds,
+            limit_wait_max=limit_wait_max,
+        )
+        if action == "fail":
+            limit_record = _limit_record(observation, auto_continue=False)
+            events.append(
+                "limit",
+                reason=observation.reason,
+                resume_at=limit_record["resume_at"],
+                action="fail",
+                source=observation.source,
+                detail=observation.detail,
+            )
+            return "rate_limit", turn_error, delivery, limit_record
+
+        limit_record = _limit_record(observation, auto_continue=True)
+        events.append(
+            "limit",
+            reason=observation.reason,
+            resume_at=limit_record["resume_at"],
+            action="wait",
+            source=observation.source,
+            detail=observation.detail,
+        )
+        events.append("state", **{"from": "running", "to": "waiting"})
+        sessions.transition(
+            session_id,
+            "waiting",
+            limit=limit_record,
+            limit_waited_seconds=limit_waited_seconds,
+        )
+        now = datetime.now(UTC)
+        assert observation.resume_at is not None  # action == "wait" guarantees this
+        delay = (
+            max(0.0, (observation.resume_at - now).total_seconds())
+            + LIMIT_RESUME_FIXED_DELAY_SECONDS
+            + random.uniform(0.0, LIMIT_RESUME_JITTER)
+        )
+        if announce_wait and errors.stderr_is_tty():
+            local_time = observation.resume_at.astimezone().strftime("%H:%M:%S")
+            print(
+                f"-- waiting for the usage limit to reset at {local_time}; Ctrl-C cancels",
+                file=sys.stderr,
+                flush=True,
+            )
+        started = time.monotonic()
+        canceled = await _sleep_through_limit(delay, cancel)
+        limit_waited_seconds += time.monotonic() - started
+        if canceled:
+            # SPEC.md `cancel`: a session in `waiting` is canceled without
+            # contacting the adapter — the scheduled resumption is dropped.
+            limit_record = {**limit_record, "auto_continue": False}
+            sessions.update_meta(
+                session_id, limit=limit_record, limit_waited_seconds=limit_waited_seconds
+            )
+            return "canceled", turn_error, delivery, limit_record
+
+        events.append("state", **{"from": "waiting", "to": "running"})
+        sessions.transition(
+            session_id, "running", limit=limit_record, limit_waited_seconds=limit_waited_seconds
+        )
+        prompt_text = (
+            request.prompt if not client.has_recorded_progress else CONTINUATION_INSTRUCTION
+        )
+
+
 def _install_signal_handlers(
     loop: asyncio.AbstractEventLoop,
     cancel: _CancelSignal,
@@ -1088,6 +1282,7 @@ def daemon_payload(request: TurnRequest) -> dict[str, Any]:
         else None,
         "resume_prepared": request.resume_prepared,
         "turn_token": request.turn_token,
+        "on_limit": request.on_limit,
     }
 
 
@@ -1574,6 +1769,7 @@ def _direct_worker_request(session_id: str) -> TurnRequest:
             rotation_resolution=payload.get("rotation_resolution"),
             resume_prepared=bool(payload.get("resume_prepared", False)),
             turn_token=payload.get("turn_token"),
+            on_limit=payload.get("on_limit", vocab.ON_LIMIT_WAIT),
         )
         return request
     except (OSError, ValueError, TypeError, KeyError, RunnerError, sessions.SessionError) as error:
@@ -1674,6 +1870,13 @@ def _finalize(
                 outcome.adapter_session_id
                 if outcome.adapter_session_id is not None
                 else (current.adapter_session_id if current is not None else None)
+            ),
+            # A turn ended from outside the prompt loop (daemon stop, a setup
+            # failure) carries no record of its own; the one on disk stays.
+            limit=(
+                outcome.limit
+                if outcome.limit is not None
+                else (current.limit if current is not None else None)
             ),
         )
     except sessions.SessionError:
@@ -2100,6 +2303,7 @@ def continue_request(
     resolution: CallResolution | None = None,
     defer_rotation: bool = False,
     rotation_resolution: Mapping[str, Any] | None = None,
+    on_limit: str = vocab.ON_LIMIT_WAIT,
 ) -> TurnRequest:
     """Build a follow-up turn from the session's persisted resolution."""
     if meta.adapter_session_id is None:
@@ -2124,6 +2328,7 @@ def continue_request(
         defer_rotation=defer_rotation,
         rotation_resolution=rotation_resolution,
         resume_prepared=False,
+        on_limit=on_limit,
     )
 
 

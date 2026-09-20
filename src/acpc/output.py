@@ -135,6 +135,8 @@ def result_envelope(
             envelope.pop("partial")
         if resume := _resume_status(meta):
             envelope["resume"] = resume
+        if meta.limit is not None:
+            envelope["limit"] = dict(meta.limit)
         if changed is not None:
             envelope["changed"] = changed
         if extra:
@@ -162,6 +164,8 @@ def result_envelope(
         envelope["partial"] = partial
     if resume := _resume_status(meta):
         envelope["resume"] = resume
+    if meta.limit is not None:
+        envelope["limit"] = dict(meta.limit)
     if truncated:
         envelope["output_file"] = paths_for_turn["answer"]
     if changed is not None:

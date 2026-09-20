@@ -533,6 +533,8 @@ class AcpcClient:
         self._cost = previous_cost
         self._usage_update_seen = False
         self._meta_usage_recorded = False
+        self._rate_limit_info: dict[str, Any] | None = None
+        self._recorded_progress = False
         self._denied: dict[str, int] = {}
         self._denial_details: dict[str, dict[str, Any]] = {}
         self._replay_sink: ReplaySink | None = None
@@ -558,6 +560,30 @@ class AcpcClient:
     def cost(self) -> float | None:
         """Return the cumulative cost reported by the adapter."""
         return self._cost
+
+    @property
+    def rate_limit_info(self) -> dict[str, Any] | None:
+        """The last `_meta["_claude/rateLimit"]` seen on a `usage_update`, if any."""
+        return dict(self._rate_limit_info) if self._rate_limit_info is not None else None
+
+    def clear_rate_limit_info(self) -> None:
+        """Drop the last-seen `_meta["_claude/rateLimit"]` before a resend.
+
+        It is a per-prompt signal, not a session fact: without this, a
+        rejection observed on one `session/prompt` would still be sitting
+        here on the next call's success and would be misread as a fresh
+        rejection of a prompt that never happened.
+        """
+        self._rate_limit_info = None
+
+    @property
+    def has_recorded_progress(self) -> bool:
+        """Whether this turn has recorded an assistant `msg` or a finished `tool`.
+
+        Used to choose, on a limit resumption, between the original prompt
+        (nothing recorded yet) and acpc's fixed continuation instruction.
+        """
+        return self._recorded_progress
 
     @property
     def denied(self) -> dict[str, int]:
@@ -723,6 +749,7 @@ class AcpcClient:
                     self._answer_parts.append("\n\n")
                 self._answer_parts.append(text)
                 self._answer_boundary_pending = False
+                self._recorded_progress = True
                 self._buffer_chunk("msg", text)
             return
 
@@ -1090,6 +1117,7 @@ class AcpcClient:
         )
         current.status = status
         current.finished = True
+        self._recorded_progress = True
 
     def _record_usage(self, update: UsageUpdate) -> None:
         self._usage_update_seen = True
@@ -1098,6 +1126,14 @@ class AcpcClient:
             amount = update.cost.amount
             self._cost = amount if self._cost is None else max(self._cost, amount)
         self.transcript.append("usage", tokens=self._tokens, cost=self._cost)
+        # SPEC.md `run`: claude-agent-acp carries the structural reset time on
+        # this notification, ahead of the JSON-RPC error a limit ends the
+        # prompt with, but only once this session has already sent one
+        # assistant message with usage — a fresh session has none yet.
+        meta = self._prompt_meta(update)
+        rate_limit_info = meta.get("_claude/rateLimit")
+        if isinstance(rate_limit_info, Mapping):
+            self._rate_limit_info = dict(rate_limit_info)
 
     async def _ask_permission(self, kind: str, title: str) -> bool:
         if self.permission_prompt is None:

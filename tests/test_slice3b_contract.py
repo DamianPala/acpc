@@ -141,6 +141,7 @@ EXPECTED_REQUIRED: dict[str, tuple[str, ...]] = {
         "stop_reason",
         "failure",
         "capabilities",
+        "limit",
         "paths",
         "created_at",
         "started_at",
@@ -197,7 +198,19 @@ EXPECTED_ENUMS: dict[str, dict[str, tuple[str, ...]]] = {
     },
     "log": {
         "$.type": tuple(
-            sorted(("error", "msg", "permission", "state", "steer", "thought", "tool", "usage"))
+            sorted(
+                (
+                    "error",
+                    "limit",
+                    "msg",
+                    "permission",
+                    "state",
+                    "steer",
+                    "thought",
+                    "tool",
+                    "usage",
+                )
+            )
         )
     },
     "probe": {
@@ -212,6 +225,7 @@ EXPECTED_ENUMS: dict[str, dict[str, tuple[str, ...]]] = {
             "starting",
             "running",
             "preparing",
+            "waiting",
             "succeeded",
             "failed",
             "canceled",
@@ -223,6 +237,7 @@ EXPECTED_ENUMS: dict[str, dict[str, tuple[str, ...]]] = {
             "starting",
             "running",
             "preparing",
+            "waiting",
             "succeeded",
             "failed",
             "canceled",

@@ -92,6 +92,12 @@ _WAIT_TIMEOUT_HELP = (
     "the session keeps running. Unbounded by default."
 )
 
+_ON_LIMIT_HELP = (
+    "What to do when a usage limit blocks the turn: wait (default) holds the turn as "
+    "`waiting` and resumes it after the reported reset, within limit_wait_max; fail ends "
+    "the turn as failed with stop_reason rate_limit."
+)
+
 _OUTPUT_FILE_HELP = (
     "Write exactly what stdout would receive to a file; stdout stays empty, on success and "
     "on a failure that returns a result. A call that returns no result creates no file. A "
@@ -113,7 +119,8 @@ _STEER_OUTPUT_FILE_HELP = (
 _ANSWER_OUTPUT_DESCRIPTION = (
     "Returns the answer result for a turn this call observed the end of — including a "
     "failed or canceled turn — and returns no result for a call that observed no turn, "
-    "including one whose --timeout deadline expired or whose watch ended in a detach. "
+    "including one whose --timeout deadline expired (`context.status` can be `waiting` "
+    "when a usage limit was holding the turn) or whose watch ended in a detach. "
     "`stop_reason`, `cost` and `answer` are present on every foreground result and "
     "omitted by `--background`."
 )
@@ -121,11 +128,14 @@ _WAIT_OUTPUT_DESCRIPTION = (
     "Selects the session's current turn when the call starts and keeps observing that "
     "turn even if the session rotates to a newer one meanwhile; returns the answer "
     "result once that turn has ended — including a failed or canceled turn — and "
-    "returns no result when a --timeout deadline expires first."
+    "returns no result when a --timeout deadline expires first, with `context.status` "
+    "naming the turn's status at the deadline, `waiting` included."
 )
 _STATUS_OUTPUT_DESCRIPTION = (
     "Follows the selector: reports the session's current turn at the time of the call, "
-    "so a session that rotated to a newer turn since is reported as that newer turn."
+    "so a session that rotated to a newer turn since is reported as that newer turn. "
+    "`limit` is `null` unless a usage limit touched that turn; its `source` is one of "
+    "`error_kind`, `rate_limit_info` or `text`."
 )
 
 # The same file, said in full for the schema: `--help` has no room for it.
@@ -4021,6 +4031,7 @@ def _create_run_session(
     cwd: str,
     alias: str | None,
     permissions_source: str | None,
+    on_limit: str = vocab.ON_LIMIT_WAIT,
 ) -> sessions.SessionMeta:
     settings = config.load_config()
     runner.auto_prune(settings.retention_seconds)
@@ -4036,6 +4047,7 @@ def _create_run_session(
             ),
             target=runner.call_target(resolution),
             name=alias,
+            on_limit=on_limit,
         )
     except sessions.SessionError as error:
         raise _session_problem(error) from None
@@ -4129,6 +4141,12 @@ def _run_foreground(
     ),
 )
 @click.option(
+    "--on-limit",
+    type=click.Choice(vocab.ON_LIMIT),
+    default=vocab.ON_LIMIT_WAIT,
+    help=_ON_LIMIT_HELP,
+)
+@click.option(
     "--name",
     "alias",
     metavar="ALIAS",
@@ -4169,6 +4187,7 @@ def run_command(
     format_name: str | None,
     timeout: float | None,
     cancel_after: float | None,
+    on_limit: str,
     alias: str | None,
     background: bool,
     max_output: int,
@@ -4221,6 +4240,7 @@ def run_command(
         cwd=resolved_cwd,
         alias=alias,
         permissions_source=permissions_source or ("default" if defaulted_permissions else None),
+        on_limit=on_limit,
     )
     request = runner.TurnRequest(
         resolution=resolution,
@@ -4229,6 +4249,7 @@ def run_command(
         wait_timeout=timeout,
         cancel_after=cancel_after,
         permission_prompt=_tty_permission_prompt if policy == "ask" else None,
+        on_limit=on_limit,
     )
 
     if background:
@@ -4469,6 +4490,12 @@ def _dispatch_background(
     ),
 )
 @click.option(
+    "--on-limit",
+    type=click.Choice(vocab.ON_LIMIT),
+    default=vocab.ON_LIMIT_WAIT,
+    help=_ON_LIMIT_HELP,
+)
+@click.option(
     "--max-output",
     type=click.IntRange(min=0),
     default=output.DEFAULT_MAX_OUTPUT,
@@ -4488,6 +4515,7 @@ def continue_command(
     background: bool,
     timeout: float | None,
     cancel_after: float | None,
+    on_limit: str,
     max_output: int,
     quiet: bool,
     json_mode: bool,
@@ -4538,6 +4566,7 @@ def continue_command(
         max_output=max_output,
         quiet=quiet,
         json_mode=selected_format == "json",
+        on_limit=on_limit,
     )
 
 
@@ -4549,6 +4578,7 @@ def _follow_up_request(
     background: bool,
     timeout: float | None,
     cancel_after: float | None,
+    on_limit: str = vocab.ON_LIMIT_WAIT,
 ) -> tuple[sessions.SessionMeta, runner.TurnRequest]:
     """Build the next turn on a finished session from its stored resolution.
 
@@ -4614,6 +4644,7 @@ def _follow_up_request(
             resolution=request_resolution,
             defer_rotation=True,
             rotation_resolution=updated_resolution,
+            on_limit=on_limit,
         )
     except (
         AcpcError,
@@ -4640,6 +4671,7 @@ def _dispatch_follow_up(
     json_mode: bool,
     emit_failure_result: bool = True,
     extra: Callable[[sessions.SessionMeta], dict[str, Any]] | None = None,
+    on_limit: str = vocab.ON_LIMIT_WAIT,
 ) -> None:
     """Run the next turn on a finished session using shared turn machinery.
 
@@ -4654,6 +4686,7 @@ def _dispatch_follow_up(
         background=background,
         timeout=timeout,
         cancel_after=cancel_after,
+        on_limit=on_limit,
     )
 
     if background:
@@ -4802,6 +4835,15 @@ _STEER_IPC_TIMEOUT = 15.0
     ),
 )
 @click.option(
+    "--on-limit",
+    "on_limit",
+    type=click.Choice(vocab.ON_LIMIT),
+    help=(
+        f"{_ON_LIMIT_HELP} Applies to the new turn of cancel-then-start; rejected with "
+        "in-place, which starts no turn."
+    ),
+)
+@click.option(
     "--max-output",
     type=click.IntRange(min=0),
     default=output.DEFAULT_MAX_OUTPUT,
@@ -4822,6 +4864,7 @@ def steer_command(
     background: bool,
     timeout: float | None,
     cancel_after: float | None,
+    on_limit: str | None,
     max_output: int,
     quiet: bool,
     json_mode: bool,
@@ -4856,6 +4899,13 @@ def steer_command(
             "--cancel-after is accepted only with --steer-mode cancel-then-start, "
             "the only mode that starts a turn to bound"
         )
+    if on_limit is not None and steer_mode == vocab.STEER_IN_PLACE:
+        # SPEC `steer`: in-place corrects a turn already in flight and starts
+        # none of its own, so there is no new turn for --on-limit to apply to.
+        raise UsageProblem(
+            "--on-limit is accepted only with --steer-mode cancel-then-start, which starts "
+            "the new turn --on-limit applies to; in-place starts none"
+        )
     instruction = _read_prompt(
         instruction_text,
         prompt_file,
@@ -4873,6 +4923,27 @@ def steer_command(
             context={"session_id": meta.session_id, "capabilities": _steer_capabilities(meta)},
         )
 
+    if steer_mode == vocab.STEER_IN_PLACE and meta.state == "waiting":
+        # SPEC `steer`: a session waiting through a usage limit has no turn in
+        # flight to correct — the channel exists but nothing is on the other
+        # end of it right now, which is a state, not a permanent incapability
+        # (`not_supported`), so `_select_steer_mode` never gets to answer.
+        raise AcpcError(
+            f"session {meta.session_id} is waiting for a usage limit to reset — "
+            "there is no turn in flight to correct in place",
+            kind=errors.CONFLICT,
+            hint=f"Run: acpc steer {meta.session_id} ... --steer-mode cancel-then-start",
+            context={
+                "session_id": meta.session_id,
+                "capabilities": _steer_capabilities(meta),
+                "correction_result": {
+                    "steer_mode": vocab.STEER_IN_PLACE,
+                    "target_turn": meta.turns,
+                    "target_status": meta.state,
+                    "message_state": "not_delivered",
+                },
+            },
+        )
     selected_mode = _select_steer_mode(meta, steer_mode)
     target = meta.target
     if selected_mode == vocab.STEER_IN_PLACE:
@@ -4900,6 +4971,7 @@ def steer_command(
         cancel_after=cancel_after,
         max_output=max_output,
         quiet=quiet,
+        on_limit=on_limit or vocab.ON_LIMIT_WAIT,
     )
 
 
@@ -4951,6 +5023,7 @@ def _steer_cancel_then_start(
     cancel_after: float | None,
     max_output: int,
     quiet: bool,
+    on_limit: str = vocab.ON_LIMIT_WAIT,
 ) -> None:
     """Interrupt the turn in flight and send the instruction to the next one.
 
@@ -5011,6 +5084,7 @@ def _steer_cancel_then_start(
             json_mode=selected_format == "json",
             emit_failure_result=False,
             extra=extra,
+            on_limit=on_limit,
         )
     except AcpcError as error:
         raise _redirect_failure(

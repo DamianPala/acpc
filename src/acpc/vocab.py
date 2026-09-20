@@ -25,6 +25,7 @@ SESSION_STATES = (
     "starting",
     "running",
     "preparing",
+    "waiting",
     "succeeded",
     "failed",
     "canceled",
@@ -35,7 +36,9 @@ SESSION_STATES = (
 # them, and `wait` returns immediately. `unknown` means liveness was observed
 # to be lost before acpc could observe the operation's terminal result.
 FINISHED_STATES = frozenset({"succeeded", "failed", "canceled", "unknown"})
-ACTIVE_STATES = frozenset({"starting", "running", "preparing"})
+# `waiting` is a turn holding for a usage limit acpc will resume by itself
+# (SPEC.md *Session states*): active for liveness, listing and `cancel`.
+ACTIVE_STATES = frozenset({"starting", "running", "preparing", "waiting"})
 
 LEGACY_SESSION_STATES = {
     "done": "succeeded",
@@ -56,6 +59,11 @@ def normalize_session_state(value: str) -> str:
 STEER_IN_PLACE = "in-place"
 STEER_CANCEL_THEN_START = "cancel-then-start"
 STEER_MODES = (STEER_IN_PLACE, STEER_CANCEL_THEN_START)
+
+# `--on-limit` (SPEC.md `run`): what to do when a usage limit blocks a turn.
+ON_LIMIT_WAIT = "wait"
+ON_LIMIT_FAIL = "fail"
+ON_LIMIT = (ON_LIMIT_WAIT, ON_LIMIT_FAIL)
 
 # Largest prompt acpc buffers from any single source: the prompt argument, `-`
 # on stdin, or `--prompt-file`.  Counted in UTF-8 bytes and enforced before a

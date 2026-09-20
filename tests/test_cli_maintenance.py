@@ -378,6 +378,36 @@ def test_daemon_stop_force_fails_active_sessions_with_the_existing_reason(
     assert meta.stop_reason == "the daemon was stopped"
 
 
+def test_daemon_stop_force_fails_a_waiting_session_the_same_way(
+    cli: CliRunner, live_daemon: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SPEC.md `daemon`: a turn holding in `waiting` is active, so `--force`
+    ends it exactly like a `running` one — a usage limit is not a reason to
+    orphan the session (slice 17, scenario 13).
+    """
+    monkeypatch.setenv("ACPC_MOCK_LIMIT_PROMPTS", "1")
+    monkeypatch.setenv("ACPC_MOCK_LIMIT_RESET_S", "60")
+
+    result = invoke(cli, "run", "mock", "echo:x", "--bg", "--quiet")
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    session_id = result.stdout.strip().splitlines()[0]
+    _wait_until_state(session_id, "waiting")
+
+    result = invoke(cli, "daemon", "stop", "mock", "--force")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert json.loads(result.stdout)["targets"] == ["mock~4ac109c6ee44d1e7"]
+    assert result.stderr == "-- stopped 1 daemon(s)\n"
+    _wait_until_state(session_id, "failed")
+    meta = sessions.read_meta(session_id)
+    assert meta.state == "failed"
+    assert meta.stop_reason == "the daemon was stopped"
+    # The limit record from `waiting` survives the forced end, but no longer
+    # promises an automatic continuation (`_finalize`'s job on any terminal
+    # state, not just a normal one).
+    assert meta.limit is not None and meta.limit["auto_continue"] is False
+
+
 def test_idle_daemon_stop_keeps_its_existing_output(cli: CliRunner, live_daemon: None) -> None:
     _start_daemon(_target())
 

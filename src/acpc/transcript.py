@@ -24,7 +24,7 @@ HEADER = {"schema": SCHEMA}
 HEADER_LINE = (json.dumps(HEADER, separators=(", ", ": ")) + "\n").encode("utf-8")
 
 EVENT_TYPES = frozenset(
-    {"msg", "thought", "tool", "permission", "error", "state", "usage", "steer"}
+    {"msg", "thought", "tool", "permission", "error", "state", "usage", "steer", "limit"}
 )
 
 _REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
@@ -38,6 +38,9 @@ _REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     # SPEC.md `steer`: every correction is recorded with what acpc sent and
     # what the adapter answered, so the transcript says why a mode was chosen.
     "steer": ("mode", "text", "outcome"),
+    # SPEC.md *State on disk*: a usage limit that touched the turn, recording
+    # why it was recognized, when it should clear, and what acpc did about it.
+    "limit": ("reason", "resume_at", "action", "source", "detail"),
 }
 
 _TAIL_READ_BYTES = 8192

@@ -13,7 +13,7 @@ from pathlib import Path
 from acpc.paths import config_file
 
 _DURATION_RE = re.compile(r"(?:\d+(?:s|m|h|d|w))+\Z")
-_CONFIG_KEYS = frozenset({"retention", "daemon_ttl", "daemon_max_concurrent"})
+_CONFIG_KEYS = frozenset({"retention", "daemon_ttl", "daemon_max_concurrent", "limit_wait_max"})
 _DURATION_UNITS = {"s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0, "w": 604800.0}
 
 
@@ -28,6 +28,7 @@ class Config:
     retention: str = "90d"
     daemon_ttl: str = "30m"
     daemon_max_concurrent: int = 8
+    limit_wait_max: str = "8h"
 
     @property
     def retention_seconds(self) -> float:
@@ -36,6 +37,10 @@ class Config:
     @property
     def daemon_ttl_seconds(self) -> float:
         return parse_duration(self.daemon_ttl)
+
+    @property
+    def limit_wait_max_seconds(self) -> float:
+        return parse_duration(self.limit_wait_max)
 
 
 DEFAULT_CONFIG = Config()
@@ -77,7 +82,7 @@ def _validate(path: Path, values: dict[str, object]) -> Config:
         raise ConfigError(
             f"{path}: unknown key(s) {names} in the root section; "
             "remove them (the supported keys are retention, daemon_ttl, "
-            "daemon_max_concurrent)"
+            "daemon_max_concurrent, limit_wait_max)"
         )
 
     retention = _validate_duration(
@@ -88,6 +93,9 @@ def _validate(path: Path, values: dict[str, object]) -> Config:
     )
     daemon_ttl = _validate_duration(
         path, "daemon_ttl", values.get("daemon_ttl", DEFAULT_CONFIG.daemon_ttl)
+    )
+    limit_wait_max = _validate_duration(
+        path, "limit_wait_max", values.get("limit_wait_max", DEFAULT_CONFIG.limit_wait_max)
     )
     max_concurrent = values.get("daemon_max_concurrent", DEFAULT_CONFIG.daemon_max_concurrent)
     if (
@@ -101,6 +109,7 @@ def _validate(path: Path, values: dict[str, object]) -> Config:
         retention=retention,
         daemon_ttl=daemon_ttl,
         daemon_max_concurrent=max_concurrent,
+        limit_wait_max=limit_wait_max,
     )
 
 

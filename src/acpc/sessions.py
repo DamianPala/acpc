@@ -67,10 +67,14 @@ _ID_ALLOCATION_ATTEMPTS = 64
 # a new turn re-opens the session through `rotate_turn`.
 _ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     "starting": frozenset({"running", "succeeded", "failed", "canceled", "unknown"}),
-    "running": frozenset({"succeeded", "failed", "canceled", "unknown"}),
+    "running": frozenset({"succeeded", "failed", "canceled", "unknown", "waiting"}),
+    # A turn holding for a usage limit either resumes on the same adapter
+    # session (back to `running`) or ends without ever resuming.
+    "waiting": frozenset({"running", "succeeded", "failed", "canceled", "unknown"}),
 }
 
 _TIMESTAMP_FIELDS = frozenset({"created_at", "started_at", "finished_at"})
+_ON_LIMIT_VALUES = frozenset(vocab.ON_LIMIT)
 _RFC3339_TIMESTAMP = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$"
 )
@@ -199,6 +203,12 @@ class SessionMeta:
     adapter_session_id: str | None = None
     target: str | None = None
     steer_mode: str | None = None
+    # SPEC.md `run`/*State on disk*: what to do when a usage limit blocks the
+    # turn, `limit` describing one that touched the current turn (`None` when
+    # none has), and the cumulative wait against `limit_wait_max` this turn.
+    on_limit: str = vocab.ON_LIMIT_WAIT
+    limit: dict[str, Any] | None = None
+    limit_waited_seconds: float = 0.0
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -470,6 +480,30 @@ def _coerce_steer_mode(value: Any, key: str, path: Path) -> str | None:
     return vocab.STEER_IN_PLACE if vocab.STEER_IN_PLACE in value else vocab.STEER_CANCEL_THEN_START
 
 
+def _coerce_on_limit(value: Any, key: str, path: Path) -> str:
+    if value is None:
+        return vocab.ON_LIMIT_WAIT
+    if not isinstance(value, str) or value not in _ON_LIMIT_VALUES:
+        raise CorruptSessionError(f"{path}: {key} is not one of {sorted(_ON_LIMIT_VALUES)}")
+    return value
+
+
+def _coerce_limit(value: Any, key: str, path: Path) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise CorruptSessionError(f"{path}: {key} is not an object")
+    return dict(value)
+
+
+def _coerce_limit_waited_seconds(value: Any, key: str, path: Path) -> float:
+    if value is None:
+        return 0.0
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise CorruptSessionError(f"{path}: {key} is not a number")
+    return float(value)
+
+
 def _coerce_denial_details(value: Any, key: str, path: Path) -> dict[str, dict[str, Any]]:
     if value is None:
         return {}
@@ -549,6 +583,11 @@ def meta_from_dict(data: Mapping[str, Any], *, path: Path) -> SessionMeta:
             data.get("steer_mode") if "steer_mode" in data else data.get("steer_modes"),
             "steer_mode" if "steer_mode" in data else "steer_modes",
             path,
+        ),
+        on_limit=_coerce_on_limit(known.get("on_limit"), "on_limit", path),
+        limit=_coerce_limit(known.get("limit"), "limit", path),
+        limit_waited_seconds=_coerce_limit_waited_seconds(
+            known.get("limit_waited_seconds"), "limit_waited_seconds", path
         ),
         extra=extra,
     )
@@ -725,6 +764,7 @@ def create_session(
     resolution: Mapping[str, Any] | None = None,
     target: str | None = None,
     name: str | None = None,
+    on_limit: str = vocab.ON_LIMIT_WAIT,
     clock: Clock | None = None,
     rng: random.Random | None = None,
 ) -> SessionMeta:
@@ -741,6 +781,7 @@ def create_session(
         prompt_snippet=prompt_snippet(prompt),
         resolution=dict(resolution or {}),
         target=target,
+        on_limit=on_limit,
     )
     with session_lock(session_id):
         paths.atomic_write(prompt_path(session_id), prompt)
@@ -801,6 +842,16 @@ def update_meta(session_id: str, **changes: Any) -> SessionMeta:
     return meta
 
 
+def _close_limit(meta: "SessionMeta") -> None:
+    """Flip a turn's `limit.auto_continue` to `false` once the turn ends.
+
+    SPEC.md `status`: `auto_continue` is `true` while the session is
+    `waiting` and `false` once the turn ended, whichever way it ended.
+    """
+    if meta.limit is not None and meta.limit.get("auto_continue"):
+        meta.limit = {**meta.limit, "auto_continue": False}
+
+
 def transition(
     session_id: str,
     to_state: str,
@@ -833,8 +884,10 @@ def transition(
         now = resolved_clock()
         if to_state == "running" and meta.started_at is None:
             meta.started_at = now
-        if to_state in vocab.FINISHED_STATES and meta.finished_at is None:
-            meta.finished_at = now
+        if to_state in vocab.FINISHED_STATES:
+            if meta.finished_at is None:
+                meta.finished_at = now
+            _close_limit(meta)
         write_meta(meta)
     return meta
 
@@ -889,8 +942,10 @@ def finalize_turn(
         now = resolved_clock()
         if to_state == "running" and meta.started_at is None:
             meta.started_at = now
-        if to_state in vocab.FINISHED_STATES and meta.finished_at is None:
-            meta.finished_at = now
+        if to_state in vocab.FINISHED_STATES:
+            if meta.finished_at is None:
+                meta.finished_at = now
+            _close_limit(meta)
         write_meta(meta)
         return meta
 
@@ -932,6 +987,7 @@ def rotate_turn(
     resume_status: str | None = None,
     pid: int | None = None,
     steer_mode: str | None = None,
+    on_limit: str | None = None,
 ) -> SessionMeta:
     """Open the next turn: park the finished turn's artifacts, reset per-turn state.
 
@@ -985,6 +1041,14 @@ def rotate_turn(
         meta.denied = {}
         meta.denial_details = {}
         meta.steer_mode = steer_mode
+        # SPEC.md `run`: a usage limit belongs to the turn it touched, so a new
+        # turn starts clean; `on_limit` is this call's own choice, not
+        # inherited, but defaults to what was already set when the caller
+        # (a plain cancel-then-start redirect) does not supply one.
+        meta.limit = None
+        meta.limit_waited_seconds = 0.0
+        if on_limit is not None:
+            meta.on_limit = on_limit
         meta.extra.pop("failure", None)
         meta.extra.pop("resume", None)
         if prompt is not None:

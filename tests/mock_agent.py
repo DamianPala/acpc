@@ -72,6 +72,23 @@ acpc asked for and whether it cancelled the turn the adapter started on its own.
 the floor: the running scenario's own timer is the only thing that ends the
 turn, which is what a cancel-deadline test needs.
 
+Usage-limit simulation (slice 17), checked before every scenario, exact-prefix
+triggers included: ``ACPC_MOCK_LIMIT_PROMPTS=N`` fails the first N
+``session/prompt`` calls in a session with the JSON-RPC error claude-agent-acp
+sends for a usage limit — ``-32603``, ``Internal error: You've hit your
+session limit · resets <time> (<zone>)``, ``data: {"errorKind":
+"rate_limit"}``; call N+1 runs its scenario normally.
+``ACPC_MOCK_LIMIT_RESET_S=S`` sets the reset time S seconds from now (default
+60; the text has minute resolution, so the clause is rounded up to the next
+full minute). ``ACPC_MOCK_LIMIT_META=1`` sends a ``usage_update`` with
+``_meta["_claude/rateLimit"] = {"status": "rejected", "resetsAt": <now + S,
+exact>, "rateLimitType": "five_hour"}`` before the error — the only way to get
+a reset time with sub-minute precision. ``ACPC_MOCK_LIMIT_NO_DATA=1`` omits
+``data`` from the error. ``ACPC_MOCK_LIMIT_NO_TIME=1`` drops the ``resets``
+clause from the text. ``ACPC_MOCK_LIMIT_AFTER_TEXT=1`` streams one message
+chunk before the error, to exercise the continuation-instruction path. The
+zone is ``TZ`` if set, else ``Europe/Warsaw``.
+
 Advertised dataset: modes ``default``/``acceptEdits``/``plan``/``yolo`` (the
 restricted mode), models ``mock-opus-5``/``mock-sonnet-5``/``mock-haiku-4-5``,
 efforts ``low``/``medium``/``high``/``xhigh`` — any other effort value is
@@ -82,12 +99,15 @@ level" to surface. A small command list is advertised after session/new.
 import asyncio
 import contextlib
 import json
+import math
 import os
 import sys
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from acp import (
     Agent,
@@ -254,6 +274,21 @@ def _steering_setting() -> str:
     return os.environ.get("ACPC_MOCK_STEERING", "")
 
 
+def _reset_clause(reset_epoch: float, zone_name: str) -> str:
+    """Render claude-agent-acp's ``resets <time> (<zone>)`` clause.
+
+    The vendor text has minute resolution, so the instant is rounded up to
+    the next full minute before it is rendered in ``zone_name`` — the same
+    rounding a real subscription limit's message would show.
+    """
+    rounded = math.ceil(reset_epoch / 60) * 60
+    local = datetime.fromtimestamp(rounded, tz=UTC).astimezone(ZoneInfo(zone_name))
+    hour12 = local.hour % 12 or 12
+    ampm = "am" if local.hour < 12 else "pm"
+    time_text = f"{hour12}:{local.minute:02d}{ampm}" if local.minute else f"{hour12}{ampm}"
+    return f"resets {time_text} ({zone_name})"
+
+
 def select_scenario(prompt: str) -> str | None:
     """MVP keyword selection: case-insensitive substring, first match wins."""
     lower = prompt.lower()
@@ -285,6 +320,7 @@ class MockAgent(Agent):
         # turns has accepted but not yet acknowledged in its stream.
         self._prompt_active: set[str] = set()
         self._steered: dict[str, list[str]] = {}
+        self._limit_prompt_counts: dict[str, int] = {}
 
     def on_connect(self, conn: Client) -> None:
         self._conn = conn
@@ -648,6 +684,7 @@ class MockAgent(Agent):
         history: list[str],
         cancel_event: asyncio.Event,
     ) -> PromptResponse:
+        await self._maybe_hit_limit(session_id)
         prefix_response = await self._prefix_trigger(session_id, prompt_text, cancel_event)
         if prefix_response is not None:
             return prefix_response
@@ -838,6 +875,60 @@ class MockAgent(Agent):
             raise RequestError(-32603, "Internal error", {"details": "upstream connection reset"})
 
         return None
+
+    async def _maybe_hit_limit(self, session_id: str) -> None:
+        """Fail this call with a usage limit, per ``ACPC_MOCK_LIMIT_*`` (slice 17).
+
+        Checked before every scenario, including the exact-prefix triggers, so
+        the resend after a wait reaches the caller's own scenario unchanged
+        once the configured number of failing calls has been used up.
+        """
+        raw_prompts = os.environ.get("ACPC_MOCK_LIMIT_PROMPTS")
+        if raw_prompts is None:
+            return
+        seen = self._limit_prompt_counts.get(session_id, 0)
+        self._limit_prompt_counts[session_id] = seen + 1
+        if seen >= int(raw_prompts):
+            return
+
+        reset_seconds = float(os.environ.get("ACPC_MOCK_LIMIT_RESET_S", "60"))
+        reset_epoch = time.time() + reset_seconds
+        zone_name = os.environ.get("TZ") or "Europe/Warsaw"
+
+        if os.environ.get("ACPC_MOCK_LIMIT_AFTER_TEXT") == "1":
+            await self._send_text(session_id, "working on it")
+        if os.environ.get("ACPC_MOCK_LIMIT_META") == "1":
+            await self._send_usage_meta(
+                session_id,
+                rate_limit={
+                    "status": "rejected",
+                    "resetsAt": reset_epoch,
+                    "rateLimitType": "five_hour",
+                },
+            )
+
+        if os.environ.get("ACPC_MOCK_LIMIT_NO_TIME") == "1":
+            text = "You've hit your session limit"
+        else:
+            text = f"You've hit your session limit · {_reset_clause(reset_epoch, zone_name)}"
+        data = (
+            None
+            if os.environ.get("ACPC_MOCK_LIMIT_NO_DATA") == "1"
+            else {"errorKind": "rate_limit"}
+        )
+        raise RequestError(-32603, f"Internal error: {text}", data)
+
+    async def _send_usage_meta(self, session_id: str, *, rate_limit: dict[str, Any]) -> None:
+        update = UsageUpdate(
+            session_update="usage_update",
+            used=0,
+            size=200_000,
+            field_meta={"_claude/rateLimit": rate_limit},
+        )
+        try:
+            await self._conn.session_update(session_id=session_id, update=update)
+        except (ConnectionError, OSError, RuntimeError):
+            pass
 
     def _history_reference(self, history: list[str]) -> str:
         if not history:

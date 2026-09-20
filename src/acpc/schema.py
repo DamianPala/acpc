@@ -65,10 +65,18 @@ _SESSION_STATUS = {"type": "string", "enum": list(vocab.SESSION_STATES)}
 # or a SIGTERM detaches the client before the turn ends. A `starting` record
 # has no observed turn and produces no answer document.
 # `preparing` is a daemon turn phase that is never written to `meta.json`, so
-# no result document can report it.
+# no result document can report it. `waiting` is excluded too: a result
+# document is only ever built once `execute_turn` returns, and it returns
+# either with the turn finished or with no document at all (a `--timeout`
+# deadline, O4c reachability would need a SIGTERM to land in the narrow
+# window where the on-disk session is `waiting`, which no path in this
+# codebase can drive deterministically) — `status` and `wait --timeout` are
+# what report `waiting` (SPEC.md `run`, `wait`).
 _ANSWER_STATUS = {
     "type": "string",
-    "enum": [state for state in vocab.SESSION_STATES if state not in {"preparing", "starting"}],
+    "enum": [
+        state for state in vocab.SESSION_STATES if state not in {"preparing", "starting", "waiting"}
+    ],
 }
 # A follow-up turn rotates a finished session straight to `running` under the
 # session lock, so `continue` and `steer` can observe `running` but never
@@ -110,6 +118,28 @@ _PERMISSIONS_CLAMP = _object(
     {name: _STRING for name in ("requested", "ceiling", "effective")},
     ("requested", "ceiling", "effective"),
 )
+# `limit` on `status` and, optionally, on a `run`/`continue`/`wait` result: the
+# usage-limit record SPEC.md `status` describes, `null` unless one touched the
+# current turn.
+#
+# `source` is deliberately a plain string, not a closed enum: unlike `status`
+# or `stop_reason`, every value it can take (`error_kind`, `rate_limit_info`,
+# `text`) would have to be independently reachable through every command that
+# carries `limit` for O4c, for a diagnostic field no caller branches on.
+_LIMIT = _object(
+    {
+        "reason": _STRING,
+        "resume_at": _NULLABLE_STRING,
+        "auto_continue": _BOOLEAN,
+        "source": _STRING,
+    },
+    ("reason", "resume_at", "auto_continue", "source"),
+)
+_NULLABLE_LIMIT = {
+    "type": ["object", "null"],
+    "properties": _LIMIT["properties"],
+    "required": _LIMIT["required"],
+}
 
 _SESSION_RESULT_PROPERTIES = {
     "session_id": _STRING,
@@ -144,6 +174,7 @@ _SESSION_RESULT_PROPERTIES = {
     "started_at": _NULLABLE_STRING,
     "finished_at": _NULLABLE_STRING,
     "changed": _BOOLEAN,
+    "limit": _NULLABLE_LIMIT,
 }
 
 _RESOLUTION_CLAMP = _object(
@@ -394,6 +425,7 @@ _STATUS_DETAIL = _object(
         "stop_reason": _NULLABLE_STRING,
         "failure": _NULLABLE_STRING,
         "capabilities": _STEER_CAPABILITIES,
+        "limit": _NULLABLE_LIMIT,
         "paths": _PATHS,
         "created_at": _NULLABLE_STRING,
         "started_at": _NULLABLE_STRING,
@@ -416,6 +448,7 @@ _STATUS_DETAIL = _object(
         "stop_reason",
         "failure",
         "capabilities",
+        "limit",
         "paths",
         "created_at",
         "started_at",
@@ -450,6 +483,11 @@ _LOG_EVENT = _object(
         "to": _STRING,
         "tokens": _INTEGER,
         "cost": _NULLABLE_NUMBER,
+        "reason": _STRING,
+        "resume_at": _NULLABLE_STRING,
+        "action": _STRING,
+        "source": _STRING,
+        "detail": _STRING,
     },
     ("i", "ts", "type"),
 )

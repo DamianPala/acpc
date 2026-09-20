@@ -154,6 +154,7 @@ def format_event(
         "state": "state ",
         "usage": "usage ",
         "steer": "steer  ",
+        "limit": "limit ",
     }
     label = labels.get(event_type, f"{event_type} ")
     if continued and event_type in {"msg", "thought"}:
@@ -204,6 +205,11 @@ def format_event(
         if isinstance(cost, (int, float)) and not isinstance(cost, bool):
             cost_text = f" · cost ${cost:.2f}"
         return f"[{timestamp}] {label}{event.get('tokens', 0)} tok{cost_text}"
+    if event_type == "limit":
+        resume_at = event.get("resume_at") or "?"
+        action = _single_line(event.get("action", "?"))
+        reason = _single_line(event.get("reason", "?"))
+        return f"[{timestamp}] {label}{reason} action={action} resumes {resume_at}"
     return f"[{timestamp}] {label}{_single_line(event)}"
 
 
@@ -610,6 +616,11 @@ def render_status_detail(
         lines.append(
             f"failure  {safe_text(meta.failure)} · continue: acpc continue {meta.session_id}"
         )
+    if meta.limit is not None:
+        resume_at = meta.limit.get("resume_at") or "·"
+        lines.append(
+            f"limit: {safe_text(meta.limit.get('reason'))}, resumes {safe_text(resume_at)}"
+        )
     return "\n".join(lines) + "\n"
 
 
@@ -675,6 +686,7 @@ def status_detail_json(
         "stop_reason": meta.stop_reason,
         "failure": meta.failure,
         "capabilities": {"steer_mode": meta.steer_mode or vocab.STEER_CANCEL_THEN_START},
+        "limit": dict(meta.limit) if meta.limit is not None else None,
         "paths": sessions.session_paths(meta.session_id),
         "created_at": _timestamp_or_none(meta.created_at),
         "started_at": _timestamp_or_none(meta.started_at),

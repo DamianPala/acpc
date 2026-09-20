@@ -676,14 +676,16 @@ def test_every_answer_command_declares_partial_and_its_emission_cases(
         "run": (
             "Returns the answer result for a turn this call observed the end of — including a "
             "failed or canceled turn — and returns no result for a call that observed no turn, "
-            "including one whose --timeout deadline expired or whose watch ended in a detach. "
+            "including one whose --timeout deadline expired (`context.status` can be `waiting` "
+            "when a usage limit was holding the turn) or whose watch ended in a detach. "
             "`stop_reason`, `cost` and `answer` are present on every foreground result and "
             "omitted by `--background`."
         ),
         "continue": (
             "Returns the answer result for a turn this call observed the end of — including a "
             "failed or canceled turn — and returns no result for a call that observed no turn, "
-            "including one whose --timeout deadline expired or whose watch ended in a detach. "
+            "including one whose --timeout deadline expired (`context.status` can be `waiting` "
+            "when a usage limit was holding the turn) or whose watch ended in a detach. "
             "`stop_reason`, `cost` and `answer` are present on every foreground result and "
             "omitted by `--background`."
         ),
@@ -691,7 +693,8 @@ def test_every_answer_command_declares_partial_and_its_emission_cases(
             "Selects the session's current turn when the call starts and keeps observing that "
             "turn even if the session rotates to a newer one meanwhile; returns the answer "
             "result once that turn has ended — including a failed or canceled turn — and "
-            "returns no result when a --timeout deadline expires first."
+            "returns no result when a --timeout deadline expires first, with `context.status` "
+            "naming the turn's status at the deadline, `waiting` included."
         ),
     }
     assert description == expected[name]
