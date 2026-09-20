@@ -2,16 +2,12 @@
 
 `classify_limit` is pure (`acpc.limits`), so its table is exercised directly.
 Everything else — a turn moving to `waiting`, the daemon resending the
-prompt, `--on-limit`, `cancel` dropping the wait — is exercised through the
-CLI against the mock adapter's `ACPC_MOCK_LIMIT_*` knobs (mock_agent.py),
+prompt, `limit_wait_max`, `cancel` dropping the wait — is exercised through
+the CLI against the mock adapter's `ACPC_MOCK_LIMIT_*` knobs (mock_agent.py),
 same as the rest of this suite.
 """
 
 import json
-import os
-import pty
-import select
-import signal
 import sys
 import threading
 import time
@@ -49,7 +45,6 @@ def state_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     agents.mkdir(parents=True)
     (agents / "mock.toml").write_text(MOCK_ENTRY, encoding="utf-8")
     monkeypatch.setenv("ACPC_HOME", str(root))
-    monkeypatch.setattr(runner, "LIMIT_RESUME_JITTER", 0.0)
     return root
 
 
@@ -206,15 +201,21 @@ def test_run_waits_through_a_limit_and_resumes_the_original_prompt(
     assert meta.limit["reason"] == "rate_limit"
     assert meta.limit["auto_continue"] is True
     assert meta.limit["source"] == "rate_limit_info"
+    assert meta.limit["resume_at"] is not None
     assert meta.turns == 1
 
     status_result = invoke(cli, "status", session_id, "--json")
-    assert json.loads(status_result.stdout)["status"] == "waiting"
+    status_document = json.loads(status_result.stdout)
+    assert status_document["status"] == "waiting"
+    assert "on_limit" not in status_document
+    assert "limit_waited_seconds" not in status_document
 
     timeout_result = invoke(cli, "wait", session_id, "--timeout", "0.2", "--json", "--quiet")
     assert timeout_result.exit_code == vocab.EXIT_TIMEOUT
     assert timeout_result.stdout == ""
     assert json.loads(timeout_result.stderr)["error"]["context"]["status"] == "waiting"
+
+    resume_at = datetime.fromisoformat(meta.limit["resume_at"])
 
     thread.join(timeout=30)
     assert "error" not in holder, holder
@@ -225,9 +226,21 @@ def test_run_waits_through_a_limit_and_resumes_the_original_prompt(
     assert document["answer"] == "x"
     assert document["turn"] == 1
     assert document["limit"]["auto_continue"] is False
+    assert "on_limit" not in document
+    assert "limit_waited_seconds" not in document
 
     final = sessions.load(session_id)
     assert final.turns == 1
+    assert final.finished_at is not None
+    # Resumption is `resume_at` plus the fixed 5 s cushion, no jitter: a
+    # generous 5-10 s window catches scheduling slack without tolerating a
+    # regression back to the old 5-30 s jittered range.
+    resumed_after = final.finished_at - resume_at.timestamp()
+    assert 5.0 <= resumed_after <= 10.0, resumed_after
+
+    raw_meta = json.loads(sessions.meta_path(session_id).read_text(encoding="utf-8"))
+    assert "on_limit" not in raw_meta
+    assert "limit_waited_seconds" not in raw_meta
     events = [
         json.loads(line) for line in invoke(cli, "log", session_id, "--json").stdout.splitlines()
     ]
@@ -303,12 +316,6 @@ def test_run_recognizes_a_text_only_limit_and_cancel_drops_the_wait(
     log_text = steering_log.read_text(encoding="utf-8") if steering_log.exists() else ""
     assert f"cancel:{final.adapter_session_id}" not in log_text
 
-    # `limit_waited_seconds` is the time actually slept (a few seconds to
-    # reach `waiting` and cancel it), not the ~65s the scheduled resume
-    # (RESET_S=60 + the fixed 5s cushion) would have added if it were taken
-    # from the planned delay regardless of the cancel landing early.
-    assert final.limit_waited_seconds < 10.0
-
 
 # --- behavior: 3. a second send after a limit uses the continuation text ----
 
@@ -330,17 +337,18 @@ def test_resend_after_progress_uses_the_continuation_instruction(
     assert runner.CONTINUATION_INSTRUCTION in document["answer"]
 
 
-# --- behavior: 4/5/6. --on-limit fail, unknown time, and the wait cap ------
+# --- behavior: 4/5/6. limit_wait_max = "0s", unknown time, and the wait cap
 
 
-def test_on_limit_fail_ends_the_turn_immediately(
-    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+def test_limit_wait_max_zero_ends_the_turn_immediately(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch, state_root: Path
 ) -> None:
+    (state_root / "config.toml").write_text('limit_wait_max = "0s"\n', encoding="utf-8")
     monkeypatch.setenv("ACPC_MOCK_LIMIT_PROMPTS", "1")
     monkeypatch.setenv("ACPC_MOCK_LIMIT_META", "1")
     monkeypatch.setenv("ACPC_MOCK_LIMIT_RESET_S", "60")
 
-    result = invoke(cli, "run", "mock", "echo:x", "--json", "--quiet", "--on-limit", "fail")
+    result = invoke(cli, "run", "mock", "echo:x", "--json", "--quiet")
 
     assert result.exit_code == vocab.EXIT_AGENT_ERROR
     document = json.loads(result.stdout)
@@ -413,28 +421,7 @@ def test_no_data_still_recognizes_the_limit_from_the_text_prefix(
     assert holder["result"].exit_code == vocab.EXIT_OK
 
 
-# --- behavior: 9/10. steer conflicts and the --on-limit/in-place refusal ---
-
-
-def test_steer_on_limit_with_in_place_is_an_invalid_input(cli: CliRunner) -> None:
-    session_id = sessions.create_session(
-        entry="mock", base_adapter="mock", prompt="steer probe"
-    ).session_id
-    sessions.mark_running(session_id, pid=os.getpid(), process_start_time="probe")
-
-    result = invoke(
-        cli,
-        "steer",
-        session_id,
-        "y",
-        "--steer-mode",
-        "in-place",
-        "--on-limit",
-        "fail",
-    )
-
-    assert result.exit_code == vocab.EXIT_USAGE
-    assert json.loads(result.stderr)["error"]["kind"] == "invalid_input"
+# --- behavior: 9/10. steer conflicts on a session with a turn in flight ----
 
 
 def test_steer_in_place_on_a_waiting_session_is_a_conflict(
@@ -542,13 +529,14 @@ def test_steer_cancel_then_start_on_a_waiting_session_starts_turn_two(
     assert sessions.load(session_id).turns == 2
 
 
-def test_steer_cancel_then_start_on_limit_fail_fails_turn_two(
-    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+def test_steer_cancel_then_start_fails_turn_two_when_limit_wait_max_is_zero(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch, state_root: Path
 ) -> None:
-    """Scenario 9 combined with `--on-limit`: `fail` applies to the NEW turn
-    `cancel-then-start` opens, not to the one it interrupts (turn 1 keeps its
-    own default `wait` and is simply canceled, never given the chance to
-    fail on its own limit).
+    """Scenario 9 combined with a lowered `limit_wait_max`: the cap is read
+    fresh when each turn starts sending, so tightening it between turn 1 and
+    turn 2 fails only the new turn `cancel-then-start` opens; turn 1 already
+    waited under the old, generous default and is simply canceled, never
+    given the chance to fail on its own limit.
     """
     monkeypatch.setenv("ACPC_MOCK_LIMIT_PROMPTS", "2")
     monkeypatch.setenv("ACPC_MOCK_LIMIT_META", "1")
@@ -570,6 +558,8 @@ def test_steer_cancel_then_start_on_limit_fail_fails_turn_two(
     session_id = _await_alias("limit-wait-cts-fail")
     _wait_for_state(session_id, "waiting")
 
+    (state_root / "config.toml").write_text('limit_wait_max = "0s"\n', encoding="utf-8")
+
     result = invoke(
         cli,
         "steer",
@@ -577,15 +567,13 @@ def test_steer_cancel_then_start_on_limit_fail_fails_turn_two(
         "z",
         "--steer-mode",
         "cancel-then-start",
-        "--on-limit",
-        "fail",
         "--json",
         "--quiet",
     )
     # `steer`'s redirect turn reports a failure as an error, not a result
     # document (`emit_failure_result=False`, unlike a plain `run`/`continue`
-    # with `--on-limit fail`); the session record is the source of truth for
-    # what turn 2 actually ended as.
+    # with a limit that fails); the session record is the source of truth
+    # for what turn 2 actually ended as.
     assert result.exit_code == vocab.EXIT_AGENT_ERROR
     assert result.stdout == ""
     # A directly spawned adapter's own stderr comes back on acpc's stderr
@@ -622,66 +610,6 @@ def test_run_timeout_while_waiting_reports_context_status_waiting(
     assert envelope["context"]["status"] == "waiting"
 
 
-# --- behavior: 12. the direct path announces the wait on a real terminal ---
-
-
-@pytest.mark.filterwarnings(
-    "ignore:This process .* is multi-threaded, use of forkpty\\(\\) may lead to deadlocks.*:DeprecationWarning"
-)
-def test_direct_path_announces_the_wait_on_a_tty(state_root: Path) -> None:
-    """SPEC (brief, `direct_worker.py` / direct path): on a TTY, the wait is
-    visible as a stderr line, so a human watching a blocking `run` is not
-    staring at what looks like a hang. `--permissions ask` forces the direct
-    path without a daemon; the mock's `echo:` scenario asks nothing, so it
-    never actually blocks on the terminal.
-    """
-    argv = [
-        sys.executable,
-        "-c",
-        "from acpc.cli import main; main()",
-        "run",
-        "mock",
-        "echo:x",
-        "--permissions",
-        "ask",
-        "--quiet",
-    ]
-    env = dict(os.environ)
-    env["ACPC_HOME"] = str(state_root)
-    env["ACPC_MOCK_LIMIT_PROMPTS"] = "1"
-    env["ACPC_MOCK_LIMIT_META"] = "1"
-    env["ACPC_MOCK_LIMIT_RESET_S"] = "1"
-
-    child_pid, master_fd = pty.fork()
-    if child_pid == 0:
-        signal.signal(signal.SIGHUP, signal.SIG_DFL)
-        os.execve(sys.executable, argv, env)
-
-    needle = b"waiting for the usage limit to reset at"
-    output = bytearray()
-    try:
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline:
-            ready, _, _ = select.select([master_fd], [], [], 0.2)
-            if not ready:
-                continue
-            try:
-                output.extend(os.read(master_fd, 4096))
-            except OSError:
-                break
-            if needle in output:
-                break
-        rendered = output.decode(errors="replace")
-        assert needle.decode() in rendered, rendered
-        assert "Ctrl-C cancels" in rendered
-    finally:
-        os.close(master_fd)
-        waited_pid, _ = os.waitpid(child_pid, os.WNOHANG)
-        if waited_pid == 0:
-            os.kill(child_pid, signal.SIGKILL)
-            os.waitpid(child_pid, 0)
-
-
 # --- behavior: 15. an untouched turn carries no limit field ----------------
 
 
@@ -696,15 +624,42 @@ def test_a_session_with_no_limit_reports_null_and_no_limit_field(cli: CliRunner)
     assert json.loads(status_result.stdout)["limit"] is None
 
 
-# --- behavior: 14. schema exposes --on-limit and the waiting status -------
+# --- behavior: 14. schema has no --on-limit; the waiting status stays ------
 
 
-def test_schema_declares_on_limit_and_the_waiting_status(cli: CliRunner) -> None:
+def test_schema_run_has_no_on_limit_flag_and_status_keeps_the_waiting_status(
+    cli: CliRunner,
+) -> None:
     run_schema = json.loads(invoke(cli, "schema", "run").stdout)
-    on_limit = next(f for f in run_schema["flags"] if f["name"] == "on-limit")
-    assert on_limit["enum"] == ["wait", "fail"]
-    assert on_limit["default"] == "wait"
+    assert all(f["name"] != "on-limit" for f in run_schema["flags"])
 
     status_schema = json.loads(invoke(cli, "schema", "status").stdout)
     assert "waiting" in status_schema["output"]["properties"]["status"]["enum"]
     assert "limit" in status_schema["output"]["properties"]
+
+
+# --- old on-disk state: pre-slice-20 keys are tolerated, not errors --------
+
+
+def test_old_meta_json_with_on_limit_and_limit_waited_seconds_keys_reads_cleanly(
+    cli: CliRunner,
+) -> None:
+    """A `meta.json` written before this slice carried `on_limit` and
+    `limit_waited_seconds`; both keys are gone from `SessionMeta` now, and
+    `meta_from_dict` folds anything it does not recognize into `extra`
+    without raising (SPEC.md *State on disk*: unknown keys survive, they are
+    never a hard error for session metadata — that rule is `config.toml`'s).
+    """
+    meta = sessions.create_session(entry="mock", base_adapter="mock", prompt="legacy probe")
+    raw = json.loads(sessions.meta_path(meta.session_id).read_text(encoding="utf-8"))
+    raw["on_limit"] = "wait"
+    raw["limit_waited_seconds"] = 12.5
+    sessions.meta_path(meta.session_id).write_text(json.dumps(raw), encoding="utf-8")
+
+    reloaded = sessions.read_meta(meta.session_id)
+
+    assert reloaded.extra["on_limit"] == "wait"
+    assert reloaded.extra["limit_waited_seconds"] == 12.5
+
+    status_result = invoke(cli, "status", meta.session_id, "--json")
+    assert status_result.exit_code == vocab.EXIT_OK

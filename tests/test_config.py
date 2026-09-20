@@ -68,12 +68,21 @@ def test_malformed_config_is_a_clean_error_naming_the_file(tmp_path: Path) -> No
     assert str(path) in str(error.value)
 
 
+def test_limit_wait_max_accepts_zero_to_turn_waiting_off(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('limit_wait_max = "0s"\n', encoding="utf-8")
+
+    assert load_config(path).limit_wait_max_seconds == 0.0
+
+
 @pytest.mark.parametrize(
     ("key", "value", "message"),
     [
         ("retention", '"not-a-duration"', "retention"),
         ("daemon_ttl", "0", "daemon_ttl"),
         ("daemon_max_concurrent", '"eight"', "positive integer"),
+        ("limit_wait_max", '"-1s"', "limit_wait_max"),
+        ("limit_wait_max", '"abc"', "limit_wait_max"),
     ],
 )
 def test_invalid_config_value_names_key_and_expected_type(

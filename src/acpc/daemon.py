@@ -1239,7 +1239,6 @@ class Daemon:
             rotation_resolution=payload.get("rotation_resolution"),
             resume_prepared=bool(payload.get("resume_prepared", False)),
             turn_token=payload.get("turn_token"),
-            on_limit=payload.get("on_limit", vocab.ON_LIMIT_WAIT),
         )
 
     async def _prepare_turn(

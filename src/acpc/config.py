@@ -40,7 +40,7 @@ class Config:
 
     @property
     def limit_wait_max_seconds(self) -> float:
-        return parse_duration(self.limit_wait_max)
+        return parse_duration(self.limit_wait_max, allow_zero=True)
 
 
 DEFAULT_CONFIG = Config()
@@ -95,7 +95,10 @@ def _validate(path: Path, values: dict[str, object]) -> Config:
         path, "daemon_ttl", values.get("daemon_ttl", DEFAULT_CONFIG.daemon_ttl)
     )
     limit_wait_max = _validate_duration(
-        path, "limit_wait_max", values.get("limit_wait_max", DEFAULT_CONFIG.limit_wait_max)
+        path,
+        "limit_wait_max",
+        values.get("limit_wait_max", DEFAULT_CONFIG.limit_wait_max),
+        allow_zero=True,
     )
     max_concurrent = values.get("daemon_max_concurrent", DEFAULT_CONFIG.daemon_max_concurrent)
     if (

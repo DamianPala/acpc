@@ -60,11 +60,6 @@ STEER_IN_PLACE = "in-place"
 STEER_CANCEL_THEN_START = "cancel-then-start"
 STEER_MODES = (STEER_IN_PLACE, STEER_CANCEL_THEN_START)
 
-# `--on-limit` (SPEC.md `run`): what to do when a usage limit blocks a turn.
-ON_LIMIT_WAIT = "wait"
-ON_LIMIT_FAIL = "fail"
-ON_LIMIT = (ON_LIMIT_WAIT, ON_LIMIT_FAIL)
-
 # Largest prompt acpc buffers from any single source: the prompt argument, `-`
 # on stdin, or `--prompt-file`.  Counted in UTF-8 bytes and enforced before a
 # session directory exists, so an oversized call leaves nothing behind.  Far

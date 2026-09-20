@@ -21,6 +21,16 @@ Gates at HEAD: 1334 tests, ruff/pyright clean, smoke 603/603, D7c green against 
 **Nothing pushed.** Not done: the tool version bump (O16, Damian's call), live runs on real
 adapters for 16-19, and the debts below.
 
+**Slice 20 (2026-09-20) trims the limit machinery of slice 17 on the standard author's
+"simplify, don't add" call:** `--on-limit` is gone from `run`/`continue`/`steer` (the policy is
+config only: `limit_wait_max = "0s"` turns waiting off, every recognized limit then ends the turn
+`failed` with `stop_reason: rate_limit`), the resume delay is a fixed 5 s after `resume_at` with
+no jitter, `limit_waited_seconds` is no longer persisted in `meta.json` (old keys read into
+`extra`, never exposed), and the direct path prints no `waiting for the usage limit` line on a
+TTY. `limit_wait_max` is read once per turn, when it starts sending. Net −150 lines in `src/`
+and `tests/`. Next: slice 21 re-pins the claim on 0.2.0-draft.11 (haz-skills `6d91b97`) and
+makes `tokens` `null` until the adapter reports usage.
+
 Debts found in review, none blocking: the TTY `human` presentation still prints the raw answer
 without control-byte escaping (O3d asks for it; a small separate slice); `continue` after
 `unknown` on turn 1 is `corrupt_state` because the daemon stores `adapter_session_id` only at the

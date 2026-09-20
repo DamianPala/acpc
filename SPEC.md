@@ -94,7 +94,7 @@ cancel SELECTOR [--format text|json]
 ```text
 continue SELECTOR [PROMPT | -] [--prompt-file FILE] [--permissions P]
     [--output-file FILE] [--format text|json] [--background]
-    [--timeout S] [--cancel-after S] [--on-limit wait|fail]
+    [--timeout S] [--cancel-after S]
     [--max-output BYTES] [--quiet]
 ```
 
@@ -104,7 +104,7 @@ A `continue` without a message, neither `PROMPT`, `-` nor `--prompt-file`, conti
 
 The adapter session is verified before a cold resume sends the new prompt. A listing check and a replay check are independent; an unavailable check leaves the resume unverified rather than inventing certainty. If acpc cannot account for every prompt known to have crossed the adapter boundary, the result says `resume: unverified — delivery record incomplete`. A mismatch fails before the new prompt is sent.
 
-Replay from `session/load` or `session/resume` is silent. It does not add old messages to the answer, transcript, stderr, token count or cost. A session in `running`, `preparing` or `waiting` cannot be continued; the `conflict` error names `steer` for the running turn and `wait` in its hint. Resolution flags that belong to a new dispatch are rejected with a hint to use `run`. `--timeout` and `--cancel-after` behave as for `run`, counted from the call: a deadline that expires during the cold resume, before the new turn was observed, leaves stdout empty with `context.status` `starting` or `preparing`. `--on-limit` applies to the turn this call starts, as for `run`.
+Replay from `session/load` or `session/resume` is silent. It does not add old messages to the answer, transcript, stderr, token count or cost. A session in `running`, `preparing` or `waiting` cannot be continued; the `conflict` error names `steer` for the running turn and `wait` in its hint. Resolution flags that belong to a new dispatch are rejected with a hint to use `run`. `--timeout` and `--cancel-after` behave as for `run`, counted from the call: a deadline that expires during the cold resume, before the new turn was observed, leaves stdout empty with `context.status` `starting` or `preparing`. A usage limit on the turn this call starts is handled as for `run`.
 
 ### `daemon`
 
@@ -207,7 +207,7 @@ resolve AGENT [--cwd DIR] [--model M] [--effort E] [--permissions P]
 run AGENT [PROMPT | -] [--prompt-file FILE] [--cwd DIR] [--model M]
     [--effort E] [--permissions P] [--mode MODE] [--home DIR]
     [--output-file FILE] [--format text|json] [--timeout S]
-    [--cancel-after S] [--on-limit wait|fail] [--name ALIAS]
+    [--cancel-after S] [--name ALIAS]
     [--max-output BYTES] [--background | --bg] [--quiet]
 ```
 
@@ -215,7 +215,7 @@ run AGENT [PROMPT | -] [--prompt-file FILE] [--cwd DIR] [--model M]
 
 `--timeout` bounds only how long this client waits, counted from the call and covering acceptance by the daemon, the adapter handshake and the turn itself; absent, the wait is unbounded. It never cancels or changes accepted work. After the deadline the session remains alive under the daemon, or under a detached direct worker when the daemon fallback was used, and the command exits 124 with `kind: timeout`, an empty stdout and no result document, even when a partial answer has already been recorded. `context` carries `session_id`, `turn` and the observed `status`: `running` for an observed turn, `starting` or `preparing` when the deadline expired while a cold daemon was still starting the adapter. `retryable` is `false`, because repeating the call would start new work; `hint` points at `log --tail` for the progress so far and at `status`, and `next` is `acpc status <id>`. `--cancel-after` bounds the work itself. When it expires, ACP cancellation is sent and the observing command reports `operation_failed` with the observed `canceled` status and the partial answer on stdout.
 
-A usage limit that blocks the turn is handled in the same turn. acpc recognizes it when the adapter fails `session/prompt` with a JSON-RPC error whose `data.errorKind` is `rate_limit`, or whose message is the vendor's usage-limit text, or when a preceding `usage_update` carried `_meta["_claude/rateLimit"]` with `status: rejected`; codex-acp reports no limit structurally, so its limits remain plain failures. The expected return time comes from `resetsAt` when the adapter sent it, otherwise from the `resets <time> (<zone>)` clause of the message, otherwise it is unknown. With `--on-limit wait`, the default, a limit whose return time is known and no further away than `limit_wait_max` moves the session to `waiting`: the turn stays open with the same number and files, `status` reports `waiting` with a `limit` object, and the daemon sends the prompt again to the same adapter session shortly after the return time, the original prompt when the turn had recorded no assistant message or tool call yet, otherwise acpc's fixed continuation instruction. A second limit in the same turn waits again while the turn's total waiting stays within `limit_wait_max`. With `--on-limit fail`, with an unknown return time, or beyond the cap, the turn ends `failed` with `stop_reason: rate_limit` and the same `limit` object; the answer recorded so far is kept. Waiting is never reported as a terminal outcome and repeating the prompt is the caller's decision, not acpc's.
+A usage limit that blocks the turn is handled in the same turn. acpc recognizes it when the adapter fails `session/prompt` with a JSON-RPC error whose `data.errorKind` is `rate_limit`, or whose message is the vendor's usage-limit text, or when a preceding `usage_update` carried `_meta["_claude/rateLimit"]` with `status: rejected`; codex-acp reports no limit structurally, so its limits remain plain failures. The expected return time comes from `resetsAt` when the adapter sent it, otherwise from the `resets <time> (<zone>)` clause of the message, otherwise it is unknown. A limit whose return time is known and no further away than `limit_wait_max` moves the session to `waiting`: the turn stays open with the same number and files, `status` reports `waiting` with a `limit` object, and the daemon sends the prompt again to the same adapter session five seconds after the return time, the original prompt when the turn had recorded no assistant message or tool call yet, otherwise acpc's fixed continuation instruction. A second limit in the same turn waits again while the turn's total waiting stays within `limit_wait_max`. With an unknown return time, or beyond the cap, the turn ends `failed` with `stop_reason: rate_limit` and the same `limit` object; the answer recorded so far is kept. Waiting is never reported as a terminal outcome and repeating the prompt is the caller's decision, not acpc's.
 
 `--timeout` is invalid with `--background`, because a background call does not wait. `--cancel-after` remains valid with `--background`. `--permissions` selects a ceiling and the adapter mode; absent, its value comes from the registry or the TTY rules below. Deprecated permission spellings remain accepted as aliases and are reported as such.
 
@@ -244,7 +244,7 @@ status SELECTOR [--format text|json]
 steer SELECTOR [INSTRUCTION | -] [--prompt-file FILE]
     [--steer-mode in-place|cancel-then-start]
     [--output-file FILE] [--format text|json] [--background]
-    [--timeout S] [--cancel-after S] [--on-limit wait|fail]
+    [--timeout S] [--cancel-after S]
     [--max-output BYTES] [--quiet]
 ```
 
@@ -252,7 +252,7 @@ steer SELECTOR [INSTRUCTION | -] [--prompt-file FILE]
 
 `in-place` adds the instruction to the active turn through the adapter's `_session/steering` extension, at the next point the adapter supports, usually after the running tool call ends. The turn keeps its number, its prompt file and its answer file; nothing rotates and no preamble is added. Support is read from the adapter's `initialize` metadata (`_meta.steering.supported`) and recorded on the session as soon as the daemon has completed that handshake, before any receipt for the session is returned; every later turn served by the same daemon reads it again. A session served by a direct child records `cancel-then-start`, because no channel reaches its process. A session that reaches no adapter at all, because the start failed before the handshake, has no active turn to correct and reports `cancel-then-start`. acpc always asks the adapter not to start a turn of its own (`idleBehavior: promptRequired`); an adapter that starts one anyway is reported as such, never presented as in-place. Several in-place corrections queue in the adapter in the order acpc sent them.
 
-`cancel-then-start` cancels the turn in flight, waits for its end and starts the next turn on the same session with the instruction under the fixed interruption preamble. During daemon-owned preparation there is no prompt to interrupt; acpc cancels preparation, reports that fact and sends the instruction plainly. `--cancel-after` bounds the new turn's work and is accepted only with `--steer-mode cancel-then-start`. `--on-limit` applies to the new turn of `cancel-then-start` and is rejected with `in-place`, which starts no turn. An `in-place` correction of a session in `waiting` fails with `conflict`, because nothing is in flight to correct; `cancel-then-start` cancels the wait, which stops the scheduled resumption, and starts the new turn.
+`cancel-then-start` cancels the turn in flight, waits for its end and starts the next turn on the same session with the instruction under the fixed interruption preamble. During daemon-owned preparation there is no prompt to interrupt; acpc cancels preparation, reports that fact and sends the instruction plainly. `--cancel-after` bounds the new turn's work and is accepted only with `--steer-mode cancel-then-start`. A usage limit on the new turn of `cancel-then-start` is handled as for `run`. An `in-place` correction of a session in `waiting` fails with `conflict`, because nothing is in flight to correct; `cancel-then-start` cancels the wait, which stops the scheduled resumption, and starts the new turn.
 
 The cancellation step selects the turn active when `steer` started and waits up to 10 s for its end. If that turn is still running at the deadline, `steer` fails with `timeout`, `target_status: running` and `message_state: not_delivered`; the cancellation stays requested and no instruction is sent. If the turn ended on its own before the cancellation took effect, `steer` reports that terminal state as `target_status` and sends the instruction plainly, without the interruption preamble. If another call started a new turn before the instruction could be sent, `steer` fails with `conflict` and leaves that turn untouched. Every failure of the cancellation step carries `session_id`, `capabilities` and `correction_result` in `context`, like a failure after it.
 
@@ -463,7 +463,7 @@ daemon_max_concurrent = 8
 limit_wait_max = "8h"
 ```
 
-`limit_wait_max` caps how long one turn may wait for usage limits in total; a duration with the `--timeout` syntax. Unknown config keys are hard errors. Relative paths in `--cwd`, `--prompt-file` and `--output-file` resolve against the caller's working directory; a leading `~` is expanded. Directories are mode 0700 and files are mode 0600 where the platform supports those permissions. Metadata and cache writes are atomic, and transcript appends are whole lines.
+`limit_wait_max` caps how long one turn may wait for usage limits in total; a duration with the `--timeout` syntax, and `"0s"` disables waiting so that every recognized limit ends the turn `failed` at once. Unknown config keys are hard errors. Relative paths in `--cwd`, `--prompt-file` and `--output-file` resolve against the caller's working directory; a leading `~` is expanded. Directories are mode 0700 and files are mode 0600 where the platform supports those permissions. Metadata and cache writes are atomic, and transcript appends are whole lines.
 
 `meta.json` uses `status`, not a second state field, and stores the resolved invocation, timestamps, turn count, tokens, cost, exit code, stop reason, failure observation, prompt snippet, adapter session id, target and the steer mode. Timestamps are RFC 3339 with a consistent microsecond precision. A per-session lock serializes turns, cleanup and metadata transitions.
 
