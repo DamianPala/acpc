@@ -162,6 +162,60 @@ def test_status_json_with_an_id_reports_detail_fields(cli: CliRunner) -> None:
     assert payload["idle_seconds"] is None
 
 
+def test_status_json_reports_the_default_policy_and_no_pending_corrections(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R2d/V4c: status names the resolved policy; corrections stay unobservable."""
+    monkeypatch.delenv("ACPC_CEILING", raising=False)
+    session_id = run_mock(cli, "echo:policy")
+
+    payload = json.loads(invoke(cli, "status", session_id, "--json").stdout)
+
+    assert payload["capabilities"] == {
+        "steer_mode": "cancel-then-start",
+        "continue_without_message": True,
+    }
+    assert payload["pending_corrections"] is None
+    assert payload["permissions"] == {
+        "policy": "read",
+        "mode": "default",
+        "source": "default",
+        "clamp": None,
+    }
+    assert "permissions:" in invoke(cli, "status", session_id, "--format", "text").stdout
+
+
+def test_status_json_reports_a_requested_permission_policy(cli: CliRunner) -> None:
+    """R2d: an explicit `--permissions` flag is named as the policy's source."""
+    result = invoke(cli, "run", "mock", "echo:edit", "--permissions", "edit", "--quiet", "--json")
+    session_id = json.loads(result.stdout)["session_id"]
+
+    permissions = json.loads(invoke(cli, "status", session_id, "--json").stdout)["permissions"]
+
+    assert permissions["policy"] == "edit"
+    assert permissions["source"] == "call flag"
+    assert permissions["clamp"] is None
+
+
+def test_status_json_reports_a_clamped_permission(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R2d: a ceiling-clamped policy still names all three clamp fields."""
+    monkeypatch.setenv("ACPC_CEILING", "edit")
+
+    result = invoke(cli, "run", "mock", "echo:clamped", "--permissions", "all", "--json")
+    session_id = json.loads(result.stdout)["session_id"]
+
+    permissions = json.loads(invoke(cli, "status", session_id, "--json").stdout)["permissions"]
+
+    assert permissions["policy"] == "edit"
+    assert permissions["clamp"] == {
+        "requested": "all",
+        "ceiling": "edit",
+        "effective": "edit",
+    }
+
+
 def test_status_reports_the_model_a_real_dispatch_resolved(cli: CliRunner) -> None:
     """End to end: the column reads the resolution the dispatch actually stored."""
     session_id = run_mock(cli, "echo:which model")

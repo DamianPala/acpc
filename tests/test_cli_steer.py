@@ -247,7 +247,10 @@ def test_steer_on_a_finished_session_names_continue(cli: CliRunner) -> None:
     assert envelope["kind"] == "conflict"
     assert "there is no turn to interrupt" in envelope["message"]
     assert envelope["hint"] == f"Run: acpc continue {session_id}"
-    assert envelope["context"]["capabilities"] == {"steer_mode": "cancel-then-start"}
+    assert envelope["context"]["capabilities"] == {
+        "steer_mode": "cancel-then-start",
+        "continue_without_message": True,
+    }
 
 
 def test_steer_degrades_to_a_plain_continue_when_the_turn_finished_first(
@@ -684,7 +687,7 @@ def test_steer_in_place_keeps_the_turn_and_queues_the_instruction(
         "target_status": "running",
         "message_state": "accepted",
     }
-    assert document["capabilities"] == {"steer_mode": "in-place"}
+    assert document["capabilities"] == {"steer_mode": "in-place", "continue_without_message": True}
     assert "partial" not in document
 
     waited = invoke(cli, "wait", session_id, "--json")
@@ -794,7 +797,10 @@ def test_an_explicit_in_place_mode_on_a_session_without_it_changes_nothing(
     assert result.exit_code == vocab.EXIT_AGENT_ERROR
     envelope = json.loads(result.stderr.splitlines()[-1])["error"]
     assert envelope["kind"] == "not_supported"
-    assert envelope["context"]["capabilities"] == {"steer_mode": "cancel-then-start"}
+    assert envelope["context"]["capabilities"] == {
+        "steer_mode": "cancel-then-start",
+        "continue_without_message": True,
+    }
     assert envelope["hint"] == (f"Run: acpc steer {session_id} ... --steer-mode cancel-then-start")
     meta = sessions.load(session_id)
     assert meta.turns == before.turns
@@ -810,7 +816,10 @@ def test_a_daemon_session_without_a_steering_adapter_shows_one_mode(
 
     detail = json.loads(invoke(cli, "status", session_id, "--json").stdout)
 
-    assert detail["capabilities"] == {"steer_mode": "cancel-then-start"}
+    assert detail["capabilities"] == {
+        "steer_mode": "cancel-then-start",
+        "continue_without_message": True,
+    }
     result = invoke(cli, "steer", session_id, "X", "--bg", "--json")
     assert result.exit_code == vocab.EXIT_OK, result.stderr
     assert json.loads(result.stdout)["correction_result"]["steer_mode"] == "cancel-then-start"
@@ -823,7 +832,10 @@ def test_a_direct_session_supports_only_cancel_then_start(
     session_id, thread = running_direct_session("chunkslow:6 direct steer")
     try:
         detail = json.loads(invoke(cli, "status", session_id, "--json").stdout)
-        assert detail["capabilities"] == {"steer_mode": "cancel-then-start"}
+        assert detail["capabilities"] == {
+            "steer_mode": "cancel-then-start",
+            "continue_without_message": True,
+        }
         assert (
             "steer: cancel-then-start"
             in invoke(cli, "status", session_id, "--format", "text").stdout
@@ -834,7 +846,10 @@ def test_a_direct_session_supports_only_cancel_then_start(
         assert result.exit_code == vocab.EXIT_AGENT_ERROR
         envelope = steer_error(result)
         assert envelope["kind"] == "not_supported"
-        assert envelope["context"]["capabilities"] == {"steer_mode": "cancel-then-start"}
+        assert envelope["context"]["capabilities"] == {
+            "steer_mode": "cancel-then-start",
+            "continue_without_message": True,
+        }
         assert sessions.read_meta(session_id).turns == 1
     finally:
         thread.join(timeout=30)
@@ -849,7 +864,10 @@ def test_status_says_unknown_until_a_session_has_reached_an_adapter(
 
     detail = json.loads(invoke(cli, "status", session_id, "--json").stdout)
 
-    assert detail["capabilities"] == {"steer_mode": "cancel-then-start"}
+    assert detail["capabilities"] == {
+        "steer_mode": "cancel-then-start",
+        "continue_without_message": True,
+    }
     assert (
         "steer: cancel-then-start" in invoke(cli, "status", session_id, "--format", "text").stdout
     )
@@ -944,7 +962,10 @@ def test_a_blocking_in_place_steer_times_out_without_a_document(
     assert envelope["context"]["turn"] == 1
     assert envelope["context"]["status"] == "running"
     assert envelope["context"]["correction_result"]["message_state"] == "accepted"
-    assert envelope["context"]["capabilities"] == {"steer_mode": "in-place"}
+    assert envelope["context"]["capabilities"] == {
+        "steer_mode": "in-place",
+        "continue_without_message": True,
+    }
     assert envelope["next"] == ["acpc", "status", session_id]
     assert sessions.read_meta(session_id).state == "running"
 

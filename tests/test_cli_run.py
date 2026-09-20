@@ -655,7 +655,10 @@ def test_a_daemon_routed_failure_still_reports_the_result(
     document = json.loads(result.stdout)
     assert document["status"] == "failed"
     assert document["partial"] is False
-    assert document["capabilities"] == {"steer_mode": "cancel-then-start"}
+    assert document["capabilities"] == {
+        "steer_mode": "cancel-then-start",
+        "continue_without_message": True,
+    }
     assert document["answer"] != ""
     assert "-- failed" in result.stderr
 
@@ -776,7 +779,10 @@ def test_cold_background_receipt_waits_for_initialize(
     # cold daemon and adapter start on a loaded host are not under test.
     assert elapsed >= 0.9
     document = json.loads(result.stdout)
-    assert document["capabilities"] == {"steer_mode": "in-place"}
+    assert document["capabilities"] == {
+        "steer_mode": "in-place",
+        "continue_without_message": True,
+    }
     status = json.loads(invoke(cli, "status", document["session_id"], "--json").stdout)
     assert status["capabilities"] == document["capabilities"]
 
@@ -814,7 +820,10 @@ def test_background_receipt_and_immediate_status_share_capabilities(
     assert result.exit_code == vocab.EXIT_OK, result.stderr
     document = json.loads(result.stdout)
     status = json.loads(invoke(cli, "status", document["session_id"], "--json").stdout)
-    assert document["capabilities"] == {"steer_mode": "in-place"}
+    assert document["capabilities"] == {
+        "steer_mode": "in-place",
+        "continue_without_message": True,
+    }
     assert status["capabilities"] == document["capabilities"]
 
 
@@ -977,7 +986,10 @@ def test_json_output_carries_the_session_id_and_paths(cli: CliRunner) -> None:
     payload = json.loads(result.stdout)
     assert payload["session_id"]
     assert payload["paths"]["answer"].endswith("answer.md")
-    assert payload["capabilities"] == {"steer_mode": "cancel-then-start"}
+    assert payload["capabilities"] == {
+        "steer_mode": "cancel-then-start",
+        "continue_without_message": True,
+    }
     assert "as json" in payload["answer"]
 
 

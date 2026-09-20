@@ -406,7 +406,6 @@ def test_status_without_an_id_names_the_collection_command(runner: CliRunner) ->
         ("skills", "get"),
         ("cancel",),
         ("continue",),
-        ("continue", "abcd"),
         ("delete",),
         ("install",),
         ("log",),

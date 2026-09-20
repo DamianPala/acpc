@@ -693,6 +693,7 @@ def test_every_answer_command_declares_partial_and_its_emission_cases(
             "failed or canceled turn — and returns no result for a call that observed no turn, "
             "including one whose --timeout deadline expired (`context.status` can be `waiting` "
             "when a usage limit was holding the turn) or whose watch ended in a detach. "
+            "`session_id` names the session and `capabilities` the session-capability object; "
             "`stop_reason`, `tokens`, `cost` and `answer` are present on every foreground result "
             "and omitted by `--background`. "
         )
@@ -702,8 +703,14 @@ def test_every_answer_command_declares_partial_and_its_emission_cases(
             "failed or canceled turn — and returns no result for a call that observed no turn, "
             "including one whose --timeout deadline expired (`context.status` can be `waiting` "
             "when a usage limit was holding the turn) or whose watch ended in a detach. "
+            "`session_id` names the session and `capabilities` the session-capability object; "
             "`stop_reason`, `tokens`, `cost` and `answer` are present on every foreground result "
             "and omitted by `--background`. "
+            "A call with no message at all — neither `PROMPT`, `-` nor `--prompt-file` — "
+            "continues an interrupted turn (`canceled`, `failed` or `unknown`) with acpc's own "
+            "continuation instruction in place of a caller-supplied prompt; a `succeeded` turn "
+            "has nothing to continue and the call fails with `invalid_input` before anything is "
+            "created. "
         )
         + text_presentation_note,
         "wait": (
@@ -712,6 +719,8 @@ def test_every_answer_command_declares_partial_and_its_emission_cases(
             "result once that turn has ended — including a failed or canceled turn — and "
             "returns no result when a --timeout deadline expires first, with `context.status` "
             "naming the turn's status at the deadline, `waiting` included. "
+            "`session_id` names the session, `capabilities` the session-capability object and "
+            "`answer` the answer text. "
         )
         + text_presentation_note,
     }

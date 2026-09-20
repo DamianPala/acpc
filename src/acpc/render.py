@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from acpc import sessions, transcript, vocab
-from acpc.output import format_duration, format_tokens
+from acpc.output import format_duration, format_tokens, session_capabilities, status_permissions
 
 Clock = Callable[[], float]
 DEFAULT_LOG_MAX_OUTPUT = 128 * 1024
@@ -611,6 +611,7 @@ def render_status_detail(
         ),
         f"dir      {directory} · answer: {Path(sessions.answer_path(meta.session_id)).name}",
         f"steer: {_steer_mode_text(meta)}",
+        _permissions_text(meta),
     ]
     if meta.failure is not None:
         lines.append(
@@ -627,6 +628,24 @@ def render_status_detail(
 def _steer_mode_text(meta: sessions.SessionMeta) -> str:
     """Render the session's default correction mode."""
     return safe_text(meta.steer_mode or vocab.STEER_CANCEL_THEN_START)
+
+
+def _permissions_text(meta: sessions.SessionMeta) -> str:
+    """Render R2d's policy inspection; `pending_corrections` has no text line.
+
+    V4c's `pending_corrections` is always `null` (SPEC.md *Pending input*), so
+    the text view has nothing to add for it beyond what `steer:` already says.
+    """
+    fields = status_permissions(meta)
+    mode = safe_text(fields["mode"]) if fields["mode"] is not None else "·"
+    line = f"permissions: {safe_text(fields['policy'])} via {mode} ({safe_text(fields['source'])})"
+    clamp = fields["clamp"]
+    if clamp is not None:
+        line += (
+            f" · clamped from {safe_text(clamp['requested'])} by inherited ceiling "
+            f"{safe_text(clamp['ceiling'])} (effective {safe_text(clamp['effective'])})"
+        )
+    return line
 
 
 def status_list_json(
@@ -685,8 +704,11 @@ def status_detail_json(
         "exit_code": meta.exit_code,
         "stop_reason": meta.stop_reason,
         "failure": meta.failure,
-        "capabilities": {"steer_mode": meta.steer_mode or vocab.STEER_CANCEL_THEN_START},
+        "capabilities": session_capabilities(meta),
         "limit": dict(meta.limit) if meta.limit is not None else None,
+        # V4c: acpc never has grounds to report a pending-correction count.
+        "pending_corrections": None,
+        "permissions": status_permissions(meta),
         "paths": sessions.session_paths(meta.session_id),
         "created_at": _timestamp_or_none(meta.created_at),
         "started_at": _timestamp_or_none(meta.started_at),

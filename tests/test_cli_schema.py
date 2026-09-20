@@ -101,8 +101,8 @@ def test_index_carries_every_field(runner: CliRunner) -> None:
     assert index["schema_version"].isdecimal() and int(index["schema_version"]) > 0
     assert index["conformance"] == {
         "name": "cli-design-standard",
-        "standard": "0.1.0-draft.7",
-        "extensions": ["managed"],
+        "standard": "0.2.0-draft.10",
+        "extensions": ["managed", "conversational"],
     }
     assert index["exit_codes"] == vocab.EXIT_DESCRIPTIONS
     assert set(index["format_defaults"]) == {"tty", "non_tty"}

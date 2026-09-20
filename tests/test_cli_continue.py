@@ -141,6 +141,19 @@ def wait_for_preparing(cli: CliRunner, session_id: str, timeout: float = 10.0) -
     pytest.fail(f"session {session_id} never became preparing")
 
 
+def wait_for_running(cli: CliRunner, session_id: str, timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        result = invoke(cli, "status", session_id, "--json")
+        if (
+            result.exit_code == vocab.EXIT_OK
+            and json.loads(result.stdout)["status"] in vocab.ACTIVE_STATES
+        ):
+            return
+        time.sleep(0.05)
+    pytest.fail(f"session {session_id} never became active")
+
+
 def wait_for_path(path: Path, timeout: float = 10.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -1206,7 +1219,10 @@ def test_continue_failure_result_contains_capabilities(
     assert result.exit_code == vocab.EXIT_AGENT_ERROR
     document = json.loads(result.stdout)
     assert document["partial"] is True
-    assert document["capabilities"] == {"steer_mode": "cancel-then-start"}
+    assert document["capabilities"] == {
+        "steer_mode": "cancel-then-start",
+        "continue_without_message": True,
+    }
 
 
 def test_fault_after_claim_before_owner_finalizes_the_turn(
@@ -2393,12 +2409,143 @@ def test_continue_preserves_the_global_transcript_cursor(cli: CliRunner) -> None
 
 
 def test_continue_keeps_the_run_prompt_source_rules(cli: CliRunner) -> None:
+    """Two sources at once is still a usage error (V1a leaves zero for no-message)."""
     session_id = start_session(cli)
 
-    result = invoke(cli, "continue", session_id)
+    result = invoke(cli, "continue", session_id, "turn two", "--prompt-file", "/dev/null")
 
     assert result.exit_code == vocab.EXIT_USAGE
     assert "exactly one prompt source" in result.stderr
+
+
+def test_continue_without_a_message_resumes_a_canceled_turn(cli: CliRunner) -> None:
+    """V1a: no PROMPT, no `-`, no --prompt-file after `canceled` sends acpc's own text."""
+    canceled = invoke(
+        cli, "run", "mock", "chunkslow:5 canceled", "--cancel-after", "0.5", "--json", "--quiet"
+    )
+    assert canceled.exit_code == vocab.EXIT_AGENT_ERROR
+    session_id = json.loads(canceled.stdout)["session_id"]
+    assert sessions.load(session_id).state == "canceled"
+
+    result = invoke(cli, "continue", session_id, "--json")
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    document = json.loads(result.stdout)
+    assert document["turn"] == 2
+    assert document["status"] == "succeeded"
+    assert document["capabilities"]["continue_without_message"] is True
+    assert (
+        sessions.prompt_path(session_id).read_text(encoding="utf-8")
+        == runner.CONTINUATION_INSTRUCTION
+    )
+
+
+def test_continue_without_a_message_resumes_a_canceled_turn_in_the_background(
+    cli: CliRunner, live_daemon: None
+) -> None:
+    canceled = invoke(
+        cli, "run", "mock", "chunkslow:5 canceled bg", "--cancel-after", "0.5", "--json", "--quiet"
+    )
+    assert canceled.exit_code == vocab.EXIT_AGENT_ERROR
+    session_id = json.loads(canceled.stdout)["session_id"]
+    assert sessions.load(session_id).state == "canceled"
+
+    result = invoke(cli, "continue", session_id, "--background", "--json")
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    receipt = json.loads(result.stdout)
+    assert receipt["next"] == ["acpc", "wait", session_id]
+    waited = invoke(cli, "wait", session_id, "--json")
+    assert waited.exit_code == vocab.EXIT_OK, waited.stderr
+    document = json.loads(waited.stdout)
+    assert document["turn"] == 2
+    assert (
+        sessions.prompt_path(session_id).read_text(encoding="utf-8")
+        == runner.CONTINUATION_INSTRUCTION
+    )
+
+
+def test_continue_without_a_message_resumes_a_failed_turn(cli: CliRunner) -> None:
+    failed = invoke(cli, "run", "mock", "fail this turn", "--json", "--quiet")
+    assert failed.exit_code == vocab.EXIT_AGENT_ERROR
+    session_id = json.loads(failed.stdout)["session_id"]
+    assert sessions.load(session_id).state == "failed"
+
+    result = invoke(cli, "continue", session_id, "--json")
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    document = json.loads(result.stdout)
+    assert document["turn"] == 2
+    assert document["status"] == "succeeded"
+    assert (
+        sessions.prompt_path(session_id).read_text(encoding="utf-8")
+        == runner.CONTINUATION_INSTRUCTION
+    )
+
+
+def test_continue_without_a_message_resumes_an_unknown_turn(cli: CliRunner) -> None:
+    """The `unknown` outcome is produced elsewhere (orphan detection); here only the
+    `continue`-without-a-message branch for it is under test, so the state is set
+    directly rather than re-driving a `kill -9` scenario another suite already covers.
+    """
+    session_id = start_session(cli)
+    meta = sessions.load(session_id)
+    meta.state = "unknown"
+    with sessions.session_lock(session_id):
+        sessions.write_meta(meta)
+
+    result = invoke(cli, "continue", session_id, "--json")
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    document = json.loads(result.stdout)
+    assert document["turn"] == 2
+    assert (
+        sessions.prompt_path(session_id).read_text(encoding="utf-8")
+        == runner.CONTINUATION_INSTRUCTION
+    )
+
+
+def test_continue_without_a_message_after_success_is_a_usage_error(cli: CliRunner) -> None:
+    session_id = start_session(cli)
+
+    result = invoke(cli, "continue", session_id, "--json")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    envelope = json.loads(result.stderr)["error"]
+    assert envelope["kind"] == "invalid_input"
+    assert "give continue a message" in envelope["hint"]
+    assert sessions.load(session_id).turns == 1
+
+
+def test_continue_with_an_explicit_empty_message_still_runs_a_turn(cli: CliRunner) -> None:
+    """An explicit empty string is a given source, not the no-message case (unchanged)."""
+    session_id = start_session(cli)
+
+    result = invoke(cli, "continue", session_id, "", "--json")
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    document = json.loads(result.stdout)
+    assert document["turn"] == 2
+    assert sessions.prompt_path(session_id).read_text(encoding="utf-8") == ""
+
+
+def test_continue_without_a_message_on_an_active_session_is_a_conflict(
+    cli: CliRunner, live_daemon: None
+) -> None:
+    """V2c-style ordering: the active-session check runs before the no-message branch."""
+    running = invoke(cli, "run", "mock", "chunkslow:5 active", "--background", "--json")
+    assert running.exit_code == vocab.EXIT_OK
+    session_id = json.loads(running.stdout)["session_id"]
+    wait_for_running(cli, session_id)
+
+    result = invoke(cli, "continue", session_id, "--json")
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    envelope = json.loads(result.stderr)["error"]
+    assert envelope["kind"] == "conflict"
+    assert sessions.load(session_id).turns == 1
+
+    invoke(cli, "cancel", session_id, "--json")
 
 
 def test_run_stores_the_tty_resolved_permission_policy(cli: CliRunner) -> None:
@@ -2486,7 +2633,10 @@ def test_background_continue_receipt_publishes_the_session_capability(
     assert result.exit_code == vocab.EXIT_OK, result.stderr
     document = json.loads(result.stdout)
     status = json.loads(invoke(cli, "status", session_id, "--json").stdout)
-    assert document["capabilities"] == {"steer_mode": "in-place"}
+    assert document["capabilities"] == {
+        "steer_mode": "in-place",
+        "continue_without_message": True,
+    }
     assert status["capabilities"] == document["capabilities"]
 
 

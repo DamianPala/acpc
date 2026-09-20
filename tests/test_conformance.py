@@ -50,8 +50,8 @@ STANDARD_SNAPSHOT = Path(__file__).with_name("fixtures") / "cli-design-standard.
 STANDARD_METADATA = STANDARD_SNAPSHOT.with_suffix(".meta.json")
 EXPECTED_TOOL_VERSION = "0.7.1"
 EXPECTED_STANDARD_NAME = "cli-design-standard"
-EXPECTED_STANDARD_VERSION = "0.1.0-draft.7"
-EXPECTED_EXTENSIONS = ["managed"]
+EXPECTED_STANDARD_VERSION = "0.2.0-draft.10"
+EXPECTED_EXTENSIONS = ["managed", "conversational"]
 REQUIRED_STANDARD_CLAUSES = (
     (
         "The identifier MUST remain usable after the initiating process exits and, until expiry "
@@ -65,6 +65,22 @@ REQUIRED_STANDARD_CLAUSES = (
         "`--follow`, an unbounded mode selected explicitly under I8c, removes the default window "
         "when offered."
     ),
+    # V6b (slice 18): counted answer tags.
+    (
+        "N is the decimal integer, without leading zeros, equal to one plus the number of LF "
+        "characters (`U+000A`) in the displayed answer text."
+    ),
+    # V1c, V4c, R2d (slice 19): the capability field, the null pending read, the policy inspection.
+    (
+        "The object SHOULD also contain `continue_without_message`: a boolean stating whether the "
+        "follow-up role accepts a request without a message (V1a)."
+    ),
+    (
+        "The read MUST then report that state explicitly rather than omit it, for example with "
+        "`null` in place of the count or with a documented field, and the command's "
+        "`output_description` MUST name that representation."
+    ),
+    "For accepted work, inspection MUST show the policy that applies to that work.",
 )
 EXPECTED_EXIT_DESCRIPTIONS = {
     "0": "Success, including an empty result: the turn ended normally, or the view rendered.",
@@ -172,6 +188,8 @@ EXPECTED_REQUIRED_FIELDS = {
         "failure",
         "capabilities",
         "limit",
+        "pending_corrections",
+        "permissions",
         "paths",
         "created_at",
         "started_at",
@@ -222,44 +240,52 @@ _TEXT_PRESENTATION_NOTE = (
     "`<metadata>`, and a human layout on one; `--json` returns the complete document."
 )
 
+_ANSWER_OUTPUT_LEAD = (
+    "Returns the answer result for a turn this call observed the end of — including a "
+    "failed or canceled turn — and returns no result for a call that observed no turn, "
+    "including one whose --timeout deadline expired (`context.status` can be `waiting` "
+    "when a usage limit was holding the turn) or whose watch ended in a detach. "
+    "`session_id` names the session and `capabilities` the session-capability object; "
+    "`stop_reason`, `tokens`, `cost` and `answer` are present on every foreground result "
+    "and omitted by `--background`. "
+)
+
 EXPECTED_OUTPUT_DESCRIPTIONS = {
-    "run": (
-        "Returns the answer result for a turn this call observed the end of — including a "
-        "failed or canceled turn — and returns no result for a call that observed no turn, "
-        "including one whose --timeout deadline expired (`context.status` can be `waiting` "
-        "when a usage limit was holding the turn) or whose watch ended in a detach. "
-        "`stop_reason`, `tokens`, `cost` and `answer` are present on every foreground result "
-        "and omitted by `--background`. "
-    )
-    + _TEXT_PRESENTATION_NOTE,
+    "run": _ANSWER_OUTPUT_LEAD + _TEXT_PRESENTATION_NOTE,
     "continue": (
-        "Returns the answer result for a turn this call observed the end of — including a "
-        "failed or canceled turn — and returns no result for a call that observed no turn, "
-        "including one whose --timeout deadline expired (`context.status` can be `waiting` "
-        "when a usage limit was holding the turn) or whose watch ended in a detach. "
-        "`stop_reason`, `tokens`, `cost` and `answer` are present on every foreground result "
-        "and omitted by `--background`. "
-    )
-    + _TEXT_PRESENTATION_NOTE,
+        _ANSWER_OUTPUT_LEAD
+        + "A call with no message at all — neither `PROMPT`, `-` nor `--prompt-file` — "
+        "continues an interrupted turn (`canceled`, `failed` or `unknown`) with acpc's own "
+        "continuation instruction in place of a caller-supplied prompt; a `succeeded` turn "
+        "has nothing to continue and the call fails with `invalid_input` before anything is "
+        "created. " + _TEXT_PRESENTATION_NOTE
+    ),
     "wait": (
         "Selects the session's current turn when the call starts and keeps observing that "
         "turn even if the session rotates to a newer one meanwhile; returns the answer "
         "result once that turn has ended — including a failed or canceled turn — and "
         "returns no result when a --timeout deadline expires first, with `context.status` "
-        "naming the turn's status at the deadline, `waiting` included. "
+        "naming the turn's status at the deadline, `waiting` included. `session_id` names "
+        "the session, `capabilities` the session-capability object and `answer` the answer "
+        "text. "
     )
     + _TEXT_PRESENTATION_NOTE,
     "status": (
         "Follows the selector: reports the session's current turn at the time of the call, "
         "so a session that rotated to a newer turn since is reported as that newer turn. "
+        "`session_id` names the session and `capabilities` the session-capability object. "
         "`limit` is `null` unless a usage limit touched that turn; its `source` is one of "
-        "`error_kind`, `rate_limit_info` or `text`."
+        "`error_kind`, `rate_limit_info` or `text`. Whether a forwarded correction is still "
+        "pending inside the adapter is not observable to acpc, so `pending_corrections` is "
+        "always `null` rather than a count. `permissions` is the inspection of the policy "
+        "applied to this session's work — `policy`, `mode`, `source` and `clamp`, the last "
+        "`null` unless the inherited ceiling narrowed the requested policy."
     ),
     "steer": (
         "Returns the answer result for the turn the correction landed on, or the acceptance "
-        "receipt under `--background`; `capabilities` and `correction_result` are always "
-        "present, and `stop_reason`, `tokens`, `cost` and `answer` join them on every "
-        "foreground result. "
+        "receipt under `--background`; `session_id` names the session, and `capabilities` and "
+        "`correction_result` are always present, and `stop_reason`, `tokens`, `cost` and "
+        "`answer` join them on every foreground result. "
     )
     + _TEXT_PRESENTATION_NOTE,
 }
@@ -388,6 +414,8 @@ _PATHS_PROPERTIES = frozenset({"dir", "prompt", "transcript", "answer"})
 _DENIAL_PROPERTIES = frozenset({"category", "count", "minimum_policy", "remedy", "target"})
 _PERMISSIONS_CLAMP_PROPERTIES = frozenset({"requested", "ceiling", "effective"})
 _LIMIT_PROPERTIES = frozenset({"reason", "resume_at", "auto_continue", "source"})
+# R2d's inspection object `status` reports: policy, mode, source and clamp, all required.
+_STATUS_PERMISSIONS_PROPERTIES = frozenset({"policy", "mode", "source", "clamp"})
 _RESOLUTION_PROPERTIES = frozenset({"model", "effort", "mode", "permissions", "home"})
 _RESOLUTION_FIELD_PROPERTIES = frozenset(
     {"value", "source", "grants", "delegates", "escalates", "clamp"}
@@ -398,7 +426,7 @@ _RESOLUTION_CLAMP_REQUIRED = frozenset({"requested", "ceiling", "effective"})
 
 # What `steer` publishes about the correction it made, in both modes.
 _STEER_RESULT_PROPERTIES = frozenset({"turn", "capabilities", "correction_result"})
-_STEER_CAPABILITIES_PROPERTIES = frozenset({"steer_mode"})
+_STEER_CAPABILITIES_PROPERTIES = frozenset({"steer_mode", "continue_without_message"})
 _STEER_CORRECTION_PROPERTIES = frozenset(
     {"steer_mode", "target_turn", "target_status", "message_state"}
 )
@@ -767,6 +795,8 @@ EXPECTED_OUTPUT_ORACLES: dict[str, dict[str, tuple[frozenset[str], frozenset[str
                     "failure",
                     "capabilities",
                     "limit",
+                    "pending_corrections",
+                    "permissions",
                     "paths",
                     "created_at",
                     "started_at",
@@ -777,6 +807,8 @@ EXPECTED_OUTPUT_ORACLES: dict[str, dict[str, tuple[frozenset[str], frozenset[str
         ),
         "output.capabilities": (_STEER_CAPABILITIES_PROPERTIES, _STEER_CAPABILITIES_PROPERTIES),
         "output.limit": (_LIMIT_PROPERTIES, frozenset(_LIMIT_PROPERTIES)),
+        "output.permissions": (_STATUS_PERMISSIONS_PROPERTIES, _STATUS_PERMISSIONS_PROPERTIES),
+        "output.permissions.clamp": (_PERMISSIONS_CLAMP_PROPERTIES, _RESOLUTION_CLAMP_REQUIRED),
         "output.paths": (_PATHS_PROPERTIES, _PATHS_PROPERTIES),
     },
 }

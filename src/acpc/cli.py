@@ -74,6 +74,16 @@ _PROMPT_HELP = (
 
 _PROMPT_LIMIT_HELP = f"{vocab.MAX_PROMPT_BYTES} bytes ({vocab.MAX_PROMPT_LABEL})"
 
+# V1a: `continue`'s own prompt contract — the only verb where all three
+# sources can be left out, and only after an interrupted turn.
+_CONTINUE_PROMPT_HELP = (
+    "The prompt, or `-` to read it from stdin; --prompt-file is the third source, and at "
+    "most one of the three may be given. Omitted along with --prompt-file, continue picks "
+    "up an interrupted turn — canceled, failed or unknown — with acpc's own continuation "
+    f"instruction; a succeeded turn requires a message. At most {vocab.MAX_PROMPT_BYTES} "
+    f"bytes ({vocab.MAX_PROMPT_LABEL}) of UTF-8, refused before anything is created."
+)
+
 # Values `TimeoutParamType` accepts, stated wherever one is taken: the type
 # name alone ("duration") does not tell a caller what to write.
 _DURATION_SYNTAX = (
@@ -129,32 +139,52 @@ _JSON_CHOICE_HELP = (
 
 # What the answer schema cannot express: when a failure still answers, and
 # which fields only one kind of call carries (D7 `output_description`, O4d/O5a).
-_ANSWER_OUTPUT_DESCRIPTION = (
+# V1b: every role that carries the session-capability object names its
+# identifier, answer and capability fields here, consistently.
+_ANSWER_OUTPUT_LEAD = (
     "Returns the answer result for a turn this call observed the end of — including a "
     "failed or canceled turn — and returns no result for a call that observed no turn, "
     "including one whose --timeout deadline expired (`context.status` can be `waiting` "
     "when a usage limit was holding the turn) or whose watch ended in a detach. "
+    "`session_id` names the session and `capabilities` the session-capability object; "
     "`stop_reason`, `tokens`, `cost` and `answer` are present on every foreground result "
     "and omitted by `--background`. "
-) + _TEXT_PRESENTATION_NOTE
+)
+_ANSWER_OUTPUT_DESCRIPTION = _ANSWER_OUTPUT_LEAD + _TEXT_PRESENTATION_NOTE
+# V1a: `continue`'s own addition — what a call with no message at all does.
+_CONTINUE_OUTPUT_DESCRIPTION = (
+    _ANSWER_OUTPUT_LEAD
+    + "A call with no message at all — neither `PROMPT`, `-` nor `--prompt-file` — "
+    "continues an interrupted turn (`canceled`, `failed` or `unknown`) with acpc's own "
+    "continuation instruction in place of a caller-supplied prompt; a `succeeded` turn "
+    "has nothing to continue and the call fails with `invalid_input` before anything is "
+    "created. " + _TEXT_PRESENTATION_NOTE
+)
 _WAIT_OUTPUT_DESCRIPTION = (
     "Selects the session's current turn when the call starts and keeps observing that "
     "turn even if the session rotates to a newer one meanwhile; returns the answer "
     "result once that turn has ended — including a failed or canceled turn — and "
     "returns no result when a --timeout deadline expires first, with `context.status` "
-    "naming the turn's status at the deadline, `waiting` included. "
+    "naming the turn's status at the deadline, `waiting` included. `session_id` names "
+    "the session, `capabilities` the session-capability object and `answer` the answer "
+    "text. "
 ) + _TEXT_PRESENTATION_NOTE
 _STEER_OUTPUT_DESCRIPTION = (
     "Returns the answer result for the turn the correction landed on, or the acceptance "
-    "receipt under `--background`; `capabilities` and `correction_result` are always "
-    "present, and `stop_reason`, `tokens`, `cost` and `answer` join them on every "
-    "foreground result. "
+    "receipt under `--background`; `session_id` names the session, and `capabilities` and "
+    "`correction_result` are always present, and `stop_reason`, `tokens`, `cost` and "
+    "`answer` join them on every foreground result. "
 ) + _TEXT_PRESENTATION_NOTE
 _STATUS_OUTPUT_DESCRIPTION = (
     "Follows the selector: reports the session's current turn at the time of the call, "
     "so a session that rotated to a newer turn since is reported as that newer turn. "
+    "`session_id` names the session and `capabilities` the session-capability object. "
     "`limit` is `null` unless a usage limit touched that turn; its `source` is one of "
-    "`error_kind`, `rate_limit_info` or `text`."
+    "`error_kind`, `rate_limit_info` or `text`. Whether a forwarded correction is still "
+    "pending inside the adapter is not observable to acpc, so `pending_corrections` is "
+    "always `null` rather than a count. `permissions` is the inspection of the policy "
+    "applied to this session's work — `policy`, `mode`, `source` and `clamp`, the last "
+    "`null` unless the inherited ceiling narrowed the requested policy."
 )
 
 # The same file, said in full for the schema: `--help` has no room for it.
@@ -4463,13 +4493,32 @@ def _dispatch_background(
         _write_stdout(result.text)
 
 
+def _continuation_prompt(meta: sessions.SessionMeta) -> str:
+    """SPEC `continue`: what a call with no message at all resumes.
+
+    Reached only once the caller supplied neither ``PROMPT``, ``-`` nor
+    ``--prompt-file`` and the session is not active (checked first). A
+    `succeeded` turn left nothing unfinished, so the call is a usage error
+    rather than a silent empty-prompt turn; every other finished state —
+    `canceled`, `failed` or `unknown` — sends acpc's own continuation
+    instruction, the same text the usage-limit resumption already sends
+    mid-turn (`runner.CONTINUATION_INSTRUCTION`).
+    """
+    if meta.state == "succeeded":
+        raise UsageProblem(
+            f"session {meta.session_id} succeeded on its last turn — nothing to continue",
+            hint="the last turn completed; give continue a message",
+        )
+    return runner.CONTINUATION_INSTRUCTION
+
+
 @effects.non_idempotent
 @schema.format_defaults(tty="text", non_tty="text")
-@schema.output_description(_ANSWER_OUTPUT_DESCRIPTION)
+@schema.output_description(_CONTINUE_OUTPUT_DESCRIPTION)
 @schema.reads_stdin("prompt_text")
 @schema.describes(
     selector=_SELECTOR_HELP,
-    prompt_text=_PROMPT_HELP,
+    prompt_text=_CONTINUE_PROMPT_HELP,
     output_file=_OUTPUT_FILE_DESCRIPTION,
 )
 @main.command(name="continue")
@@ -4568,7 +4617,10 @@ def continue_command(
     mid-conversation. A canceled session keeps its adapter context when the
     adapter supports continuation. A call that observed no turn prints no
     result. ``--permissions`` is the one ``run`` resolution flag ``continue``
-    accepts: it applies to this turn and every turn after it.
+    accepts: it applies to this turn and every turn after it. ``PROMPT`` is
+    optional after an interrupted turn — canceled, failed or unknown — where
+    it defaults to acpc's own continuation instruction; a succeeded turn
+    still requires a message.
 
     Example: ``acpc continue <session-id> "Run the tests again"``
     """
@@ -4577,12 +4629,7 @@ def continue_command(
         raise UsageProblem("--timeout only bounds waiting; use --cancel-after with --background")
     permissions = _normalize_permission(permissions)
 
-    prompt = _read_prompt(
-        prompt_text,
-        prompt_file,
-        operation="continue",
-        hint="Run: acpc continue SESSION_ID PROMPT",
-    )
+    has_message = prompt_text is not None or prompt_file is not None
     meta = _load_view_session(selector)
     if meta.is_active:
         raise AcpcError(
@@ -4595,6 +4642,16 @@ def continue_command(
             ),
             context={"session_id": meta.session_id},
         )
+    prompt = (
+        _read_prompt(
+            prompt_text,
+            prompt_file,
+            operation="continue",
+            hint="Run: acpc continue SESSION_ID PROMPT",
+        )
+        if has_message
+        else _continuation_prompt(meta)
+    )
     _dispatch_follow_up(
         meta,
         prompt,
@@ -4971,7 +5028,10 @@ def steer_command(
             f"session {meta.session_id} is {meta.state} — there is no turn to interrupt",
             kind=errors.CONFLICT,
             hint=f"Run: acpc continue {meta.session_id}",
-            context={"session_id": meta.session_id, "capabilities": _steer_capabilities(meta)},
+            context={
+                "session_id": meta.session_id,
+                "capabilities": output.session_capabilities(meta),
+            },
         )
 
     if steer_mode == vocab.STEER_IN_PLACE and meta.state == "waiting":
@@ -4986,7 +5046,7 @@ def steer_command(
             hint=f"Run: acpc steer {meta.session_id} ... --steer-mode cancel-then-start",
             context={
                 "session_id": meta.session_id,
-                "capabilities": _steer_capabilities(meta),
+                "capabilities": output.session_capabilities(meta),
                 "correction_result": {
                     "steer_mode": vocab.STEER_IN_PLACE,
                     "target_turn": meta.turns,
@@ -5026,11 +5086,6 @@ def steer_command(
     )
 
 
-def _steer_capabilities(meta: sessions.SessionMeta) -> dict[str, Any]:
-    """The capability block every `steer` result and every steer failure carries."""
-    return {"steer_mode": meta.steer_mode or vocab.STEER_CANCEL_THEN_START}
-
-
 def _in_place_unsupported(meta: sessions.SessionMeta) -> AcpcError:
     """The one refusal for a session that has no channel to steer through.
 
@@ -5043,7 +5098,10 @@ def _in_place_unsupported(meta: sessions.SessionMeta) -> AcpcError:
         kind=errors.NOT_SUPPORTED,
         retryable=False,
         hint=f"Run: acpc steer {meta.session_id} ... --steer-mode cancel-then-start",
-        context={"session_id": meta.session_id, "capabilities": _steer_capabilities(meta)},
+        context={
+            "session_id": meta.session_id,
+            "capabilities": output.session_capabilities(meta),
+        },
     )
 
 
@@ -5085,7 +5143,7 @@ def _steer_cancel_then_start(
     `session_id`, `capabilities` and `correction_result` in `context`.
     """
     target_turn = meta.turns
-    capabilities = _steer_capabilities(meta)
+    capabilities = output.session_capabilities(meta)
     session_id = meta.session_id
     try:
         cancel_result = _cancel_session(meta)
@@ -5117,7 +5175,7 @@ def _steer_cancel_then_start(
     def extra(final: sessions.SessionMeta) -> dict[str, Any]:
         return {
             "turn": final.turns,
-            "capabilities": _steer_capabilities(final),
+            "capabilities": output.session_capabilities(final),
             "correction_result": correction,
         }
 
@@ -5301,7 +5359,7 @@ def _steer_extra(meta: sessions.SessionMeta, correction: Mapping[str, Any]) -> d
     """The three fields every `steer` result carries on top of the shared shape."""
     return {
         "turn": meta.turns,
-        "capabilities": _steer_capabilities(meta),
+        "capabilities": output.session_capabilities(meta),
         "correction_result": dict(correction),
     }
 
@@ -5332,9 +5390,12 @@ def _steer_in_place(
                 f"Run: acpc wait {meta.session_id}, or acpc steer {meta.session_id} ... "
                 "--steer-mode cancel-then-start to cancel the preparation"
             ),
-            context={"session_id": meta.session_id, "capabilities": _steer_capabilities(meta)},
+            context={
+                "session_id": meta.session_id,
+                "capabilities": output.session_capabilities(meta),
+            },
         )
-    capabilities = _steer_capabilities(meta)
+    capabilities = output.session_capabilities(meta)
     delivery = _in_place_delivery(
         asyncio.run(_steer_with_daemon(target, meta.session_id, instruction)),
         meta.session_id,

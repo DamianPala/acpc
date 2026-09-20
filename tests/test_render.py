@@ -745,6 +745,7 @@ def test_status_detail_text_remains_the_existing_labeled_view() -> None:
         "agent    mock (mock) · model: mock-sonnet-5 · name: ·\n"
         f"dir      {sessions.session_dir(meta.session_id)} · answer: answer.md\n"
         "steer: cancel-then-start\n"
+        "permissions: read via · (unset)\n"
     )
 
 
@@ -756,7 +757,11 @@ def test_status_detail_names_the_session_steer_mode() -> None:
     payload = render.status_detail_json(meta, clock=lambda: 120.0)
 
     assert "steer: in-place\n" in text
-    assert payload["capabilities"] == {"steer_mode": "in-place"}
+    assert payload["capabilities"] == {
+        "steer_mode": "in-place",
+        "continue_without_message": True,
+    }
     assert render.status_detail_json(make_session())["capabilities"] == {
-        "steer_mode": "cancel-then-start"
+        "steer_mode": "cancel-then-start",
+        "continue_without_message": True,
     }

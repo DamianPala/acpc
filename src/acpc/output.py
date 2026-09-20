@@ -129,7 +129,7 @@ def result_envelope(
             "partial": False,
             "denied": _denial_payload(meta),
             "permissions_clamp": _permissions_clamp(meta),
-            "capabilities": _capabilities(meta),
+            "capabilities": session_capabilities(meta),
             "next": ["acpc", "wait", meta.session_id],
         }
         if not include_partial:
@@ -159,7 +159,7 @@ def result_envelope(
         "truncated": truncated,
         "denied": _denial_payload(meta),
         "permissions_clamp": _permissions_clamp(meta),
-        "capabilities": _capabilities(meta),
+        "capabilities": session_capabilities(meta),
         "next": ["acpc", "continue", meta.session_id],
     }
     if include_partial:
@@ -181,8 +181,17 @@ def _timestamp_or_none(value: float | None) -> str | None:
     return sessions.format_timestamp(value) if value is not None else None
 
 
-def _capabilities(meta: sessions.SessionMeta) -> dict[str, str]:
-    return {"steer_mode": meta.steer_mode or vocab.STEER_CANCEL_THEN_START}
+def session_capabilities(meta: sessions.SessionMeta) -> dict[str, Any]:
+    """The session-capability object (V1c): one shape, every result and status.
+
+    `continue_without_message` is `true` for every acpc session: `continue`
+    without a message always resumes an interrupted turn with acpc's own
+    continuation instruction (SPEC.md `continue`, slice 19).
+    """
+    return {
+        "steer_mode": meta.steer_mode or vocab.STEER_CANCEL_THEN_START,
+        "continue_without_message": True,
+    }
 
 
 def _json_text(value: object) -> str:
@@ -599,6 +608,33 @@ def _permissions_clamp(meta: sessions.SessionMeta) -> dict[str, str] | None:
     if any(not isinstance(clamp.get(field), str) for field in fields):
         return None
     return {field: clamp[field] for field in fields}
+
+
+def _resolved_mode(meta: sessions.SessionMeta) -> str | None:
+    resolved = meta.resolution.get("resolved", {})
+    mode = resolved.get("mode", {}) if isinstance(resolved, dict) else {}
+    value = mode.get("value") if isinstance(mode, dict) else None
+    return value if isinstance(value, str) else None
+
+
+def status_permissions(meta: sessions.SessionMeta) -> dict[str, Any]:
+    """R2d's non-interactive inspection: the policy in force for a session.
+
+    `policy` and `source` are the stored permission resolution's own value and
+    provenance; `mode` is the adapter mode serving it; `clamp` is `None`
+    unless the inherited ceiling narrowed the requested policy. The session's
+    `permissions_source` names an origin provenance cannot see (acpc's own
+    default, or the policy answered at the `--bg` question) and wins when set.
+    """
+    resolved = _resolved_permissions(meta)
+    policy = resolved.get("value")
+    source = meta.resolution.get("permissions_source") or resolved.get("source")
+    return {
+        "policy": policy if isinstance(policy, str) else "read",
+        "mode": _resolved_mode(meta),
+        "source": source if isinstance(source, str) else "unset",
+        "clamp": _permissions_clamp(meta),
+    }
 
 
 def _resume_status(meta: sessions.SessionMeta) -> str | None:

@@ -142,6 +142,8 @@ EXPECTED_REQUIRED: dict[str, tuple[str, ...]] = {
         "failure",
         "capabilities",
         "limit",
+        "pending_corrections",
+        "permissions",
         "paths",
         "created_at",
         "started_at",

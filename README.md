@@ -12,7 +12,7 @@ acpc is built for a specific primary user: **another agent calling it through a 
 
 `list` is the bounded collection view; active sessions show `idle <age>` since their newest transcript event, while finished sessions show `·`. `status <id>` is the fixed-cost detail view. The JSON view exposes the same idle value as `idle_seconds` (`null` when unavailable or finished). Every row also names the model the session resolved to, because entry names hide it — two variants that both `extend` the same parent run the same model, and only the column says so.
 
-A failed run is not lost: `acpc status <id>` names the failure on its `failure` line, and `acpc continue <id>` resumes the session with its transcript context intact — the failed turn's partial answer is parked as `answer.<n>.md` in the session dir.
+A failed run is not lost: `acpc status <id>` names the failure on its `failure` line, and `acpc continue <id>` resumes the session with its transcript context intact — the failed turn's partial answer is parked as `answer.<n>.md` in the session dir. `acpc continue <id>` with no message at all picks up an interrupted turn (after `canceled`, `failed` or `unknown`) with acpc's own continuation instruction; after `succeeded` there is nothing to pick up and a message is required.
 
 ```bash
 # 90% of usage is this:
@@ -38,7 +38,7 @@ When stdout is not a terminal, `run`, `continue`, `steer` and `wait` print the a
 ```text
 <result session_id="x7k2" status="succeeded" partial="false">
 <metadata>
-{"turn":1,"capabilities":{"steer_mode":"in-place"},"tokens":1834,"cost":0.02,"stop_reason":"end_turn","next":["acpc","continue","x7k2"]}
+{"turn":1,"capabilities":{"steer_mode":"in-place","continue_without_message":true},"tokens":1834,"cost":0.02,"stop_reason":"end_turn","next":["acpc","continue","x7k2"]}
 </metadata>
 <answer>
 The answer, verbatim Markdown.
@@ -138,7 +138,7 @@ $ acpc log x7k2 --since 42
 
 ## Permissions
 
-`--permissions none|read|edit|execute|all|ask` names a ceiling for ACP permission requests, classified by tool-call kind. `ask` is off the scale: reads are allowed and other categories ask on `/dev/tty`. The default is `ask` when stdin and stdout are terminals and the context permits a question, and `read` otherwise. A terminal `run --background` without an explicit policy asks once which policy to detach with. No policy question is asked under `--json`, when stdin is not a terminal, or when `NO_INPUT` is non-empty. `write` and `prompt` remain accepted as deprecated aliases for `execute` and `ask`.
+`--permissions none|read|edit|execute|all|ask` names a ceiling for ACP permission requests, classified by tool-call kind. `ask` is off the scale: reads are allowed and other categories ask on `/dev/tty`. The default is `ask` when stdin and stdout are terminals and the context permits a question, and `read` otherwise. A terminal `run --background` without an explicit policy asks once which policy to detach with. No policy question is asked under `--json`, when stdin is not a terminal, or when `NO_INPUT` is non-empty. `write` and `prompt` remain accepted as deprecated aliases for `execute` and `ask`. `acpc status <id>` shows the policy in force for a session under `permissions` (policy, adapter mode, where it came from, any clamp).
 
 Three edges worth internalizing:
 

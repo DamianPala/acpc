@@ -36,7 +36,7 @@ COMMAND_NAME = "schema"
 
 # The standard this surface is generated against.
 STANDARD_NAME = "cli-design-standard"
-STANDARD_VERSION = "0.1.0-draft.7"
+STANDARD_VERSION = "0.2.0-draft.10"
 
 # Default output format per context.  acpc renders text in both today; a
 # command that has a machine shape offers it behind its own `--json`.
@@ -118,6 +118,15 @@ _PERMISSIONS_CLAMP = _object(
     {name: _STRING for name in ("requested", "ceiling", "effective")},
     ("requested", "ceiling", "effective"),
 )
+# The session-capability object (V1c): one shape shared by `run`, `continue`,
+# `steer`, `wait` and `status`, never redeclared per command.
+_CAPABILITIES = _object(
+    {
+        "steer_mode": {"type": "string", "enum": ["in-place", "cancel-then-start"]},
+        "continue_without_message": _BOOLEAN,
+    },
+    ("steer_mode", "continue_without_message"),
+)
 # `limit` on `status` and, optionally, on a `run`/`continue`/`wait` result: the
 # usage-limit record SPEC.md `status` describes, `null` unless one touched the
 # current turn.
@@ -154,16 +163,7 @@ _SESSION_RESULT_PROPERTIES = {
     "partial": _BOOLEAN,
     "output_file": _STRING,
     "denied": _array(_DENIAL),
-    "capabilities": {
-        "type": "object",
-        "properties": {
-            "steer_mode": {
-                "type": "string",
-                "enum": ["in-place", "cancel-then-start"],
-            }
-        },
-        "required": ["steer_mode"],
-    },
+    "capabilities": _CAPABILITIES,
     "permissions_clamp": {
         "type": ["object", "null"],
         "properties": _PERMISSIONS_CLAMP["properties"],
@@ -246,10 +246,6 @@ def _session_result_schema(
     return _object(properties, required)
 
 
-_STEER_CAPABILITIES = _object(
-    {"steer_mode": {"type": "string", "enum": ["in-place", "cancel-then-start"]}},
-    ("steer_mode",),
-)
 _STEER_CORRECTION = _object(
     {
         "steer_mode": _STRING,
@@ -263,7 +259,7 @@ _STEER_CORRECTION = _object(
 # `turn` is the same field every answer result carries, holding the turn to
 # observe next, and `capabilities` belongs to the shared result shape too.
 _STEER_RESULT_PROPERTIES = {
-    "capabilities": _STEER_CAPABILITIES,
+    "capabilities": _CAPABILITIES,
     "correction_result": _STEER_CORRECTION,
 }
 
@@ -408,6 +404,23 @@ _STATUS_LIST_ITEM = _object(
         "finished_at",
     ),
 )
+# R2d's non-interactive inspection of the policy applied to accepted work:
+# `policy` and `source` share the provenance recorded on the session's stored
+# permission resolution, `mode` is the adapter mode serving it, and `clamp`
+# reuses the same shape `permissions_clamp` does.
+_STATUS_PERMISSIONS = _object(
+    {
+        "policy": _STRING,
+        "mode": _NULLABLE_STRING,
+        "source": _STRING,
+        "clamp": {
+            "type": ["object", "null"],
+            "properties": _PERMISSIONS_CLAMP["properties"],
+            "required": _PERMISSIONS_CLAMP["required"],
+        },
+    },
+    ("policy", "mode", "source", "clamp"),
+)
 _STATUS_DETAIL = _object(
     {
         "session_id": _STRING,
@@ -425,8 +438,13 @@ _STATUS_DETAIL = _object(
         "exit_code": _NULLABLE_INTEGER,
         "stop_reason": _NULLABLE_STRING,
         "failure": _NULLABLE_STRING,
-        "capabilities": _STEER_CAPABILITIES,
+        "capabilities": _CAPABILITIES,
         "limit": _NULLABLE_LIMIT,
+        # V4c: acpc cannot observe whether a forwarded correction is still
+        # pending inside the adapter, so this is always `null` rather than a
+        # count acpc never has grounds to report.
+        "pending_corrections": {"type": ["integer", "null"]},
+        "permissions": _STATUS_PERMISSIONS,
         "paths": _PATHS,
         "created_at": _NULLABLE_STRING,
         "started_at": _NULLABLE_STRING,
@@ -450,6 +468,8 @@ _STATUS_DETAIL = _object(
         "failure",
         "capabilities",
         "limit",
+        "pending_corrections",
+        "permissions",
         "paths",
         "created_at",
         "started_at",
@@ -974,7 +994,7 @@ def index(root: click.Group) -> dict[str, Any]:
         "conformance": {
             "name": STANDARD_NAME,
             "standard": STANDARD_VERSION,
-            "extensions": ["managed"],
+            "extensions": ["managed", "conversational"],
         },
         "commands": [
             {

@@ -804,7 +804,7 @@ def test_an_oversized_prompt_file_creates_no_session(
 
 
 def test_a_prompt_exactly_at_the_limit_is_accepted(cli: CliRunner) -> None:
-    """`continue` reads the prompt first, so this reaches the unknown session."""
+    """A prompt at the limit is not refused, so the call reaches the unknown session."""
     result = invoke(cli, "continue", "does-not-exist", at_the_limit())
 
     assert envelope(result)["kind"] == "not_found"
