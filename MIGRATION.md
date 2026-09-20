@@ -53,13 +53,15 @@ The old `--bg` spelling is the only command-surface alias retained in this table
 
 ### Session states
 
-The public states are `starting`, `running`, `preparing`, `succeeded`, `failed`, `canceled` and `unknown`. The reader normalizes historical state names before output. A historical terminal deadline state becomes `failed` with `stop_reason: error` and `exit_code: 1`; exit 124 is reserved for the observing client's deadline. A lost host process becomes `unknown`, which is terminal for management but says that the operation's result was not observed.
+The public states are `starting`, `running`, `preparing`, `waiting`, `succeeded`, `failed`, `canceled` and `unknown`. `waiting` is new: a vendor usage limit with a known reset time holds the turn open until acpc resends after the reset (within `limit_wait_max`, 8h by default); a caller polling `status` must treat it as non-terminal. The reader normalizes historical state names before output. A historical terminal deadline state becomes `failed` with `stop_reason: error` and `exit_code: 1`; exit 124 is reserved for the observing client's deadline. A lost host process becomes `unknown`, which is terminal for management but says that the operation's result was not observed.
 
 ### Formats and output
 
 The tool-wide default is text on a TTY and JSON on a non-TTY. Native answer and stream commands explicitly use text in both contexts. Collections use `items` and `has_more`; plain output is one identifier per line and requires an explicit limit. `log --json` is NDJSON, one transcript record per line.
 
 `agents check` always returns a collection, including a named check. `prune` and daemon stop return `targets`, `changed` and `requires_confirmation`. `install` returns `changed: null` on success because the vendor installer does not report whether it changed anything. Failed machine-format calls leave stdout empty and put the failure envelope on stderr.
+
+`tokens` is `null`, not `0`, until the adapter has reported usage for the session; a caller that did `int(tokens)` or compared it with `0` must handle `null`. The tagged text document omits `tokens` from `<metadata>` while it is `null`, and text views print `· tok`.
 
 ### State files and transcripts
 
