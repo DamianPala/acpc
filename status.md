@@ -36,9 +36,22 @@ rule, V6c: usage the adapter never reported is `null`, never `0`. `tokens` is nu
 result, in `status`, and in the `usage` transcript record; `<metadata>` omits it while `null`;
 text views show `· tok`. `tokens` stays session-cumulative across turns. A legacy `meta.json`
 with `"tokens": 0` still reads `0`. Two review rounds (the second for the `log` schema).
-Gates: 1350 tests, ruff/pyright clean, smoke 603/603, D6c green against the checkout. Next: live
-16/18/19/20/21 on claude-agent-acp and codex-acp, then the black-box probe the standard's
-session designs.
+Gates: 1350 tests, ruff/pyright clean, smoke 603/603, D6c green against the checkout
+(`0fa27f1`).
+
+**Live on real adapters (2026-09-20, `uv run acpc`, isolated home, Sonnet low and Luna low on
+the subscriptions):** slices 16, 18, 19 and 21 behave as on the mock on both claude-agent-acp
+and codex-acp: tagged document and background receipt off a TTY with `tokens` in `<metadata>`
+(claude 43 896 with cost, codex 20 184 without cost); `wait --timeout 1` exits 124 with an empty
+stdout and `retryable: true`; `cancel` of a running turn then `continue` with no message runs
+turn 2 under the continuation instruction with `resume: verified`; `status.permissions` names
+the entry file as `source`; `usage` transcript records carry the same integers. Both adapters
+report `steer_mode: in-place` under the daemon and `cancel-then-start` on a direct child. A
+usage limit cannot be provoked on demand, so slice 20 is covered by the mock only. Two
+observations: `--background` on a home whose daemon socket path exceeds 108 bytes reports only
+"the daemon ... did not come up" (the real cause, the path limit, is in the daemon log; a
+clearer error is a small debt); Claude Code's `haiku` alias rejects any `effort`, so an entry
+on it must not inherit one. Next: the black-box probe the standard's session designs.
 
 Debts found in review, none blocking: the TTY `human` presentation still prints the raw answer
 without control-byte escaping (O3d asks for it; a small separate slice); `continue` after
