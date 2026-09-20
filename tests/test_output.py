@@ -60,6 +60,7 @@ def test_json_envelope_has_pinned_fields_and_truncates_answer_only() -> None:
         "started_at",
         "finished_at",
         "stop_reason",
+        "tokens",
         "paths",
         "cost",
         "answer",
@@ -201,7 +202,27 @@ def test_summary_is_one_prefixed_stderr_line() -> None:
     assert "exit 0" in line
     assert "41k tok" in line
     assert f"dir {sessions.session_dir(meta.session_id)}" in line
-    assert f"continue: acpc continue {meta.session_id}" in line
+    assert f"Next: acpc continue {meta.session_id}" in line
+    assert "steer_mode cancel-then-start" in line and "| partial |" not in line
+
+
+def test_summary_names_partial_limit_correction_and_truncation() -> None:
+    meta = make_session(Path("."))
+    meta = sessions.transition(
+        meta.session_id, "canceled", limit={"reason": "rate_limit", "resume_at": "soon"}
+    )
+    correction = {
+        "steer_mode": "in-place",
+        "target_turn": 1,
+        "target_status": "s",
+        "message_state": "m",
+    }
+    line = output.format_summary(
+        meta, correction_result=correction, truncated_output_file="/x/answer.md"
+    )
+
+    assert "| partial |" in line and "limit: rate_limit, resumes soon" in line
+    assert "correction: in-place" in line and "truncated → /x/answer.md" in line
 
 
 def test_summary_places_continue_command_before_route_note() -> None:
@@ -219,6 +240,6 @@ def test_summary_places_continue_command_before_route_note() -> None:
     ).split(" | ")
 
     assert segments[-2:] == [
-        f"continue: acpc continue {meta.session_id}",
+        f"Next: acpc continue {meta.session_id}",
         "queued for a daemon slot",
     ]

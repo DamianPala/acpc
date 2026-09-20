@@ -92,6 +92,16 @@ def invoke(cli: CliRunner, *args: str, stdin: str | None = None):
     return cli.invoke(main, list(args), input=stdin, catch_exceptions=False)
 
 
+def force_human_presentation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Force the terminal branch of `text` (V6a) under CliRunner's non-TTY pipes.
+
+    `CliRunner` gives every test a non-TTY stdout, which now defaults to the
+    tagged document; a handful of tests are specifically about the raw,
+    byte-identical-to-answer.md human presentation, so they select it directly.
+    """
+    monkeypatch.setattr(cli_module, "_stdout_is_tty", lambda: True)
+
+
 def error_envelope(result) -> dict:
     """The structured failure: always the last non-empty line of stderr."""
     lines = [line for line in result.stderr.splitlines() if line.strip()]
@@ -743,6 +753,12 @@ def test_background_run_does_not_emit_the_early_line(cli: CliRunner, live_daemon
 
     assert result.exit_code == vocab.EXIT_OK
     assert "-- session " not in result.stderr
+    # Non-TTY stdout: the tagged receipt without an answer section (V6a).
+    lines = result.stdout.splitlines()
+    assert lines[0].startswith('<result session_id="') and lines[1] == "<metadata>"
+    assert "<answer" not in result.stdout and lines[-1] == "</result>"
+    metadata = json.loads(lines[2])
+    assert metadata["next"][:2] == ["acpc", "wait"] and "paths" in metadata
 
 
 def test_cold_background_receipt_waits_for_initialize(
@@ -841,8 +857,9 @@ def test_without_quiet_the_summary_is_exactly_one_stderr_line(cli: CliRunner) ->
 
 
 def test_early_line_segments_match_the_summary_and_stdout_matches_answer_file(
-    cli: CliRunner,
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    force_human_presentation(monkeypatch)
     result = invoke(cli, "run", "mock", "echo:format and bytes")
 
     metadata_lines = [line for line in result.stderr.splitlines() if line.startswith("-- ")]
@@ -859,8 +876,9 @@ def test_early_line_segments_match_the_summary_and_stdout_matches_answer_file(
 
 
 def test_stdout_bytes_match_answer_file_after_a_detectable_message_boundary(
-    cli: CliRunner,
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    force_human_presentation(monkeypatch)
     result = invoke(cli, "run", "mock", "separator contract probe")
 
     assert "\n\n## Answer" in result.stdout
@@ -870,10 +888,13 @@ def test_stdout_bytes_match_answer_file_after_a_detectable_message_boundary(
     assert result.stdout.encode("utf-8") == sessions.answer_path(session_id).read_bytes()
 
 
-def test_the_summary_starts_on_a_fresh_line_after_an_unterminated_answer(cli: CliRunner) -> None:
+def test_the_summary_starts_on_a_fresh_line_after_an_unterminated_answer(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """SPEC output contract: `--` separates only at a line boundary, and the
     compensating newline goes to stderr — stdout stays byte-identical to
     answer.md."""
+    force_human_presentation(monkeypatch)
     result = invoke(cli, "run", "mock", "echo:no trailing newline")
 
     assert result.stdout == "no trailing newline"
@@ -885,7 +906,10 @@ def test_the_summary_starts_on_a_fresh_line_after_an_unterminated_answer(cli: Cl
     assert lines[summary_index - 1] == ""
 
 
-def test_a_terminated_answer_gets_no_blank_line_before_the_summary(cli: CliRunner) -> None:
+def test_a_terminated_answer_gets_no_blank_line_before_the_summary(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    force_human_presentation(monkeypatch)
     result = invoke(cli, "run", "mock", "echo:ends with a newline\n")
 
     assert result.stdout == "ends with a newline\n"

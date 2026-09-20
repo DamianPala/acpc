@@ -125,9 +125,11 @@ def _daemon_is_reachable(target: str) -> bool:
 
 
 def _start_slow_session(cli: CliRunner, prompt: str = "slow:5 daemon stop probe") -> str:
-    result = invoke(cli, "run", "mock", prompt, "--bg", "--quiet")
+    # SPEC `Text presentation`: non-TTY stdout without --json is now the
+    # tagged receipt, not the bare id — --json keeps this a one-field read.
+    result = invoke(cli, "run", "mock", prompt, "--bg", "--quiet", "--json")
     assert result.exit_code == vocab.EXIT_OK, result.stderr
-    session_id = result.stdout.strip().splitlines()[0]
+    session_id = json.loads(result.stdout)["session_id"]
     _wait_until_running(cli, session_id)
     return session_id
 
@@ -388,9 +390,9 @@ def test_daemon_stop_force_fails_a_waiting_session_the_same_way(
     monkeypatch.setenv("ACPC_MOCK_LIMIT_PROMPTS", "1")
     monkeypatch.setenv("ACPC_MOCK_LIMIT_RESET_S", "60")
 
-    result = invoke(cli, "run", "mock", "echo:x", "--bg", "--quiet")
+    result = invoke(cli, "run", "mock", "echo:x", "--bg", "--quiet", "--json")
     assert result.exit_code == vocab.EXIT_OK, result.stderr
-    session_id = result.stdout.strip().splitlines()[0]
+    session_id = json.loads(result.stdout)["session_id"]
     _wait_until_state(session_id, "waiting")
 
     result = invoke(cli, "daemon", "stop", "mock", "--force")
@@ -484,9 +486,9 @@ def test_daemon_stop_uses_singular_and_plural_active_session_wording(
 def test_cancel_running_session_cancels_daemon_and_preserves_artifacts(
     cli: CliRunner, state_root: Path, live_daemon: None
 ) -> None:
-    result = invoke(cli, "run", "mock", "run the slow scenario", "--bg", "--quiet")
+    result = invoke(cli, "run", "mock", "run the slow scenario", "--bg", "--quiet", "--json")
     assert result.exit_code == vocab.EXIT_OK, result.stderr
-    session_id = result.stdout.strip().splitlines()[0]
+    session_id = json.loads(result.stdout)["session_id"]
     _wait_until_running(cli, session_id)
 
     stopped = invoke(cli, "cancel", session_id, "--json")

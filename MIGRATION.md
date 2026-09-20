@@ -39,6 +39,9 @@ This guide describes the public changes accumulated before acpc 1.0. The command
 | `continue --cwd` | `acpc run --cwd` | A continuation uses the session's stored working directory. |
 | `continue --home` | `acpc run --home` | A continuation uses the session's stored vendor home. |
 | `continue --name` | `acpc run --name` | A name is assigned when a session is created. |
+| `acpc run AGENT PROMPT --bg \| head -1` (id from the receipt's first line) | `acpc run AGENT PROMPT --bg --json \| jq -r .session_id` | On a non-terminal stdout the text receipt is now a `<result>` document; the two-line id and directory form remains on a terminal. |
+| `acpc wait ID > answer.md` (raw answer on a non-terminal stdout) | `acpc wait ID --json \| jq -r .answer > answer.md`, or read the answer section (`<answer>`, or `<answer-N>` counting its lines) | On a non-terminal stdout `run`, `continue`, `steer` and `wait` print the tagged text document; the terminal keeps the raw answer on stdout. |
+| `acpc run ... --timeout S` expecting a partial result document on the deadline | `acpc log ID --tail 20`, then `acpc status ID` (the error's `hint` and `next`) | A client deadline returns no result and creates no `--output-file`; the answer recorded so far stays in the session files. |
 
 The old `--bg` spelling is the only command-surface alias retained in this table. The aliases `-y`, `-f` and `-n` are current short spellings, not old spellings: `-y` confirms, `-f` forces daemon stop, and `-n` is the dry-run alias for prune and daemon stop.
 

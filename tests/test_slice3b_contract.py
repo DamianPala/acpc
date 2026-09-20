@@ -170,6 +170,7 @@ EXPECTED_REQUIRED: dict[str, tuple[str, ...]] = {
         "started_at",
         "finished_at",
         "stop_reason",
+        "tokens",
         "cost",
         "answer",
         "paths",

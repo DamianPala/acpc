@@ -200,6 +200,7 @@ EXPECTED_REQUIRED_FIELDS = {
         "started_at",
         "finished_at",
         "stop_reason",
+        "tokens",
         "cost",
         "answer",
         "paths",
@@ -215,36 +216,52 @@ EXPECTED_REQUIRED_FIELDS = {
 # `output_description` stating when a failure still answers.
 ANSWER_COMMANDS = frozenset({"run", "continue", "wait"})
 
+_TEXT_PRESENTATION_NOTE = (
+    "The `text` format has two presentations selected by the stdout stream: a tagged "
+    "document off a terminal, keeping a subset of this schema's fields under "
+    "`<metadata>`, and a human layout on one; `--json` returns the complete document."
+)
+
 EXPECTED_OUTPUT_DESCRIPTIONS = {
     "run": (
         "Returns the answer result for a turn this call observed the end of — including a "
         "failed or canceled turn — and returns no result for a call that observed no turn, "
         "including one whose --timeout deadline expired (`context.status` can be `waiting` "
         "when a usage limit was holding the turn) or whose watch ended in a detach. "
-        "`stop_reason`, `cost` and `answer` are present on every foreground result and "
-        "omitted by `--background`."
-    ),
+        "`stop_reason`, `tokens`, `cost` and `answer` are present on every foreground result "
+        "and omitted by `--background`. "
+    )
+    + _TEXT_PRESENTATION_NOTE,
     "continue": (
         "Returns the answer result for a turn this call observed the end of — including a "
         "failed or canceled turn — and returns no result for a call that observed no turn, "
         "including one whose --timeout deadline expired (`context.status` can be `waiting` "
         "when a usage limit was holding the turn) or whose watch ended in a detach. "
-        "`stop_reason`, `cost` and `answer` are present on every foreground result and "
-        "omitted by `--background`."
-    ),
+        "`stop_reason`, `tokens`, `cost` and `answer` are present on every foreground result "
+        "and omitted by `--background`. "
+    )
+    + _TEXT_PRESENTATION_NOTE,
     "wait": (
         "Selects the session's current turn when the call starts and keeps observing that "
         "turn even if the session rotates to a newer one meanwhile; returns the answer "
         "result once that turn has ended — including a failed or canceled turn — and "
         "returns no result when a --timeout deadline expires first, with `context.status` "
-        "naming the turn's status at the deadline, `waiting` included."
-    ),
+        "naming the turn's status at the deadline, `waiting` included. "
+    )
+    + _TEXT_PRESENTATION_NOTE,
     "status": (
         "Follows the selector: reports the session's current turn at the time of the call, "
         "so a session that rotated to a newer turn since is reported as that newer turn. "
         "`limit` is `null` unless a usage limit touched that turn; its `source` is one of "
         "`error_kind`, `rate_limit_info` or `text`."
     ),
+    "steer": (
+        "Returns the answer result for the turn the correction landed on, or the acceptance "
+        "receipt under `--background`; `capabilities` and `correction_result` are always "
+        "present, and `stop_reason`, `tokens`, `cost` and `answer` join them on every "
+        "foreground result. "
+    )
+    + _TEXT_PRESENTATION_NOTE,
 }
 
 EXPECTED_OUTPUT_ENUMS = {
@@ -348,6 +365,7 @@ _SESSION_OUTPUT_PROPERTIES = frozenset(
         "turn",
         "status",
         "stop_reason",
+        "tokens",
         "paths",
         "cost",
         "answer",
@@ -1439,7 +1457,7 @@ def test_D6d_routing_D7b_flat_entries_and_D7c_shape(cli: CliRunner) -> None:
         # that return results on failure and carry foreground-only fields
         # declare it; every other command's schema already says everything.
         description = detail.get("output_description")
-        if entry["name"] in ANSWER_COMMANDS or entry["name"] == "status":
+        if entry["name"] in ANSWER_COMMANDS or entry["name"] in {"status", "steer"}:
             assert description == EXPECTED_OUTPUT_DESCRIPTIONS[entry["name"]]
         else:
             assert description is None, entry["name"]

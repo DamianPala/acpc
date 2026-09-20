@@ -209,7 +209,7 @@ run AGENT [PROMPT | -] [--prompt-file FILE] [--cwd DIR] [--model M]
     [--max-output BYTES] [--background | --bg] [--quiet]
 ```
 
-`run` resolves an adapter or variant, creates a session, dispatches one turn and blocks by default. `--background` and its alias `--bg` dispatch and return the session id and directory without waiting for the answer. The receipt is returned once the daemon has completed the adapter's `initialize` handshake, so it names the session's correction mode under `capabilities`; a warm daemon adds no delay, a cold one adds the adapter start. It does not wait for the prompt to be sent. The daemon bounds that handshake to 60 s: an adapter that has not answered `initialize` by then is torn down and the session ends as `failed` with `agent_error`, the way a crashed adapter does. Until the handshake completes, `status` and `list` show the accepted session as `preparing`. A blocking call prints an early session line to stderr before the turn starts so the caller can inspect or cancel it mid-run.
+`run` resolves an adapter or variant, creates a session, dispatches one turn and blocks by default. `--background` and its alias `--bg` dispatch and return the acceptance receipt without waiting for the answer: on a terminal the session id and its directory on two lines, on a non-terminal stdout the tagged document without an answer section (see *Text presentation*), and with `--json` the receipt document. The receipt is returned once the daemon has completed the adapter's `initialize` handshake, so it names the session's correction mode under `capabilities`; a warm daemon adds no delay, a cold one adds the adapter start. It does not wait for the prompt to be sent. The daemon bounds that handshake to 60 s: an adapter that has not answered `initialize` by then is torn down and the session ends as `failed` with `agent_error`, the way a crashed adapter does. Until the handshake completes, `status` and `list` show the accepted session as `preparing`. A blocking call prints an early session line to stderr before the turn starts so the caller can inspect or cancel it mid-run.
 
 `--timeout` bounds only how long this client waits, counted from the call and covering acceptance by the daemon, the adapter handshake and the turn itself; absent, the wait is unbounded. It never cancels or changes accepted work. After the deadline the session remains alive under the daemon, or under a detached direct worker when the daemon fallback was used, and the command exits 124 with `kind: timeout`, an empty stdout and no result document, even when a partial answer has already been recorded. `context` carries `session_id`, `turn` and the observed `status`: `running` for an observed turn, `starting` or `preparing` when the deadline expired while a cold daemon was still starting the adapter. `retryable` is `false`, because repeating the call would start new work; `hint` points at `log --tail` for the progress so far and at `status`, and `next` is `acpc status <id>`. `--cancel-after` bounds the work itself. When it expires, ACP cancellation is sent and the observing command reports `operation_failed` with the observed `canceled` status and the partial answer on stdout.
 
@@ -299,9 +299,11 @@ The installed binary currently publishes schema version `1`, tool version `0.7.1
 
 The output format is selected by `--format` or the `--json` alias. The tool-wide default is text on a TTY and JSON on a non-TTY. `run`, `continue`, `steer`, `wait`, `log`, `resolve` and `skills get` explicitly default to text in both contexts. `log` uses `ndjson` as its machine format. Collections additionally offer `plain`, also selected by `--plain`; it requires an explicit `--limit` and emits one identifier per line.
 
+For `run`, `continue`, `steer` and `wait` the `text` format has two presentations selected by the stdout stream: the tagged document described under *Text presentation* when stdout is not a terminal, and the human layout when it is. `--output-file` receives the presentation stdout would have received. `--json` is a choice for programmatic parsing, not a prerequisite for reading an answer; it returns the original answer string and the complete document.
+
 The global `--color auto|always|never` policy affects human text only. The precedence is the explicit flag, `NO_COLOR`, `TERM=dumb`, then whether stdout is a terminal. Machine formats never contain ANSI or control bytes.
 
-stdout carries only the selected result: the answer, a machine document, a record stream, or the id and directory from `--background`.
+stdout carries only the selected result: the answer, a machine document, a record stream, or the acceptance receipt from `--background`.
 `--output-file` leaves stdout empty and writes the exact payload of the selected format to the file, on success and on a failure that returns a result. A call that returns no result creates no file.
 stderr carries acpc metadata, summaries, footers, diagnostics and adapter noise according to the command.
 A log footer never contaminates a prose or NDJSON stdout stream.
@@ -314,9 +316,42 @@ Machine success documents are the shapes published by `acpc schema`. Collections
 
 `prune` and `daemon stop` return `targets`, `changed` and `requires_confirmation`; the same shape covers preview and mutation. `delete` returns `session_id`, `removed`, `changed` and `paths`. `resolve` returns its full resolution document. `probe` returns its discovery report. `log` returns one record at a time with required `i`, `ts` and `type`, plus event-specific fields.
 
-The shared answer result for `run` and `continue` has required `status`, `session_id`, `turn`, `created_at`, `started_at`, `finished_at`, `paths`, `truncated`, `partial`, `denied`, `permissions_clamp`, `capabilities` and `changed`. Foreground success adds `stop_reason`, `cost` and `answer`; background success omits them and points `next` at `wait`. `resume`, `next`, `output_file` and `limit` are optional; `limit` appears when a usage limit touched the turn and has the shape described under `status`. `steer` uses the same document with `status` limited to `running` and `succeeded`, without `partial`, plus required `correction_result`. `capabilities` is the session-capability object described under `steer`, `{"steer_mode": "in-place" | "cancel-then-start"}`, and is the same object in every command that carries it. `wait` is read-only, so its result has no `changed` field. `turn` is the one-based number of the turn the document describes. Each schema entry declares one `output` shared by the success and failure results of that command, and `run`, `continue` and `wait` state in `output_description` which failures return a result and which fields are required only on success.
+The shared answer result for `run` and `continue` has required `status`, `session_id`, `turn`, `created_at`, `started_at`, `finished_at`, `paths`, `truncated`, `partial`, `denied`, `permissions_clamp`, `capabilities` and `changed`. Foreground success adds `stop_reason`, `tokens`, `cost` and `answer`; background success omits them and points `next` at `wait`. `tokens` is the integer token count recorded for the session so far, the same value `status` shows. `resume`, `next`, `output_file` and `limit` are optional; `limit` appears when a usage limit touched the turn and has the shape described under `status`. `steer` uses the same document with `status` limited to `running` and `succeeded`, without `partial`, plus required `correction_result`. `capabilities` is the session-capability object described under `steer`, `{"steer_mode": "in-place" | "cancel-then-start"}`, and is the same object in every command that carries it. `wait` is read-only, so its result has no `changed` field. `turn` is the one-based number of the turn the document describes. Each schema entry declares one `output` shared by the success and failure results of that command, and `run`, `continue` and `wait` state in `output_description` which failures return a result and which fields are required only on success.
 
 `paths` contains `dir`, `prompt`, `transcript` and `answer`. `denied` records permission denials by category, and `permissions_clamp` records a requested policy, the entry ceiling and the effective policy when a clamp occurred. `run`, `continue` and `wait` return their result document on stdout when acpc observed the end of the turn and holds its content, including when the turn failed or was canceled. A client deadline never produces a result document: the answer recorded so far stays in the session files and `log` reads it. `partial` is `false` when the content is the complete answer for that call, a refusal included, and `true` when the turn ended before the answer did; a result carrying `partial: true` always exits non-zero. A call that never observed a turn — an unknown agent, a rejected flag combination, a session that does not exist, a start that failed — writes nothing to stdout. The structured error stays on stderr in every case.
+
+### Text presentation
+
+On a non-terminal stdout, `run`, `continue`, `steer` and `wait` print their result as one tagged document that acpc builds, never the agent:
+
+```text
+<result session_id="q7x2" status="succeeded" partial="false">
+<metadata>
+{"turn":1,"capabilities":{"steer_mode":"in-place"},"tokens":1834,"cost":0.02,"stop_reason":"end_turn","next":["acpc","continue","q7x2"]}
+</metadata>
+<answer>
+The answer, verbatim Markdown.
+</answer>
+</result>
+```
+
+The opening tag carries `session_id`, `status` and, for documents that have it, `partial`, with `&`, `<`, `>`, `"`, tab, CR and LF escaped as `&amp;`, `&lt;`, `&gt;`, `&quot;`, `&#9;`, `&#13;` and `&#10;`. `<metadata>` holds one JSON object on a single line with the fields the text keeps from the JSON document: `turn`, `capabilities`, `next`, `stop_reason`, `tokens` and `cost` when known, `correction_result` for `steer`, `denied` when any denial was recorded, `permissions_clamp` and `resume` when present, `limit` when a usage limit touched the turn, and `truncated` with `output_file` when the answer was cut by `--max-output`. Timestamps, `paths`, `changed` and the untruncated answer stay in JSON. `<metadata>` always precedes the answer section. The answer section holds the answer text with its line breaks and Markdown as they are; terminal control bytes are escaped as in every text output and nothing else is replaced. Each tag sits on its own line: after an opening tag acpc writes one newline, then the content, then one newline, then the closing tag, so an answer that ends with a newline shows an empty line before its closing tag and an empty answer string is a section with one empty line. The answer tags are `<answer>` and `</answer>` unless the displayed answer contains one of the exact strings `<result>`, `</result>`, `<metadata>`, `</metadata>`, `<answer>` or `</answer>`; then acpc writes `<answer-N>` and `</answer-N>`, where N is one plus the number of LF characters in the displayed answer (a CR before an LF is answer text and is not counted), and the answer is exactly the N lines after the opening tag, validated by the matching closing tag on the line after them. A line inside those N lines that looks like a wrapper tag remains answer text. A background receipt is the same document without an answer section, with `paths` added to the metadata so the session directory stays visible. `--max-output` bounds the whole document; a truncated answer ends with the usual marker and the metadata names `output_file`. The document is a readable presentation, not strict XML: a caller that acts on `next` or other metadata programmatically uses `--json`, which returns the original answer string. The tags do not make an agent's answer trusted instructions.
+
+Example of the counted form, an answer of five lines whose code sample contains the wrapper's closing tag:
+
+````text
+<result session_id="q7x2" status="succeeded" partial="false">
+<answer-5>
+Close each section explicitly:
+
+```text
+</answer>
+```
+</answer-5>
+</result>
+````
+
+On a terminal, the same fields are laid out for a person: the answer on stdout as before and the metadata on stderr, in the `--` summary line, which also names the steer mode, a partial answer, a usage limit and a `Next:` command. Reading the answer never reruns the agent.
 
 ### Failures
 

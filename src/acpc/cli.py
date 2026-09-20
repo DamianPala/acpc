@@ -114,6 +114,19 @@ _STEER_OUTPUT_FILE_HELP = (
     "(90 days by default)."
 )
 
+# V6a: on a non-terminal stdout, `text` prints a tagged document keeping a
+# subset of these fields under `<metadata>` rather than the human layout;
+# see SPEC's Text presentation for the field list and layout.
+_TEXT_PRESENTATION_NOTE = (
+    "The `text` format has two presentations selected by the stdout stream: a tagged "
+    "document off a terminal, keeping a subset of this schema's fields under "
+    "`<metadata>`, and a human layout on one; `--json` returns the complete document."
+)
+_JSON_CHOICE_HELP = (
+    "Print the complete result as one JSON document instead of the text presentation; a "
+    "choice for programmatic parsing, not a requirement for reading an answer."
+)
+
 # What the answer schema cannot express: when a failure still answers, and
 # which fields only one kind of call carries (D7 `output_description`, O4d/O5a).
 _ANSWER_OUTPUT_DESCRIPTION = (
@@ -121,16 +134,22 @@ _ANSWER_OUTPUT_DESCRIPTION = (
     "failed or canceled turn — and returns no result for a call that observed no turn, "
     "including one whose --timeout deadline expired (`context.status` can be `waiting` "
     "when a usage limit was holding the turn) or whose watch ended in a detach. "
-    "`stop_reason`, `cost` and `answer` are present on every foreground result and "
-    "omitted by `--background`."
-)
+    "`stop_reason`, `tokens`, `cost` and `answer` are present on every foreground result "
+    "and omitted by `--background`. "
+) + _TEXT_PRESENTATION_NOTE
 _WAIT_OUTPUT_DESCRIPTION = (
     "Selects the session's current turn when the call starts and keeps observing that "
     "turn even if the session rotates to a newer one meanwhile; returns the answer "
     "result once that turn has ended — including a failed or canceled turn — and "
     "returns no result when a --timeout deadline expires first, with `context.status` "
-    "naming the turn's status at the deadline, `waiting` included."
-)
+    "naming the turn's status at the deadline, `waiting` included. "
+) + _TEXT_PRESENTATION_NOTE
+_STEER_OUTPUT_DESCRIPTION = (
+    "Returns the answer result for the turn the correction landed on, or the acceptance "
+    "receipt under `--background`; `capabilities` and `correction_result` are always "
+    "present, and `stop_reason`, `tokens`, `cost` and `answer` join them on every "
+    "foreground result. "
+) + _TEXT_PRESENTATION_NOTE
 _STATUS_OUTPUT_DESCRIPTION = (
     "Follows the selector: reports the session's current turn at the time of the call, "
     "so a session that rotated to a newer turn since is reported as that newer turn. "
@@ -303,6 +322,18 @@ def _select_format(
         selected = machine_name
     errors.note_machine_format(selected in {"json", "ndjson"})
     return selected
+
+
+def _select_presentation(selected_format: str) -> str:
+    """Split `text` into V6a's two stdout presentations: tagged off a terminal.
+
+    `--output-file` and `--json` never reach this: a machine format has no
+    presentation to choose, and a file destination gets whatever stdout would
+    have received, which is exactly this same call.
+    """
+    if selected_format != "text":
+        return selected_format
+    return "human" if _stdout_is_tty() else "tagged"
 
 
 def _write_rendered_file(path: str | None, result: output.OutputResult) -> bool:
@@ -4071,17 +4102,19 @@ def _run_foreground(
     if outcome.wait_timed_out:
         _emit_wait_timeout(meta.session_id, output_file, turn=meta.turns)
     final = sessions.read_meta(meta.session_id)
+    presentation = _select_presentation(selected_format)
     result = output.render_result(
         final,
         outcome.answer,
-        json_mode=selected_format == "json",
+        json_mode=presentation == "json",
+        tagged=presentation == "tagged",
         max_output=max_output,
         changed=True,
     )
     _emit_turn_result(
         result,
         output_file=output_file,
-        json_mode=selected_format == "json",
+        json_mode=presentation == "json",
     )
     if outcome.state == "detached":
         _echo_metadata(
@@ -4090,7 +4123,13 @@ def _run_foreground(
         )
         _end_turn_for(meta.session_id, outcome)
     if not quiet:
-        _echo_metadata(output.format_summary(final, route_note=_route_note(outcome)))
+        _echo_metadata(
+            output.format_summary(
+                final,
+                route_note=_route_note(outcome),
+                truncated_output_file=result.output_file if result.truncated else None,
+            )
+        )
     _end_turn_for(meta.session_id, outcome)
 
 
@@ -4170,7 +4209,7 @@ def _run_foreground(
     ),
 )
 @click.option("--quiet", is_flag=True, help="Suppress the stderr summary line.")
-@_json_option("Emit this command's output as JSON.")
+@_json_option(_JSON_CHOICE_HELP)
 @_color_option()
 @click.help_option("-h", "--help")
 def run_command(
@@ -4256,7 +4295,7 @@ def run_command(
         _dispatch_background(
             meta.session_id,
             request,
-            json_mode=selected_format == "json",
+            presentation=_select_presentation(selected_format),
             output_file=output_file,
             max_output=max_output,
         )
@@ -4387,7 +4426,7 @@ def _dispatch_background(
     session_id: str,
     request: runner.TurnRequest,
     *,
-    json_mode: bool,
+    presentation: str,
     output_file: str | None = None,
     max_output: int = output.DEFAULT_MAX_OUTPUT,
     emit_failure_result: bool = True,
@@ -4395,8 +4434,8 @@ def _dispatch_background(
 ) -> None:
     """Hand the turn to the daemon and print what the caller needs to find it.
 
-    SPEC `run --bg`: stdout is exactly the session id and its directory, so a
-    shell caller can read both without parsing prose.
+    SPEC `run --bg`: on a terminal, stdout is exactly the session id and its
+    directory; off one, `text` prints the tagged receipt (V6a) instead.
     """
     import asyncio
 
@@ -4412,7 +4451,8 @@ def _dispatch_background(
     meta = sessions.read_meta(session_id)
     result = output.render_result(
         meta,
-        json_mode=json_mode,
+        json_mode=presentation == "json",
+        tagged=presentation == "tagged",
         background=True,
         max_output=max_output,
         changed=True,
@@ -4503,7 +4543,7 @@ def _dispatch_background(
     help="Cap on stdout bytes; 0 disables the cap.",
 )
 @click.option("--quiet", is_flag=True, help="Suppress the stderr summary line.")
-@_json_option("Emit this command's output as JSON.")
+@_json_option(_JSON_CHOICE_HELP)
 @_color_option()
 @click.help_option("-h", "--help")
 def continue_command(
@@ -4565,7 +4605,7 @@ def continue_command(
         cancel_after=cancel_after,
         max_output=max_output,
         quiet=quiet,
-        json_mode=selected_format == "json",
+        presentation=_select_presentation(selected_format),
         on_limit=on_limit,
     )
 
@@ -4668,7 +4708,7 @@ def _dispatch_follow_up(
     cancel_after: float | None,
     max_output: int,
     quiet: bool,
-    json_mode: bool,
+    presentation: str,
     emit_failure_result: bool = True,
     extra: Callable[[sessions.SessionMeta], dict[str, Any]] | None = None,
     on_limit: str = vocab.ON_LIMIT_WAIT,
@@ -4677,7 +4717,8 @@ def _dispatch_follow_up(
 
     ``extra`` is for the commands whose result carries fields the shared
     answer shape does not: it is called with the result's own session record,
-    so `steer` can report the turn the correction landed on.
+    so `steer` can report the turn the correction landed on, and its
+    ``correction_result`` rides the stderr summary the same way.
     """
     current, request = _follow_up_request(
         meta.session_id,
@@ -4693,7 +4734,7 @@ def _dispatch_follow_up(
         _dispatch_background(
             meta.session_id,
             request,
-            json_mode=json_mode,
+            presentation=presentation,
             output_file=output_file,
             max_output=max_output,
             emit_failure_result=emit_failure_result,
@@ -4724,20 +4765,22 @@ def _dispatch_follow_up(
         _emit_wait_timeout(meta.session_id, output_file, turn=current.turns + 1)
 
     final = sessions.read_meta(meta.session_id)
+    extra_fields = extra(final) if extra is not None else None
 
     result = output.render_result(
         final,
         outcome.answer,
-        json_mode=json_mode,
+        json_mode=presentation == "json",
+        tagged=presentation == "tagged",
         max_output=max_output,
         changed=True,
         include_partial=emit_failure_result,
-        extra=extra(final) if extra is not None else None,
+        extra=extra_fields,
     )
     _emit_turn_result(
         result,
         output_file=output_file,
-        json_mode=json_mode,
+        json_mode=presentation == "json",
         emit_failure_result=emit_failure_result,
         success=outcome.exit_code == vocab.EXIT_OK,
     )
@@ -4748,7 +4791,14 @@ def _dispatch_follow_up(
         )
         _end_turn_for(meta.session_id, outcome)
     if not quiet:
-        _echo_metadata(output.format_summary(final, route_note=_route_note(outcome)))
+        _echo_metadata(
+            output.format_summary(
+                final,
+                route_note=_route_note(outcome),
+                correction_result=(extra_fields or {}).get("correction_result"),
+                truncated_output_file=result.output_file if result.truncated else None,
+            )
+        )
     _end_turn_for(meta.session_id, outcome)
 
 
@@ -4776,6 +4826,7 @@ _STEER_IPC_TIMEOUT = 15.0
 
 @effects.non_idempotent
 @schema.format_defaults(tty="text", non_tty="text")
+@schema.output_description(_STEER_OUTPUT_DESCRIPTION)
 @schema.reads_stdin("instruction_text")
 @schema.describes(
     selector=_SELECTOR_HELP,
@@ -4851,7 +4902,7 @@ _STEER_IPC_TIMEOUT = 15.0
     help="Cap on stdout bytes; 0 disables the cap.",
 )
 @click.option("--quiet", is_flag=True, help="Suppress the stderr summary line.")
-@_json_option("Emit this command's output as JSON.")
+@_json_option(_JSON_CHOICE_HELP)
 @_color_option()
 @click.help_option("-h", "--help")
 def steer_command(
@@ -5081,7 +5132,7 @@ def _steer_cancel_then_start(
             cancel_after=cancel_after,
             max_output=max_output,
             quiet=quiet,
-            json_mode=selected_format == "json",
+            presentation=_select_presentation(selected_format),
             emit_failure_result=False,
             extra=extra,
             on_limit=on_limit,
@@ -5313,9 +5364,11 @@ def _steer_in_place(
         # The receipt describes the acceptance, so it renders the state the
         # correction targeted; a re-read here could already show the turn's
         # end, which the `steer` schema does not publish.
+        presentation = _select_presentation(selected_format)
         result = output.render_result(
             meta,
-            json_mode=selected_format == "json",
+            json_mode=presentation == "json",
+            tagged=presentation == "tagged",
             background=True,
             max_output=max_output,
             changed=True,
@@ -5398,18 +5451,26 @@ def _observe_steered_turn(
                     "correction_result": observed_correction,
                 },
             )
+        presentation = _select_presentation(selected_format)
         result = output.render_result(
             final,
             _answer_text(session_id),
-            json_mode=selected_format == "json",
+            json_mode=presentation == "json",
+            tagged=presentation == "tagged",
             max_output=max_output,
             changed=True,
             include_partial=False,
             extra=_steer_extra(final, observed_correction),
         )
-        _emit_turn_result(result, output_file=output_file, json_mode=selected_format == "json")
+        _emit_turn_result(result, output_file=output_file, json_mode=presentation == "json")
         if not quiet:
-            _echo_metadata(output.format_summary(final))
+            _echo_metadata(
+                output.format_summary(
+                    final,
+                    correction_result=observed_correction,
+                    truncated_output_file=result.output_file if result.truncated else None,
+                )
+            )
     except (click.Abort, KeyboardInterrupt, Exception) as error:  # noqa: BLE001
         # Everything a blocking observation can fail on, including this call's
         # own deadline and the caller's Ctrl-C, leaves with the same context.
@@ -5447,7 +5508,7 @@ def _observe_steered_turn(
     help="Cap rendered output bytes; 0 disables the cap.",
 )
 @click.option("--quiet", is_flag=True, help="Suppress the stderr summary line.")
-@_json_option("Emit this command's output as JSON.")
+@_json_option(_JSON_CHOICE_HELP)
 @_color_option()
 @click.help_option("-h", "--help")
 def wait_command(
@@ -5504,10 +5565,12 @@ def wait_command(
         final, answer, is_current = _turn_result_source(meta.session_id, turn)
         observed_status = final.state
 
+        presentation = _select_presentation(selected_format)
         result = output.render_result(
             final,
             answer,
-            json_mode=selected_format == "json",
+            json_mode=presentation == "json",
+            tagged=presentation == "tagged",
             max_output=max_output,
             turn=(None if is_current else turn),
         )
@@ -5515,10 +5578,12 @@ def wait_command(
         _emit_turn_result(
             result,
             output_file=output_file,
-            json_mode=selected_format == "json",
+            json_mode=presentation == "json",
         )
         if not quiet:
-            summary = output.format_summary(final)
+            summary = output.format_summary(
+                final, truncated_output_file=result.output_file if result.truncated else None
+            )
             if (
                 is_current
                 and final.state == "failed"

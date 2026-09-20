@@ -18,7 +18,7 @@ A failed run is not lost: `acpc status <id>` names the failure on its `failure` 
 # 90% of usage is this:
 acpc run codex "fix the failing test in tests/test_auth.py" --cwd ~/repo --permissions execute
 
-# Background + collect later. --background prints the session id, then its dir:
+# Background + collect later. On a terminal --background prints the session id, then its dir:
 acpc run codex "run the full suite and summarize" --background
 acpc wait x7k2
 
@@ -31,7 +31,22 @@ Review the implementation against SPEC.md and make the required edits.
 PROMPT
 ```
 
-An agent caller reads the session id straight from the `--background` output — shell variables don't survive across its tool calls anyway. A script that really chains in one shell uses `--background --json` and takes `jq -r .session_id`.
+An agent caller reads the session id straight from the `--background` output — shell variables don't survive across its tool calls anyway. When stdout is not a terminal, that output is the tagged receipt below (the id sits in the `<result>` tag's `session_id` attribute); a script that really chains in one shell uses `--background --json` and takes `jq -r .session_id`.
+
+When stdout is not a terminal, `run`, `continue`, `steer` and `wait` print the answer inside a tagged document acpc builds, so a caller can tell the metadata from the agent's words:
+
+```text
+<result session_id="x7k2" status="succeeded" partial="false">
+<metadata>
+{"turn":1,"capabilities":{"steer_mode":"in-place"},"tokens":1834,"cost":0.02,"stop_reason":"end_turn","next":["acpc","continue","x7k2"]}
+</metadata>
+<answer>
+The answer, verbatim Markdown.
+</answer>
+</result>
+```
+
+The answer text is untouched apart from control-byte escaping. When it contains one of the wrapper's own tag strings, the answer section uses counted tags, `<answer-N>` and `</answer-N>` with N the number of answer lines, so a reader takes exactly N lines and validates the boundary with the closing tag. `--json` returns the original answer string and the complete document; it is a choice for programmatic parsing, not a requirement for reading an answer. On a terminal the answer stays raw on stdout and the metadata goes to the `--` summary line on stderr.
 
 ## Command surface
 
@@ -43,7 +58,7 @@ steer <id> (instruction | - | --prompt-file)         # correct the running turn 
 status <id>                # one session's liveness-verified vitals
 list                       # active + recent sessions, bounded by 20
 log <id> [--since CURSOR] [--limit N | --tail N] [--prose] [--wait-new | --follow]   # incremental transcript access
-wait <id> [--timeout S]    # block until done, print the answer
+wait <id> [--timeout S]    # block until the turn selected at call start ends, print its answer
 cancel <id>
 delete <id> --yes | prune [--older-than D] [--dry-run] [--yes]
 agents list|get|check|create|delete          # adapters + variants
@@ -63,6 +78,8 @@ daemon status|stop [target] [--force]   # plumbing escape hatch — never needed
 `skills list` orders entries by name, ascending, with the default window being the first 20 entries in that order.
 `daemon status` orders entries by target name, ascending, with the default window being the first 20 entries in that order.
 `prune` fixes its target set before confirmation, then locks and rechecks every target before clearing any session; a target that changed meanwhile fails with `conflict` and leaves the set intact.
+
+A vendor usage limit that blocks a turn is waited out inside that turn: the session shows `waiting`, `status` names the reason and the reset time under `limit`, and acpc resends on the same adapter session after the reset (within `limit_wait_max`, 8h by default). `--on-limit fail` ends the turn as `failed` with `stop_reason: rate_limit` instead; `cancel` during the wait drops the resumption. Only claude-agent-acp reports limits in a way acpc can read; codex limits remain plain failures.
 
 For one-time changes from earlier releases, see [MIGRATION.md](MIGRATION.md).
 
@@ -93,8 +110,8 @@ acpc skills get refresh-adapter-models
 
 ## Reading a run
 
-- **stdout carries exactly one thing**: the answer (default), a JSON envelope (`--json`), or id + session dir (`--background`). With `--output-file`, stdout stays empty and the exact selected payload goes to the file, on success and on a failure that returns a result; a call that returns no result creates no file. Never spinners, logs, or diagnostics.
-- **A failure still answers when there is an answer.** `run`, `continue` and `wait` print their result document — in `--json` too — whenever they observed the turn: a failed or canceled turn, an unobserved outcome, a `--timeout` deadline that expired while the session ran on. `partial` says whether the answer is complete (`false`) or the turn ended before it did (`true`); a result with `partial: true` always exits non-zero. The structured error stays on stderr either way. A call that never observed a turn — an unknown agent, a bad flag, a missing session — writes nothing to stdout.
+- **stdout carries exactly one thing**: the answer (raw on a terminal, inside the tagged document otherwise), a JSON envelope (`--json`), or the `--background` receipt (id + session dir on a terminal, the tagged document without an answer section otherwise). With `--output-file`, stdout stays empty and the exact selected payload goes to the file, on success and on a failure that returns a result; a call that returns no result creates no file. Never spinners, logs, or diagnostics.
+- **A failure still answers when there is an answer.** `run`, `continue` and `wait` print their result document — in `--json` too — whenever they observed the end of the turn: a failed or canceled turn, an unobserved outcome. `partial` says whether the answer is complete (`false`) or the turn ended before it did (`true`); a result with `partial: true` always exits non-zero. The structured error stays on stderr either way. A `--timeout` deadline is not an observed end: it exits 124 with an empty stdout, no file, and a `timeout` error whose hint points at `log --tail` and `status` (the answer so far stays in the session files). A call that never observed a turn — an unknown agent, a bad flag, a missing session — writes nothing to stdout.
 - **Textual acpc metadata and footers on stderr** are prefixed `--`: the end-of-run summary (duration, tokens, exit, session id, dir) and `log`/`status` footers. Error envelopes are unprefixed JSON. Harnesses that merge streams can still separate the two mechanically.
 - **`log <id>`** is the progress view — condensed one-liners, tool calls and prose interleaved. **`log <id> --prose`** is the content view — clean markdown of what the agent wrote. Its default non-follow window is the last 20 events, emitted in transcript order. `--since CURSOR --limit N` emits the first N later events, so polling never skips the middle. `--follow` without a selector starts at the transcript beginning; `--since CURSOR --follow` starts after the cursor; `--tail N --follow` replays the last N matching events in transcript order and then keeps reading. `--limit` conflicts with `--tail` and ends a follow after N emitted events.
 

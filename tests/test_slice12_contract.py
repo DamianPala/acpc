@@ -8,6 +8,7 @@ regression this slice removes.
 
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -59,6 +60,15 @@ def invoke(cli: CliRunner, *args: str):
 def document(result: Any) -> dict[str, Any]:
     """The result document on stdout, with the stderr envelope left alone."""
     return json.loads(result.stdout)
+
+
+def tagged_answer(result: Any) -> str:
+    """The answer section of a non-TTY `text` document (SPEC `Text presentation`)."""
+    match = re.search(
+        r"<answer(-\d+)?>\n(.*)\n</answer\1?>\n</result>\n\Z", result.stdout, re.DOTALL
+    )
+    assert match, result.stdout
+    return match.group(2)
 
 
 def envelope(result: Any) -> dict[str, Any]:
@@ -659,7 +669,7 @@ def test_text_mode_prints_the_same_answer_the_document_carries(cli: CliRunner) -
     assert text.exit_code == machine.exit_code == vocab.EXIT_AGENT_ERROR
     assert text.stdout
     assert machine.stdout
-    assert text.stdout == document(machine)["answer"]
+    assert tagged_answer(text) == document(machine)["answer"]
     assert envelope(text)["kind"] == envelope(machine)["kind"] == "operation_failed"
 
 
@@ -672,30 +682,38 @@ def test_every_answer_command_declares_partial_and_its_emission_cases(
     assert "partial" in detail["output"]["required"]
     assert detail["output"]["properties"]["partial"] == {"type": "boolean"}
     description = detail["output_description"]
+    text_presentation_note = (
+        "The `text` format has two presentations selected by the stdout stream: a tagged "
+        "document off a terminal, keeping a subset of this schema's fields under "
+        "`<metadata>`, and a human layout on one; `--json` returns the complete document."
+    )
     expected = {
         "run": (
             "Returns the answer result for a turn this call observed the end of — including a "
             "failed or canceled turn — and returns no result for a call that observed no turn, "
             "including one whose --timeout deadline expired (`context.status` can be `waiting` "
             "when a usage limit was holding the turn) or whose watch ended in a detach. "
-            "`stop_reason`, `cost` and `answer` are present on every foreground result and "
-            "omitted by `--background`."
-        ),
+            "`stop_reason`, `tokens`, `cost` and `answer` are present on every foreground result "
+            "and omitted by `--background`. "
+        )
+        + text_presentation_note,
         "continue": (
             "Returns the answer result for a turn this call observed the end of — including a "
             "failed or canceled turn — and returns no result for a call that observed no turn, "
             "including one whose --timeout deadline expired (`context.status` can be `waiting` "
             "when a usage limit was holding the turn) or whose watch ended in a detach. "
-            "`stop_reason`, `cost` and `answer` are present on every foreground result and "
-            "omitted by `--background`."
-        ),
+            "`stop_reason`, `tokens`, `cost` and `answer` are present on every foreground result "
+            "and omitted by `--background`. "
+        )
+        + text_presentation_note,
         "wait": (
             "Selects the session's current turn when the call starts and keeps observing that "
             "turn even if the session rotates to a newer one meanwhile; returns the answer "
             "result once that turn has ended — including a failed or canceled turn — and "
             "returns no result when a --timeout deadline expires first, with `context.status` "
-            "naming the turn's status at the deadline, `waiting` included."
-        ),
+            "naming the turn's status at the deadline, `waiting` included. "
+        )
+        + text_presentation_note,
     }
     assert description == expected[name]
     enum = detail["output"]["properties"]["status"]["enum"]

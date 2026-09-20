@@ -1283,10 +1283,11 @@ def test_continue_without_a_stored_mode_selects_and_sends_a_mode(cli: CliRunner)
     with sessions.session_lock(session_id):
         sessions.write_meta(meta)
 
-    result = invoke(cli, "continue", session_id, "settings", "--quiet")
+    result = invoke(cli, "continue", session_id, "settings", "--quiet", "--json")
 
     assert result.exit_code == vocab.EXIT_OK
-    _model, _effort, mode, _model_calls, mode_calls, _effort_calls = result.stdout.split("/")
+    answer = json.loads(result.stdout)["answer"]
+    _model, _effort, mode, _model_calls, mode_calls, _effort_calls = answer.split("/")
     assert mode == "default"
     assert mode_calls == "1"
 

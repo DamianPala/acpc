@@ -353,16 +353,19 @@ if section_ready S07-daemon-bg && section_ready S08-views \
     SLOW_MACHINERY=1
     progress "dispatching SLOW1/SLOW2/SLOW3 (mock 'slow' scenario, ~64s each)"
 
-    run_acpc run mock "run the slow scenario for SLOW1" --bg --name smoke-slow1 --quiet
+    # Non-TTY stdout without --json is now the tagged receipt (SPEC `Text
+    # presentation`), not the bare id on its own line, so --json keeps this a
+    # one-field read.
+    run_acpc run mock "run the slow scenario for SLOW1" --bg --name smoke-slow1 --quiet --json
     assert_true "dispatch SLOW1 exits 0" "$LAST_RC"
-    SLOW1_ID="$(head -n1 <<<"$LAST_OUT")"
+    SLOW1_ID="$(json_field "$LAST_OUT" '.session_id')"
     assert_session_id "SLOW1 id has the specced shape" "$SLOW1_ID"
 
-    run_acpc run mock "run the slow scenario for SLOW2" --bg --name smoke-slow2 --quiet
-    SLOW2_ID="$(head -n1 <<<"$LAST_OUT")"
+    run_acpc run mock "run the slow scenario for SLOW2" --bg --name smoke-slow2 --quiet --json
+    SLOW2_ID="$(json_field "$LAST_OUT" '.session_id')"
 
-    run_acpc run loner "run the slow scenario for SLOW3" --bg --name smoke-slow3 --quiet
-    SLOW3_ID="$(head -n1 <<<"$LAST_OUT")"
+    run_acpc run loner "run the slow scenario for SLOW3" --bg --name smoke-slow3 --quiet --json
+    SLOW3_ID="$(json_field "$LAST_OUT" '.session_id')"
 
     # --- SLOW3: unknown detection (kill -9 the process behind the session).
     # SLOW3 runs on the isolated `loner` target so the kill cannot take the
@@ -562,22 +565,26 @@ if begin_section S06-run "run sync + session dir layout + output contract + exit
     assert_eq "SIGPIPE on a closed stdout exits 141" "141" "$SIGPIPE_RC"
 
     # S11: a non-message update separates two answer messages without
-    # changing stdout's byte identity with the answer on disk.
+    # changing the answer's byte identity with the copy on disk. Non-TTY
+    # stdout without --json is now the tagged document (SPEC `Text
+    # presentation`), so the byte-identity check reads the JSON `.answer`
+    # field instead of comparing stdout directly.
     SEPARATOR_OUT="${SCRATCH}/separator.out"
     SEPARATOR_ERR="${SCRATCH}/separator.err"
     set +e
-    acpc run mock "separator smoke probe" >"$SEPARATOR_OUT" 2>"$SEPARATOR_ERR"
+    acpc run mock "separator smoke probe" --json >"$SEPARATOR_OUT" 2>"$SEPARATOR_ERR"
     SEPARATOR_RC=$?
     set -e
     assert_eq "separator smoke run exits 0" "0" "$SEPARATOR_RC"
-    SEPARATOR_TEXT="$(cat "$SEPARATOR_OUT")"
-    assert_contains "detectable message boundary keeps markdown separated" "$SEPARATOR_TEXT" $'\n\n## Answer'
-    SEPARATOR_ID="$(sed -n 's/^-- session \([^ ]*\).*/\1/p' "$SEPARATOR_ERR" | head -n1)"
+    SEPARATOR_JSON="$(cat "$SEPARATOR_OUT")"
+    SEPARATOR_ANSWER="$(json_field "$SEPARATOR_JSON" '.answer')"
+    assert_contains "detectable message boundary keeps markdown separated" "$SEPARATOR_ANSWER" $'\n\n## Answer'
+    SEPARATOR_ID="$(json_field "$SEPARATOR_JSON" '.session_id')"
     SEPARATOR_DIR="${ACPC_HOME}/sessions/${SEPARATOR_ID}"
-    if cmp -s "$SEPARATOR_OUT" "${SEPARATOR_DIR}/answer.md"; then
+    if [[ "$SEPARATOR_ANSWER" == "$(cat "${SEPARATOR_DIR}/answer.md")" ]]; then
         pass
     else
-        fail "stdout matches answer.md bytes for separated answer messages"
+        fail "json answer field matches answer.md bytes for separated answer messages"
     fi
 
     # On-disk contract: 0700 dirs / 0600 files, meta parses, transcript header
@@ -616,15 +623,15 @@ poll_slow1
 # S07-daemon-bg: --bg, wait, SIGTERM detach, daemon status/stop, concurrency
 # ==============================================================================
 if begin_section S07-daemon-bg "bg dispatch, wait, detach, daemon plumbing, concurrency"; then
-    run_acpc run mock "smoke test bg run" --bg
+    # --json, since non-TTY stdout is now the tagged receipt document (V6a),
+    # not the old raw id + dir lines.
+    run_acpc run mock "smoke test bg run" --bg --json
     assert_eq "bg run exits 0" "0" "$LAST_RC"
     assert_eq "bg dispatch prints no stderr summary" "" "$LAST_ERR"
     assert_not_contains "bg dispatch prints no early session line" "$LAST_ERR" "-- session "
-    BG1_ID="$(sed -n '1p' <<<"$LAST_OUT")"
-    BG1_DIR="$(sed -n '2p' <<<"$LAST_OUT")"
+    BG1_ID="$(json_field "$LAST_OUT" '.session_id')"
+    BG1_DIR="$(json_field "$LAST_OUT" '.paths.dir')"
     assert_session_id "bg id shape" "$BG1_ID"
-    assert_eq "bg stdout is exactly id + session dir path" "${BG1_ID}
-${BG1_DIR}" "$LAST_OUT"
     assert_eq "bg session dir matches the specced path" "${ACPC_HOME}/sessions/${BG1_ID}" "$BG1_DIR"
     assert_file "meta.json exists at dispatch time" "${BG1_DIR}/meta.json"
     assert_file "prompt.md exists at dispatch time" "${BG1_DIR}/prompt.md"
@@ -678,8 +685,8 @@ ${BG1_DIR}" "$LAST_OUT"
         "$(head -n 1 <<<"$LAST_OUT")" "pid"
     # Slow on purpose: the assertion below is about *active* sessions, and a
     # default mock turn is finished well inside the sleep that follows.
-    run_acpc run stopper "slow:30 daemon stop victim" --bg --quiet
-    DSTOP_ID="$(head -n1 <<<"$LAST_OUT")"
+    run_acpc run stopper "slow:30 daemon stop victim" --bg --quiet --json
+    DSTOP_ID="$(json_field "$LAST_OUT" '.session_id')"
     sleep 1
     run_acpc daemon stop stopper --force
     assert_eq "daemon stop exits 0" "0" "$LAST_RC"
@@ -689,8 +696,8 @@ ${BG1_DIR}" "$LAST_OUT"
     RECORDED_REASON="$(jq -r '.status' "${ACPC_HOME}/sessions/${DSTOP_ID}/meta.json")"
     assert_eq "the failure is recorded in meta" "failed" "$RECORDED_REASON"
 
-    run_acpc run stopper "slow:30 daemon stop guard" --bg --quiet
-    DSTOP_GUARD_ID="$(head -n1 <<<"$LAST_OUT")"
+    run_acpc run stopper "slow:30 daemon stop guard" --bg --quiet --json
+    DSTOP_GUARD_ID="$(json_field "$LAST_OUT" '.session_id')"
     sleep 1
     run_acpc daemon stop stopper
     assert_eq "daemon stop refuses its active session" "1" "$LAST_RC"
@@ -845,8 +852,8 @@ if begin_section S08-views "status list/detail, log default/--since/--limit/--pr
     # The timeout ending needs a session that is certainly still running.
     # SLOW1's remaining time depends on how long the assertions above took, so
     # this dispatches its own victim rather than racing a shared one.
-    run_acpc run mock "slow:20 follow timeout probe" --bg --quiet
-    FOLLOW_ID="$(head -n1 <<<"$LAST_OUT")"
+    run_acpc run mock "slow:20 follow timeout probe" --bg --quiet --json
+    FOLLOW_ID="$(json_field "$LAST_OUT" '.session_id')"
     run_acpc log "$FOLLOW_ID" --follow --timeout 3
     assert_eq "log --follow times out with 124 on a running session" "124" "$LAST_RC"
     assert_contains "the follow timeout says the session continues" "$LAST_ERR" \
@@ -859,8 +866,8 @@ if begin_section S08-views "status list/detail, log default/--since/--limit/--pr
         # Live long-poll. SLOW1 only lives ~64s, and this section reaches here
         # later than that on a loaded machine, so the poll gets its own victim
         # rather than racing SLOW1's completion.
-        run_acpc run mock "run the slow scenario for the wait-new probe" --bg --quiet
-        WAITNEW_ID="$(head -n1 <<<"$LAST_OUT")"
+        run_acpc run mock "run the slow scenario for the wait-new probe" --bg --quiet --json
+        WAITNEW_ID="$(json_field "$LAST_OUT" '.session_id')"
         run_acpc log "$WAITNEW_ID" --json
         WAITNEW_CURSOR="$(jq -r '.i' <<<"$LAST_OUT" | tail -n1)"
         run_acpc log "$WAITNEW_ID" --since "${WAITNEW_CURSOR:-0}" --wait-new --timeout 10
@@ -955,8 +962,8 @@ if begin_section S09-continue "continue + steer: context, turn rotation, cursor 
     assert_eq "continue by name works" "0" "$LAST_RC"
 
     # steer: cancel the turn in flight and redirect the session, one verb.
-    run_acpc run mock "chunkslow:30 steer victim" --bg --quiet
-    STEER_ID="$(head -n1 <<<"$LAST_OUT")"
+    run_acpc run mock "chunkslow:30 steer victim" --bg --quiet --json
+    STEER_ID="$(json_field "$LAST_OUT" '.session_id')"
     wait_for_state "$STEER_ID" "running" 20 || fail "the steer victim never started running"
     run_acpc steer "$STEER_ID" "stop what you are doing and summarize instead"
     assert_eq "steer exits 0" "0" "$LAST_RC"

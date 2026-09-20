@@ -146,6 +146,7 @@ _SESSION_RESULT_PROPERTIES = {
     "turn": _INTEGER,
     "status": _SESSION_STATUS,
     "stop_reason": _NULLABLE_STRING,
+    "tokens": _INTEGER,
     "paths": _PATHS,
     "cost": _NULLABLE_NUMBER,
     "answer": _STRING,
@@ -235,7 +236,7 @@ def _session_result_schema(
         properties.pop("changed")
     required = ["status", "session_id", "turn", "created_at", "started_at", "finished_at"]
     if foreground_only:
-        required += ["stop_reason", "cost", "answer"]
+        required += ["stop_reason", "tokens", "cost", "answer"]
     required += ["paths", "truncated"]
     if include_partial:
         required.append("partial")

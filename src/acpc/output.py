@@ -31,6 +31,7 @@ class OutputResult:
     text: str
     truncated: bool
     size_bytes: int
+    output_file: str | None = None
 
 
 def _validate_max_output(max_output: int) -> None:
@@ -74,7 +75,7 @@ def truncate_answer(
         return OutputResult(answer, False, encoded_size)
 
     text = _with_marker(answer, max_output, _marker(answer_path, kind="answer"))
-    return OutputResult(text, True, len(text.encode("utf-8")))
+    return OutputResult(text, True, len(text.encode("utf-8")), str(answer_path))
 
 
 def _paths_for(meta: sessions.SessionMeta, *, turn: int | None) -> dict[str, str]:
@@ -151,6 +152,7 @@ def result_envelope(
         "started_at": _timestamp_or_none(meta.started_at),
         "finished_at": _timestamp_or_none(meta.finished_at),
         "stop_reason": meta.stop_reason,
+        "tokens": meta.tokens,
         "paths": paths_for_turn,
         "cost": meta.cost,
         "answer": answer,
@@ -244,7 +246,7 @@ def _json_answer(
                 low = middle + 1
             else:
                 high = middle - 1
-    return OutputResult(best, True, len(best.encode("utf-8")))
+    return OutputResult(best, True, len(best.encode("utf-8")), str(answer_path))
 
 
 def write_output_file(path: Path | str, answer: str) -> int:
@@ -254,11 +256,219 @@ def write_output_file(path: Path | str, answer: str) -> int:
     return len(answer.encode("utf-8"))
 
 
+# V6b "Escaping": attribute values escape five characters plus tab, CR and LF;
+# metadata is ordinary JSON and needs none of this.
+_ATTR_ESCAPES = {
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "\t": "&#9;",
+    "\r": "&#13;",
+    "\n": "&#10;",
+}
+
+# V6b "Answer boundary": these exact, case-sensitive strings in the displayed
+# answer force the counted `<answer-N>` form; a tag with attributes, or a
+# near-miss such as `<answers>`, does not count.
+_ANSWER_TAG_TRIGGERS = (
+    "<result>",
+    "</result>",
+    "<metadata>",
+    "</metadata>",
+    "<answer>",
+    "</answer>",
+)
+
+# O3d control-byte escaping keeps `\t`, `\n` and `\r` literal: they are the
+# answer's own line and column structure, not terminal attacks, and the
+# answer-boundary line count above depends on the LF characters staying LF.
+_PRESERVED_ANSWER_WHITESPACE = frozenset({0x09, 0x0A, 0x0D})
+
+_METADATA_LEAD_FIELDS = ("turn", "capabilities", "stop_reason", "tokens", "cost")
+_METADATA_OPTIONAL_FIELDS = ("correction_result", "denied", "permissions_clamp", "resume", "limit")
+
+
+def _escape_attr(value: str) -> str:
+    return "".join(_ATTR_ESCAPES.get(character, character) for character in value)
+
+
+def _escape_answer_controls(text: str) -> str:
+    """Escape terminal control bytes in a multi-line answer (O3d).
+
+    `render.safe_text` does the same job for the condensed, single-line views
+    `log` prints, but it collapses its input to one line first — exactly the
+    line structure the answer boundary (V6b) depends on — and importing it
+    here would be circular: `render.py` already imports from this module.
+    This keeps the same escape table (`^[` for ESC, `\\uXXXX` for the other
+    non-printable bytes) but leaves `\\t`, `\\n` and `\\r` alone.
+    """
+    escaped: list[str] = []
+    for character in text:
+        codepoint = ord(character)
+        if codepoint in _PRESERVED_ANSWER_WHITESPACE:
+            escaped.append(character)
+        elif codepoint == 0x1B:
+            escaped.append("^[")
+        elif codepoint < 0x20 or 0x7F <= codepoint <= 0x9F:
+            escaped.append(f"\\u{codepoint:04x}")
+        else:
+            escaped.append(character)
+    return "".join(escaped)
+
+
+def _answer_tags(displayed: str) -> tuple[str, str]:
+    if any(trigger in displayed for trigger in _ANSWER_TAG_TRIGGERS):
+        count = 1 + displayed.count("\n")
+        return f"<answer-{count}>", f"</answer-{count}>"
+    return "<answer>", "</answer>"
+
+
+def _tagged_metadata(envelope: Mapping[str, Any], *, background: bool) -> dict[str, Any]:
+    """Select and order the JSON fields V6c keeps in `<metadata>`, minus `next`.
+
+    `next` is added last by `_with_next`, once truncation has had its say, so
+    it always ends up as the final key regardless of which optional fields
+    land before it.
+    """
+    metadata: dict[str, Any] = {}
+    for field in _METADATA_LEAD_FIELDS:
+        value = envelope.get(field)
+        if value is not None:
+            metadata[field] = value
+    for field in _METADATA_OPTIONAL_FIELDS:
+        value = envelope.get(field)
+        if value:
+            metadata[field] = value
+    if background:
+        metadata["paths"] = envelope["paths"]
+    return metadata
+
+
+def _with_next(metadata: dict[str, Any], envelope: Mapping[str, Any]) -> dict[str, Any]:
+    next_value = envelope.get("next")
+    if next_value:
+        metadata["next"] = next_value
+    return metadata
+
+
+def _tagged_document(
+    envelope: Mapping[str, Any], metadata: Mapping[str, Any], answer: str | None
+) -> str:
+    attrs = [
+        f'session_id="{_escape_attr(str(envelope["session_id"]))}"',
+        f'status="{_escape_attr(str(envelope["status"]))}"',
+    ]
+    if "partial" in envelope:
+        attrs.append(f'partial="{"true" if envelope["partial"] else "false"}"')
+    lines = [f"<result {' '.join(attrs)}>"]
+    if metadata:
+        lines += ["<metadata>", _json_text(metadata).rstrip("\n"), "</metadata>"]
+    if answer is not None:
+        open_tag, close_tag = _answer_tags(answer)
+        lines += [open_tag, answer, close_tag]
+    lines.append("</result>")
+    return "\n".join(lines) + "\n"
+
+
+def _truncated_tagged_document(
+    envelope: Mapping[str, Any],
+    base_metadata: Mapping[str, Any],
+    displayed: str,
+    max_output: int,
+    answer_path: Path | str,
+) -> OutputResult:
+    marker = _marker(answer_path, kind="answer")
+    truncated_metadata = dict(base_metadata)
+    truncated_metadata["truncated"] = True
+    truncated_metadata["output_file"] = str(answer_path)
+    truncated_metadata = _with_next(truncated_metadata, envelope)
+
+    def candidate(prefix: str) -> str:
+        return _tagged_document(envelope, truncated_metadata, prefix + marker)
+
+    # Same binary search as `_json_answer`: the wrapper adds a fixed overhead
+    # around the answer, so the largest code-point prefix within budget is
+    # found by search rather than by a byte-count subtraction.
+    low, high = 0, len(displayed)
+    best = candidate("")
+    if len(best.encode("utf-8")) <= max_output:
+        while low <= high:
+            middle = (low + high) // 2
+            trial = candidate(displayed[:middle])
+            if len(trial.encode("utf-8")) <= max_output:
+                best = trial
+                low = middle + 1
+            else:
+                high = middle - 1
+    return OutputResult(best, True, len(best.encode("utf-8")), str(answer_path))
+
+
+def render_tagged(
+    envelope: Mapping[str, Any],
+    *,
+    max_output: int,
+    answer_path: Path | str,
+) -> OutputResult:
+    """Build the tagged text document V6b describes, from the JSON envelope's own facts.
+
+    This is a second view of `envelope` (`result_envelope`'s return value), never a
+    fresh source of truth. A background envelope carries no ``answer`` key, so its
+    document has no answer section (V6a: "a receipt with no answer omits the answer
+    section"); a receipt has nothing to shorten, so `max_output` never truncates one.
+    """
+    _validate_max_output(max_output)
+    background = "answer" not in envelope
+    base_metadata = _tagged_metadata(envelope, background=background)
+    if background:
+        text = _tagged_document(envelope, _with_next(base_metadata, envelope), None)
+        return OutputResult(text, False, len(text.encode("utf-8")))
+
+    displayed = _escape_answer_controls(str(envelope["answer"]))
+    metadata = _with_next(dict(base_metadata), envelope)
+    full_text = _tagged_document(envelope, metadata, displayed)
+    full_size = len(full_text.encode("utf-8"))
+    if max_output == 0 or full_size <= max_output:
+        return OutputResult(full_text, False, full_size)
+    return _truncated_tagged_document(envelope, base_metadata, displayed, max_output, answer_path)
+
+
+def _render_background(
+    meta: sessions.SessionMeta,
+    *,
+    json_mode: bool,
+    tagged: bool,
+    max_output: int,
+    changed: bool | None,
+    include_partial: bool,
+    extra: Mapping[str, Any] | None,
+    turn: int | None,
+    answer_path: Path | str,
+) -> OutputResult:
+    envelope = result_envelope(
+        meta,
+        "",
+        background=True,
+        changed=changed,
+        include_partial=include_partial,
+        extra=extra,
+        turn=turn,
+    )
+    if json_mode:
+        text = _json_text(envelope)
+        return OutputResult(text, False, len(text.encode("utf-8")))
+    if tagged:
+        return render_tagged(envelope, max_output=max_output, answer_path=answer_path)
+    text = f"{meta.session_id}\n{sessions.session_dir(meta.session_id)}\n"
+    return OutputResult(text, False, len(text.encode("utf-8")))
+
+
 def render_result(
     meta: sessions.SessionMeta,
     answer: str = "",
     *,
     json_mode: bool = False,
+    tagged: bool = False,
     background: bool = False,
     max_output: int = DEFAULT_MAX_OUTPUT,
     changed: bool | None = None,
@@ -272,6 +482,11 @@ def render_result(
     `partial` defaults to what the session's state says about the answer: a
     turn that finished carries complete data, a turn still running or cut
     short does not.  A caller that knows better passes it explicitly.
+
+    `tagged` selects the non-TTY `text` presentation (V6b); it is ignored
+    when `json_mode` is set, and combined with `background` it renders the
+    receipt without an answer section rather than the two-line id and
+    directory.
 
     `turn` is the turn this call actually observed. Leave it `None` when
     that is the session's current turn; `wait` reporting on a turn the
@@ -290,21 +505,17 @@ def render_result(
         partial = vocab.normalize_session_state(meta.state) not in _COMPLETE_ANSWER_STATES
 
     if background:
-        if json_mode:
-            text = _json_text(
-                result_envelope(
-                    meta,
-                    "",
-                    background=True,
-                    changed=changed,
-                    include_partial=include_partial,
-                    extra=extra,
-                    turn=turn,
-                )
-            )
-        else:
-            text = f"{meta.session_id}\n{sessions.session_dir(meta.session_id)}\n"
-        return OutputResult(text, False, len(text.encode("utf-8")))
+        return _render_background(
+            meta,
+            json_mode=json_mode,
+            tagged=tagged,
+            max_output=max_output,
+            changed=changed,
+            include_partial=include_partial,
+            extra=extra,
+            turn=turn,
+            answer_path=answer_path,
+        )
 
     if json_mode:
         return _json_answer(
@@ -318,6 +529,17 @@ def render_result(
             extra=extra,
             turn=turn,
         )
+    if tagged:
+        envelope = result_envelope(
+            meta,
+            answer,
+            changed=changed,
+            partial=partial,
+            include_partial=include_partial,
+            extra=extra,
+            turn=turn,
+        )
+        return render_tagged(envelope, max_output=max_output, answer_path=answer_path)
     return truncate_answer(answer, max_output=max_output, answer_path=answer_path)
 
 
@@ -457,27 +679,57 @@ def format_session_line(meta: sessions.SessionMeta) -> str:
     return "-- " + " | ".join(_session_segments(meta))
 
 
+def _limit_summary(meta: sessions.SessionMeta) -> str | None:
+    if meta.limit is None:
+        return None
+    resume_at = meta.limit.get("resume_at") or "?"
+    return f"limit: {meta.limit.get('reason')}, resumes {resume_at}"
+
+
+def _correction_summary(correction: Mapping[str, Any]) -> str:
+    return (
+        f"correction: {correction.get('steer_mode')} → turn {correction.get('target_turn')} "
+        f"{correction.get('target_status')} ({correction.get('message_state')})"
+    )
+
+
 def format_summary(
     meta: sessions.SessionMeta,
     *,
     runtime: float | None = None,
     route_note: str | None = None,
+    correction_result: Mapping[str, Any] | None = None,
+    truncated_output_file: str | None = None,
 ) -> str:
-    """Format the single ``--`` summary line for a completed run."""
+    """Format the single ``--`` summary line for a completed run.
+
+    V6c: the text presentation keeps the steer mode, a partial answer, a
+    usage-limit wait and a `Next:` command alongside the answer, whichever
+    format carries the answer itself — this line is not one of those formats.
+    """
     duration = sessions.runtime_seconds(meta) if runtime is None else runtime
     parts = [meta.state, format_duration(duration), format_tokens(meta.tokens)]
     if meta.cost is not None:
         parts.append(f"cost ${meta.cost:.2f}")
     if meta.exit_code is not None:
         parts.append(f"exit {meta.exit_code}")
+    parts.append(f"steer_mode {meta.steer_mode or vocab.STEER_CANCEL_THEN_START}")
+    if vocab.normalize_session_state(meta.state) not in _COMPLETE_ANSWER_STATES:
+        parts.append("partial")
     if clamp := _clamp_summary(meta):
         parts.append(clamp)
     if denied := _denied_summary(meta):
         parts.append(denied)
     if resume := _resume_status(meta):
         parts.append(f"resume: {resume}")
+    if limit := _limit_summary(meta):
+        parts.append(limit)
+    if correction_result is not None:
+        parts.append(_correction_summary(correction_result))
+    if truncated_output_file is not None:
+        parts.append(f"truncated → {truncated_output_file}")
     parts.extend(_session_segments(meta))
-    parts.append(f"continue: acpc continue {meta.session_id}")
+    parts.append(f"Next: acpc continue {meta.session_id}")
     if route_note:
         parts.append(route_note)
     return "-- " + " | ".join(parts)
