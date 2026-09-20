@@ -206,6 +206,28 @@ def test_summary_is_one_prefixed_stderr_line() -> None:
     assert "steer_mode cancel-then-start" in line and "| partial |" not in line
 
 
+def test_format_tokens_shows_a_dot_for_unobserved_usage() -> None:
+    """SPEC.md V6c (draft.11): unobserved usage is `·`, never `0 tok`."""
+    assert output.format_tokens(None) == "· tok"
+    assert output.format_tokens(0) == "0 tok"
+    assert output.format_tokens(1500) == "1.5k tok"
+
+
+def test_summary_shows_a_dot_for_unobserved_tokens() -> None:
+    meta = make_session(Path("."))
+    meta = sessions.transition(
+        meta.session_id,
+        "succeeded",
+        clock=lambda: 112.0,
+        exit_code=0,
+        stop_reason="end_turn",
+    )
+    line = output.format_summary(meta, runtime=12.0)
+
+    assert "· tok" in line
+    assert "0 tok" not in line
+
+
 def test_summary_names_partial_limit_correction_and_truncation() -> None:
     meta = make_session(Path("."))
     meta = sessions.transition(

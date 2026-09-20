@@ -162,6 +162,19 @@ def test_status_json_with_an_id_reports_detail_fields(cli: CliRunner) -> None:
     assert payload["idle_seconds"] is None
 
 
+def test_status_reports_unobserved_usage_as_null_not_zero(cli: CliRunner) -> None:
+    """SPEC.md V6c (draft.11): `status` never reports a session's tokens as `0`
+    for usage acpc never observed; the `echo:` scenario sends no `usage_update`."""
+    session_id = run_mock(cli, "echo:no usage")
+
+    payload = json.loads(invoke(cli, "status", session_id, "--json").stdout)
+    text = invoke(cli, "status", session_id, "--format", "text").stdout
+
+    assert payload["tokens"] is None
+    assert "· tok" in text
+    assert "0 tok" not in text
+
+
 def test_status_json_reports_the_default_policy_and_no_pending_corrections(
     cli: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:

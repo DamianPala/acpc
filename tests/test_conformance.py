@@ -50,7 +50,7 @@ STANDARD_SNAPSHOT = Path(__file__).with_name("fixtures") / "cli-design-standard.
 STANDARD_METADATA = STANDARD_SNAPSHOT.with_suffix(".meta.json")
 EXPECTED_TOOL_VERSION = "0.7.1"
 EXPECTED_STANDARD_NAME = "cli-design-standard"
-EXPECTED_STANDARD_VERSION = "0.2.0-draft.10"
+EXPECTED_STANDARD_VERSION = "0.2.0-draft.11"
 EXPECTED_EXTENSIONS = ["managed", "conversational"]
 REQUIRED_STANDARD_CLAUSES = (
     (
@@ -81,6 +81,11 @@ REQUIRED_STANDARD_CLAUSES = (
         "`output_description` MUST name that representation."
     ),
     "For accepted work, inspection MUST show the policy that applies to that work.",
+    # V6c (draft.11, slice 21): unobserved usage reports null, never zero.
+    (
+        "Usage the tool did not observe is reported as `null` or left absent; it MUST NOT be "
+        "reported as zero."
+    ),
 )
 EXPECTED_EXIT_DESCRIPTIONS = {
     "0": "Success, including an empty result: the turn ended normally, or the view rendered.",
@@ -1396,7 +1401,7 @@ def test_D1_D3b_help_and_SPEC_match_the_generated_command_set(cli: CliRunner) ->
     assert "has_more" in list_help
 
 
-def test_D6b_parser_descriptors_and_D7a_global_flags_are_generated(cli: CliRunner) -> None:
+def test_I1_parser_descriptors_and_D6a_global_flags_are_generated(cli: CliRunner) -> None:
     index = read_index(cli)
     global_flags = {flag["name"]: flag for flag in index["global_flags"]}
     for flag in index["global_flags"]:
@@ -1445,7 +1450,7 @@ def test_D6b_parser_descriptors_and_D7a_global_flags_are_generated(cli: CliRunne
     assert global_flags
 
 
-def test_D6d_routing_D7b_flat_entries_and_D7c_shape(cli: CliRunner) -> None:
+def test_D6a_index_D6b_flat_entries_and_D7_detail_shape(cli: CliRunner) -> None:
     index = read_index(cli)
     assert set(index) == {
         "schema_version",
@@ -1620,6 +1625,35 @@ def test_D8_O4a_O4d_R1a_R1b_R5a_schema_and_success_matrix(
                 assert result.stderr == "" or result.stderr.endswith("\n")
             assert detail["interactive"] is False
         monkeypatch.setenv("NO_INPUT", "1")
+
+
+def test_V6c_a_usage_event_with_null_tokens_still_validates_against_schema_log(
+    cli: CliRunner,
+    state_root: Path,
+    live_daemon: None,
+) -> None:
+    """SPEC.md's transcript section: a `usage` event's `tokens` is `null`, never
+    `0`, for a figure the adapter did not report. Reviewer-found gap: the
+    `_meta`-only usage path (`record_prompt_usage`, e.g. Grok Build reporting a
+    cost with no `totalTokens`) writes exactly such a record, and `schema log`
+    must describe it — not just the `msg` event the schema-matrix fixture uses.
+    """
+    result = invoke(cli, "run", "mock", "meta:0:1000000000:cost only", "--json", "--quiet")
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    session_id = json.loads(result.stdout)["session_id"]
+    assert json.loads(result.stdout)["tokens"] is None
+
+    log_result = invoke(cli, "log", session_id, "--json", "--quiet")
+    assert log_result.exit_code == vocab.EXIT_OK, log_result.stderr
+    records = [json.loads(line) for line in log_result.stdout.splitlines()]
+    usage_records = [record for record in records if record["type"] == "usage"]
+    assert usage_records, records
+    assert usage_records[0]["tokens"] is None
+    assert usage_records[0]["cost"] == pytest.approx(0.1)
+
+    detail = read_detail(cli, "log")
+    for record in records:
+        _assert_schema_value(detail["output"], record, f"stdout[{record['i']}]")
 
 
 def test_O2a_O2b_default_format_is_exercised_for_every_indexed_command(
@@ -2950,7 +2984,7 @@ def test_F2b_F5_wait_interrupts_in_pipe_and_pty_contexts(cli: CliRunner, live_da
     _wait_for_state(session_id, "succeeded", timeout=10)
 
 
-def test_D7c_claim_is_bound_to_the_versioned_standard_snapshot(cli: CliRunner) -> None:
+def test_D6c_claim_is_bound_to_the_versioned_standard_snapshot(cli: CliRunner) -> None:
     snapshot = STANDARD_SNAPSHOT.read_bytes()
     snapshot_text = snapshot.decode()
     metadata = json.loads(STANDARD_METADATA.read_text(encoding="utf-8"))

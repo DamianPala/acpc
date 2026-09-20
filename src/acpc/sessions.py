@@ -193,7 +193,8 @@ class SessionMeta:
     exit_code: int | None = None
     stop_reason: str | None = None
     failure: str | None = None
-    tokens: int = 0
+    # SPEC.md V6c: usage the tool never observed is `null`, never `0`.
+    tokens: int | None = None
     cost: float | None = None
     denied: dict[str, int] = field(default_factory=dict)
     denial_details: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -553,7 +554,9 @@ def meta_from_dict(data: Mapping[str, Any], *, path: Path) -> SessionMeta:
         exit_code=exit_code,
         stop_reason=stop_reason,
         failure=_coerce_str(known.get("failure"), "failure", path),
-        tokens=_coerce_int(known.get("tokens"), "tokens", path) or 0,
+        # `or 0` would turn a genuinely unobserved `null` into a false `0`; a
+        # legacy file's explicit `0` still reads back as `0` (V6c).
+        tokens=_coerce_int(known.get("tokens"), "tokens", path),
         cost=_coerce_float(known.get("cost"), "cost", path),
         denied=_coerce_denied(known.get("denied"), "denied", path),
         denial_details=_coerce_denial_details(known.get("denial_details"), "denial_details", path),

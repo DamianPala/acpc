@@ -81,6 +81,16 @@ def test_cost_joins_metadata_only_when_not_null() -> None:
     assert metadata["cost"] == 0.02
 
 
+def test_unobserved_tokens_are_omitted_while_other_lead_fields_stay() -> None:
+    """SPEC.md V6c (draft.11): a `tokens: null` result never puts `"tokens":null`
+    in `<metadata>` — the lead-field rule already keeps out any `None` value."""
+    result = output.render_tagged(envelope(tokens=None), max_output=0, answer_path=ANSWER_PATH)
+
+    metadata = json.loads(result.text.splitlines()[2])
+    assert "tokens" not in metadata
+    assert set(metadata) == {"turn", "capabilities", "stop_reason", "next"}
+
+
 def test_optional_fields_land_between_the_lead_fields_and_next() -> None:
     result = output.render_tagged(
         envelope(

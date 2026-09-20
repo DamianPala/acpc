@@ -153,6 +153,29 @@ async def _drain_updates(predicate: Any) -> None:
         await asyncio.sleep(0)
 
 
+def test_tokens_default_to_none_not_zero(tmp_path: Path) -> None:
+    """SPEC.md V6c (draft.11): usage never observed is `None`, never `0`."""
+    client, _transcript = _make_client(tmp_path, PermissionLevel.READ)
+
+    assert client.tokens is None
+
+
+def test_tokens_carry_the_previous_turns_last_observed_value(tmp_path: Path) -> None:
+    state_root = tmp_path / "acpc-state"
+    transcript = Transcript(
+        state_root / "sessions" / "abcd" / "transcript.ndjson", clock=lambda: 100.0
+    )
+    client = AcpcClient(
+        transcript,
+        PermissionLevel.READ,
+        modes=MOCK_MODES,
+        clock=lambda: 100.0,
+        previous_tokens=1200,
+    )
+
+    assert client.tokens == 1200
+
+
 def test_answer_is_only_agent_messages_and_transcript_keeps_stream_order(
     monkeypatch: Any, tmp_path: Path
 ) -> None:

@@ -515,7 +515,7 @@ class AcpcClient:
         cancellation_dispatched: asyncio.Event | None = None,
         permission_prompt: _PermissionPrompt | None = None,
         clock: _Clock | None = None,
-        previous_tokens: int = 0,
+        previous_tokens: int | None = None,
         previous_cost: float | None = None,
     ) -> None:
         self.transcript = transcript
@@ -552,8 +552,8 @@ class AcpcClient:
         return "".join(self._answer_parts)
 
     @property
-    def tokens(self) -> int:
-        """Return the latest token figure reported by the adapter."""
+    def tokens(self) -> int | None:
+        """Return the latest token figure reported by the adapter, or `None` if unobserved."""
         return self._tokens
 
     @property

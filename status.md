@@ -28,8 +28,17 @@ config only: `limit_wait_max = "0s"` turns waiting off, every recognized limit t
 no jitter, `limit_waited_seconds` is no longer persisted in `meta.json` (old keys read into
 `extra`, never exposed), and the direct path prints no `waiting for the usage limit` line on a
 TTY. `limit_wait_max` is read once per turn, when it starts sending. Net −150 lines in `src/`
-and `tests/`. Next: slice 21 re-pins the claim on 0.2.0-draft.11 (haz-skills `6d91b97`) and
-makes `tokens` `null` until the adapter reports usage.
+and `tests/` (`3393ada`).
+
+**Slice 21 (2026-09-20) re-pins the claim on 0.2.0-draft.11** (haz-skills `6d91b97`, the draft
+that folded acpc's field report in; additive, no clause renumbered) and applies its one new
+rule, V6c: usage the adapter never reported is `null`, never `0`. `tokens` is nullable in every
+result, in `status`, and in the `usage` transcript record; `<metadata>` omits it while `null`;
+text views show `· tok`. `tokens` stays session-cumulative across turns. A legacy `meta.json`
+with `"tokens": 0` still reads `0`. Two review rounds (the second for the `log` schema).
+Gates: 1350 tests, ruff/pyright clean, smoke 603/603, D6c green against the checkout. Next: live
+16/18/19/20/21 on claude-agent-acp and codex-acp, then the black-box probe the standard's
+session designs.
 
 Debts found in review, none blocking: the TTY `human` presentation still prints the raw answer
 without control-byte escaping (O3d asks for it; a small separate slice); `continue` after

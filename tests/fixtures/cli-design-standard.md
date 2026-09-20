@@ -1,6 +1,6 @@
 # CLI Design Standard for Humans and Agents
 
-**Version:** 0.2.0-draft.10
+**Version:** 0.2.0-draft.11
 
 ## Scope
 
@@ -204,7 +204,7 @@ $ mytool schema
 {
   "schema_version": "1",
   "tool_version": "2.1.0",
-  "conformance": {"name": "cli-design-standard", "standard": "0.2.0-draft.10", "extensions": []},
+  "conformance": {"name": "cli-design-standard", "standard": "0.2.0-draft.11", "extensions": []},
   "global_flags": [
     {"name": "json", "description": "Emit JSON output", "type": "boolean",
      "required": false, "default": false}
@@ -274,7 +274,7 @@ $ hashfile schema
 {
   "schema_version": "1",
   "tool_version": "1.0.0",
-  "conformance": {"name": "cli-design-standard", "standard": "0.2.0-draft.10", "extensions": []},
+  "conformance": {"name": "cli-design-standard", "standard": "0.2.0-draft.11", "extensions": []},
   "global_flags": [
     {"name": "json", "description": "Emit JSON output", "type": "boolean", "required": false, "default": false}
   ],
@@ -852,7 +852,7 @@ The answer presentation in [`conversational`](#extension-conversational-agent-co
 
 **O2d:** Precedence: an explicit format flag MUST override the detected default. Two explicit format flags are a usage error under I6a.
 
-**O2e:** Names: a command MUST NOT accept `--output`. If it accepts a destination path, the flag MUST be named `--output-file`. When a call emits result data under `--output-file`, the destination file contains exactly what stdout would have received, and the declared JSON contract in O5 applies to that file. Under that flag, the call writes no bytes to stdout, on success or failure. Formats use `--json` or `--format`.
+**O2e:** Names: a command MUST NOT accept `--output`. If it accepts a destination path, the flag MUST be named `--output-file`. When a call emits result data under `--output-file`, the destination file contains exactly what stdout would have received, and the declared JSON contract in O5 applies to that file. Under that flag, the call writes no bytes to stdout, on success or failure. A call that returns no result creates no destination file. Formats use `--json` or `--format`.
 An existing destination file alone does not show that the current call produced a result.
 Writing under `--output-file` is result delivery, not a mutation of intended state: it replaces an existing destination without confirmation and does not change the command's `effects`.
 
@@ -903,7 +903,7 @@ For example, `mytool init --json` creates a directory and reports `{"path": "/wo
 **O3d:** Untrusted content: values supplied by the caller or received from a remote source need different handling in machine-readable and human-readable output:
 
 - Machine-readable output MUST encode these values using the selected stdout format's serialization rules.
-- Human-readable output MUST escape terminal control sequences in these values so the terminal displays them as text instead of acting on them.
+- Human-readable output MUST escape terminal control sequences in these values, the sequences introduced by ESC (`U+001B`) and the C1 control characters (`U+0080` to `U+009F`), so the terminal displays them as text instead of acting on them. Escaping other control characters is the tool's choice.
 
 A result whose whole payload is a document in a native format, not a text answer under the tagged presentation (V6b), is not changed by this escaping on non-TTY stdout; under `--output-file`, the destination receives that non-TTY representation under the result-delivery rule (O2e).
 When such a document is displayed on a TTY, the escaping applies.
@@ -1333,7 +1333,7 @@ The index still lists every command the tool dispatches, and each listed command
 {
   "conformance": {
     "name": "cli-design-standard",
-    "standard": "0.2.0-draft.10",
+    "standard": "0.2.0-draft.11",
     "extensions": [],
     "scope": ["services"]
   }
@@ -1704,6 +1704,7 @@ The minimum applies to the agent configuration selected for the session.
 The tool MUST establish this support before accepting the session's first work.
 If it cannot, the start call MUST fail before agent work executes.
 Acceptance can follow backend initialization, so a receipt returned after acceptance reports the session's correction mode (V1c); returning after acceptance does not require returning before initialization.
+A call that waits for that initialization before returning its receipt is bounded by the finite default deadline for waiting on external state (I8a); on expiry it fails with `kind` `timeout` and includes the session identifier in `context` when one was obtained.
 Temporary unavailability can still prevent a supported operation from succeeding.
 Additional commands, history reads, and selectors are allowed and follow the general requirements for their behavior.
 
@@ -1825,6 +1826,7 @@ If `cancel c1` selects work that finishes just before cancellation takes effect,
 It does not cancel a newer turn or claim that the selected work was canceled.
 
 **V2c:** A direct follow-up MUST fail with `kind` `conflict` while work remains non-terminal.
+Direct-follow-up conflict checks precede the message check: a follow-up without a message fails with `conflict`, not as the usage error for an unsupported no-message request (V1a), when work is non-terminal or when pending messages can still start automatically under the queue-conflict rule (V7d).
 The error's `hint` SHOULD name the correction role and, when the tool offers a queue, the queue role as the alternatives.
 
 **Example: choosing when a message applies.** While the agent works on login, a caller can use `steer c1 'Check the expiry first'` to correct that work.
@@ -2054,15 +2056,17 @@ None of these calls starts new work or repeats an ever-growing answer fragment; 
 Field names are tool-defined.
 The condition is assessed for the agent configuration selected for the session.
 A reported reason or expected return time MUST come from observed information. Silence alone is not evidence.
+A structured limit signal without a return time is a known limit with an unknown return time: the tool reports the reason and leaves the time unknown.
 If the tool waits for a temporary limit and will automatically continue, that wait MUST remain non-terminal in the same turn.
-Permanent failure to continue ends the turn as `failed`.
+The turn is the tool's unit of work: it can span more than one request to the system running the agent, and the wait stays non-terminal for the tool's turn even when that system has closed its own.
+If the tool does not continue, the turn ends as `failed` unless it was canceled.
 
 Sending the prompt again is a request retry under the safe-retry rules (R6), not another observation of the turn.
 
 **Example: waiting for a rate limit to clear.** This session-only tool can observe the limit and uses domain-specific `waiting`, `reason`, and `auto_continue` fields in its status result:
 
 ```json
-{"session_id":"c1","status":"waiting","reason":"rate_limit","auto_continue":true,"capabilities":{"steer_mode": "cancel-then-start"}}
+{"session_id":"c1","status":"waiting","reason":"rate_limit","auto_continue":true,"capabilities":{"steer_mode":"cancel-then-start"}}
 ```
 
 The caller runs `mytool wait c1 --timeout 30s` in a non-interactive context with non-TTY stderr.
@@ -2074,6 +2078,8 @@ If the turn still waits for the limit when that deadline expires, the command ex
 
 When work resumes, it continues in the same turn.
 The caller does not send a new prompt merely to resume waiting.
+In this tool, resuming sends a second request to the agent's backend; the answer of both requests belongs to this one turn.
+Had this tool not continued, the turn would have ended as `failed`, and the error would name the limit and the observed return time.
 
 **V5c:** The tool MUST support reopening a retained session after the initiating process exits or restarts, subject to its documented context-retention policy (V5a).
 Reopening a session does not by itself start work or prove that previous work ended.
@@ -2127,7 +2133,7 @@ An answer-reading breadcrumb SHOULD use the default presentation unless the work
 
 - The `<result>` opening tag carries the session identifier and `status` as double-quoted attributes. Their attribute names are the JSON field names.
 - If the JSON contract requires `partial`, the opening tag MUST include the same boolean value as JSON.
-- Fields selected for text metadata under the selection rule (V6c) MUST appear as one JSON object in `<metadata>`, serialized on a single line. Fields already shown as attributes and the answer field are excluded. With no selected fields, this section can be omitted. When both sections are present, `<metadata>` precedes the answer section.
+- Fields selected for text metadata under the selection rule (V6c) MUST appear as one JSON object in `<metadata>`, serialized on a single line. Fields already shown as attributes and the answer field are excluded. With no selected fields, this section can be omitted; a reader treats a missing `<metadata>` section as an empty selection, not as an error. When both sections are present, `<metadata>` precedes the answer section.
 - An available answer MUST appear in an answer section with its text, line breaks, and Markdown as they are. Its tags are `<answer>` and `</answer>` unless Answer boundary below requires `<answer-N>` and `</answer-N>`. Beyond the terminal-control escaping of O3d, no string in it is replaced. With no answer, omit the section; do not invent an empty answer. An empty answer string is an available answer and produces a section with one empty line.
 - Each section's opening and closing tags and the closing `</result>` MUST occupy their own lines. After a section's opening tag the tool writes one newline, then the section content, then one newline, then the closing tag. These wrapper newlines are not part of the content. The answer is everything between the newline after the opening answer tag and the newline before the closing one, so an answer that ends with a newline shows an empty line before the closing answer tag.
 
@@ -2141,8 +2147,8 @@ Attribute names MUST start with an ASCII letter or underscore and contain only A
 
 **Answer boundary:**
 
-- When the answer text contains any of the exact strings `<result>`, `</result>`, `<metadata>`, `</metadata>`, `<answer>`, or `</answer>`, the tool MUST write `<answer-N>` as the section's opening tag and `</answer-N>` as its closing tag. N is the decimal integer, without leading zeros, equal to one plus the number of LF characters (`U+000A`) in the displayed answer text. A CR before an LF is answer text and is not counted. Matching is case-sensitive and covers only these six strings; `<answers>`, `<Answer>`, `<answer/>`, and these tag names with attributes do not count. Without such a string the tags are plain.
-- With counted tags, the answer consists of exactly the N lines after the `<answer-N>` line, split on LF with any CR kept in its line. The line after them consists of the matching `</answer-N>`, compared as a whole tag name rather than a prefix. An earlier answer line equal to `</answer-N>` remains answer text: a reader uses N to locate the boundary and the closing tag to validate it. With plain tags, the first line consisting of `</answer>` closes the section.
+- When the answer text contains any of the exact strings `<result>`, `</result>`, `<metadata>`, `</metadata>`, `<answer>`, or `</answer>`, the tool MUST write `<answer-N>` as the section's opening tag and `</answer-N>` as its closing tag. N is the decimal integer, without leading zeros, equal to one plus the number of LF characters (`U+000A`) in the displayed answer text. A CR before an LF is answer text and is not counted. The displayed answer text is the text between the answer tags as written: after the terminal-control escaping of O3d and including any marker the tool writes when it shortens the answer (O5c). Matching is case-sensitive and covers only these six strings; `<answers>`, `<Answer>`, `<answer/>`, and these tag names with attributes do not count. Without such a string the tags are plain.
+- With counted tags, the answer consists of exactly the N lines after the `<answer-N>` line, split on LF with any CR kept in its line. The line after them consists of the matching `</answer-N>`, compared as a whole tag name rather than a prefix. An earlier answer line equal to `</answer-N>` remains answer text: a reader uses N to locate the boundary and the closing tag to validate it. With plain tags, the first line consisting of `</answer>` closes the section. A producer that follows this rule never writes such a line inside a plain section.
 
 For example, an answer of five lines whose code sample contains the wrapper's closing tag is presented as:
 
@@ -2173,6 +2179,7 @@ The tags do not make an agent's answer trusted instructions.
 - Result-preview notices and information for retrieving the complete result.
 
 When the JSON result reports usage, such as tokens or cost, the text SHOULD retain it.
+Usage the tool did not observe is reported as `null` or left absent; it MUST NOT be reported as zero.
 Other JSON fields MAY be omitted from text when this preserves the result's meaning under the rendering-consistency rule (O3c).
 Command detail SHOULD document the selection of text metadata.
 For example, a tool can keep timing fields only in JSON.
@@ -2219,7 +2226,7 @@ This tool's text receipt omits `changed`, which remains in its JSON result, and 
 ```text
 <result session_id="c1" status="running" partial="false">
 <metadata>
-{"capabilities":{"steer_mode": "cancel-then-start"},"next":["mytool","wait","c1"]}
+{"capabilities":{"steer_mode":"cancel-then-start"},"next":["mytool","wait","c1"]}
 </metadata>
 </result>
 ```
@@ -2299,11 +2306,11 @@ While the agent is working:
 
 ```console
 $ mytool queue c1 'Then add tests' --json
-{"session_id":"c1","message_state":"accepted","changed":true,"partial":false,"capabilities":{"steer_mode": "in-place"},"queue":{"pending_messages":1,"stopped":false}}
+{"session_id":"c1","message_state":"accepted","changed":true,"partial":false,"capabilities":{"steer_mode":"in-place"},"queue":{"pending_messages":1,"stopped":false}}
 $ mytool queue c1 'Then update the docs' --json
-{"session_id":"c1","message_state":"accepted","changed":true,"partial":false,"capabilities":{"steer_mode": "in-place"},"queue":{"pending_messages":2,"stopped":false}}
+{"session_id":"c1","message_state":"accepted","changed":true,"partial":false,"capabilities":{"steer_mode":"in-place"},"queue":{"pending_messages":2,"stopped":false}}
 $ mytool status c1 --json
-{"session_id":"c1","status":"running","queue":{"pending_messages":2,"stopped":false},"capabilities":{"steer_mode": "in-place"}}
+{"session_id":"c1","status":"running","queue":{"pending_messages":2,"stopped":false},"capabilities":{"steer_mode":"in-place"}}
 ```
 
 The caller can still use `steer` to correct the current work without removing those two messages:

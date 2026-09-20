@@ -36,7 +36,7 @@ COMMAND_NAME = "schema"
 
 # The standard this surface is generated against.
 STANDARD_NAME = "cli-design-standard"
-STANDARD_VERSION = "0.2.0-draft.10"
+STANDARD_VERSION = "0.2.0-draft.11"
 
 # Default output format per context.  acpc renders text in both today; a
 # command that has a machine shape offers it behind its own `--json`.
@@ -155,7 +155,7 @@ _SESSION_RESULT_PROPERTIES = {
     "turn": _INTEGER,
     "status": _SESSION_STATUS,
     "stop_reason": _NULLABLE_STRING,
-    "tokens": _INTEGER,
+    "tokens": _NULLABLE_INTEGER,
     "paths": _PATHS,
     "cost": _NULLABLE_NUMBER,
     "answer": _STRING,
@@ -433,7 +433,7 @@ _STATUS_DETAIL = _object(
         "name": _NULLABLE_STRING,
         "runtime_seconds": _NUMBER,
         "idle_seconds": _NULLABLE_NUMBER,
-        "tokens": _INTEGER,
+        "tokens": _NULLABLE_INTEGER,
         "cost": _NULLABLE_NUMBER,
         "exit_code": _NULLABLE_INTEGER,
         "stop_reason": _NULLABLE_STRING,
@@ -502,7 +502,7 @@ _LOG_EVENT = _object(
         "adapter_log_tail": _STRING,
         "from": _STRING,
         "to": _STRING,
-        "tokens": _INTEGER,
+        "tokens": _NULLABLE_INTEGER,
         "cost": _NULLABLE_NUMBER,
         "reason": _STRING,
         "resume_at": _NULLABLE_STRING,

@@ -155,6 +155,14 @@ def test_message_snippet_does_not_split_a_multibyte_character() -> None:
     snippet.encode("utf-8").decode("utf-8")
 
 
+def test_usage_event_without_a_token_count_shows_a_dot() -> None:
+    """SPEC.md V6c: a cost-only usage record never renders its tokens as `0` or `None`."""
+    line = render.format_event(event(1, "usage", tokens=None, cost=0.1))
+
+    assert line.endswith("usage · tok · cost $0.10")
+    assert render.format_event(event(2, "usage", tokens=1200, cost=None)).endswith("1200 tok")
+
+
 def test_message_length_is_only_reported_for_oversized_chunks() -> None:
     short = render.format_event(event(1, "msg", text="x" * 1023))
     large = render.format_event(event(2, "msg", text="x" * 1024))
@@ -575,6 +583,17 @@ def test_status_views_fall_back_to_a_dot_when_no_model_was_resolved() -> None:
     assert render.status_detail_json(meta, clock=lambda: 120.0)["model"] is None
 
 
+def test_status_views_show_a_dot_for_unobserved_tokens() -> None:
+    """SPEC.md V6c (draft.11): a fresh session's `tokens` is `None`, not `0`."""
+    meta = make_session()
+
+    detail = render.render_status_detail(meta, clock=lambda: 120.0)
+
+    assert "· tok" in detail
+    assert "0 tok" not in detail
+    assert render.status_detail_json(meta, clock=lambda: 120.0)["tokens"] is None
+
+
 def test_status_json_carries_the_resolved_model_in_both_shapes() -> None:
     meta = make_session(model="gpt-5.6-terra")
 
@@ -741,7 +760,7 @@ def test_status_detail_text_remains_the_existing_labeled_view() -> None:
     text = render.render_status_detail(meta, clock=lambda: 120.0)
 
     assert text == (
-        "status   starting · exit · · 0m20s · 0 tok\n"
+        "status   starting · exit · · 0m20s · · tok\n"
         "agent    mock (mock) · model: mock-sonnet-5 · name: ·\n"
         f"dir      {sessions.session_dir(meta.session_id)} · answer: answer.md\n"
         "steer: cancel-then-start\n"

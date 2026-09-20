@@ -745,12 +745,13 @@ class TestLocking:
         meta = make_session()
         session_id = meta.session_id
         rounds = 40
+        sessions.update_meta(session_id, tokens=0)
 
         def bump() -> None:
             for _ in range(rounds):
                 with sessions.session_lock(session_id):
                     current = sessions.read_meta(session_id)
-                    current.tokens += 1
+                    current.tokens = (current.tokens or 0) + 1
                     sessions.write_meta(current)
 
         workers = [threading.Thread(target=bump) for _ in range(2)]

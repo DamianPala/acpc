@@ -993,6 +993,42 @@ def test_json_output_carries_the_session_id_and_paths(cli: CliRunner) -> None:
     assert "as json" in payload["answer"]
 
 
+def test_unobserved_usage_reports_null_not_zero(cli: CliRunner) -> None:
+    """SPEC.md V6c (draft.11): usage the tool never observed is `null`, never `0`.
+
+    The `echo:` scenario answers without ever sending a `usage_update`, so
+    acpc has nothing to report.
+    """
+    result = invoke(cli, "run", "mock", "echo:hi", "--json", "--quiet")
+
+    payload = json.loads(result.stdout)
+    assert payload["tokens"] is None
+
+
+def test_unobserved_usage_is_absent_from_the_tagged_metadata(cli: CliRunner) -> None:
+    result = invoke(cli, "run", "mock", "echo:hi", "--quiet")
+
+    metadata_line = next(line for line in result.stdout.splitlines() if line.startswith("{"))
+    metadata = json.loads(metadata_line)
+    assert "tokens" not in metadata
+
+
+def test_unobserved_usage_shows_a_dot_in_the_stderr_summary(cli: CliRunner) -> None:
+    result = invoke(cli, "run", "mock", "echo:hi")
+
+    summary_line = next(line for line in result.stderr.splitlines() if "exit 0" in line)
+    assert "· tok" in summary_line
+    assert "0 tok" not in summary_line
+
+
+def test_observed_usage_still_reports_the_real_count(cli: CliRunner) -> None:
+    """A scenario that streams `usage_update` keeps reporting an int (unchanged)."""
+    result = invoke(cli, "run", "mock", "meta:1200:1000000000:tokens present", "--json", "--quiet")
+
+    payload = json.loads(result.stdout)
+    assert payload["tokens"] == 1200
+
+
 def test_max_output_caps_stdout(cli: CliRunner) -> None:
     result = invoke(
         cli, "run", "mock", "trigger the huge scenario", "--quiet", "--max-output", "512"

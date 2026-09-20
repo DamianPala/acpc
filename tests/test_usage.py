@@ -108,6 +108,25 @@ def test_prompt_meta_usage_uses_latest_tokens_and_accumulates_cost(
     ]
 
 
+def test_continue_after_unobserved_usage_reports_the_first_observed_total(
+    cli: CliRunner,
+) -> None:
+    """SPEC.md V6c: an unobserved first turn (`tokens: null`) does not stop a
+    later turn's real usage from being reported once the adapter sends it."""
+    first = invoke(cli, "run", "mock", "echo:no usage yet", "--json")
+    assert first.exit_code == 0, first.stderr
+    first_payload = json.loads(first.stdout)
+    session_id = first_payload["session_id"]
+    assert first_payload["tokens"] is None
+
+    second = invoke(cli, "continue", session_id, "meta:1200:1000000000:now observed", "--json")
+    assert second.exit_code == 0, second.stderr
+    second_payload = json.loads(second.stdout)
+
+    assert second_payload["tokens"] == 1200
+    assert sessions.read_meta(session_id).tokens == 1200
+
+
 def test_streamed_usage_wins_over_prompt_meta(cli: CliRunner) -> None:
     result = invoke(cli, "run", "mock", "both:700:3000000000:stream wins", "--json")
 

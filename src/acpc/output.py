@@ -586,7 +586,9 @@ def format_duration(seconds: float) -> str:
     return f"{minutes}m{secs:02d}s"
 
 
-def format_tokens(tokens: int) -> str:
+def format_tokens(tokens: int | None) -> str:
+    if tokens is None:
+        return "· tok"
     if tokens >= 1000:
         value = tokens / 1000
         rendered = f"{value:.1f}".rstrip("0").rstrip(".")

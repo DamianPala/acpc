@@ -204,7 +204,10 @@ def format_event(
         cost_text = ""
         if isinstance(cost, (int, float)) and not isinstance(cost, bool):
             cost_text = f" · cost ${cost:.2f}"
-        return f"[{timestamp}] {label}{event.get('tokens', 0)} tok{cost_text}"
+        # V6c: a cost-only observation carries no token count; show `·`, not 0.
+        tokens = event.get("tokens")
+        tokens_text = "·" if tokens is None else str(tokens)
+        return f"[{timestamp}] {label}{tokens_text} tok{cost_text}"
     if event_type == "limit":
         resume_at = event.get("resume_at") or "?"
         action = _single_line(event.get("action", "?"))
