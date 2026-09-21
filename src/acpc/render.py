@@ -11,6 +11,7 @@ from typing import Any
 from acpc import sessions, transcript, vocab
 from acpc.output import (
     collection_envelope,
+    escape_answer_controls,
     format_duration,
     format_tokens,
     session_capabilities,
@@ -263,7 +264,10 @@ def condense_events(events: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]
 def _prose_event(event: Mapping[str, Any]) -> str:
     event_type = event.get("type")
     if event_type == "msg":
-        return str(event.get("text", ""))
+        # SPEC.md `log`: `--prose` escapes terminal control bytes and keeps
+        # line breaks — the same table `render_result`'s human path and the
+        # tagged document use, not `safe_text`'s single-line collapse.
+        return escape_answer_controls(str(event.get("text", "")))
     if event_type == "error":
         return format_event(event)
     return ""

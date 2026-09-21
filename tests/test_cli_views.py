@@ -494,6 +494,20 @@ def test_log_prose_renders_markdown_without_tool_lines(cli: CliRunner) -> None:
     assert "## Answer" in result.stdout and "tool" not in result.stdout
 
 
+def test_log_prose_escapes_control_bytes_and_keeps_line_breaks(cli: CliRunner) -> None:
+    """SPEC.md `log`: `--prose` escapes terminal control bytes and keeps line
+    breaks — O3d applied to the full-message view, not just the answer."""
+    session_id = run_mock(cli, "echo:line one\x1b[31mred\x1b[0m\nline two\x9btwo")
+
+    result = invoke(cli, "log", session_id, "--prose")
+
+    assert "\x1b" not in result.stdout
+    assert "\x9b" not in result.stdout
+    assert "^[[31mred^[[0m" in result.stdout
+    assert "\\u009b" in result.stdout
+    assert "line one" in result.stdout and "\nline two" in result.stdout
+
+
 def test_the_log_footer_starts_on_a_fresh_line_after_unterminated_prose(cli: CliRunner) -> None:
     """Prose is verbatim message text, which need not end with a newline; the
     footer's compensating newline goes to stderr, keeping stdout clean."""

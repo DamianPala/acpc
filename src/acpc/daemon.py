@@ -1475,6 +1475,10 @@ class Daemon:
             session = await conn.new_session(cwd=request.cwd or os.getcwd(), mcp_servers=[])
             adapter_session_id = session.session_id
             client.capture_advertised(session)
+            # SPEC.md *State on disk*: recorded as soon as the adapter has
+            # accepted the session, before the prompt is sent, so a daemon
+            # killed mid-turn still leaves a continuable session.
+            sessions.update_meta(session_id, adapter_session_id=adapter_session_id)
 
         self.host.mux.bind(adapter_session_id, client)
         prompt_started = False
@@ -1524,6 +1528,9 @@ class Daemon:
         )
         if cancel.stop_reason is not None:
             stop_reason = cancel.stop_reason
+        # SPEC.md *Session states*: the adapter's `cancelled` stop reason is
+        # normalized to acpc's own `canceled` when the turn ends.
+        stop_reason = vocab.normalize_stop_reason(stop_reason)
         return runner.TurnOutcome(
             state=state,
             stop_reason=stop_reason,

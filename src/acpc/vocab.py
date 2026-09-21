@@ -53,6 +53,30 @@ def normalize_session_state(value: str) -> str:
     return LEGACY_SESSION_STATES.get(value, value)
 
 
+# SPEC.md *Session states*: "A canceled turn records `stop_reason: canceled`
+# whichever side canceled it, or `canceled during preparation` when the cancel
+# landed before any prompt was sent; the adapter's `cancelled` stop reason is
+# normalized when the turn ends and historical spellings of both reasons are
+# normalized on read." `cancelled` is the ACP wire spelling an adapter
+# reports; `cancelled during preparation` is acpc's own pre-slice-23 spelling
+# of the no-prompt-sent reason. Both are normalized on the way into acpc's own
+# metadata and on read from historical `meta.json` files. Protocol objects on
+# the wire itself (`client.py`'s `DeniedOutcome`, `RequestPermission`
+# responses) keep the ACP literal untouched — this is acpc's own
+# `stop_reason`, not the ACP payload.
+LEGACY_STOP_REASONS = {
+    "cancelled": "canceled",
+    "cancelled during preparation": "canceled during preparation",
+}
+
+
+def normalize_stop_reason(value: str | None) -> str | None:
+    """Map the ACP wire spelling of a canceled stop reason to acpc's own."""
+    if value is None:
+        return None
+    return LEGACY_STOP_REASONS.get(value, value)
+
+
 # Steering modes (SPEC.md `steer`), in preference order. `in-place` needs the
 # adapter's `_session/steering` extension; `cancel-then-start` needs only
 # `session/cancel` and a fresh `session/prompt`, so it is always available.

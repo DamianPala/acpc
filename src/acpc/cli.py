@@ -4536,6 +4536,12 @@ def _dispatch_background(
         # under the answer-result contract (O2e).
         if not emit_failure_result and output_file is not None:
             output.write_output_file(output_file, "")
+        if isinstance(problem, daemon_client.DaemonUnavailable):
+            # SPEC.md `daemon`: no daemon could serve the call at all — kept
+            # apart from an ordinary agent failure the daemon reported itself.
+            raise AgentProblem(
+                problem.reason, kind=errors.UNAVAILABLE, context={"session_id": session_id}
+            )
         raise AgentProblem(problem, context={"session_id": session_id})
     meta = sessions.read_meta(session_id)
     result = output.render_result(
@@ -4552,6 +4558,23 @@ def _dispatch_background(
         _write_stdout(result.text)
 
 
+# SPEC.md `continue`: a session with nothing in flight to correct in place —
+# `starting`, `preparing`, `waiting` — has no running turn for an in-place
+# `steer` to reach, so the hinted command adds `--steer-mode cancel-then-start`
+# and never fails with a second `conflict`.
+_STEER_NEEDS_CANCEL_THEN_START = frozenset({"starting", "preparing", "waiting"})
+
+
+def _continue_conflict_hint(meta: sessions.SessionMeta) -> str:
+    steer_mode_flag = (
+        " --steer-mode cancel-then-start" if meta.state in _STEER_NEEDS_CANCEL_THEN_START else ""
+    )
+    return (
+        f'Run: acpc steer {meta.session_id} "<instruction>"{steer_mode_flag} to correct the '
+        f"turn, or acpc wait {meta.session_id} to wait for it"
+    )
+
+
 def _continuation_prompt(meta: sessions.SessionMeta) -> str:
     """SPEC `continue`: what a call with no message at all resumes.
 
@@ -4560,15 +4583,15 @@ def _continuation_prompt(meta: sessions.SessionMeta) -> str:
     `succeeded` turn left nothing unfinished, so the call is a usage error
     rather than a silent empty-prompt turn; every other finished state —
     `canceled`, `failed` or `unknown` — sends acpc's own continuation
-    instruction, the same text the usage-limit resumption already sends
-    mid-turn (`runner.CONTINUATION_INSTRUCTION`).
+    instruction naming that state as the cause
+    (`runner.continuation_instruction`).
     """
     if meta.state == "succeeded":
         raise UsageProblem(
             f"session {meta.session_id} succeeded on its last turn — nothing to continue",
             hint="the last turn completed; give continue a message",
         )
-    return runner.CONTINUATION_INSTRUCTION
+    return runner.continuation_instruction(meta.state)
 
 
 @effects.non_idempotent
@@ -4688,10 +4711,7 @@ def continue_command(
             f"session {meta.session_id} is {meta.state} — it cannot be continued",
             kind=errors.CONFLICT,
             retryable=True,
-            hint=(
-                f'Run: acpc steer {meta.session_id} "<instruction>" to correct the running '
-                f"turn, or acpc wait {meta.session_id} to wait for it"
-            ),
+            hint=_continue_conflict_hint(meta),
             context={"session_id": meta.session_id},
         )
     prompt = (

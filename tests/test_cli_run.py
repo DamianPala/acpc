@@ -925,6 +925,52 @@ def test_a_terminated_answer_gets_no_blank_line_before_the_summary(
     assert result.stderr.startswith("-- ")
 
 
+def test_run_human_presentation_escapes_control_bytes(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SPEC.md *Text presentation*: the terminal answer escapes control bytes
+    exactly as the tagged document does, keeping line breaks."""
+    force_human_presentation(monkeypatch)
+    result = invoke(cli, "run", "mock", "echo:safe\x1b[31mred\x1b[0m\nline\x9btwo")
+
+    assert "\x1b" not in result.stdout
+    assert "\x9b" not in result.stdout
+    assert "^[[31mred^[[0m" in result.stdout
+    assert "\\u009b" in result.stdout
+    assert "\nline" in result.stdout
+
+
+def test_run_output_file_on_a_terminal_gets_the_escaped_text(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`--output-file` on a terminal gets exactly what stdout would have."""
+    force_human_presentation(monkeypatch)
+    output_file = tmp_path / "answer.txt"
+
+    result = invoke(
+        cli, "run", "mock", "echo:danger\x1b[31mred\x1b[0m", "--output-file", str(output_file)
+    )
+
+    assert result.exit_code == vocab.EXIT_OK
+    written = output_file.read_text(encoding="utf-8")
+    assert "\x1b" not in written
+    assert "^[[31mred^[[0m" in written
+
+
+def test_wait_human_presentation_escapes_control_bytes(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch, live_daemon: None
+) -> None:
+    started = invoke(cli, "run", "mock", "echo:bg\x1b[31mred\x1b[0m", "--bg", "--json")
+    assert started.exit_code == vocab.EXIT_OK
+    session_id = json.loads(started.stdout)["session_id"]
+
+    force_human_presentation(monkeypatch)
+    result = invoke(cli, "wait", session_id)
+
+    assert "\x1b" not in result.stdout
+    assert "^[[31mred^[[0m" in result.stdout
+
+
 def test_the_direct_child_note_rides_the_one_summary_line(cli: CliRunner) -> None:
     result = invoke(cli, "run", "mock", "echo:route me")
 
@@ -932,6 +978,53 @@ def test_the_direct_child_note_rides_the_one_summary_line(cli: CliRunner) -> Non
     assert len(summary_lines) == 2
     assert any("direct child" in line for line in summary_lines)
     assert any(line.startswith("-- session ") for line in summary_lines)
+
+
+def test_background_run_reports_unavailable_when_the_socket_path_is_too_long(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, live_daemon: None
+) -> None:
+    """SPEC.md `daemon`: a socket path that still exceeds the platform limit
+    even hashed starts no daemon — `run --bg` reports `unavailable` naming
+    the limit and `ACPC_HOME`, with no daemon lock or pid file left behind
+    (a spawn that was always going to fail never even starts)."""
+    long_home = tmp_path / ("x" * 150)
+    agents = long_home / "agents"
+    agents.mkdir(parents=True)
+    (agents / "mock.toml").write_text(MOCK_ENTRY, encoding="utf-8")
+    monkeypatch.setenv("ACPC_HOME", str(long_home))
+    cli = CliRunner()
+
+    result = cli.invoke(main, ["run", "mock", "echo:x", "--bg", "--json"], catch_exceptions=False)
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    envelope = error_envelope(result)
+    assert envelope["kind"] == "unavailable"
+    assert "ACPC_HOME" in envelope["message"]
+    assert "108" in envelope["message"] or "104" in envelope["message"]
+    daemon_dir = long_home / "daemon"
+    assert not daemon_dir.exists()
+
+
+def test_blocking_run_falls_back_direct_when_the_socket_path_is_too_long(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, live_daemon: None
+) -> None:
+    """Same over-long `ACPC_HOME`, but a blocking `run`: it takes the direct
+    path, as for any unavailable daemon, and names the cause in its stderr
+    summary rather than failing the call."""
+    long_home = tmp_path / ("x" * 150)
+    agents = long_home / "agents"
+    agents.mkdir(parents=True)
+    (agents / "mock.toml").write_text(MOCK_ENTRY, encoding="utf-8")
+    monkeypatch.setenv("ACPC_HOME", str(long_home))
+    cli = CliRunner()
+
+    result = cli.invoke(main, ["run", "mock", "echo:direct fallback"], catch_exceptions=False)
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    assert "direct child" in result.stderr
+    assert "ACPC_HOME" in result.stderr
+    daemon_dir = long_home / "daemon"
+    assert not daemon_dir.exists()
 
 
 def test_a_default_cwd_resolves_to_the_callers_absolute_directory(
@@ -1210,6 +1303,104 @@ def test_timeout_direct_fallback_can_still_be_canceled(cli: CliRunner) -> None:
 
     assert canceled.exit_code == vocab.EXIT_OK, canceled.stderr
     assert json.loads(canceled.stdout)["status"] == "canceled"
+
+
+def test_a_direct_child_killed_during_turn_one_still_leaves_a_continuable_session(
+    cli: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SPEC.md *State on disk*: the adapter session id is recorded as soon as
+    the adapter has accepted the session, before the prompt is sent — so a
+    direct host killed mid-turn-1 still leaves `adapter_session_id` on disk
+    and `continue` takes the normal cold-resume path instead of
+    `corrupt_state`.
+
+    The child process below is a real subprocess, not `CliRunner` — the
+    autouse `no_daemon` stub in `conftest.py` only patches
+    `daemon_client.ensure_daemon` inside this test's own process, so a plain
+    `ACPC_HOME` would let the child spawn (and go through) a real daemon,
+    leaving `runner.py`'s direct-path write untested. An `ACPC_HOME` whose
+    socket path still exceeds the platform limit after hashing (item F) is
+    the same deterministic, daemon-free mechanism the item F tests use to
+    force the direct path, with no new test-only switch.
+    """
+    long_home = tmp_path / ("x" * 150)
+    agents = long_home / "agents"
+    agents.mkdir(parents=True)
+    (agents / "mock.toml").write_text(MOCK_ENTRY, encoding="utf-8")
+    monkeypatch.setenv("ACPC_HOME", str(long_home))
+    release = tmp_path / "release-before-prompt"
+    ready = tmp_path / "before-prompt-ready"
+    monkeypatch.setenv("ACPC_MOCK_BLOCK_BEFORE_PROMPT", str(release))
+    monkeypatch.setenv("ACPC_MOCK_BLOCK_BEFORE_PROMPT_READY", str(ready))
+    command = [
+        sys.executable,
+        "-c",
+        "from acpc.cli import main; raise SystemExit(main())",
+        "run",
+        "mock",
+        "turn one killed",
+        "--name",
+        "direct-turn-one-killed",
+        "--quiet",
+    ]
+    process = subprocess.Popen(
+        command,
+        env=os.environ.copy(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not ready.exists():
+            time.sleep(0.02)
+        assert ready.exists()
+
+        deadline = time.monotonic() + 5
+        session_id = None
+        while time.monotonic() < deadline:
+            try:
+                session_id = sessions.resolve_selector("direct-turn-one-killed")
+                break
+            except sessions.SessionError:
+                time.sleep(0.02)
+        assert session_id is not None
+
+        running = sessions.read_meta(session_id)
+        assert running.state == "running"
+        assert running.turns == 1
+        # The point of the long `ACPC_HOME` above: no daemon was started, so
+        # `adapter_session_id` below can only have come from the direct path.
+        # Without this the test would silently go back to proving the daemon's
+        # write if the socket-limit mechanism ever stopped forcing direct.
+        assert not (long_home / "daemon").exists()
+        assert running.adapter_session_id is not None
+        assert running.pid is not None
+
+        os.kill(process.pid, signal.SIGKILL)
+        os.kill(running.pid, signal.SIGKILL)
+        release.touch()
+        process.communicate(timeout=10)
+
+        deadline = time.monotonic() + 5
+        unknown = sessions.load(session_id)
+        while unknown.state == "running" and time.monotonic() < deadline:
+            time.sleep(0.05)
+            unknown = sessions.load(session_id)
+        assert unknown.state == "unknown"
+        assert sessions.read_meta(session_id).adapter_session_id is not None
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=10)
+
+    monkeypatch.delenv("ACPC_MOCK_BLOCK_BEFORE_PROMPT")
+    monkeypatch.delenv("ACPC_MOCK_BLOCK_BEFORE_PROMPT_READY")
+
+    resumed = invoke(cli, "continue", session_id, "again", "--quiet")
+
+    assert resumed.exit_code == vocab.EXIT_OK, resumed.stderr
+    assert sessions.load(session_id).state == "succeeded"
 
 
 def test_a_bare_integer_timeout_is_seconds(cli: CliRunner) -> None:

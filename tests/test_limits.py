@@ -334,7 +334,9 @@ def test_resend_after_progress_uses_the_continuation_instruction(
     document = json.loads(result.stdout)
     assert document["status"] == "succeeded"
     assert "working on it" in document["answer"]
-    assert runner.CONTINUATION_INSTRUCTION in document["answer"]
+    # Pinned literally, not just against the function under test (slice 23 review debt).
+    assert "interrupted by a usage limit" in document["answer"]
+    assert runner.continuation_instruction("rate_limit") in document["answer"]
 
 
 # --- behavior: 4/5/6. limit_wait_max = "0s", unknown time, and the wait cap
@@ -464,6 +466,58 @@ def test_steer_in_place_on_a_waiting_session_is_a_conflict(
     thread.join(timeout=15)
     assert "error" not in holder, holder
     assert holder["result"].exit_code == vocab.EXIT_CANCELLED
+
+
+def test_continue_conflict_hint_on_a_waiting_session_names_cancel_then_start(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SPEC.md `continue`: a `waiting` session has nothing in flight for an
+    in-place `steer` to correct, so the conflict's hint names
+    `--steer-mode cancel-then-start` — and the hinted command actually works,
+    unlike a plain `acpc steer <id> "<instruction>"` on this session (see
+    `test_steer_in_place_on_a_waiting_session_is_a_conflict` above)."""
+    monkeypatch.setenv("ACPC_MOCK_LIMIT_PROMPTS", "1")
+    monkeypatch.setenv("ACPC_MOCK_LIMIT_META", "1")
+    monkeypatch.setenv("ACPC_MOCK_LIMIT_RESET_S", "60")
+
+    thread, holder = _run_in_background_thread(
+        cli,
+        "run",
+        "mock",
+        "echo:x",
+        "--json",
+        "--quiet",
+        "--name",
+        "limit-wait-hint",
+        "--timeout",
+        "30",
+    )
+    session_id = _await_alias("limit-wait-hint")
+    _wait_for_state(session_id, "waiting")
+
+    continue_result = invoke(cli, "continue", session_id, "z", "--json", "--quiet")
+    assert continue_result.exit_code == vocab.EXIT_AGENT_ERROR
+    envelope = json.loads(continue_result.stderr)["error"]
+    assert envelope["kind"] == "conflict"
+    hint = envelope["hint"]
+    assert f"acpc steer {session_id}" in hint
+    assert "--steer-mode cancel-then-start" in hint
+    assert f"acpc wait {session_id}" in hint
+
+    # A fresh turn 2's own limit counter restarts at 0; left set, the trigger
+    # would fail turn 2's first call too, contradicting "never a second
+    # conflict" below with a different error.
+    monkeypatch.delenv("ACPC_MOCK_LIMIT_PROMPTS", raising=False)
+
+    steered = invoke(
+        cli, "steer", session_id, "y", "--steer-mode", "cancel-then-start", "--json", "--quiet"
+    )
+    # The hinted command must actually work — never a second `conflict`
+    # (unlike plain `acpc steer` on this same session, asserted above).
+    assert steered.exit_code == vocab.EXIT_OK, steered.stderr
+
+    thread.join(timeout=15)
+    assert "error" not in holder, holder
 
 
 def test_steer_cancel_then_start_on_a_waiting_session_starts_turn_two(

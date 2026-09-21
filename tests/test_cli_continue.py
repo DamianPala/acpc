@@ -2394,6 +2394,36 @@ def test_continue_on_a_running_session_is_a_usage_error(cli: CliRunner, live_dae
     # V2c/M1d: the hint names the running turn's own correction and wait verbs.
     assert f"acpc steer {session_id}" in envelope["hint"]
     assert f"acpc wait {session_id}" in envelope["hint"]
+    # SPEC.md `continue`: `running` has a turn in flight to correct in place,
+    # so the hint does not need `--steer-mode cancel-then-start`.
+    assert "--steer-mode cancel-then-start" not in envelope["hint"]
+
+
+@pytest.mark.parametrize("state", ["starting", "preparing"])
+def test_continue_conflict_hint_names_cancel_then_start_with_nothing_in_flight(
+    cli: CliRunner, state: str
+) -> None:
+    """SPEC.md `continue`: a session with nothing in flight to correct in
+    place — `starting`, `preparing`, `waiting` — hints `--steer-mode
+    cancel-then-start`, so the hinted `steer` never fails with a second
+    `conflict`. `waiting` is covered in test_limits.py, where a session
+    genuinely reaches it; `starting` and `preparing` are set directly, the
+    same technique `test_continue_without_a_message_resumes_an_unknown_turn`
+    uses for `unknown`."""
+    session_id = start_session(cli)
+    meta = sessions.load(session_id)
+    meta.state = state
+    with sessions.session_lock(session_id):
+        sessions.write_meta(meta)
+
+    continued = invoke(cli, "continue", session_id, "turn two")
+
+    assert continued.exit_code == vocab.EXIT_AGENT_ERROR
+    envelope = json.loads(continued.stderr)["error"]
+    assert envelope["kind"] == "conflict"
+    assert "--steer-mode cancel-then-start" in envelope["hint"]
+    assert f"acpc steer {session_id}" in envelope["hint"]
+    assert f"acpc wait {session_id}" in envelope["hint"]
 
 
 def test_continue_preserves_the_global_transcript_cursor(cli: CliRunner) -> None:
@@ -2436,10 +2466,11 @@ def test_continue_without_a_message_resumes_a_canceled_turn(cli: CliRunner) -> N
     assert document["turn"] == 2
     assert document["status"] == "succeeded"
     assert document["capabilities"]["continue_without_message"] is True
-    assert (
-        sessions.prompt_path(session_id).read_text(encoding="utf-8")
-        == runner.CONTINUATION_INSTRUCTION
-    )
+    prompt_text = sessions.prompt_path(session_id).read_text(encoding="utf-8")
+    # Pinned literally, not just against the function under test (slice 23 review debt):
+    # the exact cause-naming text is what reaches the model.
+    assert "was canceled before it finished" in prompt_text
+    assert prompt_text == runner.continuation_instruction("canceled")
 
 
 def test_continue_without_a_message_resumes_a_canceled_turn_in_the_background(
@@ -2461,10 +2492,10 @@ def test_continue_without_a_message_resumes_a_canceled_turn_in_the_background(
     assert waited.exit_code == vocab.EXIT_OK, waited.stderr
     document = json.loads(waited.stdout)
     assert document["turn"] == 2
-    assert (
-        sessions.prompt_path(session_id).read_text(encoding="utf-8")
-        == runner.CONTINUATION_INSTRUCTION
-    )
+    prompt_text = sessions.prompt_path(session_id).read_text(encoding="utf-8")
+    # Pinned literally, not just against the function under test (slice 23 review debt).
+    assert "was canceled before it finished" in prompt_text
+    assert prompt_text == runner.continuation_instruction("canceled")
 
 
 def test_continue_without_a_message_resumes_a_failed_turn(cli: CliRunner) -> None:
@@ -2479,10 +2510,10 @@ def test_continue_without_a_message_resumes_a_failed_turn(cli: CliRunner) -> Non
     document = json.loads(result.stdout)
     assert document["turn"] == 2
     assert document["status"] == "succeeded"
-    assert (
-        sessions.prompt_path(session_id).read_text(encoding="utf-8")
-        == runner.CONTINUATION_INSTRUCTION
-    )
+    prompt_text = sessions.prompt_path(session_id).read_text(encoding="utf-8")
+    # Pinned literally, not just against the function under test (slice 23 review debt).
+    assert "ended with an error before it finished" in prompt_text
+    assert prompt_text == runner.continuation_instruction("failed")
 
 
 def test_continue_without_a_message_resumes_an_unknown_turn(cli: CliRunner) -> None:
@@ -2501,10 +2532,10 @@ def test_continue_without_a_message_resumes_an_unknown_turn(cli: CliRunner) -> N
     assert result.exit_code == vocab.EXIT_OK, result.stderr
     document = json.loads(result.stdout)
     assert document["turn"] == 2
-    assert (
-        sessions.prompt_path(session_id).read_text(encoding="utf-8")
-        == runner.CONTINUATION_INSTRUCTION
-    )
+    prompt_text = sessions.prompt_path(session_id).read_text(encoding="utf-8")
+    # Pinned literally, not just against the function under test (slice 23 review debt).
+    assert "its outcome was not observed" in prompt_text
+    assert prompt_text == runner.continuation_instruction("unknown")
 
 
 def test_continue_without_a_message_after_success_is_a_usage_error(cli: CliRunner) -> None:

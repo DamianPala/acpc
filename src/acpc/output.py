@@ -310,15 +310,17 @@ def _escape_attr(value: str) -> str:
     return "".join(_ATTR_ESCAPES.get(character, character) for character in value)
 
 
-def _escape_answer_controls(text: str) -> str:
+def escape_answer_controls(text: str) -> str:
     """Escape terminal control bytes in a multi-line answer (O3d).
 
     `render.safe_text` does the same job for the condensed, single-line views
     `log` prints, but it collapses its input to one line first — exactly the
-    line structure the answer boundary (V6b) depends on — and importing it
-    here would be circular: `render.py` already imports from this module.
-    This keeps the same escape table (`^[` for ESC, `\\uXXXX` for the other
-    non-printable bytes) but leaves `\\t`, `\\n` and `\\r` alone.
+    line structure the answer boundary (V6b) depends on. This keeps the same
+    escape table (`^[` for ESC, `\\uXXXX` for the other non-printable bytes)
+    but leaves `\\t`, `\\n` and `\\r` alone, so a multi-line answer or agent
+    message keeps its line breaks. `render.py` imports this for `log --prose`
+    and the tagged-document path below uses it directly; `render_result`'s
+    human-terminal path also runs the answer through it before truncation.
     """
     escaped: list[str] = []
     for character in text:
@@ -441,7 +443,7 @@ def render_tagged(
         text = _tagged_document(envelope, _with_next(base_metadata, envelope), None)
         return OutputResult(text, False, len(text.encode("utf-8")))
 
-    displayed = _escape_answer_controls(str(envelope["answer"]))
+    displayed = escape_answer_controls(str(envelope["answer"]))
     metadata = _with_next(dict(base_metadata), envelope)
     full_text = _tagged_document(envelope, metadata, displayed)
     full_size = len(full_text.encode("utf-8"))
@@ -557,7 +559,12 @@ def render_result(
             turn=turn,
         )
         return render_tagged(envelope, max_output=max_output, answer_path=answer_path)
-    return truncate_answer(answer, max_output=max_output, answer_path=answer_path)
+    # V4a/O3d: the human presentation escapes control bytes the same way the
+    # tagged document does, and `--max-output` counts the displayed bytes —
+    # so escaping runs before truncation, not after.
+    return truncate_answer(
+        escape_answer_controls(answer), max_output=max_output, answer_path=answer_path
+    )
 
 
 def emit_result(

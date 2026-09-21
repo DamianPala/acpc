@@ -531,7 +531,8 @@ def meta_from_dict(data: Mapping[str, Any], *, path: Path) -> SessionMeta:
         raise CorruptSessionError(f"{path}: resolution is not an object")
 
     exit_code = _coerce_int(known.get("exit_code"), "exit_code", path)
-    stop_reason = _coerce_str(known.get("stop_reason"), "stop_reason", path)
+    raw_stop_reason = _coerce_str(known.get("stop_reason"), "stop_reason", path)
+    stop_reason = vocab.normalize_stop_reason(raw_stop_reason)
     if raw_state_text == "timeout":
         # Legacy timeout was a terminal session state; in 1.0 only a client's
         # wait deadline uses 124, so a migrated failed turn uses its canonical

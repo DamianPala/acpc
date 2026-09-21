@@ -1286,6 +1286,82 @@ def test_a_daemon_cold_resume_prefers_session_resume(
     assert 'You asked: "turn two"' in answer
 
 
+# --- cancellation spelling ---------------------------------------------------
+
+
+def test_an_adapter_side_cancel_normalizes_the_stop_reason_spelling(
+    state_root: Path, live_daemon: None
+) -> None:
+    """SPEC.md *Session states*: `stop_reason: canceled` whichever side
+    canceled it. The mock adapter itself reports the ACP wire spelling
+    `cancelled` in its `PromptResponse` once acpc's `cancel` reaches it
+    (`tests/mock_agent.py`'s `slow:` scenario); acpc's own `stop_reason`
+    normalizes that to `canceled` — never the raw ACP literal.
+    """
+    session_id = new_session("slow:30 adapter cancel")
+    problem = asyncio.run(
+        runner.dispatch_background(
+            session_id, runner.TurnRequest(resolution=resolve(), prompt="slow:30 adapter cancel")
+        )
+    )
+    assert problem is None
+    _assert_state(session_id, "running")
+
+    cli = CliRunner()
+    canceled = cli.invoke(main, ["cancel", session_id, "--json"], catch_exceptions=False)
+    assert canceled.exit_code == vocab.EXIT_OK, canceled.stderr
+    cancel_payload = json.loads(canceled.stdout)
+    assert cancel_payload["status"] == "canceled"
+    assert cancel_payload["stop_reason"] == "canceled"
+
+    meta = _wait_for_finished(session_id)
+    assert meta.state == "canceled"
+    assert meta.stop_reason == "canceled"
+
+    status = cli.invoke(main, ["status", session_id, "--json"], catch_exceptions=False)
+    assert json.loads(status.stdout)["stop_reason"] == "canceled"
+
+    waited = cli.invoke(main, ["wait", session_id, "--json"], catch_exceptions=False)
+    assert json.loads(waited.stdout)["stop_reason"] == "canceled"
+
+    transcript_text = sessions.transcript_path(session_id).read_text(encoding="utf-8")
+    assert '"cancelled"' not in transcript_text
+
+
+def test_a_legacy_meta_json_cancelled_stop_reason_reads_back_normalized(
+    state_root: Path,
+) -> None:
+    session_id = new_session("legacy cancelled spelling")
+    meta_path = sessions.session_dir(session_id) / "meta.json"
+    raw = json.loads(meta_path.read_text(encoding="utf-8"))
+    raw["status"] = "canceled"
+    raw["stop_reason"] = "cancelled"
+    meta_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    meta = sessions.read_meta(session_id)
+
+    assert meta.stop_reason == "canceled"
+
+
+def test_a_legacy_meta_json_preparation_cancelled_spelling_reads_back_normalized(
+    state_root: Path,
+) -> None:
+    """Slice 23 round 2: `cancelled during preparation` was acpc's own
+    pre-slice-23 spelling of the no-prompt-sent reason, and is normalized on
+    read the same way the ACP wire spelling `cancelled` is."""
+    session_id = new_session("legacy preparation-cancelled spelling")
+    meta_path = sessions.session_dir(session_id) / "meta.json"
+    raw = json.loads(meta_path.read_text(encoding="utf-8"))
+    raw["status"] = "canceled"
+    raw["stop_reason"] = "cancelled during preparation"
+    meta_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    meta = sessions.read_meta(session_id)
+
+    assert meta.stop_reason == "canceled during preparation"
+    assert meta.stop_reason == runner.PREPARATION_CANCELLED_REASON
+
+
 # --- stopping ---------------------------------------------------------------
 
 
@@ -1345,6 +1421,70 @@ def test_killed_adapter_records_a_failure_event(state_root: Path, live_daemon: N
     assert "adapter" in error_events[-1]["message"].lower(), error_events
     assert error_events[-1]["observation"]
     assert error_events[-1]["next_step"].startswith("inspect the daemon log at")
+
+
+def test_a_daemon_killed_during_turn_one_still_leaves_a_continuable_session(
+    state_root: Path, live_daemon: None
+) -> None:
+    """SPEC.md *State on disk*: the adapter session id is recorded as soon as
+    the adapter has accepted the session, before the prompt is sent — so a
+    daemon killed mid-turn-1 still leaves `adapter_session_id` on disk and
+    `continue` takes the normal cold-resume path instead of `corrupt_state`.
+    """
+    import os
+    import signal
+
+    # `new_session`'s inline `resolution_payload` lacks the `adapter`/full
+    # `command` fields `continue` needs (they only land through a real CLI
+    # dispatch's `session_resolution`), so this session is started for real.
+    cli = CliRunner()
+    started = cli.invoke(
+        main,
+        ["run", "mock", "slow:30 daemon killed turn one", "--bg", "--json"],
+        catch_exceptions=False,
+    )
+    assert started.exit_code == vocab.EXIT_OK, started.stderr
+    session_id = json.loads(started.stdout)["session_id"]
+    _assert_state(session_id, "running")
+
+    # `running` is marked before `session/new` returns, so poll rather than
+    # assume: once the adapter has accepted the session (still well inside
+    # `slow:`'s own wait), its id must already be on disk.
+    deadline = time.monotonic() + 10
+    adapter_session_id = None
+    while time.monotonic() < deadline:
+        adapter_session_id = sessions.read_meta(session_id).adapter_session_id
+        if adapter_session_id is not None:
+            break
+        time.sleep(0.05)
+    assert adapter_session_id is not None
+
+    daemon_pid = asyncio.run(_daemon_pid())
+    os.kill(daemon_pid, signal.SIGKILL)
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline and _pid_alive(daemon_pid):
+        time.sleep(0.1)
+    assert not _pid_alive(daemon_pid)
+
+    # An exiting process drops its cmdline before it reaches the zombie state
+    # liveness reads, so `_pid_alive` can go false a moment before `load`
+    # calls the host dead. Poll instead of racing that window.
+    deadline = time.monotonic() + 20
+    observed = sessions.load(session_id)
+    while observed.state == "running" and time.monotonic() < deadline:
+        time.sleep(0.05)
+        observed = sessions.load(session_id)
+    assert observed.state == "unknown"
+    assert sessions.read_meta(session_id).adapter_session_id is not None
+
+    continued = cli.invoke(
+        main, ["continue", session_id, "again", "--json"], catch_exceptions=False
+    )
+
+    assert continued.exit_code == vocab.EXIT_OK, continued.stderr
+    document = json.loads(continued.stdout)
+    assert document["turn"] == 2
+    assert document.get("resume")
 
 
 def test_authentication_refusal_records_the_remedy_even_with_an_empty_log(

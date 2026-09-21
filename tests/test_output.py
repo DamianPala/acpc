@@ -35,6 +35,38 @@ def test_answer_truncation_keeps_head_marker_and_utf8_boundary(tmp_path: Path) -
     assert "-tail" not in result.text
 
 
+def test_human_path_escapes_control_bytes_and_keeps_line_structure() -> None:
+    """SPEC.md *Text presentation*: the human answer escapes control bytes the
+    same way the tagged document does, keeping `\\t`, `\\n` and `\\r` literal."""
+    meta = make_session(Path("."))
+    answer = "safe\x1b[31mred\x1b[0m\x9binjected\ttab\nline\r\n"
+
+    result = output.render_result(meta, answer, max_output=0)
+
+    assert "\x1b" not in result.text
+    assert "\x9b" not in result.text
+    assert "^[[31mred^[[0m" in result.text
+    assert "\\u009b" in result.text
+    assert "\ttab" in result.text
+    assert "\nline" in result.text
+    assert "\r\n" in result.text
+
+
+def test_human_path_truncation_counts_the_escaped_bytes() -> None:
+    """`--max-output` on the human path bounds what is actually displayed:
+    escaping ESC to `^[` doubles its byte length, so a cap sized to the raw
+    answer's bytes must still truncate the escaped, longer text."""
+    meta = make_session(Path("."))
+    answer = "\x1b[31m" * 500
+    raw_size = len(answer.encode("utf-8"))
+
+    result = output.render_result(meta, answer, max_output=raw_size)
+
+    assert result.truncated is True
+    assert "\x1b" not in result.text
+    assert len(result.text.encode("utf-8")) <= raw_size
+
+
 def test_answer_cap_zero_disables_truncation() -> None:
     meta = make_session(Path("."))
     answer = "🙂" * 1000

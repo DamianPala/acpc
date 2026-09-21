@@ -191,6 +191,16 @@ async def ensure_daemon(target: str) -> DaemonConnection | DaemonUnavailable:
     Returns a live connection, or `DaemonUnavailable` naming why the direct
     path has to be used instead.
     """
+    try:
+        # SPEC.md `daemon`: a socket path that still exceeds the platform
+        # limit after hashing starts no daemon at all — resolved here, before
+        # any connect or spawn attempt, so the caller sees the real cause
+        # (the path limit and its `ACPC_HOME` remedy) instead of a generic
+        # "did not come up" from a spawn that was always going to fail.
+        ipc.socket_path_for_target(target)
+    except ValueError as error:
+        return DaemonUnavailable(str(error))
+
     existing = await connect(target)
     if existing is not None:
         return existing

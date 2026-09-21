@@ -134,6 +134,23 @@ def test_an_unusable_socket_path_degrades_with_a_reason() -> None:
     assert routed.reason
 
 
+def test_a_socket_path_too_long_even_hashed_reports_unavailable_before_spawning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, live_daemon: None
+) -> None:
+    """SPEC.md `daemon`: the call reports `unavailable` naming the limit and
+    a shorter `ACPC_HOME`, and never spawns a daemon that was always going to
+    fail on the same path — no daemon directory is even created."""
+    long_home = tmp_path / ("x" * 150)
+    monkeypatch.setenv("ACPC_HOME", str(long_home))
+
+    routed = asyncio.run(daemon_client.ensure_daemon("mock"))
+
+    assert isinstance(routed, daemon_client.DaemonUnavailable)
+    assert "ACPC_HOME" in routed.reason
+    assert "108" in routed.reason or "104" in routed.reason
+    assert not (long_home / "daemon").exists()
+
+
 def test_cancelling_a_target_with_no_daemon_is_not_an_error() -> None:
     result = asyncio.run(daemon_client.cancel_turn(target_name(), "abcd"))
     assert isinstance(result, daemon_client.DaemonUnavailable)

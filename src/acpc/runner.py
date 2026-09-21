@@ -553,7 +553,7 @@ def exit_code_for(state: str, stop_reason: str | None = None) -> int:
 def _state_for_stop_reason(stop_reason: str | None) -> str:
     if stop_reason == "end_turn":
         return "succeeded"
-    if stop_reason == "cancelled":
+    if stop_reason in ("cancelled", "canceled"):
         return "canceled"
     if stop_reason in _FAILURE_STOP_REASONS:
         return "failed"
@@ -664,12 +664,16 @@ class _CancelSignal:
         self.request("failed", stop_reason="permission_denied")
 
 
-PREPARATION_CANCELLED_REASON = "cancelled during preparation"
+# SPEC.md *Session states*: "A canceled turn records `stop_reason: canceled`
+# whichever side canceled it, or `canceled during preparation` when the
+# cancel landed before any prompt was sent" — acpc's own public spelling
+# (slice 23 review debt: this used to be the ACP wire spelling `cancelled`).
+PREPARATION_CANCELLED_REASON = "canceled during preparation"
 
 
 def preparation_cancelled_answer(session_id: str) -> str:
     """Explain a cancellation for which no prompt crossed the ACP boundary."""
-    return f"Session {session_id} was cancelled during preparation; no prompt was sent.\n"
+    return f"Session {session_id} was canceled during preparation; no prompt was sent.\n"
 
 
 async def _drive_turn(
@@ -738,6 +742,10 @@ async def _drive_turn(
                 session = await conn.new_session(cwd=request.cwd or os.getcwd(), mcp_servers=[])
                 adapter_session_id = session.session_id
                 client.capture_advertised(session)
+                # SPEC.md *State on disk*: recorded as soon as the adapter has
+                # accepted the session, before the prompt is sent, so a host
+                # process lost mid-turn still leaves a continuable session.
+                sessions.update_meta(session_id, adapter_session_id=adapter_session_id)
 
             # After the restore, never before it: codex-acp#343 resets model and
             # effort during session/load, so applying them first would be lost.
@@ -771,6 +779,9 @@ async def _drive_turn(
     if cancel.stop_reason is not None:
         stop_reason = cancel.stop_reason
     state = cancel.state if cancel.state is not None else _state_for_stop_reason(stop_reason)
+    # SPEC.md *Session states*: the adapter's `cancelled` stop reason is
+    # normalized to acpc's own `canceled` when the turn ends.
+    stop_reason = vocab.normalize_stop_reason(stop_reason)
     return TurnOutcome(
         state=state,
         stop_reason=stop_reason,
@@ -1034,12 +1045,41 @@ def _stop_reason_of(
 # SPEC.md `run`: sent instead of the original prompt when a limit interrupted
 # it after the turn had already recorded progress, so the adapter continues
 # the same task rather than restarting it. Shared with `continue` without a
-# message (slice 19).
-CONTINUATION_INSTRUCTION = (
-    "acpc: the previous request in this turn was interrupted by a usage limit that has now "
-    "reset. Continue the task from where you stopped. Do not repeat work that is already "
-    "done; if the task was already complete, reply with the final answer."
-)
+# message (slice 19), which names the actual cause instead of always blaming
+# a usage limit (slice 23 review debt).
+_CONTINUATION_TEXTS = {
+    "rate_limit": (
+        "acpc: the previous request in this turn was interrupted by a usage limit that has now "
+        "reset. Continue the task from where you stopped. Do not repeat work that is already "
+        "done; if the task was already complete, reply with the final answer."
+    ),
+    "canceled": (
+        "acpc: the previous turn of this session was canceled before it finished. Continue the "
+        "task from where it stopped. Do not repeat work that is already done; if the task was "
+        "already complete, reply with the final answer."
+    ),
+    "failed": (
+        "acpc: the previous turn of this session ended with an error before it finished. "
+        "Continue the task from where it stopped. Do not repeat work that is already done; if "
+        "the task was already complete, reply with the final answer."
+    ),
+    "unknown": (
+        "acpc: the previous turn of this session was interrupted and its outcome was not "
+        "observed. Continue the task from where it stopped. Do not repeat work that is already "
+        "done; if the task was already complete, reply with the final answer."
+    ),
+}
+
+
+def continuation_instruction(cause: str) -> str:
+    """SPEC.md `continue`: the fixed instruction naming how the previous turn ended.
+
+    `cause` is one of `rate_limit`, `canceled`, `failed` or `unknown` — the
+    limit resumption always passes `rate_limit`; `continue` without a message
+    passes the session's own last terminal state.
+    """
+    return _CONTINUATION_TEXTS[cause]
+
 
 # How long acpc waits past a limit's own reported reset before resuming: a
 # fixed cushion for clock skew against the vendor's clock.
@@ -1205,7 +1245,9 @@ async def run_prompt_with_limits(
         events.append("state", **{"from": "waiting", "to": "running"})
         sessions.transition(session_id, "running", limit=limit_record)
         prompt_text = (
-            request.prompt if not client.has_recorded_progress else CONTINUATION_INSTRUCTION
+            request.prompt
+            if not client.has_recorded_progress
+            else continuation_instruction("rate_limit")
         )
 
 
@@ -1357,7 +1399,7 @@ async def _cancel_before_route_acceptance(
             raise ResumePreparationError(str(error)) from None
 
     outcome = TurnOutcome(
-        state=cancel.state or "cancelled",
+        state=cancel.state or "canceled",
         stop_reason=PREPARATION_CANCELLED_REASON,
         answer=preparation_cancelled_answer(session_id),
         turn_token=request.turn_token,
@@ -1640,19 +1682,24 @@ def _answer_on_disk(session_id: str) -> str:
         return ""
 
 
-async def dispatch_background(session_id: str, request: TurnRequest) -> str | None:
+async def dispatch_background(
+    session_id: str, request: TurnRequest
+) -> str | daemon_client.DaemonUnavailable | None:
     """Start a turn the caller will not wait for; None on success.
 
     `--background` needs an owner that outlives this process, which is exactly what the
     daemon is. Without one there is nobody to hand the session to, so this
-    reports why instead of silently running a child that dies on exit.
+    reports why instead of silently running a child that dies on exit — as a
+    `DaemonUnavailable` (SPEC.md `daemon`: reported to the caller as
+    `unavailable`), kept apart from a plain string once the daemon accepted
+    the turn and then refused it, which is an ordinary agent failure.
     """
     forced = routes_direct(request)
     if forced is not None:
-        return f"--background needs the daemon, and {forced}"
+        return daemon_client.DaemonUnavailable(f"--background needs the daemon, and {forced}")
     routed = await daemon_client.ensure_daemon(daemon_target(request.resolution))
     if isinstance(routed, daemon_client.DaemonUnavailable):
-        return f"--background needs the daemon: {routed.reason}"
+        return daemon_client.DaemonUnavailable(f"--background needs the daemon: {routed.reason}")
     try:
         started = await routed.start_turn(session_id, daemon_payload(request))
         if not started.get("ok"):

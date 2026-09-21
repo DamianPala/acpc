@@ -522,8 +522,10 @@ def test_a_call_that_observed_no_turn_writes_nothing_to_stdout(cli: CliRunner) -
             ("run", "mock", "hello", "--background", "--timeout", "1", "--json"),
         ),
         (
+            # SPEC.md `daemon`: a `--background` call the daemon cannot serve
+            # reports `unavailable`, not a generic agent failure.
             vocab.EXIT_AGENT_ERROR,
-            errors.AGENT_ERROR,
+            errors.UNAVAILABLE,
             ("run", "mock", "hello", "--background", "--json"),
         ),
         (vocab.EXIT_AGENT_ERROR, errors.NOT_FOUND, ("continue", "zzzz", "hello", "--json")),
@@ -576,11 +578,12 @@ def test_a_call_without_a_result_creates_no_output_file(cli: CliRunner, tmp_path
             ("run", "no-such-agent", "hello", "--json", "--quiet"),
         ),
         # A dispatch that never started a turn is no result either: the daemon
-        # is unavailable here, so `--background` fails before the turn begins.
+        # is unavailable here, so `--background` fails before the turn begins
+        # (SPEC.md `daemon`: reported as `unavailable`).
         (
             "undispatched.json",
             vocab.EXIT_AGENT_ERROR,
-            errors.AGENT_ERROR,
+            errors.UNAVAILABLE,
             ("run", "mock", "hello", "--background", "--json", "--quiet"),
         ),
         # V5a: a client deadline never produces a result document either, so
