@@ -5,6 +5,28 @@ it appears (flags, `status` output, `log` footers, `meta.json`). Keeping them
 in one dependency-free module lets every layer import them without cycles.
 """
 
+from typing import TypedDict
+
+
+class ContextOccupancy(TypedDict):
+    """Context occupancy as last reported by the adapter (SPEC.md `status`).
+
+    `used` is tokens in the context at the last report, `size` is the context
+    window (`None` when the adapter did not report it) and `peak` is the
+    largest `used` observed over the session, earlier turns included. A
+    `TypedDict` rather than a dataclass: every surface that carries this
+    (`meta.json`, the JSON result documents, the tagged `<metadata>` block)
+    writes it straight into a JSON payload, so being a plain dict already
+    needs no conversion step. One definition, shared by `client.py`,
+    `runner.py`, `daemon.py` and `sessions.py` so a session's context
+    occupancy is the same object everywhere it appears.
+    """
+
+    used: int
+    size: int | None
+    peak: int
+
+
 # Superset reasoning-effort scale, mapped per adapter (SPEC.md `run --effort`).
 EFFORT_VALUES = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
 

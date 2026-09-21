@@ -1,4 +1,4 @@
-"""Behavioral tests for cumulative token and cost reporting."""
+"""Behavioral tests for context-occupancy reporting (`used`/`size`/`peak`)."""
 
 from __future__ import annotations
 
@@ -49,13 +49,15 @@ def invoke(cli: CliRunner, *args: str):
 
 
 @pytest.mark.parametrize("use_daemon", [False, True], ids=["direct", "daemon"])
-def test_prompt_meta_usage_uses_latest_tokens_and_accumulates_cost(
+def test_prompt_meta_usage_sets_used_and_peak_with_null_size(
     cli: CliRunner,
     use_daemon: bool,
     live_daemon: None,
     monkeypatch: pytest.MonkeyPatch,
     state_root: Path,
 ) -> None:
+    """The Grok `_meta.totalTokens` path never learns a context window size and
+    never parses a cost — all cost parsing went with the `costUsdTicks` hack."""
     if not use_daemon:
 
         async def unavailable(target: str) -> daemon_client.DaemonUnavailable:
@@ -67,7 +69,7 @@ def test_prompt_meta_usage_uses_latest_tokens_and_accumulates_cost(
     assert first.exit_code == 0, first.stderr
     first_payload = json.loads(first.stdout)
     session_id = first_payload["session_id"]
-    assert first_payload["cost"] == pytest.approx(0.1)
+    assert first_payload["context"] == {"used": 120, "size": None, "peak": 120}
 
     second = invoke(
         cli,
@@ -78,21 +80,20 @@ def test_prompt_meta_usage_uses_latest_tokens_and_accumulates_cost(
     )
     assert second.exit_code == 0, second.stderr
     second_payload = json.loads(second.stdout)
-    assert second_payload["cost"] == pytest.approx(0.3)
-    assert "80 tok" in second.stderr
-    assert "cost $0.30" in second.stderr
+    assert second_payload["context"] == {"used": 80, "size": None, "peak": 120}
+    assert "ctx 80, peak 120" in second.stderr
+    assert "cost" not in second.stderr
 
     final = sessions.read_meta(session_id)
-    assert final.tokens == 80
-    assert final.cost == pytest.approx(0.3)
+    assert final.context == {"used": 80, "size": None, "peak": 120}
     status = json.loads(invoke(cli, "status", session_id, "--json").stdout)
-    assert status["tokens"] == 80
-    assert status["cost"] == pytest.approx(0.3)
+    assert status["context"] == {"used": 80, "size": None, "peak": 120}
     meta = json.loads(
         (state_root / "sessions" / session_id / "meta.json").read_text(encoding="utf-8")
     )
-    assert meta["tokens"] == 80
-    assert meta["cost"] == pytest.approx(0.3)
+    assert meta["context"] == {"used": 80, "size": None, "peak": 120}
+    assert "tokens" not in meta
+    assert "cost" not in meta
 
     events = [
         json.loads(line)
@@ -102,44 +103,47 @@ def test_prompt_meta_usage_uses_latest_tokens_and_accumulates_cost(
         if line
     ]
     usage = [event for event in events if event.get("type") == "usage"]
-    assert [(event["tokens"], event["cost"]) for event in usage] == [
-        (120, pytest.approx(0.1)),
-        (80, pytest.approx(0.3)),
-    ]
+    assert [(event["used"], event["size"]) for event in usage] == [(120, None), (80, None)]
+    assert all("cost" not in event for event in usage)
 
 
 def test_continue_after_unobserved_usage_reports_the_first_observed_total(
     cli: CliRunner,
 ) -> None:
-    """SPEC.md V6c: an unobserved first turn (`tokens: null`) does not stop a
+    """SPEC.md V6c: an unobserved first turn (`context: null`) does not stop a
     later turn's real usage from being reported once the adapter sends it."""
     first = invoke(cli, "run", "mock", "echo:no usage yet", "--json")
     assert first.exit_code == 0, first.stderr
     first_payload = json.loads(first.stdout)
     session_id = first_payload["session_id"]
-    assert first_payload["tokens"] is None
+    assert first_payload["context"] is None
 
     second = invoke(cli, "continue", session_id, "meta:1200:1000000000:now observed", "--json")
     assert second.exit_code == 0, second.stderr
     second_payload = json.loads(second.stdout)
 
-    assert second_payload["tokens"] == 1200
-    assert sessions.read_meta(session_id).tokens == 1200
+    assert second_payload["context"] == {"used": 1200, "size": None, "peak": 1200}
+    assert sessions.read_meta(session_id).context == {"used": 1200, "size": None, "peak": 1200}
 
 
 def test_streamed_usage_wins_over_prompt_meta(cli: CliRunner) -> None:
+    """The real ACP `usage_update` path (`size` always reported by the mock
+    agent) wins over the `_meta`-only path; acpc never renders the adapter's
+    own cost figure, even though the transcript keeps it."""
     result = invoke(cli, "run", "mock", "both:700:3000000000:stream wins", "--json")
 
     assert result.exit_code == 0, result.stderr
     payload = json.loads(result.stdout)
     final = sessions.read_meta(payload["session_id"])
-    assert final.tokens == 700
-    assert final.cost == pytest.approx(0.3)
-    assert payload["cost"] == pytest.approx(0.3)
-    assert "cost $0.30" in result.stderr
+    assert final.context == {"used": 700, "size": 200_000, "peak": 700}
+    assert payload["context"] == {"used": 700, "size": 200_000, "peak": 700}
+    assert "cost" not in result.stderr
+    assert "ctx 700/200k, peak 700" in result.stderr
 
 
-def test_streamed_usage_uses_latest_tokens_and_keeps_prior_cost(cli: CliRunner) -> None:
+def test_streamed_usage_uses_latest_used_and_keeps_the_larger_peak(cli: CliRunner) -> None:
+    """SPEC.md `status`: `peak` is the largest `used` observed over the
+    session, earlier turns included — it survives a smaller `continue`."""
     first = invoke(cli, "run", "mock", "both:700:3000000000:first stream", "--json")
     assert first.exit_code == 0, first.stderr
     session_id = json.loads(first.stdout)["session_id"]
@@ -155,9 +159,8 @@ def test_streamed_usage_uses_latest_tokens_and_keeps_prior_cost(cli: CliRunner) 
 
     payload = json.loads(second.stdout)
     final = sessions.read_meta(session_id)
-    assert final.tokens == 500
-    assert final.cost == pytest.approx(0.3)
-    assert payload["cost"] == pytest.approx(0.3)
+    assert final.context == {"used": 500, "size": 200_000, "peak": 700}
+    assert payload["context"] == {"used": 500, "size": 200_000, "peak": 700}
 
 
 def test_prompt_meta_usage_flushes_pending_prose_before_usage(cli: CliRunner) -> None:

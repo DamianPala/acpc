@@ -12,8 +12,9 @@ from acpc import sessions, transcript, vocab
 from acpc.output import (
     collection_envelope,
     escape_answer_controls,
+    format_context,
     format_duration,
-    format_tokens,
+    format_k,
     session_capabilities,
     status_permissions,
 )
@@ -172,8 +173,7 @@ def format_event(
         snippet = _message_snippet(text, full=full_message)
         char_count = ""
         if len(text) >= 1024:
-            compact_count = format_tokens(len(text)).removesuffix(" tok")
-            char_count = f" ({compact_count} chars)"
+            char_count = f" ({format_k(len(text))} chars)"
         return f"[{timestamp}] {label}{json.dumps(snippet, ensure_ascii=False)}{char_count}"
     if event_type == "tool":
         name = _single_line(event.get("name", "tool"))
@@ -207,14 +207,17 @@ def format_event(
     if event_type == "state":
         return f"[{timestamp}] {label}{event.get('from', '?')} → {event.get('to', '?')}"
     if event_type == "usage":
-        cost = event.get("cost")
-        cost_text = ""
-        if isinstance(cost, (int, float)) and not isinstance(cost, bool):
-            cost_text = f" · cost ${cost:.2f}"
-        # V6c: a cost-only observation carries no token count; show `·`, not 0.
-        tokens = event.get("tokens")
-        tokens_text = "·" if tokens is None else str(tokens)
-        return f"[{timestamp}] {label}{tokens_text} tok{cost_text}"
+        # Legacy events (written before 1.0) carry `tokens` in place of `used`;
+        # SPEC.md *State on disk* has them read the same way. `log` never
+        # renders `cost` or `meta`, even when a fresh event carries them —
+        # acpc reports no cost anywhere.
+        used = event.get("used", event.get("tokens"))
+        size = event.get("size")
+        if used is None:
+            return f"[{timestamp}] {label}ctx ·"
+        if size is None:
+            return f"[{timestamp}] {label}ctx {format_k(used)}"
+        return f"[{timestamp}] {label}ctx {format_k(used)}/{format_k(size)}"
     if event_type == "limit":
         resume_at = event.get("resume_at") or "?"
         action = _single_line(event.get("action", "?"))
@@ -286,8 +289,27 @@ def _truncation_note(path: Path | str) -> str:
     return f"[output truncated; full transcript: {path}]"
 
 
+def _sanitized_usage_event(event: Mapping[str, Any]) -> dict[str, Any]:
+    """Publish a stored `usage` event without the adapter's `cost` or `meta`.
+
+    SPEC.md `log`: `--format ndjson`'s one exception is a `usage` record:
+    "the adapter's `cost` and `meta` stay on disk and are not published, every
+    other stored field is, a record written before 1.0 has its `tokens`
+    published as `used`, and `size` is `null` when the record has none."
+    The on-disk key order is kept.
+    """
+    sanitized: dict[str, Any] = {}
+    for key, value in event.items():
+        if key in ("cost", "meta"):
+            continue
+        sanitized["used" if key == "tokens" else key] = value
+    sanitized.setdefault("size", None)
+    return sanitized
+
+
 def _json_line(event: Mapping[str, Any]) -> str:
-    return json.dumps(dict(event), ensure_ascii=False, separators=(",", ":")) + "\n"
+    payload = _sanitized_usage_event(event) if event.get("type") == "usage" else dict(event)
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
 
 def _continues_message(events: Sequence[Mapping[str, Any]], index: int) -> bool:
@@ -477,7 +499,7 @@ def format_log_footer(
         parts = [
             f"{meta.state}{qualifier}",
             format_duration(runtime),
-            format_tokens(meta.tokens),
+            format_context(meta.context),
             f"answer: {sessions.answer_path(meta.session_id)}",
         ]
     else:
@@ -612,12 +634,12 @@ def render_status_detail(
     idle_seconds = _idle_seconds(meta, now=now)
     idle = f" · idle {format_duration(idle_seconds)}" if idle_seconds is not None else ""
     exit_text = f"exit {meta.exit_code}" if meta.exit_code is not None else "exit ·"
-    tokens = format_tokens(meta.tokens)
+    context_text = format_context(meta.context)
     name = safe_text(meta.name) if meta.name else "·"
     directory = _display_path(sessions.session_dir(meta.session_id))
     model = meta.resolved_model or "·"
     lines = [
-        f"status   {safe_text(meta.state)}{idle} · {exit_text} · {runtime} · {tokens}",
+        f"status   {safe_text(meta.state)}{idle} · {exit_text} · {runtime} · {context_text}",
         (
             f"agent    {safe_text(meta.entry)} ({safe_text(meta.base_adapter)}) · "
             f"model: {safe_text(model)} · name: {name}"
@@ -712,8 +734,7 @@ def status_detail_json(
         "name": meta.name,
         "runtime_seconds": runtime_seconds,
         "idle_seconds": _idle_seconds(meta, now=now),
-        "tokens": meta.tokens,
-        "cost": meta.cost,
+        "context": meta.context,
         "exit_code": meta.exit_code,
         "stop_reason": meta.stop_reason,
         "failure": meta.failure,

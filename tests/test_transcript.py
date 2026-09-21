@@ -91,7 +91,7 @@ def test_append_assigns_wire_fields_and_allows_unknown_fields(
     transcript = Transcript(transcript_path, clock=lambda: 1234.5)
 
     first = transcript.append("msg", text="hello", source="agent")
-    second = transcript.append({"type": "usage", "tokens": 42, "cost": 0.01, "i": 999, "ts": 1235})
+    second = transcript.append({"type": "usage", "used": 42, "size": 200_000, "i": 999, "ts": 1235})
 
     assert first == {
         "type": "msg",

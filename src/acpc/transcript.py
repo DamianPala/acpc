@@ -34,7 +34,7 @@ _REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "permission": ("kind", "decision"),
     "error": ("message",),
     "state": ("from", "to"),
-    "usage": ("tokens", "cost"),
+    "usage": ("used", "size"),
     # SPEC.md `steer`: every correction is recorded with what acpc sent and
     # what the adapter answered, so the transcript says why a mode was chosen.
     "steer": ("mode", "text", "outcome"),

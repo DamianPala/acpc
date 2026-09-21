@@ -498,8 +498,7 @@ class TurnOutcome:
     state: str
     stop_reason: str | None
     answer: str
-    tokens: int | None = None
-    cost: float | None = None
+    context: vocab.ContextOccupancy | None = None
     denied: dict[str, int] = field(default_factory=dict)
     denial_details: dict[str, dict[str, Any]] = field(default_factory=dict)
     adapter_session_id: str | None = None
@@ -695,8 +694,7 @@ async def _drive_turn(
         end_turn=cancel.end_turn,
         cancellation_dispatched=cancel.cancellation_dispatched,
         permission_prompt=request.permission_prompt,
-        previous_tokens=stored.tokens,
-        previous_cost=stored.cost,
+        previous_context=stored.context,
     )
     turn_error: BaseException | None = None
 
@@ -786,8 +784,7 @@ async def _drive_turn(
         state=state,
         stop_reason=stop_reason,
         answer=client.answer,
-        tokens=client.tokens,
-        cost=client.cost,
+        context=client.context,
         denied=client.denied,
         denial_details=client.denial_details,
         adapter_session_id=adapter_session_id,
@@ -1488,8 +1485,7 @@ async def _execute_direct_with_wait_timeout(
                 state=current.state,
                 stop_reason=current.stop_reason,
                 answer=_answer_on_disk(session_id),
-                tokens=current.tokens,
-                cost=current.cost,
+                context=current.context,
                 finalized_elsewhere=True,
                 route_note=route_note,
             )
@@ -1872,8 +1868,7 @@ def _finalize(
             expected_turn=expected_turn,
             exit_code=outcome.exit_code,
             stop_reason=outcome.stop_reason,
-            tokens=outcome.tokens,
-            cost=outcome.cost,
+            context=outcome.context,
             denied=outcome.denied,
             denial_details=outcome.denial_details,
             error_event=error_event,

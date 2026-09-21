@@ -28,10 +28,22 @@ every complaint aimed at help prose, none at behavior. Fixed the same day in tex
 cheat sheet no longer promises `--dry-run` on `delete`, says `steer` blocks until the turn ends
 and that `wait` prints the tagged document; the three `--background` descriptions and the README
 say a receipt names the id (`--json` carries `session_id`), and the global `--json` description
-says which commands already answer JSON off a TTY. The `main` worktree still holds the uncommitted 2026-09-08 change set (six files);
-slice 24 carries its facts, so those files are to be reverted there before the merge (Damian's
-call). After the merge: `docs/plans/1.0/close/host-migration-checklist.md` (five host files read
-the old surface), `acpc daemon stop`, reinstall from `main`, `acpc -V`.
+says which commands already answer JSON off a TTY. Then slice 25, reopened the same day on
+Damian's ruling (`feat!`: `context {used, size, peak}` replaces `tokens` and `cost` on every
+agent-facing surface; acpc publishes no cost anywhere; the adapter's `cost` and the raw `_meta`
+of each `usage_update` stay in the transcript's `usage` events and `log` never publishes them;
+`meta.json` files from 0.7.1 read `tokens` as `context` and lose `cost` on their first rewrite;
+the result field `context` and the error envelope's `error.context` are told apart by path in
+SPEC and help; two builder rounds, two review rounds, nine mutations killed after the second
+round added the `log --json` tests the first had missed). Gate on the final tree: 1383 tests with
+`ACPC_STANDARD_CHECKOUT`, ruff/pyright clean, smoke 605/605, `acpc schema` free of `cost`.
+CI: `.github/workflows/gate.yml` runs that gate on `ubuntu-latest` and `macos-latest` for every
+push to `main`, every `v*` tag and every PR; its first run happens on the 1.0.0 push, so a macOS
+surprise becomes 1.0.1. Windows is a design port (Unix sockets in `ipc.py`, `fcntl` locks,
+process groups and signals in `proc.py`/`runner.py`), planned in the 1.1 backlog, not a runner.
+After the merge: `docs/plans/1.0/close/host-migration-checklist.md` (five host files read the
+old surface, all done), `acpc daemon stop`, reinstall from `main`, `acpc -V`, then a read-only
+`acpc list` and `acpc status` over the real `~/.acpc` to see the 0.7.1 sessions migrate.
 
 Left for 1.1 (from the recon in `docs/plans/1.0/recon/` and the reviews): `--max-output` below the
 wrapper's fixed overhead; the clamp suffix in `permissions.source` and the doubled clamp in the
@@ -44,8 +56,14 @@ whitespace is not a terminal sequence). From the cold-start probe: `log --prose`
 message boundaries (`waited 20sWorking through`; the renderer breaks a line only before an
 `error` event, a blank line between turns needs a SPEC sentence and a test); `probe` needs
 `--discover` and the root help does not say so; `delete` is the one irreversible session command
-without a preview (design call, not a bug). CI on three OSes is still unverified; the socket-length
-tests are the first thing that breaks on Windows.
+without a preview (design call, not a bug); `--output-file /dev/null` fails and the hint blames
+`ACPC_HOME`. Usage after slice 25 (Damian's ruling: measure consumption, never price it): a
+cumulative `usage {calls, input_tokens, cache_read_tokens, cache_write_tokens, output_tokens,
+source, quality}` built from the adapters' `_meta` once one real session per adapter has shown
+what they send, fresh `meta.json` while a session runs, subscription usage on `status`, a
+registry fact `billing`; the plan with its order is `docs/plans/1.1/backlog.md` in the `main`
+worktree. Two live checks the mock cannot give: whether claude-agent-acp and codex-acp report a
+stable `size` in `usage_update`, and what their `_meta` carries.
 
 **Phase 0.2 of the standard alignment is complete on `feat/cli-design-conformance` (2026-09-20,
 slices 14-19, HEAD `279ff97`).** The tool now claims `cli-design-standard` 0.2.0-draft.10 with

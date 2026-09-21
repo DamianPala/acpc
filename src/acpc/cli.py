@@ -138,10 +138,10 @@ _JSON_CHOICE_HELP = (
 _ANSWER_OUTPUT_LEAD = (
     "Returns the answer result for a turn this call observed the end of — including a "
     "failed or canceled turn — and returns no result for a call that observed no turn, "
-    "including one whose --timeout deadline expired (`context.status` can be `waiting` "
+    "including one whose --timeout deadline expired (`error.context.status` can be `waiting` "
     "when a usage limit was holding the turn) or whose watch ended in a detach. "
     "`session_id` names the session and `capabilities` the session-capability object; "
-    "`stop_reason`, `tokens`, `cost` and `answer` are present on every foreground result "
+    "`stop_reason`, `context` and `answer` are present on every foreground result "
     "and omitted by `--background`. "
 )
 _ANSWER_OUTPUT_DESCRIPTION = _ANSWER_OUTPUT_LEAD + _TEXT_PRESENTATION_NOTE
@@ -158,7 +158,7 @@ _WAIT_OUTPUT_DESCRIPTION = (
     "Selects the session's current turn when the call starts and keeps observing that "
     "turn even if the session rotates to a newer one meanwhile; returns the answer "
     "result once that turn has ended — including a failed or canceled turn — and "
-    "returns no result when a --timeout deadline expires first, with `context.status` "
+    "returns no result when a --timeout deadline expires first, with `error.context.status` "
     "naming the turn's status at the deadline, `waiting` included. `session_id` names "
     "the session, `capabilities` the session-capability object and `answer` the answer "
     "text. "
@@ -166,7 +166,7 @@ _WAIT_OUTPUT_DESCRIPTION = (
 _STEER_OUTPUT_DESCRIPTION = (
     "Returns the answer result for the turn the correction landed on, or the acceptance "
     "receipt under `--background`; `session_id` names the session, and `capabilities` and "
-    "`correction_result` are always present, and `stop_reason`, `tokens`, `cost` and "
+    "`correction_result` are always present, and `stop_reason`, `context` and "
     "`answer` join them on every foreground result. "
 ) + _TEXT_PRESENTATION_NOTE
 _STATUS_OUTPUT_DESCRIPTION = (
@@ -4410,7 +4410,7 @@ def run_command(
 # that end was not the one asked for.  `interrupted` is reserved for a command
 # that was itself cut short — Ctrl-C — not for observing a session somebody
 # else cancelled, which is a finished operation like any other.  The state
-# that separates them travels in `context.status`.
+# that separates them travels in `error.context.status`.
 _TURN_FAILURE_KINDS = {
     "failed": errors.OPERATION_FAILED,
     "unknown": errors.OPERATION_FAILED,

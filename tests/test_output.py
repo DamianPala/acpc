@@ -92,9 +92,8 @@ def test_json_envelope_has_pinned_fields_and_truncates_answer_only() -> None:
         "started_at",
         "finished_at",
         "stop_reason",
-        "tokens",
+        "context",
         "paths",
-        "cost",
         "answer",
         "truncated",
         "partial",
@@ -224,25 +223,27 @@ def test_summary_is_one_prefixed_stderr_line() -> None:
         clock=lambda: 112.0,
         exit_code=0,
         stop_reason="end_turn",
-        tokens=41_000,
-        cost=0.42,
+        context={"used": 41_000, "size": 200_000, "peak": 41_000},
     )
     line = output.format_summary(meta, runtime=12.0)
 
     assert line.startswith("-- ")
     assert "\n" not in line
     assert "exit 0" in line
-    assert "41k tok" in line
+    assert "ctx 41k/200k, peak 41k" in line
     assert f"dir {sessions.session_dir(meta.session_id)}" in line
     assert f"Next: acpc continue {meta.session_id}" in line
     assert "steer_mode cancel-then-start" in line and "| partial |" not in line
 
 
-def test_format_tokens_shows_a_dot_for_unobserved_usage() -> None:
-    """SPEC.md V6c (draft.11): unobserved usage is `·`, never `0 tok`."""
-    assert output.format_tokens(None) == "· tok"
-    assert output.format_tokens(0) == "0 tok"
-    assert output.format_tokens(1500) == "1.5k tok"
+def test_format_context_shows_a_dot_for_unobserved_usage() -> None:
+    """SPEC.md V6c (draft.11): unobserved usage is `·`, never zeros."""
+    assert output.format_context(None) == "ctx ·"
+    assert output.format_context({"used": 0, "size": None, "peak": 0}) == "ctx 0, peak 0"
+    assert (
+        output.format_context({"used": 1500, "size": 200_000, "peak": 1500})
+        == "ctx 1.5k/200k, peak 1.5k"
+    )
 
 
 def test_summary_shows_a_dot_for_unobserved_tokens() -> None:
@@ -256,7 +257,7 @@ def test_summary_shows_a_dot_for_unobserved_tokens() -> None:
     )
     line = output.format_summary(meta, runtime=12.0)
 
-    assert "· tok" in line
+    assert "ctx ·" in line
     assert "0 tok" not in line
 
 

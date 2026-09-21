@@ -47,7 +47,7 @@ Dispatched implementers get target doc wording verbatim in spec; orchestrating a
 
 ## Project
 
-- Python >= 3.13, cross-platform (Linux, macOS, Windows)
+- Python >= 3.13, Linux and macOS (the declared classifiers; CI runs the gate on both). Windows is a design port, not a runner: Unix sockets, `fcntl` locks and process groups have no Windows path yet
 - Toolchain: uv (build, deps, run); `src/` layout, `uv_build` backend
 - Lint/format: `uv run ruff check && uv run ruff format`
 - Type check: `uv run pyright`

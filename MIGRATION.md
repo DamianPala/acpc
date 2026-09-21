@@ -57,11 +57,11 @@ The public states are `starting`, `running`, `preparing`, `waiting`, `succeeded`
 
 ### Formats and output
 
-The tool-wide default is text on a TTY and JSON on a non-TTY. Native answer and stream commands explicitly use text in both contexts. Collections use `items` and `has_more`; plain output is one identifier per line and requires an explicit limit. `log --json` is NDJSON, one transcript record per line.
+The tool-wide default is text on a TTY and JSON on a non-TTY. Native answer and stream commands explicitly use text in both contexts. Collections use `items` and `has_more`; plain output is one identifier per line and requires an explicit limit. `log --json` is NDJSON, one transcript record per line, with `usage` records reduced to `used` and `size`.
 
 `agents check` always returns a collection, including a named check. `prune` and daemon stop return `targets`, `changed` and `requires_confirmation`. `install` returns `changed: null` on success because the vendor installer does not report whether it changed anything. Failed machine-format calls leave stdout empty and put the failure envelope on stderr.
 
-`tokens` is `null`, not `0`, until the adapter has reported usage for the session; a caller that did `int(tokens)` or compared it with `0` must handle `null`. The tagged text document omits `tokens` from `<metadata>` while it is `null`, and text views print `· tok`.
+`tokens` and `cost` are gone. `context` replaces them: `null` until the adapter has reported usage for the session, never an object of zeros, and otherwise `{used, size, peak}`, the tokens in the context at the last report, the context window (`null` when the adapter did not report it) and the largest `used` seen over the session. A caller that read `tokens` reads `context.used`; a caller that read `cost` has no replacement, acpc publishes no cost. The tagged text document omits `context` from `<metadata>` while it is `null`, and text views print `ctx ·`. A `meta.json` written before 1.0 is read with `tokens` as `context` and `cost` dropped; the first rewrite removes both keys from the file.
 
 ### State files and transcripts
 

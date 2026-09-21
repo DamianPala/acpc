@@ -157,7 +157,7 @@ def test_tokens_default_to_none_not_zero(tmp_path: Path) -> None:
     """SPEC.md V6c (draft.11): usage never observed is `None`, never `0`."""
     client, _transcript = _make_client(tmp_path, PermissionLevel.READ)
 
-    assert client.tokens is None
+    assert client.context is None
 
 
 def test_tokens_carry_the_previous_turns_last_observed_value(tmp_path: Path) -> None:
@@ -170,10 +170,10 @@ def test_tokens_carry_the_previous_turns_last_observed_value(tmp_path: Path) -> 
         PermissionLevel.READ,
         modes=MOCK_MODES,
         clock=lambda: 100.0,
-        previous_tokens=1200,
+        previous_context={"used": 1200, "size": None, "peak": 1200},
     )
 
-    assert client.tokens == 1200
+    assert client.context == {"used": 1200, "size": None, "peak": 1200}
 
 
 def test_answer_is_only_agent_messages_and_transcript_keeps_stream_order(
@@ -288,14 +288,13 @@ def test_replay_is_silent_and_collects_user_messages_without_flushing_pending_pr
     messages, cursor_before = asyncio.run(scenario())
     assert messages == ["first message", "second", "anonymous run", "new run"]
     assert client.answer == "before"
-    assert client.tokens == 7
-    assert client.cost is None
+    assert client.context == {"used": 7, "size": 100, "peak": 7}
     events_after = transcript.read()
     assert events_after.events == [
         {
             "type": "usage",
-            "tokens": 7,
-            "cost": None,
+            "used": 7,
+            "size": 100,
             "ts": "1970-01-01T00:01:40.000000Z",
             "i": 1,
         }
@@ -1398,7 +1397,9 @@ def test_tool_usage_and_advertised_data_are_captured(tmp_path: Path, monkeypatch
             session = await conn.new_session(cwd=str(tmp_path))
             client.capture_advertised(session)
             await conn.prompt(session_id=session.session_id, prompt=[text_block("ordinary task")])
-            await _drain_updates(lambda: client.tokens == 1200)
+            await _drain_updates(
+                lambda: client.context is not None and client.context["used"] == 1200
+            )
 
     asyncio.run(scenario())
 
@@ -1422,8 +1423,8 @@ def test_tool_usage_and_advertised_data_are_captured(tmp_path: Path, monkeypatch
     assert [event for event in events if event["type"] == "usage"] == [
         {
             "type": "usage",
-            "tokens": 1200,
-            "cost": None,
+            "used": 1200,
+            "size": 200_000,
             "ts": "1970-01-01T00:01:40.000000Z",
             "i": 5,
         }

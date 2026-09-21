@@ -23,14 +23,13 @@ def envelope(**overrides: object) -> dict[str, object]:
         "started_at": "2026-01-01T00:00:00Z",
         "finished_at": "2026-01-01T00:00:01Z",
         "stop_reason": "end_turn",
-        "tokens": 42,
+        "context": {"used": 42, "size": 200_000, "peak": 42},
         "paths": {
             "dir": "/state/sessions/q7x2",
             "prompt": "/state/sessions/q7x2/prompt.md",
             "transcript": "/state/sessions/q7x2/transcript.ndjson",
             "answer": "/state/sessions/q7x2/answer.md",
         },
-        "cost": None,
         "answer": "hello",
         "truncated": False,
         "denied": [],
@@ -47,8 +46,7 @@ def background_envelope(**overrides: object) -> dict[str, object]:
     base = envelope(**overrides)
     base.pop("answer", None)
     base.pop("stop_reason", None)
-    base.pop("tokens", None)
-    base.pop("cost", None)
+    base.pop("context", None)
     base["next"] = ["acpc", "wait", base["session_id"]]
     return base
 
@@ -57,13 +55,24 @@ ANSWER_PATH = "/state/sessions/q7x2/answer.md"
 
 
 def test_layout_matches_the_spec_worked_example_exactly() -> None:
-    result = output.render_tagged(envelope(), max_output=0, answer_path=ANSWER_PATH)
+    """SPEC.md *Text presentation* worked example: `capabilities` carries
+    `continue_without_message` and `context` sits between `capabilities` and
+    `stop_reason` in `<metadata>`."""
+    result = output.render_tagged(
+        envelope(
+            capabilities={"steer_mode": "in-place", "continue_without_message": True},
+            context={"used": 1834, "size": 200_000, "peak": 1834},
+        ),
+        max_output=0,
+        answer_path=ANSWER_PATH,
+    )
 
     assert result.text == (
         '<result session_id="q7x2" status="succeeded" partial="false">\n'
         "<metadata>\n"
-        '{"turn":1,"capabilities":{"steer_mode":"cancel-then-start"},'
-        '"stop_reason":"end_turn","tokens":42,"next":["acpc","continue","q7x2"]}\n'
+        '{"turn":1,"capabilities":{"steer_mode":"in-place","continue_without_message":true},'
+        '"context":{"used":1834,"size":200000,"peak":1834},'
+        '"stop_reason":"end_turn","next":["acpc","continue","q7x2"]}\n'
         "</metadata>\n"
         "<answer>\n"
         "hello\n"
@@ -72,22 +81,13 @@ def test_layout_matches_the_spec_worked_example_exactly() -> None:
     )
 
 
-def test_cost_joins_metadata_only_when_not_null() -> None:
-    result = output.render_tagged(envelope(cost=0.02), max_output=0, answer_path=ANSWER_PATH)
-
-    metadata_line = result.text.splitlines()[2]
-    metadata = json.loads(metadata_line)
-    assert list(metadata) == ["turn", "capabilities", "stop_reason", "tokens", "cost", "next"]
-    assert metadata["cost"] == 0.02
-
-
-def test_unobserved_tokens_are_omitted_while_other_lead_fields_stay() -> None:
-    """SPEC.md V6c (draft.11): a `tokens: null` result never puts `"tokens":null`
+def test_unobserved_context_is_omitted_while_other_lead_fields_stay() -> None:
+    """SPEC.md V6c (draft.11): a `context: null` result never puts `"context":null`
     in `<metadata>` — the lead-field rule already keeps out any `None` value."""
-    result = output.render_tagged(envelope(tokens=None), max_output=0, answer_path=ANSWER_PATH)
+    result = output.render_tagged(envelope(context=None), max_output=0, answer_path=ANSWER_PATH)
 
     metadata = json.loads(result.text.splitlines()[2])
-    assert "tokens" not in metadata
+    assert "context" not in metadata
     assert set(metadata) == {"turn", "capabilities", "stop_reason", "next"}
 
 
@@ -107,8 +107,8 @@ def test_optional_fields_land_between_the_lead_fields_and_next() -> None:
     assert list(metadata) == [
         "turn",
         "capabilities",
+        "context",
         "stop_reason",
-        "tokens",
         "denied",
         "permissions_clamp",
         "resume",
@@ -125,7 +125,7 @@ def test_empty_optional_fields_are_omitted_not_written_as_empty() -> None:
     )
 
     metadata = json.loads(result.text.splitlines()[2])
-    assert set(metadata) == {"turn", "capabilities", "stop_reason", "tokens", "next"}
+    assert set(metadata) == {"turn", "capabilities", "context", "stop_reason", "next"}
 
 
 def test_no_selected_fields_omits_the_metadata_section() -> None:
@@ -133,8 +133,7 @@ def test_no_selected_fields_omits_the_metadata_section() -> None:
         turn=None,
         capabilities=None,
         stop_reason=None,
-        tokens=None,
-        cost=None,
+        context=None,
         next=None,
     )
     result = output.render_tagged(bare, max_output=0, answer_path=ANSWER_PATH)

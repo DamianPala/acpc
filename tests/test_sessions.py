@@ -111,8 +111,7 @@ class TestCreateSession:
             "turns",
             "exit_code",
             "stop_reason",
-            "tokens",
-            "cost",
+            "context",
             "prompt_snippet",
             "resolution",
             "adapter_session_id",
@@ -160,6 +159,31 @@ class TestCreateSession:
         assert "state" not in rewritten
         assert rewritten["created_at"] == "2025-10-09T08:53:20.000000Z"
 
+    @pytest.mark.parametrize("legacy_cost", [None, 0.19])
+    def test_legacy_tokens_and_cost_become_context_and_cost_is_dropped(
+        self, legacy_cost: float | None
+    ) -> None:
+        """SPEC.md *State on disk*: metadata written before 1.0 carried `tokens`
+        and `cost`; on read, `tokens` becomes `context` with `used` and `peak`
+        equal to it and `size` `null`, and `cost` is dropped — whether or not
+        the legacy file had one."""
+        meta = make_session()
+        path = sessions.meta_path(meta.session_id)
+        payload = json.loads(path.read_text())
+        del payload["context"]
+        payload["tokens"] = 38_259
+        payload["cost"] = legacy_cost
+        path.write_text(json.dumps(payload))
+
+        loaded = sessions.read_meta(meta.session_id)
+        assert loaded.context == {"used": 38_259, "size": None, "peak": 38_259}
+
+        sessions.update_meta(meta.session_id, name="rewritten")
+        rewritten = json.loads(path.read_text())
+        assert rewritten["context"] == {"used": 38_259, "size": None, "peak": 38_259}
+        assert "tokens" not in rewritten
+        assert "cost" not in rewritten
+
     def test_a_fresh_session_has_no_answer_yet(self) -> None:
         meta = make_session()
         assert not sessions.answer_path(meta.session_id).exists()
@@ -206,14 +230,14 @@ class TestTransitions:
             "succeeded",
             exit_code=0,
             stop_reason="end_turn",
-            tokens=41_000,
+            context={"used": 41_000, "size": None, "peak": 41_000},
             clock=at(90.0),
         )
         assert done.state == "succeeded"
         assert done.finished_at == BASE_TIME + 90.0
         assert done.exit_code == 0
         assert done.stop_reason == "end_turn"
-        assert done.tokens == 41_000
+        assert done.context == {"used": 41_000, "size": None, "peak": 41_000}
 
     @pytest.mark.parametrize("final", ["succeeded", "failed", "canceled", "unknown"])
     def test_every_final_state_is_reachable_from_running(self, final: str) -> None:
@@ -249,10 +273,14 @@ class TestTransitions:
 
     def test_update_meta_persists_known_fields(self) -> None:
         meta = make_session()
-        sessions.update_meta(meta.session_id, adapter_session_id="acp-123", cost=0.42)
+        sessions.update_meta(
+            meta.session_id,
+            adapter_session_id="acp-123",
+            context={"used": 100, "size": None, "peak": 100},
+        )
         stored = sessions.read_meta(meta.session_id)
         assert stored.adapter_session_id == "acp-123"
-        assert stored.cost == 0.42
+        assert stored.context == {"used": 100, "size": None, "peak": 100}
 
 
 class TestLivenessAndOrphans:
@@ -733,11 +761,11 @@ class TestDamagedState:
         payload["future_field"] = {"kept": True}
         sessions.meta_path(meta.session_id).write_text(json.dumps(payload))
 
-        sessions.update_meta(meta.session_id, tokens=7)
+        sessions.update_meta(meta.session_id, context={"used": 7, "size": None, "peak": 7})
 
         reread = json.loads(sessions.meta_path(meta.session_id).read_text())
         assert reread["future_field"] == {"kept": True}
-        assert reread["tokens"] == 7
+        assert reread["context"] == {"used": 7, "size": None, "peak": 7}
 
 
 class TestLocking:
@@ -745,13 +773,14 @@ class TestLocking:
         meta = make_session()
         session_id = meta.session_id
         rounds = 40
-        sessions.update_meta(session_id, tokens=0)
+        sessions.update_meta(session_id, context={"used": 0, "size": None, "peak": 0})
 
         def bump() -> None:
             for _ in range(rounds):
                 with sessions.session_lock(session_id):
                     current = sessions.read_meta(session_id)
-                    current.tokens = (current.tokens or 0) + 1
+                    used = (current.context["used"] if current.context else 0) + 1
+                    current.context = {"used": used, "size": None, "peak": used}
                     sessions.write_meta(current)
 
         workers = [threading.Thread(target=bump) for _ in range(2)]
@@ -760,13 +789,15 @@ class TestLocking:
         for worker in workers:
             worker.join(timeout=20)
 
-        assert sessions.read_meta(session_id).tokens == 2 * rounds
+        final_context = sessions.read_meta(session_id).context
+        assert final_context is not None
+        assert final_context["used"] == 2 * rounds
 
     def test_the_lock_is_re_entrant_within_a_thread(self) -> None:
         meta = make_session()
         with sessions.session_lock(meta.session_id), sessions.session_lock(meta.session_id):
-            sessions.update_meta(meta.session_id, tokens=3)
-        assert sessions.read_meta(meta.session_id).tokens == 3
+            sessions.update_meta(meta.session_id, context={"used": 3, "size": None, "peak": 3})
+        assert sessions.read_meta(meta.session_id).context == {"used": 3, "size": None, "peak": 3}
 
     def test_meta_is_never_read_torn(self) -> None:
         meta = make_session()
@@ -776,7 +807,9 @@ class TestLocking:
 
         def write() -> None:
             for index in range(200):
-                sessions.update_meta(session_id, tokens=index)
+                sessions.update_meta(
+                    session_id, context={"used": index, "size": None, "peak": index}
+                )
             stop.set()
 
         def read() -> None:

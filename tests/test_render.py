@@ -156,11 +156,22 @@ def test_message_snippet_does_not_split_a_multibyte_character() -> None:
 
 
 def test_usage_event_without_a_token_count_shows_a_dot() -> None:
-    """SPEC.md V6c: a cost-only usage record never renders its tokens as `0` or `None`."""
-    line = render.format_event(event(1, "usage", tokens=None, cost=0.1))
+    """SPEC.md *State on disk*: a usage record with nothing observed shows `·`,
+    never `0`; `log` never renders `cost`, even when the event carries one."""
+    line = render.format_event(event(1, "usage", used=None, size=None, cost=0.1))
 
-    assert line.endswith("usage · tok · cost $0.10")
-    assert render.format_event(event(2, "usage", tokens=1200, cost=None)).endswith("1200 tok")
+    assert line.endswith("usage ctx ·")
+    assert render.format_event(event(2, "usage", used=1200, size=200_000)).endswith(
+        "usage ctx 1.2k/200k"
+    )
+
+
+def test_usage_event_reads_legacy_tokens_as_used() -> None:
+    """SPEC.md *State on disk*: a transcript written before 1.0 records `tokens`
+    in place of `used`; `log` reads it the same way."""
+    line = render.format_event(event(1, "usage", tokens=1200))
+
+    assert line.endswith("usage ctx 1.2k")
 
 
 def test_message_length_is_only_reported_for_oversized_chunks() -> None:
@@ -369,8 +380,7 @@ def test_log_footer_groups_state_qualifier_and_matches_spec() -> None:
         clock=lambda: 160.0,
         exit_code=0,
         stop_reason="end_turn",
-        tokens=41_000,
-        cost=0.42,
+        context={"used": 41_000, "size": 200_000, "peak": 41_000},
     )
     done_footer = render.format_log_footer(
         done,
@@ -383,7 +393,8 @@ def test_log_footer_groups_state_qualifier_and_matches_spec() -> None:
 
     assert running_footer == "-- running 3m12s | events 26–45 of 45 | cursor: 45"
     assert done_footer == (
-        f"-- succeeded exit 0 | 3m12s | 41k tok | answer: {sessions.answer_path(done.session_id)} "
+        "-- succeeded exit 0 | 3m12s | ctx 41k/200k, peak 41k | "
+        f"answer: {sessions.answer_path(done.session_id)} "
         "| events 26–45 of 45 | cursor: 45"
     )
 
@@ -584,14 +595,13 @@ def test_status_views_fall_back_to_a_dot_when_no_model_was_resolved() -> None:
 
 
 def test_status_views_show_a_dot_for_unobserved_tokens() -> None:
-    """SPEC.md V6c (draft.11): a fresh session's `tokens` is `None`, not `0`."""
+    """SPEC.md V6c (draft.11): a fresh session's `context` is `None`, not zeros."""
     meta = make_session()
 
     detail = render.render_status_detail(meta, clock=lambda: 120.0)
 
-    assert "· tok" in detail
-    assert "0 tok" not in detail
-    assert render.status_detail_json(meta, clock=lambda: 120.0)["tokens"] is None
+    assert "ctx ·" in detail
+    assert render.status_detail_json(meta, clock=lambda: 120.0)["context"] is None
 
 
 def test_status_json_carries_the_resolved_model_in_both_shapes() -> None:
@@ -760,7 +770,7 @@ def test_status_detail_text_remains_the_existing_labeled_view() -> None:
     text = render.render_status_detail(meta, clock=lambda: 120.0)
 
     assert text == (
-        "status   starting · exit · · 0m20s · · tok\n"
+        "status   starting · exit · · 0m20s · ctx ·\n"
         "agent    mock (mock) · model: mock-sonnet-5 · name: ·\n"
         f"dir      {sessions.session_dir(meta.session_id)} · answer: answer.md\n"
         "steer: cancel-then-start\n"

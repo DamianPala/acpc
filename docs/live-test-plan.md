@@ -87,7 +87,7 @@ Caveat for A2 on a *base adapter* name: on a fresh home a cache miss triggers th
 
 | # | Do | Expect |
 |---|---|---|
-| B1 | Time `acpc run lt "Reply with exactly: OK"` from the clean home | A daemon starts; stderr summary (one `--` line: duration, tokens, exit, id, dir); record wall time |
+| B1 | Time `acpc run lt "Reply with exactly: OK"` from the clean home | A daemon starts; stderr summary (one `--` line: duration, ctx, exit, id, dir); record wall time |
 | B2 | Repeat it | Faster; `acpc daemon status` shows the same PID; record the delta |
 | B3 | `acpc daemon status` | One concrete target per entry used so far, each with PID, uptime, log path |
 | B4 | `acpc run lt2 "Reply with exactly: OK"` | A **second** daemon; both alive in `daemon status` |

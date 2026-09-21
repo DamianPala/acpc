@@ -186,8 +186,7 @@ EXPECTED_REQUIRED_FIELDS = {
         "name",
         "runtime_seconds",
         "idle_seconds",
-        "tokens",
-        "cost",
+        "context",
         "exit_code",
         "stop_reason",
         "failure",
@@ -223,8 +222,7 @@ EXPECTED_REQUIRED_FIELDS = {
         "started_at",
         "finished_at",
         "stop_reason",
-        "tokens",
-        "cost",
+        "context",
         "answer",
         "paths",
         "truncated",
@@ -248,10 +246,10 @@ _TEXT_PRESENTATION_NOTE = (
 _ANSWER_OUTPUT_LEAD = (
     "Returns the answer result for a turn this call observed the end of — including a "
     "failed or canceled turn — and returns no result for a call that observed no turn, "
-    "including one whose --timeout deadline expired (`context.status` can be `waiting` "
+    "including one whose --timeout deadline expired (`error.context.status` can be `waiting` "
     "when a usage limit was holding the turn) or whose watch ended in a detach. "
     "`session_id` names the session and `capabilities` the session-capability object; "
-    "`stop_reason`, `tokens`, `cost` and `answer` are present on every foreground result "
+    "`stop_reason`, `context` and `answer` are present on every foreground result "
     "and omitted by `--background`. "
 )
 
@@ -269,7 +267,7 @@ EXPECTED_OUTPUT_DESCRIPTIONS = {
         "Selects the session's current turn when the call starts and keeps observing that "
         "turn even if the session rotates to a newer one meanwhile; returns the answer "
         "result once that turn has ended — including a failed or canceled turn — and "
-        "returns no result when a --timeout deadline expires first, with `context.status` "
+        "returns no result when a --timeout deadline expires first, with `error.context.status` "
         "naming the turn's status at the deadline, `waiting` included. `session_id` names "
         "the session, `capabilities` the session-capability object and `answer` the answer "
         "text. "
@@ -289,7 +287,7 @@ EXPECTED_OUTPUT_DESCRIPTIONS = {
     "steer": (
         "Returns the answer result for the turn the correction landed on, or the acceptance "
         "receipt under `--background`; `session_id` names the session, and `capabilities` and "
-        "`correction_result` are always present, and `stop_reason`, `tokens`, `cost` and "
+        "`correction_result` are always present, and `stop_reason`, `context` and "
         "`answer` join them on every foreground result. "
     )
     + _TEXT_PRESENTATION_NOTE,
@@ -396,9 +394,8 @@ _SESSION_OUTPUT_PROPERTIES = frozenset(
         "turn",
         "status",
         "stop_reason",
-        "tokens",
+        "context",
         "paths",
-        "cost",
         "answer",
         "truncated",
         "partial",
@@ -419,6 +416,9 @@ _PATHS_PROPERTIES = frozenset({"dir", "prompt", "transcript", "answer"})
 _DENIAL_PROPERTIES = frozenset({"category", "count", "minimum_policy", "remedy", "target"})
 _PERMISSIONS_CLAMP_PROPERTIES = frozenset({"requested", "ceiling", "effective"})
 _LIMIT_PROPERTIES = frozenset({"reason", "resume_at", "auto_continue", "source"})
+# SPEC.md `status`: the session's context occupancy, the same object on every
+# result that carries it (`run`, `continue`, `wait`, `steer`, `status`).
+_CONTEXT_PROPERTIES = frozenset({"used", "size", "peak"})
 # R2d's inspection object `status` reports: policy, mode, source and clamp, all required.
 _STATUS_PERMISSIONS_PROPERTIES = frozenset({"policy", "mode", "source", "clamp"})
 _RESOLUTION_PROPERTIES = frozenset({"model", "effort", "mode", "permissions", "home"})
@@ -448,6 +448,7 @@ def _session_output_oracle(
     return {
         "output": (properties, frozenset(required)),
         "output.capabilities": (_STEER_CAPABILITIES_PROPERTIES, _STEER_CAPABILITIES_PROPERTIES),
+        "output.context": (_CONTEXT_PROPERTIES, _CONTEXT_PROPERTIES),
         "output.paths": (_PATHS_PROPERTIES, frozenset(_PATHS_PROPERTIES)),
         "output.denied[]": (_DENIAL_PROPERTIES, frozenset(_DENIAL_PROPERTIES - {"target"})),
         "output.permissions_clamp": (
@@ -666,8 +667,8 @@ EXPECTED_OUTPUT_ORACLES: dict[str, dict[str, tuple[frozenset[str], frozenset[str
                     "adapter_log_tail",
                     "from",
                     "to",
-                    "tokens",
-                    "cost",
+                    "used",
+                    "size",
                     "reason",
                     "resume_at",
                     "action",
@@ -793,8 +794,7 @@ EXPECTED_OUTPUT_ORACLES: dict[str, dict[str, tuple[frozenset[str], frozenset[str
                     "name",
                     "runtime_seconds",
                     "idle_seconds",
-                    "tokens",
-                    "cost",
+                    "context",
                     "exit_code",
                     "stop_reason",
                     "failure",
@@ -811,6 +811,7 @@ EXPECTED_OUTPUT_ORACLES: dict[str, dict[str, tuple[frozenset[str], frozenset[str
             frozenset(EXPECTED_REQUIRED_FIELDS["status"]),
         ),
         "output.capabilities": (_STEER_CAPABILITIES_PROPERTIES, _STEER_CAPABILITIES_PROPERTIES),
+        "output.context": (_CONTEXT_PROPERTIES, _CONTEXT_PROPERTIES),
         "output.limit": (_LIMIT_PROPERTIES, frozenset(_LIMIT_PROPERTIES)),
         "output.permissions": (_STATUS_PERMISSIONS_PROPERTIES, _STATUS_PERMISSIONS_PROPERTIES),
         "output.permissions.clamp": (_PERMISSIONS_CLAMP_PROPERTIES, _RESOLUTION_CLAMP_REQUIRED),
@@ -1625,29 +1626,32 @@ def test_D8_O4a_O4d_R1a_R1b_R5a_schema_and_success_matrix(
         monkeypatch.setenv("NO_INPUT", "1")
 
 
-def test_V6c_a_usage_event_with_null_tokens_still_validates_against_schema_log(
+def test_V6c_a_meta_only_usage_event_validates_against_schema_log(
     cli: CliRunner,
     state_root: Path,
     live_daemon: None,
 ) -> None:
-    """SPEC.md's transcript section: a `usage` event's `tokens` is `null`, never
-    `0`, for a figure the adapter did not report. Reviewer-found gap: the
-    `_meta`-only usage path (`record_prompt_usage`, e.g. Grok Build reporting a
-    cost with no `totalTokens`) writes exactly such a record, and `schema log`
-    must describe it — not just the `msg` event the schema-matrix fixture uses.
+    """SPEC.md's transcript section: a `usage` event's `used`/`size` describe
+    what the adapter reported, never a fabricated `0`. The `_meta`-only usage
+    path (`record_prompt_usage`, e.g. Grok Build putting totals on the prompt
+    response instead of streaming `usage_update`) writes `used` with `size`
+    `null` and no `cost` at all — that heuristic parsed no cost even before
+    1.0 dropped cost reporting entirely — and `schema log` must describe it,
+    not just the `msg` event the schema-matrix fixture uses.
     """
-    result = invoke(cli, "run", "mock", "meta:0:1000000000:cost only", "--json", "--quiet")
+    result = invoke(cli, "run", "mock", "meta:500:1000000000:usage from meta", "--json", "--quiet")
     assert result.exit_code == vocab.EXIT_OK, result.stderr
     session_id = json.loads(result.stdout)["session_id"]
-    assert json.loads(result.stdout)["tokens"] is None
+    assert json.loads(result.stdout)["context"] == {"used": 500, "size": None, "peak": 500}
 
     log_result = invoke(cli, "log", session_id, "--json", "--quiet")
     assert log_result.exit_code == vocab.EXIT_OK, log_result.stderr
     records = [json.loads(line) for line in log_result.stdout.splitlines()]
     usage_records = [record for record in records if record["type"] == "usage"]
     assert usage_records, records
-    assert usage_records[0]["tokens"] is None
-    assert usage_records[0]["cost"] == pytest.approx(0.1)
+    assert usage_records[0]["used"] == 500
+    assert usage_records[0]["size"] is None
+    assert "cost" not in usage_records[0]
 
     detail = read_detail(cli, "log")
     for record in records:
@@ -2639,7 +2643,7 @@ def _observe_log_types(cli: CliRunner, observed: dict[str, set[Any]]) -> None:
         "permission": {"kind": "read", "decision": "allowed"},
         "error": {"message": "error"},
         "state": {"from": "running", "to": "succeeded"},
-        "usage": {"tokens": 0, "cost": 0.0},
+        "usage": {"used": 0, "size": None},
         "steer": {"mode": "in-place", "text": "steer", "outcome": "injected"},
         "limit": {
             "reason": "rate_limit",

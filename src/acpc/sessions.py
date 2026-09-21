@@ -194,8 +194,7 @@ class SessionMeta:
     stop_reason: str | None = None
     failure: str | None = None
     # SPEC.md V6c: usage the tool never observed is `null`, never `0`.
-    tokens: int | None = None
-    cost: float | None = None
+    context: vocab.ContextOccupancy | None = None
     denied: dict[str, int] = field(default_factory=dict)
     denial_details: dict[str, dict[str, Any]] = field(default_factory=dict)
     prompt_snippet: str = ""
@@ -432,14 +431,6 @@ def _coerce_int(value: Any, key: str, path: Path) -> int | None:
     return value
 
 
-def _coerce_float(value: Any, key: str, path: Path) -> float | None:
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise CorruptSessionError(f"{path}: {key} is not a number")
-    return float(value)
-
-
 def _coerce_str(value: Any, key: str, path: Path) -> str | None:
     if value is None:
         return None
@@ -502,6 +493,35 @@ def _coerce_denial_details(value: Any, key: str, path: Path) -> dict[str, dict[s
     return details
 
 
+def _coerce_context(
+    known: Mapping[str, Any], data: Mapping[str, Any], path: Path
+) -> vocab.ContextOccupancy | None:
+    """Read `context`, migrating a pre-1.0 `tokens`/`cost` pair on the way in.
+
+    SPEC.md *State on disk*: "Metadata written before 1.0 carried `tokens` and
+    `cost` instead; on read, `tokens` becomes `context` with `used` and `peak`
+    equal to it and `size` `null`, and `cost` is dropped." `"context" in known`
+    tells a migrated or fresh file (even one explicitly `null`) apart from an
+    old file that never had the key at all.
+    """
+    if "context" in known:
+        value = known.get("context")
+        if value is None:
+            return None
+        if not isinstance(value, dict):
+            raise CorruptSessionError(f"{path}: context is not an object")
+        used = _coerce_int(value.get("used"), "context.used", path)
+        size = _coerce_int(value.get("size"), "context.size", path)
+        peak = _coerce_int(value.get("peak"), "context.peak", path)
+        if used is None or peak is None:
+            raise CorruptSessionError(f"{path}: context is missing used or peak")
+        return {"used": used, "size": size, "peak": peak}
+    legacy_tokens = _coerce_int(data.get("tokens"), "tokens", path)
+    if legacy_tokens is None:
+        return None
+    return {"used": legacy_tokens, "size": None, "peak": legacy_tokens}
+
+
 def meta_from_dict(data: Mapping[str, Any], *, path: Path) -> SessionMeta:
     """Build a `SessionMeta` from parsed JSON, rejecting damaged state.
 
@@ -512,7 +532,8 @@ def meta_from_dict(data: Mapping[str, Any], *, path: Path) -> SessionMeta:
     extra = {
         key: value
         for key, value in data.items()
-        if key not in _META_FIELDS and key not in {"status", "state", "steer_modes"}
+        if key not in _META_FIELDS
+        and key not in {"status", "state", "steer_modes", "tokens", "cost"}
     }
 
     session_id = _coerce_str(known.get("session_id"), "session_id", path)
@@ -555,10 +576,7 @@ def meta_from_dict(data: Mapping[str, Any], *, path: Path) -> SessionMeta:
         exit_code=exit_code,
         stop_reason=stop_reason,
         failure=_coerce_str(known.get("failure"), "failure", path),
-        # `or 0` would turn a genuinely unobserved `null` into a false `0`; a
-        # legacy file's explicit `0` still reads back as `0` (V6c).
-        tokens=_coerce_int(known.get("tokens"), "tokens", path),
-        cost=_coerce_float(known.get("cost"), "cost", path),
+        context=_coerce_context(known, data, path),
         denied=_coerce_denied(known.get("denied"), "denied", path),
         denial_details=_coerce_denial_details(known.get("denial_details"), "denial_details", path),
         prompt_snippet=_coerce_str(known.get("prompt_snippet"), "prompt_snippet", path) or "",
@@ -916,7 +934,7 @@ def finalize_turn(
         if delivery_record_incomplete:
             meta.extra[DELIVERY_RECORD_INCOMPLETE] = True
         for key, value in changes.items():
-            if key in {"tokens", "cost"} and value is None:
+            if key == "context" and value is None:
                 continue
             setattr(meta, key, value)
         now = resolved_clock()

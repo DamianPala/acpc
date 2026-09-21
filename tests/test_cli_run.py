@@ -1095,7 +1095,7 @@ def test_unobserved_usage_reports_null_not_zero(cli: CliRunner) -> None:
     result = invoke(cli, "run", "mock", "echo:hi", "--json", "--quiet")
 
     payload = json.loads(result.stdout)
-    assert payload["tokens"] is None
+    assert payload["context"] is None
 
 
 def test_unobserved_usage_is_absent_from_the_tagged_metadata(cli: CliRunner) -> None:
@@ -1103,15 +1103,14 @@ def test_unobserved_usage_is_absent_from_the_tagged_metadata(cli: CliRunner) -> 
 
     metadata_line = next(line for line in result.stdout.splitlines() if line.startswith("{"))
     metadata = json.loads(metadata_line)
-    assert "tokens" not in metadata
+    assert "context" not in metadata
 
 
 def test_unobserved_usage_shows_a_dot_in_the_stderr_summary(cli: CliRunner) -> None:
     result = invoke(cli, "run", "mock", "echo:hi")
 
     summary_line = next(line for line in result.stderr.splitlines() if "exit 0" in line)
-    assert "· tok" in summary_line
-    assert "0 tok" not in summary_line
+    assert "ctx ·" in summary_line
 
 
 def test_observed_usage_still_reports_the_real_count(cli: CliRunner) -> None:
@@ -1119,7 +1118,7 @@ def test_observed_usage_still_reports_the_real_count(cli: CliRunner) -> None:
     result = invoke(cli, "run", "mock", "meta:1200:1000000000:tokens present", "--json", "--quiet")
 
     payload = json.loads(result.stdout)
-    assert payload["tokens"] == 1200
+    assert payload["context"] == {"used": 1200, "size": None, "peak": 1200}
 
 
 def test_max_output_caps_stdout(cli: CliRunner) -> None:

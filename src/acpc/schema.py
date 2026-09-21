@@ -149,15 +149,27 @@ _NULLABLE_LIMIT = {
     "properties": _LIMIT["properties"],
     "required": _LIMIT["required"],
 }
+# SPEC.md `status`: the session's context occupancy as last reported by the
+# adapter — `null` as a whole until one has been reported for the session.
+# The same object shape backs `status`, `run`/`continue`/`wait`/`steer` and
+# `<metadata>`, so it is defined once and referenced everywhere.
+_CONTEXT = {
+    "type": ["object", "null"],
+    "properties": {
+        "used": _INTEGER,
+        "size": _NULLABLE_INTEGER,
+        "peak": _INTEGER,
+    },
+    "required": ["used", "size", "peak"],
+}
 
 _SESSION_RESULT_PROPERTIES = {
     "session_id": _STRING,
     "turn": _INTEGER,
     "status": _SESSION_STATUS,
     "stop_reason": _NULLABLE_STRING,
-    "tokens": _NULLABLE_INTEGER,
+    "context": _CONTEXT,
     "paths": _PATHS,
-    "cost": _NULLABLE_NUMBER,
     "answer": _STRING,
     "truncated": _BOOLEAN,
     "partial": _BOOLEAN,
@@ -236,7 +248,7 @@ def _session_result_schema(
         properties.pop("changed")
     required = ["status", "session_id", "turn", "created_at", "started_at", "finished_at"]
     if foreground_only:
-        required += ["stop_reason", "tokens", "cost", "answer"]
+        required += ["stop_reason", "context", "answer"]
     required += ["paths", "truncated"]
     if include_partial:
         required.append("partial")
@@ -433,8 +445,7 @@ _STATUS_DETAIL = _object(
         "name": _NULLABLE_STRING,
         "runtime_seconds": _NUMBER,
         "idle_seconds": _NULLABLE_NUMBER,
-        "tokens": _NULLABLE_INTEGER,
-        "cost": _NULLABLE_NUMBER,
+        "context": _CONTEXT,
         "exit_code": _NULLABLE_INTEGER,
         "stop_reason": _NULLABLE_STRING,
         "failure": _NULLABLE_STRING,
@@ -461,8 +472,7 @@ _STATUS_DETAIL = _object(
         "name",
         "runtime_seconds",
         "idle_seconds",
-        "tokens",
-        "cost",
+        "context",
         "exit_code",
         "stop_reason",
         "failure",
@@ -502,8 +512,14 @@ _LOG_EVENT = _object(
         "adapter_log_tail": _STRING,
         "from": _STRING,
         "to": _STRING,
-        "tokens": _NULLABLE_INTEGER,
-        "cost": _NULLABLE_NUMBER,
+        # SPEC.md *State on disk*: "A `usage` event records `used` and `size`
+        # as observed at that point... `log` publishes a usage event as
+        # context occupancy only, in every format: the condensed view shows
+        # `used` and `size`, and the NDJSON stream carries the record without
+        # `cost` and `meta`." Not the `context` object `status` and the
+        # answer results publish — a single event has no `peak` of its own.
+        "used": _NULLABLE_INTEGER,
+        "size": _NULLABLE_INTEGER,
         "reason": _STRING,
         "resume_at": _NULLABLE_STRING,
         "action": _STRING,

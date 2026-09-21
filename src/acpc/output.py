@@ -160,9 +160,8 @@ def result_envelope(
         "started_at": _timestamp_or_none(meta.started_at),
         "finished_at": _timestamp_or_none(meta.finished_at),
         "stop_reason": meta.stop_reason,
-        "tokens": meta.tokens,
+        "context": meta.context,
         "paths": paths_for_turn,
-        "cost": meta.cost,
         "answer": answer,
         "truncated": truncated,
         "denied": _denial_payload(meta),
@@ -302,7 +301,7 @@ _ANSWER_TAG_TRIGGERS = (
 # answer-boundary line count above depends on the LF characters staying LF.
 _PRESERVED_ANSWER_WHITESPACE = frozenset({0x09, 0x0A, 0x0D})
 
-_METADATA_LEAD_FIELDS = ("turn", "capabilities", "stop_reason", "tokens", "cost")
+_METADATA_LEAD_FIELDS = ("turn", "capabilities", "context", "stop_reason")
 _METADATA_OPTIONAL_FIELDS = ("correction_result", "denied", "permissions_clamp", "resume", "limit")
 
 
@@ -601,14 +600,32 @@ def format_duration(seconds: float) -> str:
     return f"{minutes}m{secs:02d}s"
 
 
-def format_tokens(tokens: int | None) -> str:
-    if tokens is None:
-        return "· tok"
-    if tokens >= 1000:
-        value = tokens / 1000
-        rendered = f"{value:.1f}".rstrip("0").rstrip(".")
-        return f"{rendered}k tok"
-    return f"{tokens} tok"
+def format_k(value: int) -> str:
+    """Format a count in `k`-suffixed thousands: `1.8k`, trailing zeros stripped.
+
+    Shared by `format_context` and `log`'s compact character count, so both
+    round large numbers the same way.
+    """
+    if value >= 1000:
+        rendered = f"{value / 1000:.1f}".rstrip("0").rstrip(".")
+        return f"{rendered}k"
+    return str(value)
+
+
+def format_context(context: vocab.ContextOccupancy | None) -> str:
+    """Format a session's context occupancy (SPEC.md `status`, *Output contract*).
+
+    `ctx 1.8k/200k, peak 1.8k` when the adapter reported a window size,
+    `ctx 1.8k, peak 1.8k` without one, and `ctx ·` while `context` is `null`
+    because the adapter has not reported usage for the session yet.
+    """
+    if context is None:
+        return "ctx ·"
+    used = format_k(context["used"])
+    peak = format_k(context["peak"])
+    if context["size"] is not None:
+        return f"ctx {used}/{format_k(context['size'])}, peak {peak}"
+    return f"ctx {used}, peak {peak}"
 
 
 def _resolved_permissions(meta: sessions.SessionMeta) -> dict[str, Any]:
@@ -761,9 +778,7 @@ def format_summary(
     format carries the answer itself — this line is not one of those formats.
     """
     duration = sessions.runtime_seconds(meta) if runtime is None else runtime
-    parts = [meta.state, format_duration(duration), format_tokens(meta.tokens)]
-    if meta.cost is not None:
-        parts.append(f"cost ${meta.cost:.2f}")
+    parts = [meta.state, format_duration(duration), format_context(meta.context)]
     if meta.exit_code is not None:
         parts.append(f"exit {meta.exit_code}")
     parts.append(f"steer_mode {meta.steer_mode or vocab.STEER_CANCEL_THEN_START}")

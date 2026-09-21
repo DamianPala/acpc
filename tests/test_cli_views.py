@@ -170,9 +170,26 @@ def test_status_reports_unobserved_usage_as_null_not_zero(cli: CliRunner) -> Non
     payload = json.loads(invoke(cli, "status", session_id, "--json").stdout)
     text = invoke(cli, "status", session_id, "--format", "text").stdout
 
-    assert payload["tokens"] is None
-    assert "· tok" in text
-    assert "0 tok" not in text
+    assert payload["context"] is None
+    assert "ctx ·" in text
+
+
+def test_status_renders_a_legacy_meta_json_tokens_field_as_context(
+    cli: CliRunner, state_root: Path
+) -> None:
+    """SPEC.md *State on disk*: a legacy `tokens` field reads as `context` with
+    `used` and `peak` equal to it and `size` `null`."""
+    session_id = run_mock(cli, "echo:legacy tokens")
+    meta_path = state_root / "sessions" / session_id / "meta.json"
+    payload = json.loads(meta_path.read_text(encoding="utf-8"))
+    del payload["context"]
+    payload["tokens"] = 38_259
+    payload["cost"] = 0.19
+    meta_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    text = invoke(cli, "status", session_id, "--format", "text").stdout
+
+    assert "ctx 38.3k, peak 38.3k" in text
 
 
 def test_status_json_reports_the_default_policy_and_no_pending_corrections(
@@ -483,6 +500,66 @@ def test_log_json_emits_indexed_ndjson(cli: CliRunner) -> None:
     events = [json.loads(line) for line in result.stdout.splitlines()]
 
     assert events and all(isinstance(event["i"], int) for event in events)
+
+
+def test_log_json_and_ndjson_drop_the_usage_event_cost_and_meta(
+    cli: CliRunner, state_root: Path
+) -> None:
+    """SPEC.md `log`: `--format ndjson`'s one exception is a `usage` record,
+    published with `used` and `size` only — the adapter's `cost` and `meta`
+    stay on disk, and every other stored key keeps its on-disk order.
+
+    SPEC.md *State on disk* also keeps unknown fields, so a key acpc does not
+    know about survives the same publication that drops `cost` and `meta`."""
+    session_id = run_mock(cli, "both:700:3000000000:cost and meta")
+    transcript_path = state_root / "sessions" / session_id / "transcript.ndjson"
+    lines = transcript_path.read_text(encoding="utf-8").splitlines()
+    usage_index = next(i for i, line in enumerate(lines) if json.loads(line).get("type") == "usage")
+    on_disk = json.loads(lines[usage_index])
+    assert on_disk["cost"] == pytest.approx(0.3)
+    on_disk["meta"] = {"_claude/rateLimit": {"status": "ok"}}
+    on_disk["future_field"] = {"written_by": "a later acpc"}
+    lines[usage_index] = json.dumps(on_disk)
+    transcript_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    expected = {key: value for key, value in on_disk.items() if key not in ("cost", "meta")}
+
+    for args in (("--json",), ("--format", "ndjson")):
+        result = invoke(cli, "log", session_id, *args)
+        events = [json.loads(line) for line in result.stdout.splitlines()]
+        usage_events = [event for event in events if event.get("type") == "usage"]
+        assert usage_events == [expected]
+        assert list(usage_events[0].keys()) == list(expected.keys())
+
+
+def test_log_json_and_ndjson_read_a_legacy_usage_events_tokens_as_used(
+    cli: CliRunner, state_root: Path
+) -> None:
+    """SPEC.md *State on disk*: transcripts written before 1.0 record `tokens`
+    in place of `used`, read as such; `log` renames it in place and reports
+    `size: null` when the legacy record has none."""
+    session_id = run_mock(cli, "echo:legacy usage event")
+    transcript_path = state_root / "sessions" / session_id / "transcript.ndjson"
+    existing = [
+        json.loads(line) for line in transcript_path.read_text(encoding="utf-8").splitlines()
+    ]
+    next_index = max(event["i"] for event in existing if "i" in event) + 1
+    legacy_event = {
+        "type": "usage",
+        "tokens": 1234,
+        "cost": 0.01,
+        "ts": "2026-01-01T00:00:00.000000Z",
+        "i": next_index,
+    }
+    with transcript_path.open("a", encoding="utf-8") as file:
+        file.write(json.dumps(legacy_event) + "\n")
+
+    for args in (("--json",), ("--format", "ndjson")):
+        result = invoke(cli, "log", session_id, *args)
+        events = [json.loads(line) for line in result.stdout.splitlines()]
+        usage_events = [event for event in events if event.get("i") == next_index]
+        assert usage_events == [
+            {"type": "usage", "used": 1234, "ts": legacy_event["ts"], "i": next_index, "size": None}
+        ]
 
 
 def test_log_prose_renders_markdown_without_tool_lines(cli: CliRunner) -> None:

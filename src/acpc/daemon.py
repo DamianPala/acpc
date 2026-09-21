@@ -1436,8 +1436,7 @@ class Daemon:
             modes=request.resolution.entry.modes,
             end_turn=cancel.end_turn,
             cancellation_dispatched=cancel.cancellation_dispatched,
-            previous_tokens=stored.tokens,
-            previous_cost=stored.cost,
+            previous_context=stored.context,
         )
 
         turn_error: BaseException | None = None
@@ -1535,8 +1534,7 @@ class Daemon:
             state=state,
             stop_reason=stop_reason,
             answer=client.answer,
-            tokens=client.tokens,
-            cost=client.cost,
+            context=client.context,
             denied=client.denied,
             denial_details=client.denial_details,
             adapter_session_id=adapter_session_id,
