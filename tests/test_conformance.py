@@ -1679,16 +1679,32 @@ def test_O2a_O2b_default_format_is_exercised_for_every_indexed_command(
             assert result.stdout or result.stderr, name
 
 
-def _read_fd(fd: int) -> bytes:
-    data = bytearray()
-    try:
-        while chunk := os.read(fd, 4096):
-            data.extend(chunk)
-    except OSError:
-        pass
-    finally:
-        os.close(fd)
-    return bytes(data)
+def _drain_master(fd: int, sink: bytearray, child_exited: threading.Event) -> None:
+    """Read a pty master while the child runs, then once more after it exited.
+
+    Reading concurrently keeps the child from blocking on a full pty queue;
+    the parent keeps its own slave descriptor open until the read is over,
+    so the queue survives the child's exit (a BSD pty discards whatever is
+    still queued once the slave's last descriptor closes, which is how the
+    macOS runner read back an empty stdout; Linux keeps the data, so this
+    changes nothing there). Everything the child wrote is queued by the time
+    `child_exited` is set, so one final pass after seeing it drains the rest.
+    """
+    while True:
+        ready, _, _ = select.select([fd], [], [], 0.05)
+        if ready:
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                return
+            sink.extend(chunk)
+            continue
+        if child_exited.is_set():
+            while select.select([fd], [], [], 0)[0]:
+                chunk = os.read(fd, 4096)
+                if not chunk:
+                    return
+                sink.extend(chunk)
+            return
 
 
 def _run_with_stream_context(
@@ -1707,6 +1723,8 @@ def _run_with_stream_context(
             slaves.append(None)
             targets.append(subprocess.PIPE)
     process: subprocess.Popen[bytes] | None = None
+    child_exited = threading.Event()
+    readers: list[tuple[threading.Thread, bytearray]] = []
     try:
         process = subprocess.Popen(
             [sys.executable, "-c", "from acpc.cli import main; raise SystemExit(main())", *args],
@@ -1715,11 +1733,19 @@ def _run_with_stream_context(
             stderr=targets[1],
             env=os.environ.copy(),
         )
-        for slave in slaves:
-            if slave is not None:
-                os.close(slave)
+        for master in masters:
+            sink = bytearray()
+            thread = threading.Thread(
+                target=_drain_master, args=(master, sink, child_exited), daemon=True
+            )
+            thread.start()
+            readers.append((thread, sink))
         pipe_stdout, pipe_stderr = process.communicate(timeout=10)
-        tty_output = [_read_fd(master) for master in masters]
+        child_exited.set()
+        for thread, _ in readers:
+            thread.join(timeout=10)
+            assert not thread.is_alive(), "pty master reader did not finish after the child exited"
+        tty_output = [bytes(sink) for _, sink in readers]
         output = iter(tty_output)
         stdout = next(output) if stdout_tty else pipe_stdout
         stderr = next(output) if not stdout_tty and stderr_tty else pipe_stderr

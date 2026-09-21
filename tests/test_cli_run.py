@@ -1498,11 +1498,19 @@ def test_an_execute_floor_ask_refusal_names_the_permission_floor(
     assert "the lowest policy grok-floor runs under is execute" in message
 
 
-def test_real_grok_refusal_names_the_permission_floor(cli: CliRunner) -> None:
+def test_real_grok_refusal_names_the_permission_floor(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The floor refusal is only reachable past the install check, which is a
+    # `shutil.which` on the entry's command; a stand-in on PATH keeps the test
+    # independent of whether the host has the vendor CLI (the CI runners don't).
+    stand_in = tmp_path / "grok"
+    stand_in.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    stand_in.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
+
     result = invoke(cli, "run", "grok", "probe")
 
-    # Fails on the ubuntu-latest runner with exit 1 and passes everywhere local;
-    # the envelope in the assertion message is the only way to see why there.
     assert result.exit_code == vocab.EXIT_USAGE, result.output
     message = error_envelope(result)["message"]
     assert "the lowest policy grok runs under is execute" in message
