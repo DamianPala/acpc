@@ -1337,12 +1337,16 @@ if begin_section S12-cli "help contract, -V, TTY rules, hostile inputs"; then
     assert_contains "non-TTY default permissions is read (visible in resolve)" \
         "$LAST_OUT" "read"
 
-    # setsid + pipe drive the non-TTY path explicitly
+    # A new session (no controlling terminal) + pipe drive the non-TTY path
+    # explicitly. A Python child does what util-linux setsid would; macOS
+    # ships no setsid binary.
     set +e
-    setsid bash -c 'acpc status last' </dev/null >"${SCRATCH}/setsid.out" 2>"${SCRATCH}/setsid.err"
+    "$PYTHON_BIN" -c 'import subprocess, sys
+sys.exit(subprocess.call(["bash", "-c", "acpc status last"], start_new_session=True))' \
+        </dev/null >"${SCRATCH}/setsid.out" 2>"${SCRATCH}/setsid.err"
     SETSID_RC=$?
     set -e
-    assert_eq "'last' rejected under setsid" "2" "$SETSID_RC"
+    assert_eq "'last' rejected in a new session" "2" "$SETSID_RC"
 
     # TTY-positive checks via a pty, best-effort
     cat >"${SCRATCH}/pty_check.py" <<'PYEOF'
