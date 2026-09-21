@@ -2,8 +2,11 @@
 
 ## Now
 
-**1.0.0 is built on `feat/cli-design-conformance` (2026-09-21) and waits for Damian's push, PR
-merge without squash and tag `v1.0.0`.** Three closing slices after the alignment, one commit
+**1.0.0 is merged to `main` with `--no-ff` (`6f47d46`, 2026-09-21), tagged `v1.0.0` locally
+and installed on the host; only Damian's `git push origin main v1.0.0` is left, and the release
+page comes after that on his go.** The branch was merged once before slice 25, so the earlier
+local merge and tag were dropped (nothing had been pushed) and redone on the final branch tip
+`891e834`. Three closing slices after the alignment, one commit
 each, Sonnet builder plus Opus reviewer with mutation testing on a `git archive` copy: 22
 `4ecad7e` (`refactor(cli)`: duplicate JSON emitters merged, `output.collection_envelope` and
 `_emit_maintenance_result`, `_render_log_page` and `steer_command` split under 100 lines, the
