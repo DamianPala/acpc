@@ -191,8 +191,6 @@ def expected_flag(parameter: click.Option) -> dict[str, Any]:
         expected["aliases"] = aliases
     if isinstance(parameter.type, click.Choice):
         expected["enum"] = [str(choice) for choice in parameter.type.choices]
-    if parameter.multiple:
-        expected["repeatable"] = True
     return expected
 
 

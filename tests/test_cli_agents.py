@@ -109,6 +109,41 @@ def test_agents_check_without_name_is_a_bounded_collection(cli: CliRunner) -> No
     assert isinstance(payload["has_more"], bool)
 
 
+def test_agents_list_reports_has_more_past_the_default_limit(
+    cli: CliRunner, state_root: Path
+) -> None:
+    """Mutation coverage: nothing else in the suite proves this truncation
+    signal for `agents list` (recon D, mutation 10)."""
+    for index in range(20):
+        (state_root / "agents" / f"variant-{index:02d}.toml").write_text(
+            'extends = "mock"\n', encoding="utf-8"
+        )
+
+    result = invoke(cli, "agents", "list", "--json")
+
+    payload = json.loads(result.stdout)
+    assert len(payload["items"]) == 20
+    assert payload["has_more"] is True
+
+
+def test_agents_check_reports_has_more_past_the_default_limit(
+    cli: CliRunner, state_root: Path
+) -> None:
+    """Mutation coverage: nothing else in the suite proves this truncation
+    signal for `agents check` (recon D, mutation 10). Every extra entry is a
+    fast-failing phantom so the check does not spawn 20 real subprocesses."""
+    for index in range(20):
+        (state_root / "agents" / f"phantom-{index:02d}.toml").write_text(
+            PHANTOM_ENTRY, encoding="utf-8"
+        )
+
+    result = invoke(cli, "agents", "check", "--json")
+
+    payload = json.loads(result.stdout)
+    assert len(payload["items"]) == 20
+    assert payload["has_more"] is True
+
+
 @pytest.mark.parametrize("flag", ["--limit", "--plain"])
 def test_agents_check_rejects_collection_flags_with_a_name(cli: CliRunner, flag: str) -> None:
     extra = (flag, "1") if flag == "--limit" else (flag,)

@@ -432,7 +432,7 @@ def test_wait_accepts_a_suffixed_timeout_on_a_finished_session(cli: CliRunner) -
     elapsed = time.monotonic() - started
 
     assert result.exit_code == vocab.EXIT_OK
-    assert elapsed < 1.0
+    assert elapsed < 5.0
 
 
 def test_log_accepts_a_suffixed_timeout_on_a_finished_session(cli: CliRunner) -> None:

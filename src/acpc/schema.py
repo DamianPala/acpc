@@ -883,8 +883,6 @@ def _descriptor(
         descriptor["aliases"] = aliases
     if isinstance(parameter, click.Argument) and parameter.nargs == -1:
         descriptor["variadic"] = True
-    if isinstance(parameter, click.Option) and parameter.multiple:
-        descriptor["repeatable"] = True
     if parameter.name in getattr(command, _STDIN, frozenset()):
         descriptor["accepts_stdin"] = True
     return descriptor

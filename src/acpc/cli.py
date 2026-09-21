@@ -1532,8 +1532,6 @@ def _tty_permission_prompt(kind: str, title: str) -> bool:
 
 def _emit_resolution(payload: dict[str, Any], *, json_mode: bool) -> None:
     if json_mode:
-        import json
-
         click.echo(json.dumps(payload, ensure_ascii=False))
         return
     lines = [
@@ -1735,7 +1733,7 @@ def _agent_list_payload(registry: AgentRegistry) -> dict[str, Any]:
                     "description": variant.description,
                 }
             )
-    return {"items": rows, "has_more": False}
+    return output.collection_envelope(rows, has_more=False)
 
 
 def _cache_footer(record: cache.CachedAdvertised | None) -> str:
@@ -1983,7 +1981,7 @@ def _run_agents_list(selected_format: str, limit: int, plain: bool) -> None:
         registry = AgentRegistry()
         all_items = list(_agent_list_payload(registry)["items"])
         items = all_items[:limit]
-        payload = {"items": items, "has_more": len(items) < len(all_items)}
+        payload = output.collection_envelope(items, has_more=len(items) < len(all_items))
         if selected_format == "json":
             _emit_json(payload)
         elif selected_format == "plain":
@@ -2169,12 +2167,11 @@ def _agents_check(
     for entry in entries:
         results.append(_check_one(registry, entry, timeout))
     if name is None:
-        payload: dict[str, Any] = {
-            "items": results,
-            "has_more": len(results) < len(_check_entries(registry, None)),
-        }
+        payload: dict[str, Any] = output.collection_envelope(
+            results, has_more=len(results) < len(_check_entries(registry, None))
+        )
     else:
-        payload = {"items": results, "has_more": False}
+        payload = output.collection_envelope(results, has_more=False)
     if selected_format == "json":
         _emit_json(payload)
     elif selected_format == "plain":
@@ -2553,7 +2550,7 @@ def _run_skills_list(selected_format: str, limit: int) -> None:
     """Render the bounded bundled-skill collection."""
     bundled = skills.list_skills()
     items = [_skill_payload(skill, include_body=False) for skill in bundled[:limit]]
-    payload = {"items": items, "has_more": len(items) < len(bundled)}
+    payload = output.collection_envelope(items, has_more=len(items) < len(bundled))
     if selected_format == "json":
         _emit_json(payload)
     elif selected_format == "plain":
@@ -2963,8 +2960,24 @@ def _cancel_session(meta: sessions.SessionMeta) -> _CancelResult:
     return _cancel_local_session(meta)
 
 
-def _maintenance_json(payload: Mapping[str, Any]) -> None:
-    _write_stdout(json.dumps(dict(payload), ensure_ascii=False) + "\n")
+def _emit_maintenance_result(
+    payload: Mapping[str, Any],
+    *,
+    selected_format: str,
+    text: str | None,
+    summary: str,
+) -> None:
+    """Print a maintenance command's payload, then its stderr summary.
+
+    ``--format json`` prints ``payload``; otherwise ``text`` is written verbatim
+    when given, and nothing otherwise (a command with no non-JSON receipt).
+    ``summary`` is the stderr line's content after the ``-- `` prefix.
+    """
+    if selected_format == "json":
+        _emit_json(payload)
+    elif text is not None:
+        _write_stdout(text)
+    click.echo(f"-- {summary}", err=True)
 
 
 @effects.non_idempotent
@@ -3015,11 +3028,12 @@ def cancel_command(selector: str, format_name: str | None, json_mode: bool) -> N
         "stop_reason": meta.stop_reason,
         "changed": changed,
     }
-    if selected_format == "json":
-        _maintenance_json(payload)
-    else:
-        _write_stdout(f"{meta.session_id} {meta.state}\n")
-    click.echo(f"-- canceled {meta.session_id} · {meta.state}", err=True)
+    _emit_maintenance_result(
+        payload,
+        selected_format=selected_format,
+        text=f"{meta.session_id} {meta.state}\n",
+        summary=f"canceled {meta.session_id} · {meta.state}",
+    )
 
 
 @effects.non_idempotent
@@ -3073,11 +3087,12 @@ def delete_command(
         "changed": True,
         "paths": advertised_paths,
     }
-    if selected_format == "json":
-        _maintenance_json(payload)
-    else:
-        _write_stdout(f"removed {meta.session_id}\n")
-    click.echo(f"-- removed session {meta.session_id}", err=True)
+    _emit_maintenance_result(
+        payload,
+        selected_format=selected_format,
+        text=f"removed {meta.session_id}\n",
+        summary=f"removed session {meta.session_id}",
+    )
 
 
 @effects.non_idempotent
@@ -3180,13 +3195,11 @@ def prune_command(
         "changed": bool(session_ids) and not dry_run,
         "requires_confirmation": bool(session_ids),
     }
-    if selected_format == "json":
-        _maintenance_json(payload)
-    elif session_ids:
-        _write_stdout("\n".join(session_ids) + "\n")
-    click.echo(
-        f"-- prune {'would remove' if dry_run else 'removed'} {len(session_ids)} session(s)",
-        err=True,
+    _emit_maintenance_result(
+        payload,
+        selected_format=selected_format,
+        text="\n".join(session_ids) + "\n" if session_ids else None,
+        summary=f"prune {'would remove' if dry_run else 'removed'} {len(session_ids)} session(s)",
     )
 
 
@@ -3621,7 +3634,7 @@ def log_command(
     )
 
 
-def _render_log_page(
+def _select_log_page(
     meta: sessions.SessionMeta,
     transcript_file: transcript.Transcript,
     *,
@@ -3630,18 +3643,15 @@ def _render_log_page(
     limit: int | None,
     prose: bool,
     json_mode: bool,
-    max_output: int,
     wait_new: bool,
     explicit_since: bool,
     timeout: float | None,
-    quiet: bool,
-    since_note: str | None,
-) -> None:
-    """Print one page of a transcript, optionally waiting for it to exist.
+) -> tuple[sessions.SessionMeta, transcript.TranscriptPage, int, bool, bool]:
+    """Select the page `log` reports, waiting once for a new event if asked.
 
-    This is `log` without `--follow`: a single read that either has events
-    already or waits once for the first new one, then the footer that tells a
-    poller where to resume and whether the session is still going.
+    Returns the (possibly refreshed) session meta, the page, the cursor it
+    was read from (`--wait-new` may advance it before the read), and whether
+    the wait timed out / gave up waiting for a new event.
     """
     selection_tail = tail
     if wait_new and not explicit_since:
@@ -3684,7 +3694,25 @@ def _render_log_page(
         # The wait may have outlived the state this command started with; the
         # footer is the caller's termination signal, so it must be current.
         meta = _load_view_session(meta.session_id)
+    return meta, page, cursor, timed_out, gave_up_waiting
 
+
+def _emit_log_page(
+    meta: sessions.SessionMeta,
+    transcript_file: transcript.Transcript,
+    page: transcript.TranscriptPage,
+    *,
+    cursor: int,
+    prose: bool,
+    json_mode: bool,
+    max_output: int,
+    quiet: bool,
+    since_note: str | None,
+    timeout: float | None,
+    timed_out: bool,
+    gave_up_waiting: bool,
+) -> None:
+    """Render one selected page and its footer; raise on a `--wait-new` timeout."""
     full_last_message = meta.state in {"failed", "unknown"}
     rendered = render.render_events(
         page.events,
@@ -3723,6 +3751,56 @@ def _render_log_page(
             hint=f"Run: acpc log {meta.session_id} --wait-new --since {rendered.next_cursor}",
             context={"session_id": meta.session_id, "cursor": rendered.next_cursor},
         )
+
+
+def _render_log_page(
+    meta: sessions.SessionMeta,
+    transcript_file: transcript.Transcript,
+    *,
+    cursor: int,
+    tail: int | None,
+    limit: int | None,
+    prose: bool,
+    json_mode: bool,
+    max_output: int,
+    wait_new: bool,
+    explicit_since: bool,
+    timeout: float | None,
+    quiet: bool,
+    since_note: str | None,
+) -> None:
+    """Print one page of a transcript, optionally waiting for it to exist.
+
+    This is `log` without `--follow`: a single read that either has events
+    already or waits once for the first new one, then the footer that tells a
+    poller where to resume and whether the session is still going.
+    """
+    meta, page, cursor, timed_out, gave_up_waiting = _select_log_page(
+        meta,
+        transcript_file,
+        cursor=cursor,
+        tail=tail,
+        limit=limit,
+        prose=prose,
+        json_mode=json_mode,
+        wait_new=wait_new,
+        explicit_since=explicit_since,
+        timeout=timeout,
+    )
+    _emit_log_page(
+        meta,
+        transcript_file,
+        page,
+        cursor=cursor,
+        prose=prose,
+        json_mode=json_mode,
+        max_output=max_output,
+        quiet=quiet,
+        since_note=since_note,
+        timeout=timeout,
+        timed_out=timed_out,
+        gave_up_waiting=gave_up_waiting,
+    )
 
 
 def _sleep_until(deadline: float | None) -> None:
@@ -4450,8 +4528,6 @@ def _dispatch_background(
     SPEC `run --bg`: on a terminal, stdout is exactly the session id and its
     directory; off one, `text` prints the tagged receipt (V6a) instead.
     """
-    import asyncio
-
     problem = asyncio.run(runner.dispatch_background(session_id, request))
     if problem is not None:
         # The session exists by now: the caller has to be able to reach it
@@ -4852,6 +4928,64 @@ _STEER_MODE_HELP = (
 _STEER_IPC_TIMEOUT = 15.0
 
 
+def _check_steer_option_conflicts(
+    background: bool,
+    timeout: float | None,
+    cancel_after: float | None,
+    steer_mode: str | None,
+) -> None:
+    """Reject the `steer` option combinations that make no sense together."""
+    if background and timeout is not None:
+        raise UsageProblem("--timeout only bounds waiting; use --cancel-after with --background")
+    if cancel_after is not None and steer_mode != vocab.STEER_CANCEL_THEN_START:
+        # SPEC `steer`: only cancel-then-start starts a turn to bound, so the
+        # rule is static. Making it a capability question would give the same
+        # command line two different meanings on two sessions.
+        raise UsageProblem(
+            "--cancel-after is accepted only with --steer-mode cancel-then-start, "
+            "the only mode that starts a turn to bound"
+        )
+
+
+def _load_steerable_session(selector: str, steer_mode: str | None) -> sessions.SessionMeta:
+    """Load the target session, refusing it if there is no turn to interrupt."""
+    meta = _load_view_session(selector)
+    if not meta.is_active:
+        meta = _status_view_meta(meta)
+    if not meta.is_active and meta.state != "preparing":
+        raise AcpcError(
+            f"session {meta.session_id} is {meta.state} — there is no turn to interrupt",
+            kind=errors.CONFLICT,
+            hint=f"Run: acpc continue {meta.session_id}",
+            context={
+                "session_id": meta.session_id,
+                "capabilities": output.session_capabilities(meta),
+            },
+        )
+    if steer_mode == vocab.STEER_IN_PLACE and meta.state == "waiting":
+        # SPEC `steer`: a session waiting through a usage limit has no turn in
+        # flight to correct — the channel exists but nothing is on the other
+        # end of it right now, which is a state, not a permanent incapability
+        # (`not_supported`), so `_select_steer_mode` never gets to answer.
+        raise AcpcError(
+            f"session {meta.session_id} is waiting for a usage limit to reset — "
+            "there is no turn in flight to correct in place",
+            kind=errors.CONFLICT,
+            hint=f"Run: acpc steer {meta.session_id} ... --steer-mode cancel-then-start",
+            context={
+                "session_id": meta.session_id,
+                "capabilities": output.session_capabilities(meta),
+                "correction_result": {
+                    "steer_mode": vocab.STEER_IN_PLACE,
+                    "target_turn": meta.turns,
+                    "target_status": meta.state,
+                    "message_state": "not_delivered",
+                },
+            },
+        )
+    return meta
+
+
 @effects.non_idempotent
 @schema.format_defaults(tty="text", non_tty="text")
 @schema.output_description(_STEER_OUTPUT_DESCRIPTION)
@@ -4958,57 +5092,14 @@ def steer_command(
     Example: ``acpc steer x7k2 "Stop editing; diagnose only"``
     """
     selected_format = _select_format(format_name, json_mode, native_text=True)
-    if background and timeout is not None:
-        raise UsageProblem("--timeout only bounds waiting; use --cancel-after with --background")
-    if cancel_after is not None and steer_mode != vocab.STEER_CANCEL_THEN_START:
-        # SPEC `steer`: only cancel-then-start starts a turn to bound, so the
-        # rule is static. Making it a capability question would give the same
-        # command line two different meanings on two sessions.
-        raise UsageProblem(
-            "--cancel-after is accepted only with --steer-mode cancel-then-start, "
-            "the only mode that starts a turn to bound"
-        )
+    _check_steer_option_conflicts(background, timeout, cancel_after, steer_mode)
     instruction = _read_prompt(
         instruction_text,
         prompt_file,
         operation="steer",
         hint="Run: acpc steer SESSION_ID INSTRUCTION",
     )
-    meta = _load_view_session(selector)
-    if not meta.is_active:
-        meta = _status_view_meta(meta)
-    if not meta.is_active and meta.state != "preparing":
-        raise AcpcError(
-            f"session {meta.session_id} is {meta.state} — there is no turn to interrupt",
-            kind=errors.CONFLICT,
-            hint=f"Run: acpc continue {meta.session_id}",
-            context={
-                "session_id": meta.session_id,
-                "capabilities": output.session_capabilities(meta),
-            },
-        )
-
-    if steer_mode == vocab.STEER_IN_PLACE and meta.state == "waiting":
-        # SPEC `steer`: a session waiting through a usage limit has no turn in
-        # flight to correct — the channel exists but nothing is on the other
-        # end of it right now, which is a state, not a permanent incapability
-        # (`not_supported`), so `_select_steer_mode` never gets to answer.
-        raise AcpcError(
-            f"session {meta.session_id} is waiting for a usage limit to reset — "
-            "there is no turn in flight to correct in place",
-            kind=errors.CONFLICT,
-            hint=f"Run: acpc steer {meta.session_id} ... --steer-mode cancel-then-start",
-            context={
-                "session_id": meta.session_id,
-                "capabilities": output.session_capabilities(meta),
-                "correction_result": {
-                    "steer_mode": vocab.STEER_IN_PLACE,
-                    "target_turn": meta.turns,
-                    "target_status": meta.state,
-                    "message_state": "not_delivered",
-                },
-            },
-        )
+    meta = _load_steerable_session(selector, steer_mode)
     selected_mode = _select_steer_mode(meta, steer_mode)
     target = meta.target
     if selected_mode == vocab.STEER_IN_PLACE:
@@ -5717,20 +5808,10 @@ def daemon_status_command(
         and ctx.get_parameter_source("limit") is not click.core.ParameterSource.COMMANDLINE
     ):
         raise UsageProblem("--plain requires an explicit --limit")
-    import asyncio
-
     all_entries = asyncio.run(_collect_daemon_status(agent))
     entries = all_entries[:limit]
     if selected_format == "json":
-        import json
-
-        _write_stdout(
-            json.dumps(
-                {"items": entries, "has_more": len(entries) < len(all_entries)},
-                ensure_ascii=False,
-            )
-            + "\n"
-        )
+        _emit_json(output.collection_envelope(entries, has_more=len(entries) < len(all_entries)))
         return
     if selected_format == "plain":
         _write_stdout("".join(f"{item['target']}\n" for item in entries))
@@ -5831,8 +5912,6 @@ def daemon_stop_command(
     Example: ``acpc daemon stop mock``
     """
     selected_format = _select_format(format_name, json_mode)
-    import asyncio
-
     targets = runner.daemon_targets_for(agent) if agent else runner.all_daemon_targets()
     if not force:
         _refuse_stop_over_active_sessions(agent, targets)
@@ -5860,11 +5939,11 @@ def daemon_stop_command(
         "changed": bool(stopped) and not dry_run,
         "requires_confirmation": agent is None and bool(targets),
     }
-    if selected_format == "json":
-        _maintenance_json(payload)
-    click.echo(
-        f"-- {'would stop' if dry_run else 'stopped'} {len(stopped)} daemon(s)",
-        err=True,
+    _emit_maintenance_result(
+        payload,
+        selected_format=selected_format,
+        text=None,
+        summary=f"{'would stop' if dry_run else 'stopped'} {len(stopped)} daemon(s)",
     )
 
 

@@ -1051,6 +1051,17 @@ def test_cancel_after_needs_an_explicit_cancel_then_start(cli: CliRunner) -> Non
         assert "Usage:" not in result.stdout
 
 
+def test_background_with_timeout_needs_cancel_after_instead(cli: CliRunner) -> None:
+    """SPEC steer: --timeout only bounds waiting; --background needs --cancel-after
+    to bound the redirected work itself, so the rule is static and holds on an
+    untouched session too."""
+    result = invoke(cli, "steer", "x7k2", "diagnose", "--background", "--timeout", "5")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert "--cancel-after" in result.stderr
+    assert "Usage:" not in result.stdout
+
+
 def test_in_place_on_a_session_with_no_prompt_in_flight_is_a_conflict(
     cli: CliRunner,
 ) -> None:

@@ -9,7 +9,13 @@ from pathlib import Path
 from typing import Any
 
 from acpc import sessions, transcript, vocab
-from acpc.output import format_duration, format_tokens, session_capabilities, status_permissions
+from acpc.output import (
+    collection_envelope,
+    format_duration,
+    format_tokens,
+    session_capabilities,
+    status_permissions,
+)
 
 Clock = Callable[[], float]
 DEFAULT_LOG_MAX_OUTPUT = 128 * 1024
@@ -677,7 +683,7 @@ def status_list_json(
                 "finished_at": _timestamp_or_none(meta.finished_at),
             }
         )
-    return {"items": rows, "has_more": len(selected) < len(sessions_in)}
+    return collection_envelope(rows, has_more=len(selected) < len(sessions_in))
 
 
 def _timestamp_or_none(value: float | None) -> str | None:

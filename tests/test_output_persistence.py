@@ -1,4 +1,4 @@
-"""Direct behavioral coverage for slice 4's output and persistence contract."""
+"""Direct behavioral coverage for the output and persistence contract."""
 
 import json
 import os

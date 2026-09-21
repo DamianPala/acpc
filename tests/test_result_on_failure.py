@@ -1,9 +1,9 @@
-"""Direct behavioral coverage for slice 12's result-on-failure contract.
+"""Direct behavioral coverage for the result-on-failure contract.
 
 Every test here separates the two streams: the result document on stdout, the
 structured error on stderr, and the exit code on its own.  A test that only
 checked the exit code, or the merged output, would pass against exactly the
-regression this slice removes.
+regression this contract guards against.
 """
 
 import json

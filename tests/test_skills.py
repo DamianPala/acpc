@@ -146,6 +146,22 @@ def test_list_has_header_alignment_sorting_and_bounded_rendered_description(
     assert len(listed["items"]) <= 20
 
 
+def test_list_reports_has_more_past_the_default_limit(
+    cli: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mutation coverage: nothing else in the suite proves this truncation
+    signal for `skills list` (recon D, mutation 10)."""
+    root = _resource_root(tmp_path, monkeypatch)
+    for index in range(21):
+        _write_skill(root, f"skill-{index:02d}", f"---\ndescription: entry {index}\n---\nbody\n")
+
+    result = invoke(cli, "skills", "list", "--json")
+
+    payload = json.loads(result.stdout)
+    assert len(payload["items"]) == 20
+    assert payload["has_more"] is True
+
+
 def test_detail_preserves_body_and_places_directory_metadata_on_stderr(
     cli: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

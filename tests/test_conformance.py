@@ -24,7 +24,7 @@ import time
 import warnings
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any
 
 import click
 import pytest
@@ -923,8 +923,6 @@ def _descriptor_for(option: click.Option) -> dict[str, Any]:
         descriptor["aliases"] = aliases
     if isinstance(option.type, click.Choice):
         descriptor["enum"] = [str(choice) for choice in option.type.choices]
-    if option.multiple:
-        descriptor["repeatable"] = True
     return descriptor
 
 
@@ -2073,44 +2071,35 @@ def test_D5a_background_breadcrumb_is_an_executable_wait_vector(
     assert json.loads(waited.stdout)["session_id"] == payload["session_id"]
 
 
-def test_O8_broken_pipe_is_a_documented_pipe_exit(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    class BrokenStream:
-        def write(self, _text: str) -> None:
-            raise BrokenPipeError
+def test_O8_broken_pipe_is_a_documented_pipe_exit() -> None:
+    """SPEC O8: a genuinely closed pipe reader is exit 141 with a clean stderr.
 
-        def flush(self) -> None:
-            raise BrokenPipeError
+    Closing the read end before the child ever writes forces its first
+    ``acpc`` stdout write to fail with a real EPIPE — the same mechanics a
+    shell hits piping into a reader that exits early (``acpc list | true``)
+    — instead of a monkeypatched ``_leave_on_broken_pipe``.
+    """
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "from acpc.cli import main; raise SystemExit(main())",
+            "list",
+            "--json",
+        ],
+        env=os.environ.copy(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
+        text=True,
+    )
+    assert process.stdout is not None
+    process.stdout.close()
 
-    def leave() -> NoReturn:
-        raise SystemExit(vocab.EXIT_SIGPIPE)
+    _, stderr = process.communicate(timeout=15)
 
-    monkeypatch.setattr(cli_module.sys, "stdout", BrokenStream())
-    monkeypatch.setattr(cli_module, "_leave_on_broken_pipe", leave)
-
-    with pytest.raises(SystemExit) as raised:
-        cli_module._write_stdout("pipe")
-
-    assert raised.value.code == vocab.EXIT_SIGPIPE
-
-
-def test_O8_main_keeps_the_documented_pipe_exit(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def broken_write(_text: str) -> None:
-        raise BrokenPipeError
-
-    def leave() -> NoReturn:
-        raise SystemExit(vocab.EXIT_SIGPIPE)
-
-    monkeypatch.setattr(cli_module, "_write_stdout", broken_write)
-    monkeypatch.setattr(cli_module, "_leave_on_broken_pipe", leave)
-
-    with pytest.raises(SystemExit) as raised:
-        main.main(args=("list",), standalone_mode=True)
-
-    assert raised.value.code == vocab.EXIT_SIGPIPE
+    assert process.returncode == vocab.EXIT_SIGPIPE
+    assert "Traceback" not in stderr
 
 
 @pytest.mark.parametrize("cleanup", ["delete", "prune_explicit", "prune_bare"])

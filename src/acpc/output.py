@@ -8,7 +8,7 @@ is kept on stderr.
 
 import json
 import sys
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO
@@ -90,6 +90,14 @@ def _paths_for(meta: sessions.SessionMeta, *, turn: int | None) -> dict[str, str
         result["answer"] = str(sessions.turn_path(meta.session_id, "answer", turn))
         result["prompt"] = str(sessions.turn_path(meta.session_id, "prompt", turn))
     return result
+
+
+def collection_envelope(items: Sequence[Any], *, has_more: bool) -> dict[str, Any]:
+    """Build the ``{"items": [...], "has_more": bool}`` shape every bounded
+    ``--json`` list uses (``list``, ``agents list``, ``agents check``,
+    ``daemon status``, ``skills list``).
+    """
+    return {"items": list(items), "has_more": has_more}
 
 
 def result_envelope(

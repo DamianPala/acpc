@@ -161,6 +161,40 @@ def test_daemon_status_with_no_daemons_is_a_successful_empty_report(cli: CliRunn
     assert "no daemons running" in result.stderr
 
 
+def test_daemon_status_reports_has_more_past_the_default_limit(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mutation coverage: nothing else in the suite proves this truncation
+    signal for `daemon status` (recon D, mutation 10)."""
+    entries = [
+        {
+            "target": f"mock~target-{index:02d}",
+            "version": "0.7.1",
+            "pid": 1000 + index,
+            "uptime_seconds": 4.5,
+            "log": "/tmp/mock.log",
+            "sessions": [],
+            "preparing": [],
+            "restoring": [],
+            "max_concurrent": 1,
+            "idle_seconds": 2.0,
+        }
+        for index in range(21)
+    ]
+
+    async def fake_status(agent: str | None) -> list[dict[str, Any]]:
+        del agent
+        return entries
+
+    monkeypatch.setattr(cli_module, "_collect_daemon_status", fake_status)
+
+    result = invoke(cli, "daemon", "status", "--json")
+
+    payload = json.loads(result.stdout)
+    assert len(payload["items"]) == 20
+    assert payload["has_more"] is True
+
+
 def test_daemon_targets_are_sorted_and_repeatable(state_root: Path) -> None:
     daemon_dir = state_root / "daemon"
     daemon_dir.mkdir()
@@ -742,6 +776,16 @@ def test_cancel_json_is_one_object_on_stdout(cli: CliRunner) -> None:
     assert result.stderr.startswith("-- canceled ")
 
 
+def test_cancel_text_stdout_is_exactly_the_session_id_and_state(cli: CliRunner) -> None:
+    session_id = _finished_session()
+
+    result = invoke(cli, "cancel", session_id, "--format", "text")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert result.stdout == f"{session_id} succeeded\n"
+    assert result.stderr.startswith("-- ")
+
+
 def test_delete_deletes_a_finished_session(cli: CliRunner) -> None:
     session_id = _finished_session()
 
@@ -788,6 +832,16 @@ def test_delete_json_reports_the_removed_session(cli: CliRunner) -> None:
     payload = json.loads(result.stdout)
     assert payload["session_id"] == session_id
     assert payload["removed"] is True
+
+
+def test_delete_text_stdout_is_exactly_removed_session_id(cli: CliRunner) -> None:
+    session_id = _finished_session()
+
+    result = invoke(cli, "delete", session_id, "--yes", "--format", "text")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert result.stdout == f"removed {session_id}\n"
+    assert result.stderr.startswith("-- ")
 
 
 def test_prune_dry_run_lists_old_finished_sessions_without_deleting(
@@ -897,6 +951,44 @@ def test_prune_json_is_one_object_on_stdout(cli: CliRunner, state_root: Path) ->
         "changed": False,
         "requires_confirmation": True,
     }
+    assert result.stderr.startswith("-- prune ")
+
+
+def test_prune_text_stdout_lists_pruned_ids_with_trailing_newline(
+    cli: CliRunner, state_root: Path
+) -> None:
+    session_id = _finished_session()
+    _backdate(state_root, session_id, finished=200 * 86400)
+
+    result = invoke(cli, "prune", "--older-than", "100d", "--yes", "--format", "text")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert result.stdout == f"{session_id}\n"
+    assert result.stderr.startswith("-- prune ")
+
+
+def test_prune_text_stdout_separates_several_ids_with_one_newline_each(
+    cli: CliRunner, state_root: Path
+) -> None:
+    """Two targets pin the separator itself, which one id cannot: the order is
+    not contract, but one id per line with a trailing newline is."""
+    pruned = {_finished_session(), _finished_session()}
+    for session_id in pruned:
+        _backdate(state_root, session_id, finished=200 * 86400)
+
+    result = invoke(cli, "prune", "--older-than", "100d", "--yes", "--format", "text")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert result.stdout.endswith("\n")
+    assert set(result.stdout.splitlines()) == pruned
+    assert result.stderr.startswith("-- prune ")
+
+
+def test_prune_text_stdout_is_empty_without_candidates(cli: CliRunner) -> None:
+    result = invoke(cli, "prune", "--older-than", "100d", "--yes", "--format", "text")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert result.stdout == ""
     assert result.stderr.startswith("-- prune ")
 
 
