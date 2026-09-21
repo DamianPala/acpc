@@ -11,13 +11,51 @@ from unittest.mock import patch
 import pytest
 
 from acpc.proc import (
+    _ps_fields,
+    _PsUnavailableError,
     classify_process_identity,
     is_process_alive,
     kill_process_tree,
+    process_cmdline,
     process_group_kwargs,
+    process_identity_supported,
     process_liveness,
     process_start_time,
 )
+
+
+def _lstart_under(locale_name: str) -> str:
+    """`ps`'s `lstart` for this very process, rendered under `locale_name`."""
+    completed = subprocess.run(
+        ["ps", "-o", "lstart=", "-p", str(os.getpid())],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "LC_ALL": locale_name},
+    )
+    return completed.stdout.strip()
+
+
+def _non_c_locale() -> str | None:
+    """Return an installed locale that renders `lstart` differently from C.
+
+    A name that merely differs from "C" is not enough to prove anything: on a
+    glibc box `locale -a` lists `C.utf8` first, and it renders `strftime`'s
+    `%c` exactly as `C` does, so a test comparing the two would pass whether
+    or not `_ps_fields` pins the locale at all.
+    """
+    try:
+        completed = subprocess.run(["locale", "-a"], capture_output=True, text=True, check=False)
+    except OSError:
+        return None
+    under_c = _lstart_under("C")
+    for name in completed.stdout.splitlines():
+        name = name.strip()
+        if not name or name.upper() in ("C", "POSIX"):
+            continue
+        if _lstart_under(name) != under_c:
+            return name
+    return None
 
 
 class TestProcessGroupKwargs:
@@ -274,3 +312,219 @@ class TestProcessIdentitySignal:
             if process.poll() is None:
                 process.kill()
                 process.wait()
+
+
+class TestPsFields:
+    """`_ps_fields` is the shared foundation of the darwin backend, exercised
+    directly here since Linux's procps `ps` accepts the same column spelling."""
+
+    def test_live_process_returns_lstart_stat_and_command(self) -> None:
+        process = subprocess.Popen(["sleep", "30"])
+        try:
+            fields = _ps_fields(process.pid, "lstart", "stat", "command")
+            assert fields is not None
+            assert len(fields) == 3
+            lstart, stat, command = fields
+            assert lstart
+            assert stat
+            assert "sleep" in command
+        finally:
+            process.kill()
+            process.wait()
+
+    def test_dead_pid_returns_none(self) -> None:
+        process = subprocess.Popen(["sleep", "0"])
+        process.wait()
+        assert _ps_fields(process.pid, "stat") is None
+
+    def test_missing_ps_binary_raises_the_private_unavailable_error(self, tmp_path: Path) -> None:
+        """`ps` failing to run is an infrastructure failure, not a dead pid: it must
+        be distinguishable from "the pid is gone" so callers don't conflate the two
+        (see `TestDarwinLiveness::test_ps_unavailable_is_unverifiable_not_dead`)."""
+        process = subprocess.Popen(["sleep", "30"])
+        try:
+            with (
+                patch.dict(os.environ, {"PATH": str(tmp_path)}),
+                pytest.raises(_PsUnavailableError),
+            ):
+                _ps_fields(process.pid, "stat")
+        finally:
+            process.kill()
+            process.wait()
+
+
+class TestDarwinProcessIdentity:
+    """Runs the darwin backend on Linux's ps: `sys.platform` is patched to
+    ``"darwin"`` while the real `ps` underneath is procps, not BSD `ps`, but
+    both accept the same `-o <col>=` spelling for the columns used here."""
+
+    def test_identity_supported_on_darwin(self) -> None:
+        with patch.object(sys, "platform", "darwin"):
+            assert process_identity_supported() is True
+
+    def test_start_time_of_a_live_process_is_stable(self) -> None:
+        process = subprocess.Popen(["sleep", "30"])
+        try:
+            with patch.object(sys, "platform", "darwin"):
+                token = process_start_time(process.pid)
+                assert token
+                assert process_start_time(process.pid) == token
+        finally:
+            process.kill()
+            process.wait()
+
+    def test_start_time_of_a_dead_pid_is_none(self) -> None:
+        process = subprocess.Popen(["sleep", "0"])
+        process.wait()
+        with patch.object(sys, "platform", "darwin"):
+            assert process_start_time(process.pid) is None
+
+    def test_start_time_token_does_not_change_with_the_caller_s_locale(self) -> None:
+        """`ps`'s `lstart` is `strftime(..., "%c", ...)`, which depends on `LC_TIME`.
+
+        The token is written by one process and compared by another later
+        (`sessions.py:971`/`:1054` write it, `sessions.py:666` reads it back), so if
+        `_ps_fields` didn't pin the locale it renders in, a daemon started under one
+        `LC_ALL` and a caller reading under another would see a live process as dead.
+        """
+        other_locale = _non_c_locale()
+        if other_locale is None:
+            pytest.skip("no installed locale besides C/POSIX to prove LC_ALL is pinned")
+        process = subprocess.Popen(["sleep", "30"])
+        try:
+            with patch.object(sys, "platform", "darwin"):
+                with patch.dict(os.environ, {"LC_ALL": other_locale}):
+                    token_under_other_locale = process_start_time(process.pid)
+                with patch.dict(os.environ, {"LC_ALL": "C"}):
+                    token_under_c = process_start_time(process.pid)
+            assert token_under_other_locale is not None
+            assert token_under_other_locale == token_under_c
+        finally:
+            process.kill()
+            process.wait()
+
+    def test_cmdline_of_a_live_process_contains_the_command(self) -> None:
+        process = subprocess.Popen(["sleep", "30"])
+        try:
+            with patch.object(sys, "platform", "darwin"):
+                command_line = process_cmdline(process.pid)
+            assert command_line is not None
+            assert "sleep" in command_line
+        finally:
+            process.kill()
+            process.wait()
+
+
+class TestDarwinLiveness:
+    """Same rationale as TestDarwinProcessIdentity: real processes, patched platform."""
+
+    def test_live_process_with_its_own_token_is_verified(self) -> None:
+        process = subprocess.Popen(["sleep", "30"])
+        try:
+            with patch.object(sys, "platform", "darwin"):
+                token = process_start_time(process.pid)
+                assert token is not None
+                assert process_liveness(process.pid, token) == "verified"
+        finally:
+            process.kill()
+            process.wait()
+
+    def test_live_process_with_a_different_token_is_dead(self) -> None:
+        process = subprocess.Popen(["sleep", "30"])
+        try:
+            with patch.object(sys, "platform", "darwin"):
+                assert process_liveness(process.pid, "not-the-token") == "dead"
+        finally:
+            process.kill()
+            process.wait()
+
+    def test_live_process_without_a_token_is_unverifiable(self) -> None:
+        process = subprocess.Popen(["sleep", "30"])
+        try:
+            with patch.object(sys, "platform", "darwin"):
+                assert process_liveness(process.pid) == "unverifiable"
+        finally:
+            process.kill()
+            process.wait()
+
+    def test_ps_unavailable_is_unverifiable_not_dead(self, tmp_path: Path) -> None:
+        """`ps` failing to run must read as "cannot tell", not "dead".
+
+        `sessions.py`'s `_verify_liveness` persists a `dead` verdict as a
+        permanent `state = "unknown"` (`exit_code = EXIT_AGENT_ERROR`) -- so if a
+        transient infrastructure failure (missing `ps`, or a `fork`/`posix_spawn`
+        failure under `RLIMIT_NPROC`) mapped to `dead`, a healthy, live session
+        would be marked dead forever. Linux's equivalent infrastructure failure
+        (`OSError` reading `/proc/<pid>/stat`) already returns `unverifiable`;
+        this pins the same contract for darwin.
+        """
+        process = subprocess.Popen(["sleep", "30"])
+        try:
+            with (
+                patch.object(sys, "platform", "darwin"),
+                patch.dict(os.environ, {"PATH": str(tmp_path)}),
+            ):
+                assert process_liveness(process.pid) == "unverifiable"
+                assert process_liveness(process.pid, "some-token") == "unverifiable"
+                assert process_start_time(process.pid) is None
+        finally:
+            process.kill()
+            process.wait()
+
+    def test_zombie_child_is_dead(self) -> None:
+        process = subprocess.Popen([sys.executable, "-c", "pass"])
+        try:
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline:
+                # `ps`, not procfs: the branch this pins is the one macOS takes,
+                # so the test itself has to be runnable there, where /proc is absent.
+                state = subprocess.run(
+                    ["ps", "-o", "stat=", "-p", str(process.pid)],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                ).stdout.strip()
+                if state.startswith("Z"):
+                    with patch.object(sys, "platform", "darwin"):
+                        assert process_liveness(process.pid) == "dead"
+                    return
+                time.sleep(0.01)
+            pytest.fail("child did not become a zombie while its parent kept it unreaped")
+        finally:
+            process.wait()
+
+    def test_dead_pid_is_dead(self) -> None:
+        process = subprocess.Popen(["sleep", "0"])
+        process.wait()
+        with patch.object(sys, "platform", "darwin"):
+            assert process_liveness(process.pid) == "dead"
+
+
+class TestDarwinKillProcessTree:
+    """Same rationale as TestDarwinProcessIdentity: real process groups, patched platform."""
+
+    def test_signals_a_correctly_identified_group_leader(self) -> None:
+        process = subprocess.Popen(["sleep", "30"], start_new_session=True)
+        try:
+            with patch.object(sys, "platform", "darwin"):
+                token = process_start_time(process.pid)
+                assert token is not None
+                result = kill_process_tree(process.pid, expected_process_start_time=token)
+            assert result == "signalled"
+            process.wait(timeout=5)
+            assert process.returncode != 0
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+
+    def test_refuses_a_stale_token(self) -> None:
+        process = subprocess.Popen(["sleep", "30"], start_new_session=True)
+        try:
+            with patch.object(sys, "platform", "darwin"):
+                result = kill_process_tree(process.pid, expected_process_start_time="stale-token")
+            assert result == "refused"
+            assert process.poll() is None
+        finally:
+            process.kill()
+            process.wait()

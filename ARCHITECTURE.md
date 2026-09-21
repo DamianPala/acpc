@@ -38,7 +38,7 @@ interaction.py                  interactive context, /dev/tty question, confirma
 effects.py                      effect classification declared on each click command
 schema.py                       `acpc schema`: the command surface generated from the click tree
 paths.py (frozen)               ~/.acpc layout, ACPC_HOME, atomic_write, 0700/0600
-proc.py (frozen)                process identity/liveness, kill_process_tree, pidfd
+proc.py                         process identity/liveness, kill_process_tree; procfs + pidfd on Linux, `ps` on macOS
 permissions.py (frozen)         kind classification + approval policy
 vocab.py (frozen)               efforts, permission values, session states, exit codes
 ```

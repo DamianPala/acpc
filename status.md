@@ -2,9 +2,27 @@
 
 ## Now
 
-**1.0.0 is merged to `main` with `--no-ff` (`6f47d46`, 2026-09-21), tagged `v1.0.0` locally
-and installed on the host; only Damian's `git push origin main v1.0.0` is left, and the release
-page comes after that on his go.** The branch was merged once before slice 25, so the earlier
+**1.0.1 in progress (2026-09-21): the first CI run of 1.0.0 failed 20 of 1383 tests on
+`macos-latest`, all from one root: `proc.py` identified processes through `/proc` only, so on
+macOS `cancel` could not identify a direct worker, PID reuse was never caught and a worker killed
+mid-turn was never seen as dead.** Slice 26 (`fix(proc)`, branch `fix/macos-process-identity`,
+Sonnet builder plus Opus reviewer, two rounds each) adds a darwin backend over BSD `ps` with the
+Linux contract: `lstart` as the start token (second resolution, `LC_ALL=C` so the token does not
+vary with the caller's locale), `command` for the argument list, `stat` for zombies, and a `ps`
+that cannot run reads as `unverifiable`, not `dead`, so `sessions.py` never persists a live
+session as `unknown` over an infrastructure failure. The darwin branch is exercised on Linux
+through procps, which accepts the same column spelling; the first contact with real BSD `ps` is
+the `macos-latest` run after the push. Two pty tests are skipped on darwin with the CI evidence in
+the reason (the closed-terminal install gate hangs there; the pty half of F2b/F5 reads an empty
+stderr), the pipe half of F2b/F5 still runs, and both pty drain loops now fail loudly past a
+10 s deadline instead of masking a hang. Gate: 1399 tests with `ACPC_STANDARD_CHECKOUT`,
+ruff/pyright clean, smoke 605/605. Next: merge to `main`, Damian pushes, read the `macos-latest`
+run and the ubuntu grok envelope (`315d7c8` prints it), then bump 1.0.1, tag, release page on
+his go (notes cover 0.7.1 to 1.0.1, since `v1.0.0` has no page).
+
+1.0.0 is merged to `main` with `--no-ff` (`6f47d46`, 2026-09-21), tagged `v1.0.0`, pushed with
+the tag the same day and installed on the host; the release page waits for 1.0.1.
+The branch was merged once before slice 25, so the earlier
 local merge and tag were dropped (nothing had been pushed) and redone on the final branch tip
 `891e834`. Three closing slices after the alignment, one commit
 each, Sonnet builder plus Opus reviewer with mutation testing on a `git archive` copy: 22
