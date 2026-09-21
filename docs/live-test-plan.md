@@ -147,6 +147,8 @@ D2 shipped broken in 0.2 and was caught by review, not tests. Measure it.
 
 Verifies the shipped codex TOML against vendor reality, one trivial prompt per check. Last verified 2026-08-06: modes `read-only`/`agent`/`agent-full-access`, `bypass_modes = ["agent-full-access"]`, preset `[effort_by_model]` rows allow low/medium/high/xhigh and unlisted models use the derived union; vendor still rejects minimal/ultra with `Invalid params`.
 
+`gpt-6-astra` verified 2026-09-05 against codex-acp 1.10.0 / codex-cli 0.153.4: live turns accepted low/medium/high/xhigh and max, matching the model's API reference. The app-server catalogue (`model/list`) advertises a sixth level, `ultra`, described as maximum reasoning with automatic task delegation — a harness mode, absent from the API reference, so the row stops at max. Because that row carries max, the derived union unlisted codex models fall back to now reaches max as well; every preset model still refuses it.
+
 | # | Do | Expect / record |
 |---|---|---|
 | V1 | `acpc agents codex` after one real run | Advertised modes, models, commands as the vendor announces them; compare `bypass_modes` and `[effort_by_model]` in the shipped TOML against reality; fix the TOML in the same change |

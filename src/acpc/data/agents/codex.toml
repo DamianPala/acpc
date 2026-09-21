@@ -38,7 +38,12 @@ fast = { model = "gpt-5.6-luna", effort = "high" }
 standard = { model = "gpt-5.6-terra", effort = "xhigh" }
 max = { model = "gpt-5.6-sol", effort = "xhigh" }
 
+# gpt-6-astra, catalogue 2026-09-05: its API reference takes reasoning.effort
+# low/medium/high/xhigh/max. The app-server catalogue also advertises `ultra`,
+# which is the harness's delegation mode rather than an API level, so the row
+# stops at max.
 [effort_by_model]
 "gpt-5.6-luna" = ["low", "medium", "high", "xhigh"]
 "gpt-5.6-terra" = ["low", "medium", "high", "xhigh"]
 "gpt-5.6-sol" = ["low", "medium", "high", "xhigh"]
+"gpt-6-astra" = ["low", "medium", "high", "xhigh", "max"]
