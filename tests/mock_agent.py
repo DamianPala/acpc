@@ -47,6 +47,48 @@ Anything else runs the default scenario: three tool events, a progress msg, a
 usage update, and a markdown answer quoting the prompt — history-aware, so a
 continued session's answer references the previous turn.
 
+Steering extension (``_session/steering``), enabled by ``ACPC_MOCK_STEERING=1``:
+``initialize`` then advertises ``_meta.steering.supported``, and a steering
+request is answered according to what this agent is doing:
+
+- a prompt is in flight -> the text joins that turn's queue and the answer is
+  ``{"outcome": "injected"}``; ``slow:N`` and ``chunkslow:N`` then emit one
+  ``steered: <text>`` message per queued correction, in acceptance order,
+  before their final message, which is what "the same turn" looks like
+- no prompt is in flight -> ``promptRequired`` when the request asked for it
+  (``idleBehavior: promptRequired``), else ``startedNewTurn``
+
+Knobs, all read from the environment at request time:
+``ACPC_MOCK_STEERING=declared-only`` advertises the capability and then
+answers method-not-found; ``ACPC_MOCK_STEERING_RACE=1`` always answers
+``startedNewTurn``; ``ACPC_MOCK_STEERING_FORCE=promptRequired`` always answers
+``promptRequired``, active prompt or not; ``ACPC_MOCK_STEERING_HANG=1`` never
+answers at all. ``ACPC_MOCK_STEERING_LOG`` names a file that receives one line
+per steering request (plus one ``idle:`` line naming the ``idleBehavior`` it
+asked for) and per ``session/cancel`` — the evidence a test uses to see what
+acpc asked for and whether it cancelled the turn the adapter started on its own.
+
+``ACPC_MOCK_IGNORE_CANCEL=1`` drops every ``session/cancel`` notification on
+the floor: the running scenario's own timer is the only thing that ends the
+turn, which is what a cancel-deadline test needs.
+
+Usage-limit simulation (slice 17), checked before every scenario, exact-prefix
+triggers included: ``ACPC_MOCK_LIMIT_PROMPTS=N`` fails the first N
+``session/prompt`` calls in a session with the JSON-RPC error claude-agent-acp
+sends for a usage limit — ``-32603``, ``Internal error: You've hit your
+session limit · resets <time> (<zone>)``, ``data: {"errorKind":
+"rate_limit"}``; call N+1 runs its scenario normally.
+``ACPC_MOCK_LIMIT_RESET_S=S`` sets the reset time S seconds from now (default
+60; the text has minute resolution, so the clause is rounded up to the next
+full minute). ``ACPC_MOCK_LIMIT_META=1`` sends a ``usage_update`` with
+``_meta["_claude/rateLimit"] = {"status": "rejected", "resetsAt": <now + S,
+exact>, "rateLimitType": "five_hour"}`` before the error — the only way to get
+a reset time with sub-minute precision. ``ACPC_MOCK_LIMIT_NO_DATA=1`` omits
+``data`` from the error. ``ACPC_MOCK_LIMIT_NO_TIME=1`` drops the ``resets``
+clause from the text. ``ACPC_MOCK_LIMIT_AFTER_TEXT=1`` streams one message
+chunk before the error, to exercise the continuation-instruction path. The
+zone is ``TZ`` if set, else ``Europe/Warsaw``.
+
 Advertised dataset: modes ``default``/``acceptEdits``/``plan``/``yolo`` (the
 restricted mode), models ``mock-opus-5``/``mock-sonnet-5``/``mock-haiku-4-5``,
 efforts ``low``/``medium``/``high``/``xhigh`` — any other effort value is
@@ -57,12 +99,15 @@ level" to surface. A small command list is advertised after session/new.
 import asyncio
 import contextlib
 import json
+import math
 import os
 import sys
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from acp import (
     Agent,
@@ -224,6 +269,26 @@ def _leading_delay(prompt: str) -> int:
     return int(prompt.split(":", 1)[1].split()[0])
 
 
+def _steering_setting() -> str:
+    """The mock's steering behaviour: ``""``, ``1`` or ``declared-only``."""
+    return os.environ.get("ACPC_MOCK_STEERING", "")
+
+
+def _reset_clause(reset_epoch: float, zone_name: str) -> str:
+    """Render claude-agent-acp's ``resets <time> (<zone>)`` clause.
+
+    The vendor text has minute resolution, so the instant is rounded up to
+    the next full minute before it is rendered in ``zone_name`` — the same
+    rounding a real subscription limit's message would show.
+    """
+    rounded = math.ceil(reset_epoch / 60) * 60
+    local = datetime.fromtimestamp(rounded, tz=UTC).astimezone(ZoneInfo(zone_name))
+    hour12 = local.hour % 12 or 12
+    ampm = "am" if local.hour < 12 else "pm"
+    time_text = f"{hour12}:{local.minute:02d}{ampm}" if local.minute else f"{hour12}{ampm}"
+    return f"resets {time_text} ({zone_name})"
+
+
 def select_scenario(prompt: str) -> str | None:
     """MVP keyword selection: case-insensitive substring, first match wins."""
     lower = prompt.lower()
@@ -251,6 +316,11 @@ class MockAgent(Agent):
         self._late_calls: dict[str, tuple[str, Path, str]] = {}
         self._last_restored_session: str | None = None
         self._restore_settled = asyncio.Event()
+        # Sessions with a prompt in flight, and the corrections each of those
+        # turns has accepted but not yet acknowledged in its stream.
+        self._prompt_active: set[str] = set()
+        self._steered: dict[str, list[str]] = {}
+        self._limit_prompt_counts: dict[str, int] = {}
 
     def on_connect(self, conn: Client) -> None:
         self._conn = conn
@@ -359,7 +429,11 @@ class MockAgent(Agent):
         client_info: Any = None,
         **kwargs: Any,
     ) -> InitializeResponse:
-        raw_delay = os.environ.get("ACPC_MOCK_INITIALIZE_DELAY")
+        if os.environ.get("ACPC_MOCK_INIT_HANG") == "1":
+            await asyncio.Event().wait()
+        raw_delay = os.environ.get("ACPC_MOCK_INIT_DELAY") or os.environ.get(
+            "ACPC_MOCK_INITIALIZE_DELAY"
+        )
         if raw_delay:
             await asyncio.sleep(float(raw_delay))
         self._initialized = True
@@ -372,10 +446,16 @@ class MockAgent(Agent):
         capabilities = AgentCapabilities(
             load_session=True, session_capabilities=session_capabilities
         )
+        # Vendor-faithful placement: steering is an extension, so its flag
+        # rides top-level `_meta`, never `agentCapabilities`.
+        field_meta: dict[str, Any] | None = None
+        if _steering_setting() in {"1", "declared-only"}:
+            field_meta = {"steering": {"supported": True}}
         return InitializeResponse(
             protocol_version=protocol_version,
             agent_capabilities=capabilities,
             agent_info=Implementation(name="mock-agent", title="Mock Agent", version="0.1.0"),
+            field_meta=field_meta,
         )
 
     def _config_options(
@@ -589,6 +669,22 @@ class MockAgent(Agent):
         cancel_event = self._cancel_events.setdefault(session_id, asyncio.Event())
         cancel_event.clear()
 
+        # In flight for the whole scenario body: a steering request arriving
+        # anywhere in here is a correction to *this* turn.
+        self._prompt_active.add(session_id)
+        try:
+            return await self._run_scenario(session_id, prompt_text, history, cancel_event)
+        finally:
+            self._prompt_active.discard(session_id)
+
+    async def _run_scenario(
+        self,
+        session_id: str,
+        prompt_text: str,
+        history: list[str],
+        cancel_event: asyncio.Event,
+    ) -> PromptResponse:
+        await self._maybe_hit_limit(session_id)
         prefix_response = await self._prefix_trigger(session_id, prompt_text, cancel_event)
         if prefix_response is not None:
             return prefix_response
@@ -649,6 +745,7 @@ class MockAgent(Agent):
                 return PromptResponse(stop_reason="cancelled")
             except TimeoutError:
                 pass
+            await self._send_steered(session_id)
             await self._send_text(session_id, f"waited {delay}s")
             return PromptResponse(stop_reason="end_turn")
 
@@ -660,12 +757,14 @@ class MockAgent(Agent):
                 return PromptResponse(stop_reason="cancelled")
             except TimeoutError:
                 pass
+            await self._send_steered(session_id)
             await self._send_text(session_id, "finished")
             return PromptResponse(stop_reason="end_turn")
 
         if prompt_text.startswith("chunkhold:"):
             release_path = Path(prompt_text.split(":", 1)[1])
             await self._send_text(session_id, "holding")
+            await self._send_usage(session_id, used=0)
             deadline = time.monotonic() + HOLD_LIMIT_SECONDS
             while not release_path.exists():
                 if cancel_event.is_set():
@@ -776,6 +875,60 @@ class MockAgent(Agent):
             raise RequestError(-32603, "Internal error", {"details": "upstream connection reset"})
 
         return None
+
+    async def _maybe_hit_limit(self, session_id: str) -> None:
+        """Fail this call with a usage limit, per ``ACPC_MOCK_LIMIT_*`` (slice 17).
+
+        Checked before every scenario, including the exact-prefix triggers, so
+        the resend after a wait reaches the caller's own scenario unchanged
+        once the configured number of failing calls has been used up.
+        """
+        raw_prompts = os.environ.get("ACPC_MOCK_LIMIT_PROMPTS")
+        if raw_prompts is None:
+            return
+        seen = self._limit_prompt_counts.get(session_id, 0)
+        self._limit_prompt_counts[session_id] = seen + 1
+        if seen >= int(raw_prompts):
+            return
+
+        reset_seconds = float(os.environ.get("ACPC_MOCK_LIMIT_RESET_S", "60"))
+        reset_epoch = time.time() + reset_seconds
+        zone_name = os.environ.get("TZ") or "Europe/Warsaw"
+
+        if os.environ.get("ACPC_MOCK_LIMIT_AFTER_TEXT") == "1":
+            await self._send_text(session_id, "working on it")
+        if os.environ.get("ACPC_MOCK_LIMIT_META") == "1":
+            await self._send_usage_meta(
+                session_id,
+                rate_limit={
+                    "status": "rejected",
+                    "resetsAt": reset_epoch,
+                    "rateLimitType": "five_hour",
+                },
+            )
+
+        if os.environ.get("ACPC_MOCK_LIMIT_NO_TIME") == "1":
+            text = "You've hit your session limit"
+        else:
+            text = f"You've hit your session limit · {_reset_clause(reset_epoch, zone_name)}"
+        data = (
+            None
+            if os.environ.get("ACPC_MOCK_LIMIT_NO_DATA") == "1"
+            else {"errorKind": "rate_limit"}
+        )
+        raise RequestError(-32603, f"Internal error: {text}", data)
+
+    async def _send_usage_meta(self, session_id: str, *, rate_limit: dict[str, Any]) -> None:
+        update = UsageUpdate(
+            session_update="usage_update",
+            used=0,
+            size=200_000,
+            field_meta={"_claude/rateLimit": rate_limit},
+        )
+        try:
+            await self._conn.session_update(session_id=session_id, update=update)
+        except (ConnectionError, OSError, RuntimeError):
+            pass
 
     def _history_reference(self, history: list[str]) -> str:
         if not history:
@@ -927,6 +1080,16 @@ class MockAgent(Agent):
         chunk = update_agent_message(text_block(text))
         await self._conn.session_update(session_id=session_id, update=chunk)
 
+    async def _send_steered(self, session_id: str) -> None:
+        """Acknowledge accepted corrections inside the turn that took them.
+
+        One message per correction, in the order acpc sent them: what the
+        stream shows is that the instruction arrived in the *same* turn, which
+        is the difference in-place claims over cancel-then-start.
+        """
+        for text in self._steered.pop(session_id, []):
+            await self._send_text(session_id, f"steered: {text}")
+
     async def _send_usage(self, session_id: str, used: int, cost: float | None = None) -> None:
         update = UsageUpdate(
             session_update="usage_update",
@@ -992,6 +1155,12 @@ class MockAgent(Agent):
         return True
 
     async def cancel(self, session_id: str, **kwargs: Any) -> None:
+        self._record_steering(f"cancel:{session_id}")
+        if os.environ.get("ACPC_MOCK_IGNORE_CANCEL") == "1":
+            # A deadline test needs a turn that outlives the 10s cancel wait;
+            # this stands in for an adapter that never acknowledges the
+            # request, so the scenario's own timer is what ends the turn.
+            return
         self._cancel_events.setdefault(session_id, asyncio.Event()).set()
 
     async def close_session(self, session_id: str, **kwargs: Any) -> CloseSessionResponse:
@@ -1003,6 +1172,7 @@ class MockAgent(Agent):
         self._cancel_events.pop(session_id, None)
         self._models.pop(session_id, None)
         self._modes.pop(session_id, None)
+        self._steered.pop(session_id, None)
         return CloseSessionResponse()
 
     async def list_sessions(
@@ -1125,6 +1295,14 @@ class MockAgent(Agent):
             await asyncio.sleep(float(raw))
 
     @staticmethod
+    def _record_steering(event: str) -> None:
+        """Append one line of steering evidence, when a test asked for it."""
+        path = os.environ.get("ACPC_MOCK_STEERING_LOG")
+        if path:
+            with Path(path).open("a", encoding="utf-8") as handle:
+                handle.write(f"{event}\n")
+
+    @staticmethod
     def _record_session_method(method: str) -> None:
         path = os.environ.get("ACPC_MOCK_SESSION_METHOD_FILE")
         if path:
@@ -1158,7 +1336,42 @@ class MockAgent(Agent):
         return AuthenticateResponse()
 
     async def ext_method(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
-        return {}
+        name = method.removeprefix("_")
+        if name != "session/steering":
+            return {}
+        if _steering_setting() == "1":
+            return await self._steer(params)
+        # `declared-only` advertised the capability in `initialize` and denies
+        # the method here; an unset setting never advertised it at all.
+        raise RequestError.method_not_found(f"_{name}")
+
+    async def _steer(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Answer one steering request according to what this agent is doing."""
+        session_id = params.get("sessionId")
+        blocks = params.get("prompt")
+        text = "".join(
+            block.get("text", "")
+            for block in (blocks if isinstance(blocks, list) else [])
+            if isinstance(block, dict) and isinstance(block.get("text"), str)
+        )
+        meta = params.get("_meta")
+        steering_meta = meta.get("steering") if isinstance(meta, dict) else None
+        idle = steering_meta.get("idleBehavior") if isinstance(steering_meta, dict) else None
+        self._record_steering(f"steer:{session_id}:{text}")
+        self._record_steering(f"idle:{idle}")
+        if os.environ.get("ACPC_MOCK_STEERING_HANG") == "1":
+            # Never answers: the request crossed and the reply never did.
+            await asyncio.sleep(HOLD_LIMIT_SECONDS)
+        if os.environ.get("ACPC_MOCK_STEERING_RACE") == "1":
+            return {"outcome": "startedNewTurn"}
+        if os.environ.get("ACPC_MOCK_STEERING_FORCE") == "promptRequired":
+            return {"outcome": "promptRequired"}
+        if session_id in self._prompt_active:
+            self._steered.setdefault(str(session_id), []).append(text)
+            return {"outcome": "injected"}
+        if idle == "promptRequired":
+            return {"outcome": "promptRequired"}
+        return {"outcome": "startedNewTurn"}
 
     async def ext_notification(self, method: str, params: dict[str, Any]) -> None:
         pass

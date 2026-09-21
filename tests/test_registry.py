@@ -36,7 +36,6 @@ def test_shipped_adapter_facts_and_presets_are_available(tmp_path: Path) -> None
         "plan": {"grants": "edit", "delegates": True},
         "auto": {"grants": "all", "delegates": False},
         "acceptEdits": {"grants": "execute", "delegates": True},
-        "dontAsk": {"grants": "none", "delegates": False},
         "bypassPermissions": {"grants": "all", "delegates": False},
     }
     assert {
@@ -768,18 +767,30 @@ def test_shipped_codex_preset_rows_reject_unsupported_efforts(tmp_path: Path) ->
         "gpt-5.6-luna": expected,
         "gpt-5.6-terra": expected,
         "gpt-5.6-sol": expected,
+        "gpt-6-astra": ("low", "medium", "high", "xhigh", "max"),
     }
     assert registry.resolve_call("codex", effort="low").effort == "low"
     assert registry.resolve_call("codex", effort="xhigh").effort == "xhigh"
     for model in codex.preset_models:
-        for effort in ("none", "minimal", "ultra"):
-            with pytest.raises(RegistryError, match="supported levels: low, medium, high, xhigh"):
+        for effort in ("none", "minimal", "max", "ultra"):
+            with pytest.raises(RegistryError, match=r"supported levels: low, medium, high, xhigh$"):
                 registry.resolve_call("codex", model=model, effort=effort)
 
     # Models without a row retain the derived-union fallback and its warning.
     assert (
         registry.resolve_call("codex", model="gpt-5.6-unlisted", effort="xhigh").effort == "xhigh"
     )
+    # The union spans every listed row, so an unlisted model reaches a level no
+    # preset model takes.
+    assert registry.resolve_call("codex", model="gpt-5.6-unlisted", effort="max").effort == "max"
+
+
+def test_shipped_codex_astra_row_allows_max_but_not_ultra(tmp_path: Path) -> None:
+    registry = AgentRegistry(tmp_path / "agents")
+
+    assert registry.resolve_call("codex", model="gpt-6-astra", effort="max").effort == "max"
+    with pytest.raises(RegistryError, match="supported levels: low, medium, high, xhigh, max"):
+        registry.resolve_call("codex", model="gpt-6-astra", effort="ultra")
 
 
 def test_unknown_effort_lists_global_vocab(tmp_path: Path) -> None:

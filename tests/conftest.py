@@ -9,11 +9,12 @@ through and stops what they started.
 
 import asyncio
 import os
+import time
 from collections.abc import Iterator
 
 import pytest
 
-from acpc import daemon_client, runner
+from acpc import daemon_client, proc, runner
 
 
 @pytest.fixture(autouse=True)
@@ -56,7 +57,13 @@ async def _stop_all() -> None:
         daemon = await daemon_client.connect(target)
         if daemon is None:
             continue
+        pid = (await daemon.status()).get("pid")
         try:
             await daemon.stop()
         finally:
             await daemon.close()
+        if isinstance(pid, int):
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline and proc.process_cmdline(pid):
+                await asyncio.sleep(0.02)
+            assert not proc.process_cmdline(pid), f"daemon {pid} did not exit after stop"

@@ -9,7 +9,7 @@ import click
 import pytest
 from click.testing import CliRunner
 
-from acpc import cli, vocab
+from acpc import __version__, interaction, schema, vocab
 from acpc.cli import main
 
 MOCK_AGENT_SCRIPT = str(Path(__file__).with_name("mock_agent.py"))
@@ -79,14 +79,45 @@ def test_root_help_is_a_compact_cheat_sheet(runner: CliRunner) -> None:
     assert len(result.stdout.splitlines()) <= 100
     assert "--permissions execute" in result.stdout
     assert "request_permission" in result.stdout
+    assert "status <id>       liveness-verified metadata for one session" in result.stdout
     assert (
-        "status            running + the 5 most recent finished (--all for every session)"
+        "list              running + the 20 most recent sessions (--limit N to change)"
         in result.stdout
     )
     assert (
-        "stop <id>         stop a running session; it stays resumable with continue"
+        "cancel <id>       cancel a running session; it stays resumable with continue"
         in result.stdout
     )
+
+
+def test_root_help_describes_every_group_and_command(runner: CliRunner) -> None:
+    result = invoke(runner, "--help")
+
+    assert result.exit_code == vocab.EXIT_OK
+    lines = result.stdout.splitlines()
+    for group in ("agents", "daemon", "skills"):
+        line = next(line for line in lines if line.startswith(f"  {group} "))
+        assert len(line.split()) > 1
+    for entry in schema.index(main)["commands"]:
+        prefix = f"  {entry['name']}"
+        line = next(line for line in lines if line.startswith(prefix))
+        assert len(line.split()) > len(entry["name"].split())
+
+
+def test_root_help_command_catalog_does_not_present_groups_as_commands(
+    runner: CliRunner,
+) -> None:
+    result = invoke(runner, "--help")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert "Common commands:" not in result.stdout
+    commands = result.stdout.split("Commands:\n", maxsplit=1)[1].split(
+        "  Use `acpc <command> --help`", maxsplit=1
+    )[0]
+    assert "agents list" in commands
+    assert "skills list" in commands
+    assert "daemon status" in commands
+    assert all(line.strip() not in {"agents", "skills", "daemon"} for line in commands.splitlines())
 
 
 def test_permission_help_names_the_tier_gloss(runner: CliRunner) -> None:
@@ -139,15 +170,15 @@ def test_every_registered_command_has_helpful_options_and_both_help_spellings(
 
 @pytest.mark.parametrize("spelling", ["-h", "--help"])
 def test_named_agents_view_accepts_both_help_spellings(runner: CliRunner, spelling: str) -> None:
-    result = invoke(runner, "agents", "mock", spelling)
+    result = invoke(runner, "agents", "get", "mock", spelling)
 
     assert result.exit_code == vocab.EXIT_OK
-    assert "Render one named adapter or variant." in result.stdout
+    assert "Show one adapter or variant" in result.stdout
 
 
 def test_help_names_behavioral_defaults_and_global_output_default(runner: CliRunner) -> None:
     def normalized(text: str) -> str:
-        return " ".join(text.split()).replace("wall- clock", "wall-clock")
+        return " ".join(text.split()).replace("wall- clock", "wall-clock").replace("-- ", "--")
 
     run_help = normalized(invoke(runner, "run", "--help").stdout)
     continue_help = normalized(invoke(runner, "continue", "--help").stdout)
@@ -155,13 +186,23 @@ def test_help_names_behavioral_defaults_and_global_output_default(runner: CliRun
     wait_help = normalized(invoke(runner, "wait", "--help").stdout)
     log_help = normalized(invoke(runner, "log", "--help").stdout)
 
-    assert "absent, no wall-clock limit (the callee runs until it is done)" in run_help
-    assert "absent, no wall-clock limit (the callee runs until it is done)" in continue_help
-    assert "absent, no wall-clock limit (the callee runs until it is done)" in steer_help
-    assert "absent, it blocks indefinitely" in wait_help
-    assert "absent, it blocks indefinitely" in log_help
-    assert "without --since or --tail, show the last 20 events" in log_help
-    assert "absent, ask on a TTY and read otherwise" in run_help
+    assert "the session keeps running" in run_help
+    assert "the session keeps running" in continue_help
+    assert "the session keeps running" in steer_help
+    assert "--cancel-after" in run_help
+    assert "--cancel-after" in continue_help
+    assert "--cancel-after" in steer_help
+    assert "Unbounded by default" in wait_help
+    assert "unbounded by default" in log_help
+    assert "Without --since, --limit, or --tail this shows the last 20 events" in log_help
+    assert "emit selected records in transcript order" in log_help
+    assert "Conflicts with --tail" in log_help
+    assert "Select the last N matching records and emit them in transcript order" in log_help
+    assert "--tail replays its last N records first" in log_help
+    assert (
+        "absent, ask when acpc could put the question — stdin and stdout both terminals, "
+        "no --json, NO_INPUT unset — and read in every other case"
+    ) in run_help
     assert "[default: 131072" in run_help
     assert "[default: 131072" in wait_help
     assert "[default: 131072" in log_help
@@ -171,32 +212,35 @@ def test_help_explains_session_lifecycle_and_retention(runner: CliRunner) -> Non
     def normalized(text: str) -> str:
         return " ".join(text.split()).replace("mid- conversation", "mid-conversation")
 
-    stop_help = normalized(invoke(runner, "stop", "--help").stdout)
+    stop_help = normalized(invoke(runner, "cancel", "--help").stdout)
+    list_help = normalized(invoke(runner, "list", "--help").stdout)
     status_help = normalized(invoke(runner, "status", "--help").stdout)
     wait_help = normalized(invoke(runner, "wait", "--help").stdout)
     continue_help = normalized(invoke(runner, "continue", "--help").stdout)
     steer_help = normalized(invoke(runner, "steer", "--help").stdout)
     prune_help = normalized(invoke(runner, "prune", "--help").stdout)
 
-    assert "Stop a running session; it stays resumable with ``acpc continue``." in stop_help
-    assert "Cancels the turn in flight (ACP ``session/cancel``)" in stop_help
-    assert "Show every session, not just running + the 5 most recent finished." in status_help
+    assert "Cancel the running turn; the session stays usable with ``acpc continue``." in stop_help
     assert (
-        "With no id and no ``--all``: every running session plus the 5 most recent finished ones."
-        in status_help
+        "Selects the turn in flight when the call starts and sends ACP ``session/cancel``"
+        in stop_help
     )
-    assert (
-        "Stop waiting after this duration (exit 124; the session keeps running); absent, it blocks indefinitely."
-        in wait_help
-    )
-    assert "The exit code mirrors the session result." in wait_help
+    assert "an unknown id is ``not_found``" in stop_help
+    assert "List liveness-verified sessions as a bounded collection." in list_help
+    assert "Return at most N sessions" in list_help
+    assert "Show liveness-verified metadata for one session" in status_help
+    assert "absent, text on a TTY and JSON on non-TTY" in status_help
+    assert "exits 124: the session keeps running" in wait_help
+    assert "The exit code mirrors the turn's result." in wait_help
     assert "the free way to reprint an answer." in wait_help
     assert "editing an entry never changes a session mid-conversation." in continue_help
     assert (
         "``--permissions`` is the one ``run`` resolution flag ``continue`` accepts" in continue_help
     )
-    assert "A finished session is a usage error: there is no turn to interrupt" in steer_help
-    assert "the follow-up verb for it is ``acpc continue``." in steer_help
+    assert (
+        "A finished session is a ``conflict``; the follow-up verb is ``acpc continue``."
+        in steer_help
+    )
     assert (
         "the ``retention`` key in the global config (``~/.acpc/config.toml``, default 90d; ``ACPC_HOME`` moves the root)"
         in prune_help
@@ -232,7 +276,7 @@ def test_log_help_documents_activity_waiting(runner: CliRunner) -> None:
     assert "Example" in result.stdout
 
 
-@pytest.mark.parametrize("verb", ["stop", "rm", "install"])
+@pytest.mark.parametrize("verb", ["cancel", "delete", "install"])
 def test_short_verbs_have_real_help_pages(runner: CliRunner, verb: str) -> None:
     root_help = invoke(runner, "--help")
     command_help = invoke(runner, verb, "--help")
@@ -250,7 +294,7 @@ def test_no_command_redirects_to_root_help_and_root_keeps_verb_one_liners(
     ]
 
     assert redirected == []
-    for name in ("stop", "rm", "prune", "install"):
+    for name in ("cancel", "delete", "prune", "install"):
         described = [
             line
             for line in root_help.splitlines()
@@ -264,30 +308,24 @@ def test_no_command_redirects_to_root_help_and_root_keeps_verb_one_liners(
     [
         (
             ("--follow",),
-            (
-                "Error: --follow is not a flag on this command — following a session "
-                "is: acpc log <id> --follow [--timeout S]"
-            ),
+            ("Error: --follow is a log flag; use: acpc log <id> --follow [--timeout S]"),
         ),
         (
             ("-f",),
-            (
-                "Error: --follow is not a flag on this command — following a session "
-                "is: acpc log <id> --follow [--timeout S]"
-            ),
+            ("Error: -f is not accepted; use --follow: acpc log <id> --follow [--timeout S]"),
         ),
         (
             ("status", "--detach"),
             (
                 "Error: --detach is not an acpc flag — background dispatch is: acpc run "
-                '<agent> "<prompt>" --bg'
+                '<agent> "<prompt>" --background'
             ),
         ),
         (
             ("-d",),
             (
                 "Error: --detach is not an acpc flag — background dispatch is: acpc run "
-                '<agent> "<prompt>" --bg'
+                '<agent> "<prompt>" --background'
             ),
         ),
         (
@@ -339,16 +377,71 @@ def test_neighboring_tool_aliases_are_one_line_usage_errors(
     result = invoke(runner, *args)
 
     assert result.exit_code == vocab.EXIT_USAGE
-    assert result.stderr == f"{expected}\n"
+    # stderr is a pipe here, so the actionable line arrives inside the envelope.
     assert len(result.stderr.splitlines()) == 1
+    envelope = json.loads(result.stderr)["error"]
+    assert envelope["kind"] == "invalid_input"
+    assert f"Error: {envelope['message']}" == expected
     assert "Traceback" not in result.stderr
 
 
-def test_top_level_command_does_not_get_a_daemon_hint(runner: CliRunner) -> None:
-    result = invoke(runner, "list")
+def test_status_without_an_id_names_the_collection_command(runner: CliRunner) -> None:
+    result = invoke(runner, "status")
 
     assert result.exit_code == vocab.EXIT_USAGE
-    assert "daemon status" not in result.stderr
+    assert "acpc list" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("agents",),
+        ("skills",),
+        ("daemon",),
+        ("probe",),
+        ("probe", "mock"),
+        ("agents", "create"),
+        ("agents", "get"),
+        ("agents", "delete"),
+        ("skills", "get"),
+        ("cancel",),
+        ("continue",),
+        ("delete",),
+        ("install",),
+        ("log",),
+        ("resolve",),
+        ("run",),
+        ("status",),
+        ("steer",),
+        ("steer", "abcd"),
+        ("wait",),
+    ],
+)
+def test_missing_required_input_is_one_enveloped_error_with_a_hint(
+    runner: CliRunner, args: tuple[str, ...]
+) -> None:
+    result = invoke(runner, *args)
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert len(result.stderr.splitlines()) == 1
+    error = json.loads(result.stderr)["error"]
+    assert error["kind"] == "invalid_input"
+    assert error["message"]
+    assert error["hint"]
+    assert "Usage:" not in error["message"]
+
+
+@pytest.mark.parametrize(
+    "args",
+    [("status", "--limit", "1"), ("status", "--plain", "--limit", "1")],
+)
+def test_status_collection_flags_name_the_replacement_command(
+    runner: CliRunner, args: tuple[str, ...]
+) -> None:
+    result = invoke(runner, *args)
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert "acpc list" in result.stderr
 
 
 def test_short_version_matches_long_version(runner: CliRunner) -> None:
@@ -356,13 +449,15 @@ def test_short_version_matches_long_version(runner: CliRunner) -> None:
     long_version = invoke(runner, "--version")
 
     assert short_version.stdout == long_version.stdout
-    assert "acpc" in short_version.stdout
+    # The version string alone: a caller that reads it should not have to
+    # strip a tool name off the front of it.
+    assert short_version.stdout.strip() == __version__
 
 
 def test_background_prompt_policy_is_rejected_on_a_tty(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(cli, "_stdout_is_tty", lambda: True)
+    monkeypatch.setattr(interaction, "stdout_is_tty", lambda: True)
 
     result = invoke(runner, "run", "mock", "hello", "--permissions", "prompt", "--bg")
 
@@ -375,7 +470,7 @@ def test_fresh_nested_state_root_lists_no_sessions(
 ) -> None:
     monkeypatch.setenv("ACPC_HOME", str(tmp_path / "nested" / "state"))
 
-    result = invoke(runner, "status")
+    result = invoke(runner, "list")
 
     assert result.exit_code == vocab.EXIT_OK
 
@@ -390,7 +485,7 @@ def test_last_selector_is_rejected_without_a_tty(runner: CliRunner) -> None:
 
 
 def test_unknown_flag_is_a_usage_error(runner: CliRunner) -> None:
-    result = invoke(runner, "status", "--bogus")
+    result = invoke(runner, "list", "--bogus")
 
     assert result.exit_code == vocab.EXIT_USAGE
     assert "--bogus" in result.stderr

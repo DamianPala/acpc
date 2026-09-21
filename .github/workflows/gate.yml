@@ -1,0 +1,45 @@
+name: gate
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      # Daemon sockets live under the state root; keep the path short on both
+      # platforms (108 bytes on Linux, 104 on macOS, where $TMPDIR is long).
+      TMPDIR: /tmp
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+
+      - name: GNU coreutils and bash 5 for smoke.sh
+        if: runner.os == 'macOS'
+        run: |
+          brew install bash coreutils
+          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix)/opt/coreutils/libexec/gnubin" >> "$GITHUB_PATH"
+
+      - run: uv sync --frozen
+
+      - run: uv run --frozen ruff check
+      - run: uv run --frozen ruff format --check
+      - run: uv run --frozen pyright
+      - run: uv run --frozen pytest -q -p no:cacheprovider
+      - run: ./smoke.sh

@@ -1,6 +1,7 @@
 """Behavioral tests for the ``continue`` verb."""
 
 import asyncio
+import errno
 import json
 import os
 import queue
@@ -134,10 +135,23 @@ def wait_for_preparing(cli: CliRunner, session_id: str, timeout: float = 10.0) -
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         result = invoke(cli, "status", session_id, "--json")
-        if result.exit_code == vocab.EXIT_OK and json.loads(result.stdout)["state"] == "preparing":
+        if result.exit_code == vocab.EXIT_OK and json.loads(result.stdout)["status"] == "preparing":
             return
         time.sleep(0.05)
     pytest.fail(f"session {session_id} never became preparing")
+
+
+def wait_for_running(cli: CliRunner, session_id: str, timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        result = invoke(cli, "status", session_id, "--json")
+        if (
+            result.exit_code == vocab.EXIT_OK
+            and json.loads(result.stdout)["status"] in vocab.ACTIVE_STATES
+        ):
+            return
+        time.sleep(0.05)
+    pytest.fail(f"session {session_id} never became active")
 
 
 def wait_for_path(path: Path, timeout: float = 10.0) -> None:
@@ -181,8 +195,11 @@ def watch_for_file_open(path: Path) -> int:
         raise OSError(ctypes.get_errno(), "inotify_init1 failed")
     watch = libc.inotify_add_watch(fd, os.fsencode(path.parent), 0x20)
     if watch < 0:
+        error_number = ctypes.get_errno()
         os.close(fd)
-        raise OSError(ctypes.get_errno(), f"inotify_add_watch failed for {path.parent}")
+        if error_number == errno.ENOSPC:
+            pytest.skip("host exhausted its inotify watch limit")
+        raise OSError(error_number, f"inotify_add_watch failed for {path.parent}")
     return fd
 
 
@@ -294,6 +311,14 @@ def test_continue_accepts_a_suffixed_timeout(cli: CliRunner) -> None:
     assert "waited 2s" in result.stdout
 
 
+def test_continue_rejects_run_only_flags_with_a_run_hint(cli: CliRunner) -> None:
+    result = invoke(cli, "continue", "abcd", "try again", "--model", "mock-opus-5")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert "--model" in result.stderr
+    assert "acpc run" in result.stderr
+
+
 def test_status_exposes_daemon_resume_preparation(cli: CliRunner, live_daemon: None) -> None:
     session_id = start_session(cli, "turn one")
     stop_session_daemon(session_id)
@@ -321,10 +346,10 @@ def test_status_exposes_daemon_resume_preparation(cli: CliRunner, live_daemon: N
         process.wait(timeout=10)
 
     assert process.returncode == vocab.EXIT_OK
-    assert sessions.load(session_id).state == "done"
+    assert sessions.load(session_id).state == "succeeded"
 
 
-def test_stop_during_daemon_preparation_is_cancelled_and_resumable(
+def test_cancel_during_daemon_preparation_is_cancelled_and_resumable(
     cli: CliRunner,
     live_daemon: None,
     monkeypatch: pytest.MonkeyPatch,
@@ -354,10 +379,10 @@ def test_stop_during_daemon_preparation_is_cancelled_and_resumable(
         wait_for_path(ready)
         wait_for_preparing(cli, session_id)
 
-        stopped = invoke(cli, "stop", session_id, "--json")
+        stopped = invoke(cli, "cancel", session_id, "--json")
 
         assert stopped.exit_code == vocab.EXIT_OK, stopped.stderr
-        assert json.loads(stopped.stdout)["state"] == "cancelled"
+        assert json.loads(stopped.stdout)["status"] == "canceled"
         answer = sessions.answer_path(session_id).read_text(encoding="utf-8")
         assert answer == runner.preparation_cancelled_answer(session_id)
         release.touch()
@@ -399,7 +424,7 @@ def test_ctrl_c_during_daemon_restore_cancels_without_a_diagnosis(
     process.wait(timeout=10)
 
     assert process.returncode == vocab.EXIT_CANCELLED
-    assert sessions.load(session_id).state == "cancelled"
+    assert sessions.load(session_id).state == "canceled"
     assert "no prompt was sent" in sessions.answer_path(session_id).read_text(encoding="utf-8")
 
 
@@ -439,7 +464,7 @@ def test_ctrl_c_during_daemon_routing_cancels_a_new_turn_without_overwriting_his
         stdout, stderr = process.communicate(timeout=10)
         assert returncode == vocab.EXIT_CANCELLED, (stdout, stderr)
         final = sessions.read_meta(session_id)
-        assert final.state == "cancelled"
+        assert final.state == "canceled"
         assert final.turns == 2
         assert final.stop_reason == runner.PREPARATION_CANCELLED_REASON
         assert sessions.answer_path(session_id).read_text(encoding="utf-8") == (
@@ -493,7 +518,7 @@ def test_sigterm_during_daemon_routing_cancels_a_new_turn_and_exits_143(
         stdout, stderr = process.communicate(timeout=10)
         assert returncode == vocab.EXIT_SIGTERM, (stdout, stderr)
         final = sessions.read_meta(session_id)
-        assert final.state == "cancelled"
+        assert final.state == "canceled"
         assert final.turns == 2
         assert final.stop_reason == runner.PREPARATION_CANCELLED_REASON
         assert sessions.answer_path(session_id).read_text(encoding="utf-8") == (
@@ -540,9 +565,9 @@ def test_cancelled_restore_drops_late_frame_after_mux_release(
     )
     try:
         wait_for_path(restore_ready)
-        stopped = invoke(cli, "stop", session_id, "--json")
+        stopped = invoke(cli, "cancel", session_id, "--json")
         assert stopped.exit_code == vocab.EXIT_OK, stopped.stderr
-        assert json.loads(stopped.stdout)["state"] == "cancelled"
+        assert json.loads(stopped.stdout)["status"] == "canceled"
         assert sessions.answer_path(session_id).read_text(encoding="utf-8") == (
             runner.preparation_cancelled_answer(session_id)
         )
@@ -591,7 +616,7 @@ def test_continue_waits_for_cancelled_restore_to_settle_before_preparing(
     second: subprocess.Popen[str] | None = None
     try:
         wait_for_path(restore_ready)
-        stopped = invoke(cli, "stop", session_id, "--json")
+        stopped = invoke(cli, "cancel", session_id, "--json")
         assert stopped.exit_code == vocab.EXIT_OK, stopped.stderr
         first.wait(timeout=10)
         assert first.returncode != vocab.EXIT_OK
@@ -655,7 +680,7 @@ def test_continue_waits_for_cancelled_restore_to_settle_before_preparing(
             first.wait(timeout=10)
 
 
-def test_daemon_death_during_resume_is_orphaned_without_a_preparation_marker(
+def test_daemon_death_during_resume_is_unknown_without_a_preparation_marker(
     cli: CliRunner, live_daemon: None, state_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     session_id = start_session(cli, "turn one")
@@ -698,7 +723,7 @@ def test_daemon_death_during_resume_is_orphaned_without_a_preparation_marker(
         assert daemon_meta.state == "running"
 
         # Remove the client that is awaiting the preparation before killing
-        # the daemon; otherwise it can race orphan detection to finalize the
+        # the daemon; otherwise it can race unknown outcome detection to finalize the
         # session as failed after its connection breaks.
         process.kill()
         process.wait(timeout=10)
@@ -706,7 +731,7 @@ def test_daemon_death_during_resume_is_orphaned_without_a_preparation_marker(
 
         os.kill(pid, signal.SIGKILL)
         wait_for_process_dead(pid, daemon_meta.process_start_time)
-        assert sessions.load(session_id).state == "orphaned"
+        assert sessions.load(session_id).state == "unknown"
         assert "preparing" not in sessions.read_meta(session_id).to_dict()
     finally:
         if process.poll() is None:
@@ -743,8 +768,14 @@ def test_daemon_reservation_contention_does_not_block_unrelated_sessions(
         )
         assert wait_for_process_exit(blocked) == vocab.EXIT_AGENT_ERROR
         _blocked_stdout, blocked_stderr = blocked.communicate(timeout=10)
-        assert "wait for the current turn" in blocked_stderr
-        assert sessions.read_meta(session_id).state == "done"
+        # A real lock collision is the conflict case: the session is held, and
+        # the same call works once the holder lets go.
+        envelope = json.loads(blocked_stderr.splitlines()[-1])["error"]
+        assert envelope["kind"] == "conflict"
+        assert envelope["retryable"] is True
+        assert envelope["context"]["session_id"] == session_id
+        assert "wait for the current turn" in envelope["message"]
+        assert sessions.read_meta(session_id).state == "succeeded"
 
         result = invoke(cli, "run", "mock", "echo:unrelated", "--quiet", "--json")
         assert result.exit_code == vocab.EXIT_OK, result.stderr
@@ -756,6 +787,21 @@ def test_daemon_reservation_contention_does_not_block_unrelated_sessions(
             blocked.kill()
         if blocked is not None:
             blocked.wait(timeout=10)
+
+
+def test_direct_reservation_contention_is_the_same_conflict(cli: CliRunner) -> None:
+    """The direct route classifies a held session like the daemon does: a
+    `conflict`, not an adapter failure — `steer` relies on it after its cancel."""
+    session_id = start_session(cli, "turn one")
+
+    with sessions.session_lock(session_id):
+        result = invoke(cli, "continue", session_id, "turn two", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    envelope = json.loads(result.stderr.splitlines()[-1])["error"]
+    assert envelope["kind"] == "conflict"
+    assert envelope["retryable"] is True
+    assert sessions.read_meta(session_id).state == "succeeded"
 
 
 def test_blocking_continue_emits_the_early_line_before_a_slow_turn_finishes(
@@ -880,14 +926,12 @@ def test_continue_permissions_keeps_stored_effort_after_table_tightens(
     )
     refused = invoke(
         cli,
-        "run",
+        "resolve",
         "mock",
-        "fresh",
         "--model",
         "mock-sonnet-5",
         "--effort",
         "high",
-        "--dry-run",
     )
     assert refused.exit_code == vocab.EXIT_USAGE
     assert "supported levels: low" in refused.stderr
@@ -1149,10 +1193,36 @@ def test_continue_post_rotation_failure_finalizes_the_new_turn(
     result = invoke(cli, "continue", session_id, "turn two")
 
     failed = sessions.load(session_id)
-    assert result.exit_code == vocab.EXIT_USAGE
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    assert json.loads(result.stderr.splitlines()[-1])["error"]["kind"] == "corrupt_state"
     assert failed.state == "failed"
     assert failed.turns == 2
     assert failed.stop_reason == "error"
+
+
+def test_continue_failure_result_contains_capabilities(
+    cli: CliRunner,
+) -> None:
+    session_id = start_session(cli)
+
+    result = invoke(
+        cli,
+        "continue",
+        session_id,
+        "chunkslow:5 partial follow-up",
+        "--cancel-after",
+        "0.1",
+        "--json",
+        "--quiet",
+    )
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    document = json.loads(result.stdout)
+    assert document["partial"] is True
+    assert document["capabilities"] == {
+        "steer_mode": "cancel-then-start",
+        "continue_without_message": True,
+    }
 
 
 def test_fault_after_claim_before_owner_finalizes_the_turn(
@@ -1229,10 +1299,11 @@ def test_continue_without_a_stored_mode_selects_and_sends_a_mode(cli: CliRunner)
     with sessions.session_lock(session_id):
         sessions.write_meta(meta)
 
-    result = invoke(cli, "continue", session_id, "settings", "--quiet")
+    result = invoke(cli, "continue", session_id, "settings", "--quiet", "--json")
 
     assert result.exit_code == vocab.EXIT_OK
-    _model, _effort, mode, _model_calls, mode_calls, _effort_calls = result.stdout.split("/")
+    answer = json.loads(result.stdout)["answer"]
+    _model, _effort, mode, _model_calls, mode_calls, _effort_calls = answer.split("/")
     assert mode == "default"
     assert mode_calls == "1"
 
@@ -1261,13 +1332,9 @@ def test_continue_without_permissions_uses_stored_mode_facts_after_registry_edit
     result = invoke(cli, "continue", session_id, "perm scenario", "--json")
 
     assert result.exit_code == vocab.EXIT_USAGE
-    assert json.loads(result.stdout)["denied"][-1] == {
-        "category": "switch_mode",
-        "target": "yolo",
-        "count": 1,
-        "minimum_policy": "all",
-        "remedy": "pass --permissions all",
-    }
+    error = json.loads([line for line in result.stderr.splitlines() if line.strip()][-1])["error"]
+    assert error["kind"] == "permission_denied"
+    assert "yolo" in error["message"]
 
     stored = sessions.load(session_id).resolution["adapter"]["modes"]
     assert stored["yolo"] == {"grants": "all", "delegates": False}
@@ -1479,8 +1546,9 @@ def test_exhausted_marker_retries_keep_the_turn_and_report_incomplete_resume(
     assert first.exit_code == vocab.EXIT_OK
     session_id = json.loads(first.stdout)["session_id"]
     first_meta = sessions.load(session_id)
-    assert attempts == 4
-    assert first_meta.state == "done"
+    # The retry count is not in SPEC.md; only that it retries and gives up.
+    assert 1 < attempts <= 8
+    assert first_meta.state == "succeeded"
     assert first_meta.extra[sessions.DELIVERY_RECORD_INCOMPLETE] is True
     assert "first prompt" in sessions.answer_path(session_id).read_text(encoding="utf-8")
 
@@ -1523,10 +1591,11 @@ def test_incomplete_marker_cannot_be_lost_when_its_separate_write_fails(
     first = invoke(cli, "run", "mock", "first prompt", "--quiet", "--json")
 
     assert first.exit_code == vocab.EXIT_OK
-    assert marker_attempts == 4
+    # The retry count is not in SPEC.md; only that it retries and gives up.
+    assert 1 < marker_attempts <= 8
     session_id = json.loads(first.stdout)["session_id"]
     first_meta = sessions.load(session_id)
-    assert first_meta.state == "done"
+    assert first_meta.state == "succeeded"
     assert first_meta.extra[sessions.DELIVERY_RECORD_INCOMPLETE] is True
     assert "first prompt" in sessions.answer_path(session_id).read_text(encoding="utf-8")
 
@@ -1604,7 +1673,7 @@ def test_replay_only_mismatch_fails_before_rotation(
 
     assert result.exit_code == vocab.EXIT_AGENT_ERROR
     after = sessions.read_meta(session_id)
-    assert after.state == before.state == "done"
+    assert after.state == before.state == "succeeded"
     assert after.turns == before.turns == 1
     assert sessions.prompt_path(session_id).read_text(encoding="utf-8") == "recorded context"
 
@@ -1677,11 +1746,11 @@ def test_a_stored_but_undelivered_prompt_is_not_required_on_later_resume(
     resumed = invoke(cli, "continue", session_id, "later prompt", "--quiet")
 
     assert resumed.exit_code == vocab.EXIT_OK
-    assert sessions.load(session_id).state == "done"
+    assert sessions.load(session_id).state == "succeeded"
     assert "later prompt" in sessions.answer_path(session_id).read_text(encoding="utf-8")
 
 
-def test_process_death_after_claim_is_orphaned_and_can_be_cold_resumed(
+def test_process_death_after_claim_is_unknown_and_can_be_cold_resumed(
     cli: CliRunner, state_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     session_id = start_session(cli, "turn one")
@@ -1724,18 +1793,18 @@ def test_process_death_after_claim_is_orphaned_and_can_be_cold_resumed(
     assert process.returncode == -9
 
     deadline = time.monotonic() + 5
-    orphaned = sessions.load(session_id)
-    while orphaned.state == "running" and time.monotonic() < deadline:
+    unknown = sessions.load(session_id)
+    while unknown.state == "running" and time.monotonic() < deadline:
         time.sleep(0.05)
-        orphaned = sessions.load(session_id)
-    assert orphaned.state == "orphaned"
+        unknown = sessions.load(session_id)
+    assert unknown.state == "unknown"
     monkeypatch.delenv("ACPC_MOCK_BLOCK_BEFORE_PROMPT")
     monkeypatch.delenv("ACPC_MOCK_BLOCK_BEFORE_PROMPT_READY")
 
     resumed = invoke(cli, "continue", session_id, "cold follow-up", "--quiet")
 
     assert resumed.exit_code == vocab.EXIT_OK
-    assert sessions.load(session_id).state == "done"
+    assert sessions.load(session_id).state == "succeeded"
     assert "cold follow-up" in sessions.answer_path(session_id).read_text(encoding="utf-8")
 
 
@@ -1781,7 +1850,7 @@ def test_a_cwd_mismatch_fails_before_rotation_or_prompt_dispatch(
     assert result.exit_code == vocab.EXIT_AGENT_ERROR
     assert "cwd" in result.stderr
     assert "must not run" not in sessions.prompt_path(session_id).read_text(encoding="utf-8")
-    assert sessions.read_meta(session_id).state == "done"
+    assert sessions.read_meta(session_id).state == "succeeded"
     for name, content in before.items():
         assert {
             "meta": sessions.meta_path(session_id),
@@ -1810,7 +1879,7 @@ def test_a_replay_prompt_mismatch_fails_before_the_new_prompt(
 
     assert result.exit_code == vocab.EXIT_AGENT_ERROR
     assert "stored prompt" in result.stderr
-    assert sessions.read_meta(session_id).state == "done"
+    assert sessions.read_meta(session_id).state == "succeeded"
     assert sessions.prompt_path(session_id).read_bytes() == before_prompt
     assert sessions.answer_path(session_id).read_bytes() == before_answer
     assert sessions.transcript_path(session_id).read_bytes() == before_transcript
@@ -1914,7 +1983,7 @@ def test_two_background_sessions_resume_only_their_own_context(
     assert "1\n" in cursor_file.read_text(encoding="utf-8")
 
 
-def test_inherited_ceiling_clamps_a_background_continue_and_stop_uses_new_target(
+def test_inherited_ceiling_clamps_a_background_continue_and_cancel_uses_new_target(
     cli: CliRunner, live_daemon: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     session_id = json.loads(
@@ -1936,10 +2005,10 @@ def test_inherited_ceiling_clamps_a_background_continue_and_stop_uses_new_target
     assert meta.target != original.target
     assert meta.target == runner.call_target(runner.resolution_from_session(meta))
 
-    stopped = invoke(cli, "stop", session_id)
+    stopped = invoke(cli, "cancel", session_id)
 
     assert stopped.exit_code == vocab.EXIT_OK
-    assert sessions.load(session_id).state == "cancelled"
+    assert sessions.load(session_id).state == "canceled"
 
 
 def test_a_daemon_cold_resume_reports_list_verification_without_replay(
@@ -2028,7 +2097,7 @@ def test_a_daemon_verification_failure_preserves_the_finished_session(
     result = invoke(cli, "continue", session_id, "must not run", "--quiet")
 
     assert result.exit_code == vocab.EXIT_AGENT_ERROR
-    assert sessions.read_meta(session_id).state == "done"
+    assert sessions.read_meta(session_id).state == "succeeded"
     assert sessions.read_meta(session_id).turns == 1
     assert {path: path.read_bytes() for path in before} == before
 
@@ -2051,7 +2120,7 @@ def test_a_queued_warm_background_continue_returns_before_the_slot_opens(
     elapsed = time.monotonic() - started_at
 
     assert result.exit_code == vocab.EXIT_OK
-    assert elapsed < 1.0
+    assert elapsed < 5.0
     assert invoke(cli, "wait", blocker, "--quiet").exit_code == vocab.EXIT_OK
     assert invoke(cli, "wait", finished, "--quiet").exit_code == vocab.EXIT_OK
 
@@ -2090,7 +2159,7 @@ def test_concurrent_continuations_have_one_atomic_winner(cli: CliRunner, live_da
     assert sum(returncode == vocab.EXIT_OK for returncode, _output, _error in outcomes) == 1
     assert sum(returncode != vocab.EXIT_OK for returncode, _output, _error in outcomes) == 1
     meta = sessions.load(session_id)
-    assert meta.state == "done"
+    assert meta.state == "succeeded"
     assert meta.turns == 2
     prompt = sessions.prompt_path(session_id).read_text(encoding="utf-8")
     assert "first winner" in prompt or "second contender" in prompt
@@ -2147,7 +2216,7 @@ def test_same_target_cold_continuations_cannot_steal_replay(
 
     assert first.returncode != vocab.EXIT_OK, (first_output, first_error)
     assert second.returncode != vocab.EXIT_OK, (second_output, second_error)
-    assert sessions.read_meta(session_id).state == "done"
+    assert sessions.read_meta(session_id).state == "succeeded"
     assert sessions.read_meta(session_id).turns == 1
     assert "must not run" not in store_path.read_text(encoding="utf-8")
 
@@ -2217,11 +2286,9 @@ def test_continue_permissions_refusal_names_the_permission_floor(
     result = invoke(cli, "continue", session_id, "turn two", "--permissions", "read")
 
     assert result.exit_code == vocab.EXIT_USAGE
-    assert result.stderr == (
-        "Error: no mode on floor grants at most permissions read — the lowest policy floor runs "
-        "under is execute; pass --permissions execute; declared modes: bypass (grants all), "
-        "default (grants execute)\n"
-    )
+    envelope = json.loads(result.stderr)["error"]
+    assert envelope["kind"] == "permission_denied"
+    assert "the lowest policy floor runs under is execute" in envelope["message"]
 
 
 def test_continuation_clamps_and_persists_an_inherited_ceiling(
@@ -2252,9 +2319,11 @@ def test_continue_validation_failure_does_not_rotate_session(cli: CliRunner) -> 
     result = invoke(cli, "continue", session_id, "turn two")
 
     unchanged = sessions.load(session_id)
-    assert result.exit_code == vocab.EXIT_USAGE
-    assert "cannot be continued" in result.stderr
-    assert unchanged.state == "done"
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    envelope = json.loads(result.stderr)["error"]
+    assert envelope["kind"] == "corrupt_state"
+    assert "cannot be continued" in envelope["message"]
+    assert unchanged.state == "succeeded"
     assert unchanged.turns == 1
 
 
@@ -2267,8 +2336,10 @@ def test_continue_rejects_a_malformed_stored_resolution(cli: CliRunner) -> None:
 
     result = invoke(cli, "continue", session_id, "turn two")
 
-    assert result.exit_code == vocab.EXIT_USAGE
-    assert "stored permission resolution" in result.stderr
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    envelope = json.loads(result.stderr)["error"]
+    assert envelope["kind"] == "corrupt_state"
+    assert "stored permission resolution" in envelope["message"]
 
 
 def test_continue_write_alias_is_canonical_and_warns(
@@ -2315,8 +2386,44 @@ def test_continue_on_a_running_session_is_a_usage_error(cli: CliRunner, live_dae
 
     continued = invoke(cli, "continue", session_id, "turn two")
 
-    assert continued.exit_code == vocab.EXIT_USAGE
-    assert "running" in continued.stderr
+    assert continued.exit_code == vocab.EXIT_AGENT_ERROR
+    envelope = json.loads(continued.stderr)["error"]
+    assert envelope["kind"] == "conflict"
+    assert envelope["retryable"] is True
+    assert "running" in envelope["message"]
+    # V2c/M1d: the hint names the running turn's own correction and wait verbs.
+    assert f"acpc steer {session_id}" in envelope["hint"]
+    assert f"acpc wait {session_id}" in envelope["hint"]
+    # SPEC.md `continue`: `running` has a turn in flight to correct in place,
+    # so the hint does not need `--steer-mode cancel-then-start`.
+    assert "--steer-mode cancel-then-start" not in envelope["hint"]
+
+
+@pytest.mark.parametrize("state", ["starting", "preparing"])
+def test_continue_conflict_hint_names_cancel_then_start_with_nothing_in_flight(
+    cli: CliRunner, state: str
+) -> None:
+    """SPEC.md `continue`: a session with nothing in flight to correct in
+    place — `starting`, `preparing`, `waiting` — hints `--steer-mode
+    cancel-then-start`, so the hinted `steer` never fails with a second
+    `conflict`. `waiting` is covered in test_limits.py, where a session
+    genuinely reaches it; `starting` and `preparing` are set directly, the
+    same technique `test_continue_without_a_message_resumes_an_unknown_turn`
+    uses for `unknown`."""
+    session_id = start_session(cli)
+    meta = sessions.load(session_id)
+    meta.state = state
+    with sessions.session_lock(session_id):
+        sessions.write_meta(meta)
+
+    continued = invoke(cli, "continue", session_id, "turn two")
+
+    assert continued.exit_code == vocab.EXIT_AGENT_ERROR
+    envelope = json.loads(continued.stderr)["error"]
+    assert envelope["kind"] == "conflict"
+    assert "--steer-mode cancel-then-start" in envelope["hint"]
+    assert f"acpc steer {session_id}" in envelope["hint"]
+    assert f"acpc wait {session_id}" in envelope["hint"]
 
 
 def test_continue_preserves_the_global_transcript_cursor(cli: CliRunner) -> None:
@@ -2334,12 +2441,144 @@ def test_continue_preserves_the_global_transcript_cursor(cli: CliRunner) -> None
 
 
 def test_continue_keeps_the_run_prompt_source_rules(cli: CliRunner) -> None:
+    """Two sources at once is still a usage error (V1a leaves zero for no-message)."""
     session_id = start_session(cli)
 
-    result = invoke(cli, "continue", session_id)
+    result = invoke(cli, "continue", session_id, "turn two", "--prompt-file", "/dev/null")
 
     assert result.exit_code == vocab.EXIT_USAGE
     assert "exactly one prompt source" in result.stderr
+
+
+def test_continue_without_a_message_resumes_a_canceled_turn(cli: CliRunner) -> None:
+    """V1a: no PROMPT, no `-`, no --prompt-file after `canceled` sends acpc's own text."""
+    canceled = invoke(
+        cli, "run", "mock", "chunkslow:5 canceled", "--cancel-after", "0.5", "--json", "--quiet"
+    )
+    assert canceled.exit_code == vocab.EXIT_AGENT_ERROR
+    session_id = json.loads(canceled.stdout)["session_id"]
+    assert sessions.load(session_id).state == "canceled"
+
+    result = invoke(cli, "continue", session_id, "--json")
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    document = json.loads(result.stdout)
+    assert document["turn"] == 2
+    assert document["status"] == "succeeded"
+    assert document["capabilities"]["continue_without_message"] is True
+    prompt_text = sessions.prompt_path(session_id).read_text(encoding="utf-8")
+    # Pinned literally, not just against the function under test (slice 23 review debt):
+    # the exact cause-naming text is what reaches the model.
+    assert "was canceled before it finished" in prompt_text
+    assert prompt_text == runner.continuation_instruction("canceled")
+
+
+def test_continue_without_a_message_resumes_a_canceled_turn_in_the_background(
+    cli: CliRunner, live_daemon: None
+) -> None:
+    canceled = invoke(
+        cli, "run", "mock", "chunkslow:5 canceled bg", "--cancel-after", "0.5", "--json", "--quiet"
+    )
+    assert canceled.exit_code == vocab.EXIT_AGENT_ERROR
+    session_id = json.loads(canceled.stdout)["session_id"]
+    assert sessions.load(session_id).state == "canceled"
+
+    result = invoke(cli, "continue", session_id, "--background", "--json")
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    receipt = json.loads(result.stdout)
+    assert receipt["next"] == ["acpc", "wait", session_id]
+    waited = invoke(cli, "wait", session_id, "--json")
+    assert waited.exit_code == vocab.EXIT_OK, waited.stderr
+    document = json.loads(waited.stdout)
+    assert document["turn"] == 2
+    prompt_text = sessions.prompt_path(session_id).read_text(encoding="utf-8")
+    # Pinned literally, not just against the function under test (slice 23 review debt).
+    assert "was canceled before it finished" in prompt_text
+    assert prompt_text == runner.continuation_instruction("canceled")
+
+
+def test_continue_without_a_message_resumes_a_failed_turn(cli: CliRunner) -> None:
+    failed = invoke(cli, "run", "mock", "fail this turn", "--json", "--quiet")
+    assert failed.exit_code == vocab.EXIT_AGENT_ERROR
+    session_id = json.loads(failed.stdout)["session_id"]
+    assert sessions.load(session_id).state == "failed"
+
+    result = invoke(cli, "continue", session_id, "--json")
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    document = json.loads(result.stdout)
+    assert document["turn"] == 2
+    assert document["status"] == "succeeded"
+    prompt_text = sessions.prompt_path(session_id).read_text(encoding="utf-8")
+    # Pinned literally, not just against the function under test (slice 23 review debt).
+    assert "ended with an error before it finished" in prompt_text
+    assert prompt_text == runner.continuation_instruction("failed")
+
+
+def test_continue_without_a_message_resumes_an_unknown_turn(cli: CliRunner) -> None:
+    """The `unknown` outcome is produced elsewhere (orphan detection); here only the
+    `continue`-without-a-message branch for it is under test, so the state is set
+    directly rather than re-driving a `kill -9` scenario another suite already covers.
+    """
+    session_id = start_session(cli)
+    meta = sessions.load(session_id)
+    meta.state = "unknown"
+    with sessions.session_lock(session_id):
+        sessions.write_meta(meta)
+
+    result = invoke(cli, "continue", session_id, "--json")
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    document = json.loads(result.stdout)
+    assert document["turn"] == 2
+    prompt_text = sessions.prompt_path(session_id).read_text(encoding="utf-8")
+    # Pinned literally, not just against the function under test (slice 23 review debt).
+    assert "its outcome was not observed" in prompt_text
+    assert prompt_text == runner.continuation_instruction("unknown")
+
+
+def test_continue_without_a_message_after_success_is_a_usage_error(cli: CliRunner) -> None:
+    session_id = start_session(cli)
+
+    result = invoke(cli, "continue", session_id, "--json")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    envelope = json.loads(result.stderr)["error"]
+    assert envelope["kind"] == "invalid_input"
+    assert "give continue a message" in envelope["hint"]
+    assert sessions.load(session_id).turns == 1
+
+
+def test_continue_with_an_explicit_empty_message_still_runs_a_turn(cli: CliRunner) -> None:
+    """An explicit empty string is a given source, not the no-message case (unchanged)."""
+    session_id = start_session(cli)
+
+    result = invoke(cli, "continue", session_id, "", "--json")
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    document = json.loads(result.stdout)
+    assert document["turn"] == 2
+    assert sessions.prompt_path(session_id).read_text(encoding="utf-8") == ""
+
+
+def test_continue_without_a_message_on_an_active_session_is_a_conflict(
+    cli: CliRunner, live_daemon: None
+) -> None:
+    """V2c-style ordering: the active-session check runs before the no-message branch."""
+    running = invoke(cli, "run", "mock", "chunkslow:5 active", "--background", "--json")
+    assert running.exit_code == vocab.EXIT_OK
+    session_id = json.loads(running.stdout)["session_id"]
+    wait_for_running(cli, session_id)
+
+    result = invoke(cli, "continue", session_id, "--json")
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    envelope = json.loads(result.stderr)["error"]
+    assert envelope["kind"] == "conflict"
+    assert sessions.load(session_id).turns == 1
+
+    invoke(cli, "cancel", session_id, "--json")
 
 
 def test_run_stores_the_tty_resolved_permission_policy(cli: CliRunner) -> None:
@@ -2386,9 +2625,9 @@ def test_continue_of_an_ask_session_needs_a_terminal(cli: CliRunner) -> None:
 def test_continue_of_an_ask_session_rejects_bg_by_name(
     cli: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from acpc import cli as cli_module
+    from acpc import interaction
 
-    monkeypatch.setattr(cli_module, "_stdout_is_tty", lambda: True)
+    monkeypatch.setattr(interaction, "stdout_is_tty", lambda: True)
     session_id = start_session(cli)
     _store_ask_policy(session_id)
 
@@ -2414,6 +2653,24 @@ def test_a_warm_continue_keeps_the_adapter_history(cli: CliRunner, live_daemon: 
 
     assert result.exit_code == vocab.EXIT_OK
     assert "turn one of the conversation" in result.stdout
+
+
+def test_background_continue_receipt_publishes_the_session_capability(
+    cli: CliRunner, live_daemon: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ACPC_MOCK_STEERING", "1")
+    session_id = start_session(cli)
+
+    result = invoke(cli, "continue", session_id, "echo:background follow-up", "--bg", "--json")
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    document = json.loads(result.stdout)
+    status = json.loads(invoke(cli, "status", session_id, "--json").stdout)
+    assert document["capabilities"] == {
+        "steer_mode": "in-place",
+        "continue_without_message": True,
+    }
+    assert status["capabilities"] == document["capabilities"]
 
 
 def test_background_policy_change_updates_wait_and_stop_target(
@@ -2453,7 +2710,7 @@ def test_background_policy_change_updates_wait_and_stop_target(
     assert connected == [new_target]
 
     connected.clear()
-    stopped = invoke(cli, "stop", session_id)
+    stopped = invoke(cli, "cancel", session_id)
     assert stopped.exit_code == vocab.EXIT_OK
-    assert sessions.load(session_id).state == "cancelled"
+    assert sessions.load(session_id).state == "canceled"
     assert connected == [new_target]

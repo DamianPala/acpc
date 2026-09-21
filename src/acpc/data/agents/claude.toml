@@ -51,7 +51,6 @@ default = { grants = "read", delegates = true }
 plan = { grants = "edit", delegates = true }
 auto = { grants = "all", delegates = false, escalates = true }
 acceptEdits = { grants = "execute", delegates = true }
-dontAsk = { grants = "none", delegates = false }
 bypassPermissions = { grants = "all", delegates = false }
 
 [presets]

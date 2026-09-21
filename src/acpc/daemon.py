@@ -31,13 +31,14 @@ import os
 import shlex
 import sys
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from acp import PROTOCOL_VERSION, text_block
+from acp import PROTOCOL_VERSION, RequestError
 
-from acpc import __version__, config, ipc, paths, runner, sessions, transcript, vocab
+from acpc import __version__, config, errors, ipc, paths, runner, sessions, transcript, vocab
 from acpc.client import (
     REPLAY_GENERATION_KEY,
     VALIDATED_SESSION_ID_KEY,
@@ -52,8 +53,48 @@ from acpc.spawn import spawn_adapter
 # and still see expiry, long enough to cost nothing over a 30-minute default.
 IDLE_CHECK_INTERVAL = 0.5
 
+# How long one `_session/steering` request may take before its outcome is
+# unknown: the adapter's acknowledgement is a single round trip, and past this
+# bound the instruction may or may not have landed. A test can lower it.
+STEER_REQUEST_TIMEOUT = 10.0
+
+# The adapter must answer `initialize` before the daemon accepts a turn. A test
+# can lower this bound; a hung adapter must never hold a session in `starting`.
+HOST_START_TIMEOUT = 60.0
+
 # Frames name their operation under this key.
 OP = "op"
+
+# JSON-RPC's "no such method": an adapter that never implemented the steering
+# extension answers an unknown `_session/steering` with exactly this code.
+_METHOD_NOT_FOUND = -32601
+
+
+@dataclass(frozen=True, slots=True)
+class _NoSteeringOutcome:
+    """A steering reply that reports a failure instead of an adapter outcome."""
+
+    payload: dict[str, Any]
+
+
+async def _steering_request(raw: Any, adapter_session_id: str, text: str) -> Any:
+    """Send one `_session/steering` request down the warm adapter connection.
+
+    A module function rather than a method because it holds nothing but the
+    wire shape: the caller owns the connection's lifetime, and this is the one
+    place the extension's request is written down.
+    """
+    return await raw.send_request(
+        "_session/steering",
+        {
+            "sessionId": adapter_session_id,
+            "prompt": [{"type": "text", "text": text}],
+            # SPEC.md `steer`: acpc asks the adapter never to start a turn of
+            # its own, so an instruction that arrives with nothing in flight
+            # is refused rather than silently becoming a new turn.
+            "_meta": {"steering": {"idleBehavior": "promptRequired"}},
+        },
+    )
 
 
 class DaemonError(Exception):
@@ -64,9 +105,50 @@ class SpawnArgvMismatch(DaemonError):
     """The live entry now requires a different adapter process argv."""
 
 
+class AdapterHandshakeTimeout(DaemonError):
+    """The adapter did not answer the ACP initialize handshake in time."""
+
+
 def log_path_for_target(target: str) -> Path:
     """Where this target's daemon and adapter stderr go (SPEC.md `daemon`)."""
     return paths.daemon_dir() / f"{target}.log"
+
+
+def steering_supported(initialize: Any) -> bool:
+    """Read the adapter's steering capability off its `initialize` answer.
+
+    SPEC.md `steer` reads support from top-level `_meta.steering.supported`,
+    not from `agentCapabilities`: the extension is not part of the ACP schema,
+    so the flag that carries it is the reserved metadata channel. The value is
+    absent for an adapter that does not implement the extension at all, and
+    only an explicit `true` claims it.
+    """
+    meta = getattr(initialize, "field_meta", None)
+    if not isinstance(meta, Mapping):
+        return False
+    steering = meta.get("steering")
+    if not isinstance(steering, Mapping):
+        return False
+    return steering.get("supported") is True
+
+
+def _refusal_kind(error: BaseException) -> str | None:
+    """Classify a refused turn, so the client reports what the daemon saw.
+
+    The reply crosses a socket as text, and a message is not a contract: the
+    caller matches on the kind, which is why the side that knows sets it.
+    """
+    if isinstance(error, runner.ResumeRotationError):
+        return errors.CONFLICT if error.turn_token is None else errors.CORRUPT_STATE
+    if isinstance(error, sessions.SessionStateError):
+        return errors.CONFLICT
+    if isinstance(error, sessions.CorruptSessionError):
+        return errors.CORRUPT_STATE
+    if isinstance(error, sessions.SessionNotFound):
+        return errors.NOT_FOUND
+    if isinstance(error, AdapterHandshakeTimeout):
+        return errors.AGENT_ERROR
+    return None
 
 
 @dataclass(slots=True)
@@ -74,13 +156,14 @@ class _Turn:
     """One in-flight turn owned by this daemon."""
 
     session_id: str
-    task: "asyncio.Task[runner.TurnOutcome] | None"
+    task: "asyncio.Task[Any] | None"
     cancel: runner._CancelSignal
     phase: str = "preparing"
     claim_established: bool = False
     backup: "_PreparationBackup | None" = None
     preparation_cancelable: bool = False
     preparation_done: "asyncio.Future[dict[str, Any]] | None" = None
+    turn_token: int | None = None
     waiters: list["asyncio.Future[dict[str, Any]]"] = field(default_factory=list)
     result: dict[str, Any] | None = None
 
@@ -216,6 +299,9 @@ class AdapterHost:
         self._process: Any = None
         self._command: tuple[str, tuple[str, ...]] | None = None
         self.agent_capabilities: Any = None
+        # SPEC.md `steer`: whether this adapter takes `_session/steering`.
+        # Retained per warm process, exactly like the capabilities above.
+        self.steering_supported = False
         self._starting = asyncio.Lock()
         # acpc session id -> the adapter session id it is bound to, for as long
         # as this adapter process lives. Presence here *is* "warm".
@@ -286,7 +372,15 @@ class AdapterHost:
                     drain_stderr=True,
                 )
             )
-            initialize = await conn.initialize(protocol_version=PROTOCOL_VERSION)
+            try:
+                initialize = await asyncio.wait_for(
+                    conn.initialize(protocol_version=PROTOCOL_VERSION),
+                    timeout=HOST_START_TIMEOUT,
+                )
+            except TimeoutError as error:
+                raise AdapterHandshakeTimeout(
+                    f"adapter handshake did not complete within {HOST_START_TIMEOUT:g}s"
+                ) from error
         except BaseException:
             # A cancelled preparation can interrupt initialize after the
             # adapter process and its transport have been entered, before the
@@ -299,6 +393,7 @@ class AdapterHost:
         self._process = process
         self._command = (command, args)
         self.agent_capabilities = getattr(initialize, "agent_capabilities", None)
+        self.steering_supported = steering_supported(initialize)
         return conn
 
     async def close(self) -> None:
@@ -317,6 +412,7 @@ class AdapterHost:
         self._process = None
         self._command = None
         self.agent_capabilities = None
+        self.steering_supported = False
         self.adapter_sessions.clear()
 
     def start_restore(self, adapter_session_id: str, coroutine: Any) -> asyncio.Task[Any]:
@@ -554,6 +650,8 @@ class Daemon:
             return await self._await_preparation(frame)
         if operation == "cancel":
             return self._cancel(frame)
+        if operation == "steer":
+            return await self._steer(frame)
         if operation == "status":
             return self._status()
         if operation == "stop":
@@ -587,7 +685,7 @@ class Daemon:
             "version": __version__,
             "target": self.target,
             "pid": os.getpid(),
-            "uptime": time.time() - self.started_at,
+            "uptime_seconds": time.time() - self.started_at,
             "log": str(log_path_for_target(self.target)),
             "sessions": sorted(self.turns),
             "preparing": sorted(
@@ -598,22 +696,156 @@ class Daemon:
         }
 
     def _cancel(self, frame: dict[str, Any]) -> dict[str, Any]:
+        """Cancel the turn this daemon holds for one session.
+
+        SPEC.md `cancel`: a call selects the turn active when it starts, so a
+        request naming an older ``turn_token`` than the one this daemon has
+        established must not reach into whatever turn is running now — it
+        reports `stale` and lets the caller reselect. A frame with no token,
+        or one that arrives before this turn's own token is established, is
+        never "a different token" and is honored as before.
+        """
         session_id = frame.get("session_id", "")
         turn = self.turns.get(session_id)
         if turn is None:
             return {"ok": False, "error": f"session {session_id} is not running here"}
-        turn.cancel.request("cancelled")
-        if turn.phase == "preparing" and turn.preparation_cancelable and turn.task is not None:
-            # Preparation has no prompt task whose ACP cancellation can wind it
-            # down. Cancelling the daemon-owned preparation task runs its
-            # reservation, adapter binding and replay-generation finalizers.
+        requested_token = frame.get("turn_token")
+        if isinstance(requested_token, bool) or not isinstance(requested_token, int):
+            requested_token = None
+        if (
+            requested_token is not None
+            and turn.turn_token is not None
+            and turn.turn_token != requested_token
+        ):
+            return {
+                "ok": False,
+                "kind": errors.CONFLICT,
+                "stale": True,
+                "turn_token": turn.turn_token,
+            }
+        turn.cancel.request("canceled")
+        if (
+            turn.phase == "preparing"
+            and turn.task is not None
+            and (not turn.claim_established or turn.preparation_cancelable)
+        ):
+            # During cold start this is the request handler itself; after
+            # acceptance it is the daemon-owned preparation/turn task.
             turn.task.cancel()
-        return {"ok": True}
+        return {"ok": True, "turn_token": turn.turn_token}
+
+    async def _steer(self, frame: dict[str, Any]) -> dict[str, Any]:
+        """Deliver an in-place correction to a turn this daemon is running.
+
+        SPEC.md `steer`: the instruction goes to the adapter's
+        `_session/steering` extension over the connection that already owns
+        the turn. Nothing here rotates, re-prompts or finalizes — the turn
+        keeps its number and its files, and only the adapter's answer says
+        whether the instruction landed. A failed delivery is never retried
+        and never falls back to cancel-then-start: repeating the instruction
+        is the caller's decision.
+        """
+        session_id = frame.get("session_id", "")
+        text = frame.get("text", "")
+        turn = self.turns.get(session_id)
+        if turn is None or turn.phase != "running":
+            return {
+                "ok": False,
+                "kind": errors.CONFLICT,
+                "error": f"session {session_id} has no turn in flight",
+            }
+        adapter_session_id = self.host.adapter_sessions.get(session_id)
+        if adapter_session_id is None or not self.host.steering_supported:
+            return {
+                "ok": False,
+                "kind": errors.NOT_SUPPORTED,
+                "error": "the adapter does not support in-place steering",
+            }
+        raw = getattr(self.host._conn, "_conn", None)
+        if raw is None or not hasattr(raw, "send_request"):
+            # The adapter process is gone, so nothing crossed and nothing can.
+            return {"ok": False, "kind": errors.OUTCOME_UNKNOWN}
+        reply = await self._steering_reply(raw, adapter_session_id, text)
+        if isinstance(reply, _NoSteeringOutcome):
+            return reply.payload
+        return await self._apply_steering(session_id, adapter_session_id, text, turn, reply)
+
+    async def _steering_reply(self, raw: Any, adapter_session_id: str, text: str) -> Any:
+        """Send the request and describe everything that is not an outcome."""
+        try:
+            return await asyncio.wait_for(
+                _steering_request(raw, adapter_session_id, text),
+                timeout=STEER_REQUEST_TIMEOUT,
+            )
+        except TimeoutError:
+            # The request crossed; the answer is the one thing missing.
+            return _NoSteeringOutcome({"ok": False, "kind": errors.OUTCOME_UNKNOWN, "sent": True})
+        except RequestError as error:
+            if error.code == _METHOD_NOT_FOUND:
+                # The adapter declared the extension and then denied it — a
+                # capability lie, not a delivery acpc can report on.
+                return _NoSteeringOutcome({"ok": False, "kind": errors.NOT_SUPPORTED})
+            return _NoSteeringOutcome({"ok": False, "kind": errors.OUTCOME_UNKNOWN, "sent": True})
+        except Exception:  # noqa: BLE001
+            # A transport failure after the frame went out is exactly the
+            # case SPEC calls unknown: the adapter may have taken it.
+            return _NoSteeringOutcome({"ok": False, "kind": errors.OUTCOME_UNKNOWN, "sent": True})
+
+    async def _apply_steering(
+        self,
+        session_id: str,
+        adapter_session_id: str,
+        text: str,
+        turn: _Turn,
+        reply: Any,
+    ) -> dict[str, Any]:
+        """Turn the adapter's own answer into this daemon's reply."""
+        outcome = reply.get("outcome") if isinstance(reply, Mapping) else None
+        if outcome == "injected":
+            self._record_steer(session_id, text, "injected")
+            return {"ok": True, "outcome": "injected", "turn_token": turn.turn_token}
+        if outcome == "promptRequired":
+            self._record_steer(session_id, text, "promptRequired")
+            return {"ok": False, "kind": errors.CONFLICT, "outcome": "promptRequired"}
+        if outcome == "startedNewTurn":
+            # The adapter started a turn of its own. acpc owns neither it nor
+            # its ending, so it is cancelled and the result stays unknown.
+            self._record_steer(session_id, text, "startedNewTurn")
+            await self._cancel_adapter_turn(adapter_session_id)
+            return {"ok": False, "kind": errors.OUTCOME_UNKNOWN, "outcome": "startedNewTurn"}
+        # An answer acpc does not recognize is not a delivery it can describe,
+        # so it is reported the way an unanswered request is.
+        self._record_steer(session_id, text, outcome if isinstance(outcome, str) else "unknown")
+        return {"ok": False, "kind": errors.OUTCOME_UNKNOWN, "sent": True}
+
+    async def _cancel_adapter_turn(self, adapter_session_id: str) -> None:
+        """Cancel a turn the adapter started on its own after a steering request."""
+        raw = getattr(self.host._conn, "_conn", None)
+        if raw is None or not hasattr(raw, "send_notification"):
+            return
+        with contextlib.suppress(Exception):
+            await raw.send_notification("session/cancel", {"sessionId": adapter_session_id})
+
+    def _record_steer(self, session_id: str, text: str, outcome: str) -> None:
+        """Append the correction to the session transcript.
+
+        The steer itself has already happened, so a transcript that cannot be
+        written must not turn into a failed reply: the caller would be told the
+        instruction did not land when it did.
+        """
+        with contextlib.suppress(OSError, sessions.SessionError, transcript.TranscriptError):
+            transcript.Transcript(sessions.transcript_path(session_id)).append(
+                "steer", mode=vocab.STEER_IN_PLACE, text=text, outcome=outcome
+            )
 
     async def _start(self, frame: dict[str, Any]) -> dict[str, Any]:
         session_id = frame.get("session_id", "")
         if session_id in self.turns:
-            return {"ok": False, "error": f"session {session_id} already has a turn in flight"}
+            return {
+                "ok": False,
+                "error": f"session {session_id} already has a turn in flight",
+                "kind": errors.CONFLICT,
+            }
         try:
             request = self._rebuild_request(frame.get("payload") or {})
         except Exception as error:  # noqa: BLE001
@@ -641,6 +873,7 @@ class Daemon:
             ),
         )
         self.turns[session_id] = turn
+        turn.task = asyncio.current_task()
         self._last_busy = time.monotonic()
 
         try:
@@ -651,12 +884,18 @@ class Daemon:
                     request = runner._prepare_resumed_turn(
                         session_id, request, events, pid=os.getpid()
                     )
-            else:
+            if not self.host.started or self.host._adapter_died():
+                await self.host.ensure(request.resolution)
+            self._record_steer_mode(session_id)
+            if not preparation:
                 sessions.mark_running(session_id, pid=os.getpid())
                 transcript.Transcript(sessions.transcript_path(session_id)).append(
                     "state", **{"from": "starting", "to": "running"}
                 )
             turn.claim_established = True
+            turn.turn_token = request.turn_token
+            if turn.turn_token is None:
+                turn.turn_token = sessions.read_meta(session_id).turns
         except runner.ResumeRotationError as error:
             if error.turn_token is None:
                 self._rollback_preparation(session_id, turn)
@@ -664,17 +903,56 @@ class Daemon:
             return {
                 "ok": False,
                 "error": runner.describe_error(error),
+                "kind": _refusal_kind(error),
                 "preserve_session": preparation,
             }
         except BaseException as error:  # noqa: BLE001
-            self._rollback_preparation(session_id, turn)
-            self.turns.pop(session_id, None)
+            canceled = isinstance(error, asyncio.CancelledError) and turn.cancel.state == "canceled"
+            stop_reason = "error"
+            if isinstance(error, asyncio.CancelledError) and turn.cancel.state == "failed":
+                # The daemon is shutting down under this handshake: the session
+                # records that reason, the way a running turn does.
+                stop_reason = turn.cancel.stop_reason or "the daemon was stopped"
+                error = runner.TurnEndedByAcpc(stop_reason)
+            finalized = False
+            if preparation:
+                if canceled and turn.backup is not None:
+                    expected_turn = sessions.read_meta(session_id).turns
+                    outcome = runner.TurnOutcome(
+                        state="canceled",
+                        stop_reason=runner.PREPARATION_CANCELLED_REASON,
+                        answer=runner.preparation_cancelled_answer(session_id),
+                        turn_token=expected_turn,
+                    )
+                    runner._finalize(session_id, outcome, expected_turn=expected_turn)
+                    self._finish(session_id, outcome)
+                    finalized = True
+                else:
+                    self._rollback_preparation(session_id, turn)
+            elif canceled:
+                outcome = runner.TurnOutcome(state="canceled", stop_reason="canceled", answer="")
+                runner._finalize(session_id, outcome)
+                self._finish(session_id, outcome)
+                finalized = True
+            else:
+                with contextlib.suppress(Exception):
+                    sessions.update_meta(session_id, steer_mode=vocab.STEER_CANCEL_THEN_START)
+                with contextlib.suppress(Exception):
+                    runner._finalize(
+                        session_id,
+                        runner.TurnOutcome(state="failed", stop_reason=stop_reason, answer=""),
+                        error=error,
+                    )
+            if not finalized:
+                self.turns.pop(session_id, None)
             return {
                 "ok": False,
                 "error": runner.describe_error(error),
+                "kind": _refusal_kind(error),
                 "preserve_session": preparation,
             }
 
+        turn.task = None
         turn_coro = self._run_accepted_turn(session_id, request, turn)
         try:
             task = asyncio.create_task(turn_coro, name=f"acpc.turn.{session_id}")
@@ -732,7 +1010,7 @@ class Daemon:
             raise
         except asyncio.CancelledError:
             if (
-                turn.cancel.state == "cancelled"
+                turn.cancel.state == "canceled"
                 and turn.phase == "preparing"
                 and turn.preparation_cancelable
             ):
@@ -744,7 +1022,7 @@ class Daemon:
                 except sessions.SessionError:
                     expected_turn = current_request.turn_token
                 outcome = runner.TurnOutcome(
-                    state="cancelled",
+                    state="canceled",
                     stop_reason=runner.PREPARATION_CANCELLED_REASON,
                     answer=runner.preparation_cancelled_answer(session_id),
                     turn_token=expected_turn,
@@ -787,15 +1065,50 @@ class Daemon:
             raise
 
     async def _await(self, frame: dict[str, Any]) -> dict[str, Any]:
+        """Block until the session's turn ends, or say so at once if it already has.
+
+        ``turn`` (optional) pins the call to one turn (M1g): a caller that
+        started observing turn N before it lost the race to a rotation gets
+        `stale` immediately rather than waiting on a turn that is not the one
+        it asked about, and reads that turn's own parked outcome instead. A
+        frame with no `turn` is served as it always was — the same leniency
+        `_cancel` gives an untokened request. One that arrives before this
+        daemon's own turn has a token yet (`_start` assigns it only once
+        backend initialization clears, up to the full `--timeout` on a cold
+        start) is checked against the on-disk turn count instead, the same
+        source `_start` itself falls back to once the token is available.
+        """
         session_id = frame.get("session_id", "")
-        turn = self.turns.get(session_id)
-        if turn is None:
-            return {"ok": True, "outcome": self._outcome_from_disk(session_id)}
-        if turn.result is not None:
-            return {"ok": True, "outcome": turn.result}
-        waiter: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
-        turn.waiters.append(waiter)
-        return {"ok": True, "outcome": await waiter}
+        requested_turn = frame.get("turn")
+        if isinstance(requested_turn, bool) or not isinstance(requested_turn, int):
+            requested_turn = None
+        in_flight = self.turns.get(session_id)
+        if in_flight is not None:
+            if requested_turn is not None:
+                current_token = (
+                    in_flight.turn_token
+                    if in_flight.turn_token is not None
+                    else self._current_turns(session_id)
+                )
+                if current_token is not None and current_token != requested_turn:
+                    return {"ok": True, "stale": True, "turn": current_token}
+            if in_flight.result is not None:
+                return {"ok": True, "outcome": in_flight.result}
+            waiter: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+            in_flight.waiters.append(waiter)
+            return {"ok": True, "outcome": await waiter}
+        if requested_turn is not None:
+            current_turn = self._current_turns(session_id)
+            if current_turn is not None and current_turn != requested_turn:
+                return {"ok": True, "stale": True, "turn": current_turn}
+        return {"ok": True, "outcome": self._outcome_from_disk(session_id)}
+
+    @staticmethod
+    def _current_turns(session_id: str) -> int | None:
+        try:
+            return sessions.read_meta(session_id).turns
+        except sessions.SessionError:
+            return None
 
     async def _await_preparation(self, frame: dict[str, Any]) -> dict[str, Any]:
         """Wait only for deferred resume preparation, not for the prompt."""
@@ -920,7 +1233,7 @@ class Daemon:
             resolution=resolution,
             prompt=payload.get("prompt", ""),
             cwd=payload.get("cwd"),
-            timeout=payload.get("timeout"),
+            cancel_after=payload.get("cancel_after"),
             resume_adapter_session=payload.get("resume_adapter_session"),
             defer_rotation=bool(payload.get("defer_rotation", False)),
             rotation_resolution=payload.get("rotation_resolution"),
@@ -1058,14 +1371,14 @@ class Daemon:
                 )
                 preparing_cancel = (
                     isinstance(caught, asyncio.CancelledError)
-                    and turn.cancel.state == "cancelled"
+                    and turn.cancel.state == "canceled"
                     and turn.phase == "preparing"
                     and turn.preparation_cancelable
                 )
                 if preparing_cancel:
                     error = None
                 outcome = runner.TurnOutcome(
-                    state=("cancelled" if preparing_cancel else turn.cancel.state or "failed"),
+                    state=("canceled" if preparing_cancel else turn.cancel.state or "failed"),
                     stop_reason=(
                         runner.PREPARATION_CANCELLED_REASON
                         if preparing_cancel
@@ -1123,12 +1436,10 @@ class Daemon:
             modes=request.resolution.entry.modes,
             end_turn=cancel.end_turn,
             cancellation_dispatched=cancel.cancellation_dispatched,
-            previous_tokens=stored.tokens,
-            previous_cost=stored.cost,
+            previous_context=stored.context,
         )
 
         turn_error: BaseException | None = None
-        prompt_task: asyncio.Task[Any] | None = None
         warm = self.host.adapter_sessions.get(session_id)
         if warm is not None:
             # The adapter still holds this session, so its own history is
@@ -1163,63 +1474,51 @@ class Daemon:
             session = await conn.new_session(cwd=request.cwd or os.getcwd(), mcp_servers=[])
             adapter_session_id = session.session_id
             client.capture_advertised(session)
+            # SPEC.md *State on disk*: recorded as soon as the adapter has
+            # accepted the session, before the prompt is sent, so a daemon
+            # killed mid-turn still leaves a continuable session.
+            sessions.update_meta(session_id, adapter_session_id=adapter_session_id)
 
         self.host.mux.bind(adapter_session_id, client)
+        prompt_started = False
         try:
             try:
                 await runner.apply_call_options(conn, adapter_session_id, request)
-                delivery = runner.register_prompt_delivery(
-                    conn,
-                    session_id,
-                    adapter_session_id,
-                    request.prompt,
-                    on_delivered=lambda: self._prompt_delivered(
-                        session_id, adapter_session_id, turn
-                    ),
-                )
                 if cancel.requested.is_set() and request.resume_prepared:
                     return runner.TurnOutcome(
-                        state="cancelled",
+                        state="canceled",
                         stop_reason=runner.PREPARATION_CANCELLED_REASON,
                         answer=runner.preparation_cancelled_answer(session_id),
                         adapter_session_id=adapter_session_id,
                         turn_token=request.turn_token,
                     )
-                prompt_task = asyncio.create_task(
-                    conn.prompt(session_id=adapter_session_id, prompt=[text_block(request.prompt)])
+                prompt_started = True
+                (
+                    stop_reason,
+                    turn_error,
+                    delivery,
+                    limit_record,
+                ) = await runner.run_prompt_with_limits(
+                    conn,
+                    session_id,
+                    adapter_session_id,
+                    request,
+                    cancel,
+                    client,
+                    events,
+                    on_delivered=lambda: self._prompt_delivered(
+                        session_id, adapter_session_id, turn
+                    ),
                 )
             except BaseException as error:
-                if request.turn_token is None:
+                if prompt_started or request.turn_token is None:
                     raise
                 if isinstance(error, asyncio.CancelledError):
                     raise
                 raise runner.ResumeSetupError(
                     runner.describe_error(error), turn_token=request.turn_token
                 ) from None
-            try:
-                stop_reason = await runner._await_prompt(
-                    conn,
-                    adapter_session_id,
-                    prompt_task,
-                    request,
-                    cancel,
-                    usage_client=client,
-                )
-            except Exception as caught:  # noqa: BLE001
-                # Same bargain as the direct path: keep the streamed prose as the
-                # failed session's answer and carry the cause on the outcome.
-                turn_error = caught
-                stop_reason = "error"
-            try:
-                await delivery.ensure_persisted(prompt_completed=turn_error is None)
-            except Exception as caught:  # noqa: BLE001
-                turn_error = caught if turn_error is None else turn_error
-                stop_reason = "error"
         finally:
-            if prompt_task is not None and not prompt_task.done():
-                prompt_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await prompt_task
             self.host.mux.release(adapter_session_id)
             client.flush()
 
@@ -1228,12 +1527,14 @@ class Daemon:
         )
         if cancel.stop_reason is not None:
             stop_reason = cancel.stop_reason
+        # SPEC.md *Session states*: the adapter's `cancelled` stop reason is
+        # normalized to acpc's own `canceled` when the turn ends.
+        stop_reason = vocab.normalize_stop_reason(stop_reason)
         return runner.TurnOutcome(
             state=state,
             stop_reason=stop_reason,
             answer=client.answer,
-            tokens=client.tokens,
-            cost=client.cost,
+            context=client.context,
             denied=client.denied,
             denial_details=client.denial_details,
             adapter_session_id=adapter_session_id,
@@ -1241,12 +1542,24 @@ class Daemon:
             error=turn_error,
             delivery_record_incomplete=delivery.delivery_record_incomplete,
             turn_token=request.turn_token,
+            limit=limit_record,
         )
 
     def _prompt_delivered(self, session_id: str, adapter_session_id: str, turn: _Turn) -> None:
         """Enter the running phase only after the outgoing prompt was observed."""
         turn.phase = "running"
         self.host.adapter_sessions[session_id] = adapter_session_id
+        # SPEC.md `steer`: support is read from `initialize` and recorded on the
+        # session. The start receipt records it earlier; this callback keeps the
+        # record correct for any path that reaches prompt delivery later.
+        with contextlib.suppress(OSError, sessions.SessionError):
+            self._record_steer_mode(session_id)
+
+    def _record_steer_mode(self, session_id: str) -> None:
+        mode = (
+            vocab.STEER_IN_PLACE if self.host.steering_supported else vocab.STEER_CANCEL_THEN_START
+        )
+        sessions.update_meta(session_id, steer_mode=mode)
 
     def _finish(
         self, session_id: str, outcome: runner.TurnOutcome, *, error: BaseException | None = None
@@ -1257,7 +1570,7 @@ class Daemon:
             return
         state = outcome.state
         if state == "terminated":
-            state = "cancelled"
+            state = "canceled"
         payload = {
             "state": state,
             "exit_code": outcome.exit_code,

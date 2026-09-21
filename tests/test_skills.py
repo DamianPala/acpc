@@ -30,7 +30,7 @@ def invoke(cli: CliRunner, *args: str):
 def _resource_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     root = tmp_path / "bundled"
     root.mkdir()
-    monkeypatch.setattr(skills, "_bundled_resources", lambda: iter(sorted(root.iterdir())))
+    monkeypatch.setattr(skills, "_bundled_resources", lambda: iter(root.iterdir()))
     return root
 
 
@@ -116,8 +116,13 @@ def test_list_has_header_alignment_sorting_and_bounded_rendered_description(
         "  and enough words to exceed the eighty character roster budget safely.\n"
         "---\na\n",
     )
+    monkeypatch.setattr(
+        skills,
+        "_bundled_resources",
+        lambda: iter((root / "zeta", root / "alpha-name-longer-than-header")),
+    )
 
-    result = invoke(cli, "skills")
+    result = invoke(cli, "skills", "list", "--format", "text")
 
     assert result.exit_code == vocab.EXIT_OK
     lines = result.stdout.splitlines()
@@ -129,9 +134,32 @@ def test_list_has_header_alignment_sorting_and_bounded_rendered_description(
     header = lines[0]
     alpha = lines[1]
     assert alpha.index("A long") == header.index("DESCRIPTION")
-    assert alpha.endswith("...")
-    assert len(alpha.split("  ", 1)[1]) <= 80
+    assert "..." in alpha
+    assert "full: acpc skills get alpha-name-longer-than-header" in alpha
     assert "repeated whitespace and" in alpha
+
+    listed = json.loads(invoke(cli, "skills", "list", "--json").stdout)
+    assert [item["name"] for item in listed["items"]] == [
+        "alpha-name-longer-than-header",
+        "zeta",
+    ]
+    assert len(listed["items"]) <= 20
+
+
+def test_list_reports_has_more_past_the_default_limit(
+    cli: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mutation coverage: nothing else in the suite proves this truncation
+    signal for `skills list` (recon D, mutation 10)."""
+    root = _resource_root(tmp_path, monkeypatch)
+    for index in range(21):
+        _write_skill(root, f"skill-{index:02d}", f"---\ndescription: entry {index}\n---\nbody\n")
+
+    result = invoke(cli, "skills", "list", "--json")
+
+    payload = json.loads(result.stdout)
+    assert len(payload["items"]) == 20
+    assert payload["has_more"] is True
 
 
 def test_detail_preserves_body_and_places_directory_metadata_on_stderr(
@@ -141,7 +169,7 @@ def test_detail_preserves_body_and_places_directory_metadata_on_stderr(
     body = "# Exact body\n\nUnicode: café\nwithout final newline"
     directory = _write_skill(root, "exact", f"---\ndescription: x\n---\n{body}")
 
-    result = invoke(cli, "skills", "exact")
+    result = invoke(cli, "skills", "get", "exact", "--format", "text")
 
     assert result.exit_code == vocab.EXIT_OK
     assert result.stdout == body
@@ -155,21 +183,22 @@ def test_json_views_include_paths_body_and_null_description(
     root = _resource_root(tmp_path, monkeypatch)
     directory = _write_skill(root, "json-skill", "---\nname: ignored\n---\nbody\n")
 
-    listed = invoke(cli, "skills", "--json")
-    detail = invoke(cli, "skills", "json-skill", "--json")
+    listed = invoke(cli, "skills", "list", "--json")
+    detail = invoke(cli, "skills", "get", "json-skill", "--json")
 
     assert listed.exit_code == vocab.EXIT_OK
     assert detail.exit_code == vocab.EXIT_OK
     list_payload = json.loads(listed.stdout)
     detail_payload = json.loads(detail.stdout)
     assert list_payload == {
-        "skills": [
+        "items": [
             {
                 "name": "json-skill",
                 "description": None,
                 "path": str(directory),
             }
-        ]
+        ],
+        "has_more": False,
     }
     assert detail_payload == {
         "name": "json-skill",
@@ -179,16 +208,18 @@ def test_json_views_include_paths_body_and_null_description(
     }
     assert f"-- skill json-skill | dir {directory}" in detail.stderr
 
-    before_the_name = invoke(cli, "skills", "--json", "json-skill")
+    before_the_name = invoke(cli, "skills", "get", "json-skill", "--json")
     assert before_the_name.exit_code == vocab.EXIT_OK
     assert json.loads(before_the_name.stdout) == detail_payload
 
 
-def test_unknown_skill_is_usage_error_pointing_at_listing_command(cli: CliRunner) -> None:
-    result = invoke(cli, "skills", "does-not-exist")
+def test_unknown_skill_is_not_found_pointing_at_listing_command(cli: CliRunner) -> None:
+    result = invoke(cli, "skills", "get", "does-not-exist")
 
-    assert result.exit_code == vocab.EXIT_USAGE
-    assert "acpc skills" in result.stderr
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    envelope = json.loads(result.stderr)["error"]
+    assert envelope["kind"] == "not_found"
+    assert envelope["hint"] == "Run: acpc skills list"
 
 
 def test_directory_without_skill_file_is_skipped(
@@ -198,7 +229,7 @@ def test_directory_without_skill_file_is_skipped(
     (root / "half-installed").mkdir()
     _write_skill(root, "complete", "---\ndescription: ready\n---\nbody\n")
 
-    result = invoke(cli, "skills")
+    result = invoke(cli, "skills", "list")
 
     assert result.exit_code == vocab.EXIT_OK
     assert "complete" in result.stdout
@@ -206,8 +237,8 @@ def test_directory_without_skill_file_is_skipped(
 
 
 def test_skill_help_pages_document_json(cli: CliRunner) -> None:
-    group = invoke(cli, "skills", "--help")
-    detail = invoke(cli, "skills", "provider-bringup", "--help")
+    group = invoke(cli, "skills", "list", "--help")
+    detail = invoke(cli, "skills", "get", "provider-bringup", "--help")
 
     assert group.exit_code == vocab.EXIT_OK
     assert detail.exit_code == vocab.EXIT_OK

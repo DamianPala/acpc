@@ -91,11 +91,17 @@ def test_append_assigns_wire_fields_and_allows_unknown_fields(
     transcript = Transcript(transcript_path, clock=lambda: 1234.5)
 
     first = transcript.append("msg", text="hello", source="agent")
-    second = transcript.append({"type": "usage", "tokens": 42, "cost": 0.01, "i": 999, "ts": 1235})
+    second = transcript.append({"type": "usage", "used": 42, "size": 200_000, "i": 999, "ts": 1235})
 
-    assert first == {"type": "msg", "text": "hello", "source": "agent", "ts": 1234.5, "i": 1}
+    assert first == {
+        "type": "msg",
+        "text": "hello",
+        "source": "agent",
+        "ts": "1970-01-01T00:20:34.500000Z",
+        "i": 1,
+    }
     assert second["i"] == 2
-    assert second["ts"] == 1235
+    assert second["ts"] == "1970-01-01T00:20:35.000000Z"
     assert [event["i"] for event in transcript.read().events] == [1, 2]
     assert all(
         "i" in event and "ts" in event and "type" in event for event in transcript.read().events
@@ -109,7 +115,7 @@ def test_since_and_tail_share_one_global_cursor_across_turns(transcript_path: Pa
     transcript.append("msg", text="turn one")
     first_turn = transcript.read(since=0)
 
-    transcript.append("state", **{"from": "running", "to": "done"})
+    transcript.append("state", **{"from": "running", "to": "succeeded"})
     transcript.append("msg", text="turn two")
     second_turn = transcript.read(since=first_turn.next_cursor)
     tailed = transcript.read(since=0, tail=2)
@@ -138,7 +144,7 @@ def test_reopening_an_existing_transcript_continues_its_cursor(transcript_path: 
     second.append("error", message="second instance")
 
     assert [event["i"] for event in second.read().events] == [1, 2]
-    assert second.read().events[-1]["ts"] == 11
+    assert second.read().events[-1]["ts"] == "1970-01-01T00:00:11.000000Z"
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Windows chmod does not provide owner read/write bits")
@@ -190,7 +196,7 @@ def test_missing_or_wrong_schema_header_is_rejected(transcript_path: Path) -> No
         Transcript(missing)
 
     wrong = transcript_path.with_name("wrong-schema.ndjson")
-    wrong.write_text('{"schema": "acpc.transcript/2"}\n')
+    wrong.write_text('{"schema": "acpc.transcript/1"}\n')
     with pytest.raises(TranscriptError, match="wrong-schema.ndjson"):
         Transcript(wrong)
 
@@ -220,3 +226,31 @@ def test_concurrent_appends_produce_one_contiguous_cursor(transcript_path: Path)
     assert [event["i"] for event in events] == list(range(1, 65))
     assert [event["type"] for event in events] == ["msg"] * 64
     assert all(event["text"].startswith("event ") for event in events)
+
+
+def test_a_steer_event_carries_the_mode_the_text_and_the_outcome(
+    transcript_path: Path,
+) -> None:
+    """SPEC `steer`: one record per correction, complete enough to read back."""
+    transcript = Transcript(transcript_path)
+
+    appended = transcript.append("steer", mode="in-place", text="diagnose only", outcome="injected")
+
+    assert appended["type"] == "steer"
+    assert transcript.read().events[0] == appended
+
+
+def test_a_steer_event_without_an_outcome_is_rejected(transcript_path: Path) -> None:
+    """An acknowledged correction and a refused one are different records, so a
+    steer event without an outcome is not a steer event."""
+    transcript = Transcript(transcript_path)
+
+    with pytest.raises(TranscriptError, match="outcome"):
+        transcript.append("steer", mode="in-place", text="diagnose only")
+
+
+def test_a_steer_event_without_a_mode_is_rejected(transcript_path: Path) -> None:
+    transcript = Transcript(transcript_path)
+
+    with pytest.raises(TranscriptError, match="mode"):
+        transcript.append("steer", text="diagnose only", outcome="injected")

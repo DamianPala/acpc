@@ -1,764 +1,536 @@
 # acpc Specification
 
-What a CLI for dispatching agents (codex, claude) should look like from the perspective of its primary user: another agent calling it through a shell tool.
-Normative: the implementation is adjusted to match this document; behavior changes land here first, in the same change as the code.
-
-## How an agent consumes a CLI (design constraints)
-
-1. **It sees command output once, at the end, as a text blob.** Anything "live" (spinners, progress, streaming) is invisible or noise. Streaming only makes sense as append-to-file, read incrementally later.
-2. **Tool output limits.** Harnesses cap what a tool call returns inline; past the cap, output is diverted to a file with a short preview, or hard-truncated. Large results belong in files the tool writes itself; stdout carries the answer when short, and always the file path.
-3. **The calling harness has background execution with completion notification.** A blocking sync mode is therefore the default: the caller runs `acpc run ...` in the background and gets woken when it exits. `--bg` is the second option.
+This is the normative contract for the acpc command-line tool.
+It describes the installed binary in this repository, and behavior changes land here in the same change as the implementation.
 
 ## Command surface
 
-Small verb set. The whole mental model in one sentence:
-*"`run` blocks and prints the answer; `--bg` returns an ID; `status`/`log`/`wait`/`continue`/`steer`/`stop` operate on that ID; everything is on disk under a predictable path."*
+The primary caller is another agent using a shell tool.
+The default path is `run`, which waits and prints the answer once.
+`--background` returns a session id and directory; `wait` collects the answer later.
+All session state is inspectable under `ACPC_HOME`.
 
-```
-run <agent> (prompt | - | --prompt-file) [options]   # default: block, stdout = final answer
-continue <id> (prompt | - | --prompt-file)           # follow-up in the same session context
-steer <id> (instruction | - | --prompt-file)         # interrupt the running turn and redirect it
-status [id]                           # no id: list active + recent; with id: one session's vitals
-log <id> [--since CURSOR] [--tail N] [--wait-new | --follow]   # incremental transcript access
-wait <id> [--timeout S]               # block until done, print the answer
-stop <id>
-rm <id> | prune [--older-than D] [--dry-run]   # session cleanup (auto-prune per config retention)
-agents [name] [--models|--commands|--check]   # adapters + variants; with name: resolved definition (cached)
-agents init <name> --extends <agent>  # scaffold a variant
-probe <entry> --discover [--json]     # the adapter's advertised modes, diffed against the entry
-skills [name] [--json]                # bundled skills; with name: skill body and directory
-install <agent>                       # one-step fix for "not installed"
-daemon status|stop [target] [--force]   # plumbing escape hatch — never needed in the happy path
-```
+The following table is the machine-readable command index embedded in this document. It is deliberately small: the conformance test compares these paths and effects with `acpc schema`, while the prose and help text may evolve independently.
 
-`<id>` everywhere accepts a session id or a `--name` alias; `last` works too, but only on a TTY (see *TTY vs non-TTY*). Session ids are 4 characters from a 32-glyph alphabet — lowercase letters and digits minus the ambiguous `0`/`o` and `1`/`l` — re-rolled on collision — a local handle; the adapter's own long session id stays internal, mapped in `meta.json`.
+| Command path | Effect |
+| --- | --- |
+| `agents check` | `read_only` |
+| `agents create` | `non_idempotent` |
+| `agents delete` | `non_idempotent` |
+| `agents get` | `read_only` |
+| `agents list` | `read_only` |
+| `cancel` | `non_idempotent` |
+| `continue` | `non_idempotent` |
+| `daemon status` | `read_only` |
+| `daemon stop` | `idempotent` |
+| `delete` | `non_idempotent` |
+| `install` | `non_idempotent` |
+| `list` | `read_only` |
+| `log` | `read_only` |
+| `probe` | `read_only` |
+| `prune` | `non_idempotent` |
+| `resolve` | `read_only` |
+| `run` | `non_idempotent` |
+| `skills get` | `read_only` |
+| `skills list` | `read_only` |
+| `status` | `read_only` |
+| `steer` | `non_idempotent` |
+| `wait` | `read_only` |
 
-90% of usage is `run codex "do X" --cwd /path/to/repo --permissions execute` and reading stdout. That path must be trivial; everything else is optional.
+`agents`, `daemon` and `skills` are command groups, not command entries, when invoked without the subcommand that performs useful work.
+`schema` is reserved for introspection and is not listed in the index.
+The root command prints help.
 
-Command reference below is alphabetical. Sections open with their synopsis; `--json` applies uniformly (see *Output contract*) and is listed only where its semantics differ (`log`).
+Every indexed command accepts `--json` and `--color`.
+These two flags are published once as `global_flags` by `acpc schema`.
+`--help` and `--version` are available through Click but are not command-surface flags.
+Command-specific flags are published by `acpc schema <path>`, with names without leading hyphens and short spellings in `aliases`.
+
+Every command declares one effect.
+`read_only` does not change intended state.
+An observation may persist an observed liveness change and its placeholder response, such as `status` recording `unknown` after a daemon disappears.
+`idempotent` may change state but a repeated successful call with unchanged inputs does not perform a second transition.
+`non_idempotent` has no such promise.
+
+Every session selector accepts a four-character session id, a `--name` alias created by `run`, or `last`. `last` is resolved only in an interactive context, so an agent or script must use an id or an alias.
+
+Every prompt-bearing command accepts exactly one prompt source: a positional argument, `-` for stdin, or `--prompt-file FILE`. The prompt limit is 1 MiB (1 048 576 UTF-8 bytes), enforced before a session directory or daemon is created. `--prompt-file` is read under the same cap. The limit is unrelated to the stdout cap `--max-output`.
 
 ### `agents`
 
+`agents` manages shipped adapter entries and local variants through explicit subcommands.
+
+```text
+agents list [--limit N] [--plain] [--format text|json|plain]
+agents get NAME [--models] [--commands] [--format text|json]
+agents check [NAME] [--limit N] [--plain] [--timeout S] [--format text|json|plain]
+agents create NAME --extends AGENT [--model M] [--effort E] [--mode MODE] [--permissions P] [--home DIR] [--format text|json]
+agents delete NAME [--yes] [--format text|json]
 ```
-agents [name] [--models | --commands | --check]
-agents init <name> --extends <agent> [--model M] [--effort E] [--mode MODE] [--permissions P] [--home DIR]
+
+`agents list` returns a bounded collection with `items` and `has_more`, defaulting to 20 entries. Entries are ordered by adapter name, ascending; each adapter is followed by its variants in name order, and the default window is the first 20 of that order. `--plain` prints one adapter or variant name per line and requires an explicit `--limit`.
+
+`agents get` renders one adapter or variant.
+The detail contains resolved values with provenance, environment declarations, and the adapter's advertised modes, models and slash commands.
+`--models` and `--commands` select the corresponding advertised view, and they are mutually exclusive.
+A variant points at its base adapter rather than duplicating the catalog.
+
+`agents check` runs the adapter connection check without sending a prompt. Without `NAME` it checks every registered adapter and variant, bounded by the default limit of 20. Entries are ordered by name, ascending, and the default window is the first 20 of that order. With `NAME` it checks exactly one entry and returns a one-item collection with `has_more: false`; `NAME` cannot be combined with `--limit` or `--plain`. The default connection timeout is 30 seconds. A check that reaches the adapter and reports `ok: false` is still a successful command with exit code 0; failed checks are summarized on stderr.
+
+`agents create` writes a strict local variant under `ACPC_HOME/agents`. Existing names are a `conflict`, and names that are path-like or collide with an `agents` subcommand are invalid. It requires `--extends` and does not ask for confirmation.
+
+`agents delete` removes only a local file under `ACPC_HOME/agents`, including a local override of a shipped adapter. It never removes a shipped adapter. The file is usually hand-written and acpc has no operation that restores it, so deletion is a narrow irreversible mutation and requires confirmation: a terminal caller is asked, and every other caller must pass `--yes`. An unknown name fails as `not_found` before the gate and does not require `--yes`.
+
+### `cancel`
+
+```text
+cancel SELECTOR [--format text|json]
 ```
 
-| Option | Purpose |
-|--------|---------|
-| `--models` / `--commands` | Dump the full advertised list. Accepted on any name — a variant delegates to its parent |
-| `--check` | Live probe: launch + auth + apply the resolved options (mode/model/effort), so a config the adapter would reject fails the check rather than the next run; no prompt is sent, so model access itself still surfaces at `run` time. With name one adapter, without every installed one; one line per adapter, any failure → exit 1 |
-| `init --extends <agent>` | Scaffold a variant; the flags mirror the entry's fields |
-
-Without name: one aligned row per adapter and variant. Variants (indented) show only their delta, under a header naming its columns — model, effort, permissions, home, description (`·` = unset; home `~`-abbreviated, copy-able into `--home`); widths are computed from the rows, per *Output contract*. Adapter rows are a different shape — entry, display name, install status — and carry no header of their own, since one header cannot describe both. Status is `installed` or `missing`; a missing adapter that defines `install_command` appends `→ acpc install <name>`, one that instead names `install_docs` appends that URL, and one with neither stays `missing`. Never `acpc install` for an entry that cannot run it. Auth is not shown — cached auth state rots; the truth surfaces at `run` time as an actionable error. `agents --check` is the opt-in live probe.
-
-With name: the resolved definition, field by field with provenance — the entry in general; one concrete call's resolution, with call-site flags applied, is `run --dry-run`.
-
-Advertised data — modes, models, slash commands — is adapter-level (variants inherit their parent's):
-
-- It appears in the adapter's detail view only; a variant's view ends with a pointer instead of repeating the catalogs.
-- Model and command lists are capped in the adapter view (first 3 + count); modes always print in full, each with its `grants`, whether it delegates and whether it escalates — the list is short, and this view is the only place a caller can see which modes a given policy admits. Model lists are short and curated, so `--models` prints them in full. Commands can be 50+ with paragraph-length descriptions, so each truncates to its first sentence; complete text lives in the cache file the footer names.
-- `agents --models` without a name: cross-agent overview, variants collapsed to one line each.
-- All of it is cached and refreshed on every real run (ACP announces it only after session creation); a run whose merged catalogs are unchanged leaves the cache file and its age untouched. On a cache miss — `agents <name>` before the first ever run — the live probe runs automatically instead of printing empty fields.
-- Every view that prints advertised data ends with one cache-age footer; views built from live state alone (the bare list, a variant's resolution) have none.
-
-```
-$ acpc agents
-claude  Claude Code (Anthropic)  installed
-codex   Codex CLI (OpenAI)       installed
-  ENTRY     MODEL         EFFORT  PERMISSIONS  HOME                 DESCRIPTION
-  builder   gpt-5.6-luna  xhigh   execute      ~/.codex-openrouter  Implements a task against a plan; writes the code and runs the commands the...
-  explorer  gpt-5.6-luna  low     read         ~/.codex-openrouter  Answers a question, reading only.
-  planner   gpt-5.6-sol   xhigh   execute      ~/.codex-openrouter  Decomposes a problem into a plan.
-  reviewer  gpt-5.6-sol   xhigh   read         ~/.codex-openrouter  Hunts defects in a change.
-
-$ acpc agents builder           # what this entry resolves to
-extends      codex
-description  Implements a task against a plan; writes the code and runs the commands the plan calls for.
-model        gpt-5.6-luna (entry)
-effort       xhigh (entry)
-mode         · (unset)
-permissions  execute (entry)
-home         ~/.codex-openrouter (entry)
-env          MODEL_PROVIDER=openrouter (entry) · passthrough: OPENROUTER_API_KEY
--- modes/models/commands: acpc agents codex
-
-$ acpc agents codex --commands
-/init          Create an AGENTS.md file with instructions for Codex
-/review        Review current changes and find issues
-/$image-gen    Generate or transform bitmap image assets from text prompts or references…
-/$openai-docs  Use when the user asks how to build with OpenAI products or APIs…
-…
--- 47 commands (cached 2h ago) | full descriptions: ~/.acpc/cache/codex/commands.md
-
-$ acpc agents claude            # base adapter: same view, defaults instead of overrides
-adapter      Claude Code (Anthropic) · installed · claude-code-acp 0.5.1
-model        claude-sonnet-5 (adapter default)
-effort       high (adapter default)
-permissions  ask on TTY, read otherwise (unset)
-home         ~/.claude (default)
-modes        6 · default (read · delegates) · acceptEdits (execute · delegates) · plan (edit · delegates)
-             auto (all · escalates) · dontAsk (none) · bypassPermissions (all)
-models       4 · claude-opus-5 · claude-sonnet-5 · claude-haiku-4-5 · …   (--models for all)
-commands     52 · /review · /init · /compact · …          (--commands for all)
-variants     none
--- cached 30m ago
-
-$ acpc agents claude --models
-presets   TIER      MODEL             EFFORT
-          fast      claude-haiku-4-5  ·
-          standard  claude-sonnet-5   high
-          max       claude-opus-5     max
-models    claude-opus-5
-          claude-sonnet-5
-          claude-haiku-4-5
-          claude-opus-4-8
--- cached 30m ago
-
-$ acpc agents --models
-codex
-  presets   TIER      MODEL          EFFORT
-            fast      gpt-5.6-luna   high
-            standard  gpt-5.6-terra  xhigh
-            max       gpt-5.6-sol    xhigh
-  models    gpt-5.6-sol · gpt-5.6-terra · gpt-5.6-luna · gpt-5.5 · gpt-5.4
-  variants  ENTRY     MODEL         EFFORT
-            builder   gpt-5.6-luna  xhigh
-            explorer  gpt-5.6-luna  low
-            planner   gpt-5.6-sol   xhigh
-            reviewer  gpt-5.6-sol   xhigh
-claude
-  presets   TIER      MODEL             EFFORT
-            fast      claude-haiku-4-5  ·
-            standard  claude-sonnet-5   high
-            max       claude-opus-5     max
-  models    claude-opus-5 · claude-sonnet-5 · claude-haiku-4-5 · claude-opus-4-8
--- cached: codex 2h ago · claude 30m ago
-
-$ acpc agents init builder --extends codex --model gpt-5.6-luna --effort xhigh
-```
+`cancel` selects the session's active turn when the call starts and requests ACP cancellation of that turn only. It reports the state actually observed afterward: a successful request may report `running` while the adapter is settling, and `changed` is `true` exactly when this call sent the request. If the selected turn ended before the request took effect, the result reports that turn's observed terminal state with `changed: false`, and a newer turn started meanwhile by `continue` or `steer` is left untouched; the next `cancel` selects again and can stop that newer turn, which is why the command is `non_idempotent`. Canceling one session never asks for confirmation. A session in `waiting` is canceled without contacting the adapter: the scheduled resumption is dropped and the turn ends `canceled`. On a finished session it is a successful no-op with `changed: false`; an unknown selector is `not_found`. A daemon-owned continuation preparation can be canceled before its prompt is sent and receives a no-prompt placeholder.
 
 ### `continue`
 
+```text
+continue SELECTOR [PROMPT | -] [--prompt-file FILE] [--permissions P]
+    [--output-file FILE] [--format text|json] [--background]
+    [--timeout S] [--cancel-after S]
+    [--max-output BYTES] [--quiet]
 ```
-continue <id> (prompt | - | --prompt-file F) [--permissions P] [-o FILE] [--bg] [--timeout S] [--max-output BYTES] [--quiet]
-```
 
-| Option | Purpose |
-|--------|---------|
-| prompt as arg, `-` (stdin), or `--prompt-file` | Exactly one source, as in `run` |
-| `--permissions none\|read\|edit\|execute\|all\|ask` | New policy for this and later turns. Without it, the stored policy is reused; with it, mode selection runs against the adapter's current `[modes]`. The run default is `ask` on a TTY and `read` otherwise; `--bg` counts as non-TTY. `write` and `prompt` are deprecated aliases |
-| `-o` / `--bg` / `--timeout` / `--max-output` / `--quiet` | As in `run` — same machinery, same semantics |
+`continue` starts the next turn on a finished session and preserves the adapter context. It blocks and prints the answer unless `--background` is given. Model, effort, mode, home and the stored policy come from the session. The sole resolution override is `--permissions`, which applies to this and later turns and re-selects a mode against the current adapter table.
 
-Follow-up turn in an existing session, full context preserved. The caller can send feedback on the callee's own work instead of restarting from scratch.
+A `continue` without a message, neither `PROMPT`, `-` nor `--prompt-file`, continues unfinished work: it is accepted when the session's last turn ended `canceled`, `failed` or `unknown`, and sends acpc's continuation instruction as the new turn's prompt. The instruction states how the previous turn ended, `canceled`, `failed` or `unknown`, and asks the agent to continue without repeating finished work; the usage-limit resumption sends the same instruction with the limit as the cause. The instruction is recorded in `prompt.md` like any prompt. After a `succeeded` turn there is nothing to continue and the call fails with `invalid_input`, exit 2, and a hint to supply a message. The capability object reports this support as `continue_without_message: true`.
 
-- **Sessions are durable on the adapter side**: a cold resume prefers ACP `session/resume` where the adapter advertises it and falls back to `session/load`, so `continue` works after the daemon expired or the machine rebooted — the daemon only makes the next turn start warm. Observable behavior is identical either way; the preference exists because ACP v2 folds `session/load` into `session/resume`, and an adapter offering neither fails with an actionable error.
-- **Replay is consumed silently.** `session/load` requires the adapter to replay the whole conversation, and that replay updates nothing user-visible: not `answer.md`, not the transcript, not the stderr stream, not the token or cost tally. The history is already in the transcript from when it happened, and re-appending it would double every earlier turn in the one file a caller reads for the answer. The rule holds on both routes — the warm daemon and the direct child — so a cold `continue` and a warm one produce the same `answer.md`. `session/resume` replays nothing at all, which is the same promise reached more cheaply.
-- **A cold resume is verified before the new prompt is sent.** Reattaching by id is a claim, not a fact: an adapter may have rotated its store, or the id may name a conversation that is no longer the one acpc recorded, and a turn dispatched on the wrong conversation is worse than no turn at all — the callee answers confidently out of someone else's context. So acpc checks, always, with no flag to ask for it. Where the adapter can list its sessions, the stored adapter session id must be present with a matching `cwd`. Where the restore replays the conversation, the replayed *user* messages must contain the session's stored prompts as an ordered subsequence — ordered because turns happen in order, a subsequence rather than an exact match because the replay legitimately carries messages acpc never stored: a rolled-back turn comes back in the replay anyway (codex-acp#355), and a session can be prompted out of band. Extra messages are therefore not evidence of a mixup; a stored prompt that is missing, or one that arrives out of order, is. Only the user side is compared: agent text, thoughts, tool calls, ids and event counts all differ between adapters, across versions and between runs, and comparing them would fail honest resumes. Prompt text is compared exactly, because a prompt's own whitespace is part of it — indentation carries meaning in code, YAML and markdown, and a comparison that folds it away would accept a prompt that says something else.
-- **Only prompts acpc knows it delivered are compared, and each check stands alone.** A turn can store its prompt and then die before the adapter ever receives it; requiring that prompt afterwards would make the session permanently unresumable, which is a worse failure than the one the check exists to prevent. So acpc records which prompts crossed the boundary and verifies against that record, never against prompts it merely wrote down. The two checks are independent: each runs when it can and neither implies the other, so an adapter that lists but does not replay is verified by the listing alone rather than failed for the replay it never promised. A check that cannot run is not a failure — an adapter that neither lists nor replays is resumed unverified, because refusing would make `continue` unusable against conforming adapters, and today, with `session/resume` replaying nothing, that is the ordinary case rather than an exotic one.
-- **A delivery record that does not account for every prompt cannot verify a resume.** acpc compares a resume against the prompts it recorded as delivered, so that record has to be complete or known not to be. It can fall short two ways: the write can fail, and the connection can offer no way to observe the outgoing prompt at all — in which case nothing is recorded and nothing fails, which is the more dangerous of the two, because the comparison then passes against an empty record instead of failing. A record missing an entry cannot be detected by the check itself either: the replay carries a prompt the record does not, and extra replayed messages are deliberately not evidence of a mixup. So acpc retries a failed marker write before the turn finalizes, and where a prompt crossed the wire but could not be recorded — whether the write failed or the delivery was never observable — it records that the session's delivery record is incomplete, and the turn still finishes: failing a turn the adapter has already received discards a real answer to protect a bookkeeping entry. A cold resume of such a session reports `resume: unverified — delivery record incomplete`, in the summary and in `--json`, even where the subsequence check itself passed, and a resume that compared no prompts at all is never reported as verified on the strength of that comparison.
-- **Unverified is reported, never silently equated with verified.** A cold resume says which of the two checks ran: the end-of-run summary carries a `resume: verified` segment when at least one check passed, and `resume: unverified — <what was unavailable>` when neither could run. The same value appears in `--json`. A caller that cares whether its session was confirmed can read it; one that does not is unaffected, since the turn runs either way. A mismatch, by contrast, fails the `continue` with an actionable error naming what did not line up — a stored prompt that is missing, or one that arrived out of order, and which of the two — *before* the prompt is dispatched, so a failed verification costs nothing and changes nothing.
-- **`continue` on a `running` session is an error**, not a queue.
-- **The turn runs with the session's stored resolution**: model, effort, mode, permissions and home come from `meta.json`, not from re-resolving the agent entry — editing an entry never changes a session mid-conversation. The mode is stored with the two facts it was selected on, `grants` and `delegates`, so a turn never re-reads `[modes]` and an edited adapter definition cannot move a running session's ceiling. A session stored without a mode runs selection once from its stored policy, records the result, and sends that mode. How model and effort are applied — `model_via`, `effort_via`, `effort_cli_flag`, and `effort_config_id` — is stored on the adapter block with those facts (see *Agent variants*) and reused on the direct-child path; a missing via means `config_option`. A daemon-hosted turn re-resolves those apply-path fields from the live entry.
-- **`--permissions` is the one `run` *resolution* flag `continue` accepts** (the output-shaping flags above ride along unchanged), because a turn can end by refusing something the caller would have allowed — a denied category, or a mode switch above the ceiling. The new policy applies to this turn and every turn after it, re-runs mode selection against the adapter's current `[modes]` — the one case where a turn reads it, because the caller asked for a new mode — and writes the policy and the resulting mode triple back to `meta.json`, so the session carries one policy at a time rather than a history of them. It moves in either direction: lowering it is how a caller hands a session on with less authority than it had. Rewriting that adapter block copies the vias from the live selection (see *Agent variants*) rather than dropping them: stripping them would send the next turn down `config_option` and, for `effort_via = "cli"`, collapse distinct efforts onto one daemon target.
-- **The early session line applies here too**: a blocking `continue` prints `-- session <id> | dir <path>` at dispatch, exactly as `run` does (see *Output contract*).
-- **`continue` is also the recovery path after an adapter failure.** A turn killed mid-stream — an idle timeout, a torn connection, a crashed adapter — leaves the session `failed` with its transcript intact, and `continue` resumes on that context instead of restarting the work from zero; the interrupted turn's partial answer is parked as `answer.<n>.md` by the normal rotation, so nothing the turn already produced is lost.
+The adapter session is verified before a cold resume sends the new prompt. A listing check and a replay check are independent; an unavailable check leaves the resume unverified rather than inventing certainty. If acpc cannot account for every prompt known to have crossed the adapter boundary, the result says `resume: unverified — delivery record incomplete`. A mismatch fails before the new prompt is sent.
 
-A separate verb only because `run` takes an agent and `continue` takes a session. Each turn's prompt and answer are kept on disk (see *State on disk*). A `run`-only flag here is a usage error that names the rule — `continue reuses the session's model — drop --model` — never a bare "unrecognized argument".
-
-```
-acpc continue researcher "expand section 3, it's too thin"
-acpc continue last "now apply the same fix to the v2 API"   # TTY only
-```
+Replay from `session/load` or `session/resume` is silent. It does not add old messages to the answer, transcript, stderr or context occupancy. A session in `starting`, `running`, `preparing` or `waiting` cannot be continued; the `conflict` error's hint names `steer` and `wait`, and for a session that has nothing in flight to correct in place (`starting`, `preparing`, `waiting`) it names `--steer-mode cancel-then-start`, so the hinted command never fails with a second `conflict`. Resolution flags that belong to a new dispatch are rejected with a hint to use `run`. `--timeout` and `--cancel-after` behave as for `run`, counted from the call: a deadline that expires during the cold resume, before the new turn was observed, leaves stdout empty with `error.context.status` `starting` or `preparing`. A usage limit on the turn this call starts is handled as for `run`.
 
 ### `daemon`
 
-Plumbing, deliberately minimal. The daemon is a performance cache — it keeps adapters warm, nothing more.
+Daemons are an automatic performance cache, one per concrete target consisting of an agent entry, vendor home, literal declared environment, named passthrough values, resolved permission policy and process-level spawn identity when `effort_via = "cli"`.
+Secret values affect the target hash but are never exposed.
+A daemon starts on demand, keeps one adapter warm, serves up to `daemon_max_concurrent` turns at once, queues further turns, and expires after `daemon_ttl` of idleness.
+A detached session keeps its daemon alive.
+A version-skewed daemon stands down before the next mutating request; read-only status observes the running version instead.
+A daemon socket path that exceeds the platform limit (108 bytes on Linux, 104 on macOS) even in its hashed form starts no daemon: the call reports `unavailable` naming the limit and a shorter `ACPC_HOME` as the remedy, and a blocking call takes the direct path as for any unavailable daemon.
 
-- **Auto-managed**: starts on first use, expires after an idle TTL (default `30m`, `daemon_ttl` in the global config; idle = no active sessions, so a detached session keeps its daemon alive). No `start`/`restart` verbs — `daemon stop <target>` plus the next run *is* the restart.
-- **Keyed per target** (agent + home + declared env — see *Agent variants*): one daemon serves any number of sessions on its target; concurrent *turns* run up to `daemon_max_concurrent` (default 8; further turns queue and start when a slot opens, noted on stderr) — an idle or detached session holds no slot. Different homes/providers are separate targets, so fan-out never serializes. When the entry applies effort on the CLI (`effort_via = "cli"`), the resolved effort and flag name join that key too — the flag is process-level and cannot be changed after spawn. A turn routed to a warm daemon whose adapter was spawned with a different argv is failed with an error naming both, never silently served; `daemon stop <target>` is the remedy the error names.
-- **The `[target]` argument** to `daemon status`/`stop` is an agent or variant name and addresses every target under it; `daemon status` lists each concrete target with its log path.
-- **Two uses**: a wedged or stale daemon (`daemon stop`), and debugging (`daemon status` prints the acpc version the daemon runs, PID, uptime, idle age and the per-target log path — the only place adapter stderr goes in daemon mode; the version is there because a caller reporting a wedged daemon should not need a second command to say which build wedged). The **idle age** is the TTL's own clock: time since the target last had an active session, rendered `idle <age>` in the vocabulary session `status` uses, and `·` while the target is currently serving one. Uptime cannot answer what the view is usually opened for — a daemon reporting `up 1h48m` under a 30 m TTL looks leaked and may simply have been busy until a moment ago. The TTL measures idle time, so idle time is what says how close the daemon is to being reaped.
-- **`daemon stop` refuses a target with active sessions.** A target serving sessions in state `running` or `starting` is not stopped: one error line naming the count and the ids, exit 2, nothing signalled — stopping a daemon under a live dispatch is nearly always a mistake, and the ids are exactly what the caller needs in order to `wait` or `stop` them first. Liveness is verified as everywhere else, so a session whose process is already gone reads `orphaned` and does not block the stop. When the argument addresses several targets, the guard is evaluated across all of them before anything is stopped: one blocking session refuses the whole command, because a partial stop would leave the caller guessing which half happened. `--force` stops anyway, and the sessions it takes down transition to `failed` with the reason recorded in meta — never orphaned.
-- **Version skew self-heals**: a daemon that doesn't match the client version restarts itself on connect.
-- **Fallback**: if the daemon cannot start at all (restricted sandboxes), `run` spawns the adapter as a direct child — visibly: the stderr summary says so, and SIGTERM then cancels instead of detaching.
+```text
+daemon status [AGENT] [--limit N] [--plain] [--format text|json|plain]
+daemon stop [AGENT] [--force] [--dry-run] [--yes] [--format text|json]
+```
 
+`daemon status` reports bounded items with `target`, `version`, `pid`, `uptime_seconds`, `log`, `sessions`, `preparing`, `restoring`, `max_concurrent` and `idle_seconds`. Entries are ordered by target name, ascending, and the default window is the first 20 of that order. It connects only to the addressed daemon and does not restart it.
+
+Named `daemon stop AGENT` stops the targeted daemon without a confirmation gate. Bare `daemon stop` resolves every daemon before confirmation; an empty target set succeeds unchanged without confirmation, while a non-empty set requires `--yes`. `--dry-run` lists the targets and requires confirmation exactly when that set is non-empty. Active `starting` or `running` sessions refuse the stop with `precondition_failed` unless `--force` is supplied. The active-session precondition is checked again after confirmation before the stop is sent. `--yes` confirms the action and `--force` overrides that precondition; neither substitutes for the other. A forced stop finalizes affected sessions as `failed`.
+
+### `delete`
+
+```text
+delete SELECTOR [--yes] [--format text|json]
 ```
-acpc daemon status
-acpc daemon stop codex          # controlled nuke; beats pkill, which kills mid-task dispatches
-acpc daemon stop codex --force  # ... and take its running sessions down with it
-```
+
+`delete` clears the selected session directory only after the session is finished and the caller has supplied `--yes`, then leaves a permanent tombstone marker in that directory. It does not prompt at a terminal. The session's transcript, prompt, answer and metadata are removed together. The identifier remains reserved forever, so repeating the call reports `not_found` and no later session can reuse it. The structured result contains `session_id`, `removed`, `changed` and `paths`.
 
 ### `install`
 
-Run the entry's trusted `install_command`. An entry without one — the shipped
-`grok` adapter is the first — refuses `acpc install` and names the vendor
-docs (`install_docs`) instead: acpc already registers the adapter; the binary
-is the vendor CLI.
+```text
+install AGENT [--yes] [--format text|json]
+```
 
+`install` resolves the registry entry, then runs its trusted `install_command`. An entry without one is `not_supported`; an unknown entry is `not_found`. A terminal caller is asked for confirmation, and every other caller must pass `--yes`. The installer owns the effect, so success reports `changed: null` rather than guessing whether the vendor changed anything. An installer failure is exit 1 with the structured result or failure envelope appropriate to the selected format.
+
+### `list`
+
+```text
+list [--limit N] [--plain] [--format text|json|plain]
 ```
-acpc install codex
-```
+
+`list` returns liveness-verified sessions, active first and then the most recent finished sessions, bounded by 20 by default. The window is the first N of this order: active sessions first, newest by creation time, then finished sessions, newest by finish time, falling back to creation time when a session has none; ties are broken by session id, descending in both groups. The collection has `items` and `has_more`. Each item contains `session_id`, `entry`, `model`, `status`, `name`, `prompt_snippet`, `runtime_seconds`, `idle_seconds`, `created_at`, `started_at` and `finished_at`. A daemon-owned continuation preparation appears as `preparing`. `--plain` emits one session id per line and requires an explicit `--limit`.
 
 ### `log`
 
-Incremental transcript view; the main progress-tracking tool.
-
-```
-log <id> [--since CURSOR] [--tail N] [--prose] [--json] [--max-output BYTES]
-    [--wait-new [--timeout S]] [-f | --follow [--timeout S]] [--quiet]
-```
-
-| Option | Purpose |
-|--------|---------|
-| (default) | Last 20 events, condensed — the progress view: "what is it doing" |
-| `--since CURSOR` | Only events after the cursor, never re-emitted; combinable with `--tail`. A cursor past the transcript's end adds one stderr note naming the highest cursor there is — `-- --since 999 is past the transcript's end (highest cursor: 45)`. A note and not a usage error: a poller that overshoots by one is doing nothing wrong and has to keep working, so stdout and the exit code are unchanged. Only an explicitly passed `--since` is checked; the implicit start points (`--wait-new`, `--follow --tail 0`) are not caller mistakes |
-| `--tail N` | Just the last N of the selected events |
-| `--prose` | The content view: "what is it thinking/writing" — agent messages only, untruncated, no tool lines; agents write markdown natively, so this reads as clean markdown. The event window (`--since`/`--tail`) selects; `--prose` only renders — a full-history dump is always an explicit `--since 0` |
-| `--json` | Raw transcript events for `jq`, each carrying its index; not for reading — lossless inspection is `transcript.ndjson` itself. With `--prose` a usage error — one view per call |
-| `--max-output <bytes>` | As in `run` (default 128 KiB, 0 disables), but applied at event granularity: whole events until the budget, then a marker line naming `transcript.ndjson`. The footer cursor covers only what was printed, so a poller never skips content; a single over-budget event is the exception — head + marker, cursor advances past it. With `--json` the stream stays valid NDJSON: truncation appears as a final typed `truncated` event naming `transcript.ndjson`, never a bare marker line |
-| `--wait-new [--timeout S]` | Long-poll: block until new events appear or the timeout expires (exit 124); without `--timeout` it blocks indefinitely. Waits for *activity* (vs `wait` for completion) — enables mid-run intervention, e.g. `stop` an agent that drifted off task. After waking, the normal selection applies to the new events: `--since`, then `--tail`. On a finished session it returns immediately, the `logs -f` convention — following a stopped stream ends: anything past the cursor prints as usual, and with nothing new it exits 124 with the finished footer naming the state (a silent exit is indistinguishable from a hang); completion is `wait`'s job. A timeout on a *running* session says so on stderr — `-- still running (gave up waiting after Ns) — session continues; acpc stop <id> to cancel`. With `--follow` a usage error: one waiting mode per call |
-| `-f` / `--follow [--timeout S]` | Collect events until the session ends — one bounded call in place of a hand-rolled `--wait-new` polling loop. Starts with a bounded replay for orientation: the last **10** events by default, `--tail N` to change that, `--tail 0` for new events only; an explicit `--since` resumes exactly and replays nothing. `--prose` and `--json` render as they do everywhere else, and `--max-output` budgets the whole stream, not each page. Events are rendered once, as they arrive, so a failed session's last message is not expanded the way the snapshot view expands it — the footer names the state and the answer path |
-| `--quiet` | Suppress the stderr footer, as in `run` |
-
-One chronological stream, tool calls and agent prose interleaved — the sequence is the causal narrative. Events are condensed one-liners: tool call with arg summary, result status, duration; agent message as a 200-char snippet; permission requests; errors; state changes. The snippet cuts at the last whitespace before the limit, never mid-word — a broken word is a token the reader has to repair — with a hard cut reserved for a single token longer than the limit itself. Length is reported only when it is worth knowing: at 1024 characters or more, compactly (`(2.7k chars)`), and not at all below, where it was noise on every line and the footer's token count already carries the aggregate. A `msg` or `thought` event that directly follows one of the same type continues it across no boundary (see *Output contract*), and says so with a continuation mark after its label — `msg ↪` — so a message split across several lines is not misread as several messages. Errors are never filtered — in every view; in `--prose` they keep their condensed `[time] error …` line form amid the markdown. Nor are they truncated, with one exception: `--max-output` may head-truncate a single over-budget event, errors included — the budget wins. Full content stays in `transcript.ndjson`.
-
-```
-$ acpc log x7k2 --since 42
-[12:01:05] tool  Bash "pytest -x" → exit 1 (2.3s)
-[12:01:20] msg   "Tests fail because the fixture assumes..." (280 chars)
-[12:02:10] error permission denied: write outside cwd
--- running 3m12s | 45 events | cursor: 45
-
-$ acpc log x7k2 --prose         # same events, the content question: full messages, no tool lines
-Tests fail because the fixture assumes a clean database. Two options:
-
-1. Reset the schema in `conftest.py` — simplest, but slows the whole suite.
-2. Wrap each test in a transaction and roll back.
-
-Going with 2; `test_auth` needs its own fixture either way.
-
-[12:02:10] error permission denied: write outside cwd
--- running 3m12s | 45 events | cursor: 45
+```text
+log SELECTOR [--since CURSOR] [--limit N | --tail N] [--prose]
+    [--format text|ndjson] [--max-output BYTES]
+    [--wait-new | --follow] [--timeout S] [--quiet]
 ```
 
-- **Footer doubles as status**: state and runtime, the range this page covered (`events 60–79 of 79` — always present, so the reader never has to work out whether history is hidden; the total is the event count, which is why it is not also printed on its own), new cursor; a finished footer adds exit code, tokens and the answer path. Footers separate unlike segments with `|`, peer items with `·`. It goes to **stderr** (prefixed `--`, like the run summary): stdout stays pure transcript content, so `log --prose > file.md` yields clean markdown, while an agent caller still sees the cursor — harnesses merge the streams. Agent prose can itself contain `--`-prefixed lines, so stream, not prefix, is what separates content from metadata.
-- **Cursor = event number, stateless.** The caller carries the cursor; two pollers on one session cannot corrupt each other. The index is global across views — `--prose` and the default share one cursor space.
-- **Finished session**: same output, footer becomes `-- done exit 0 | 3m12s | 41k tok | answer: <path> | events 26–45 of 45 | cursor: 45` — duration and tokens/cost included, because a `--bg` caller never sees the stderr summary; the cursor stays, so a poller's final call needs no special casing. When the state is `failed`, `timeout` or `orphaned`, the last agent message prints in full — it usually contains the reason. When the adapter died without saying anything it contains nothing useful, and the reason is instead the `error` event a `failed` session always records (see *Session states*) — which needs no special rule here, since error events render in any `log` view like every other event.
-- **The transcript records what the adapter reports**, which is not always everything the callee attempted. A vendor that blocks an action inside its own process need emit nothing over ACP: codex's sandbox denials arrive as neither tool call, error nor permission event — measured on codex-acp 1.1.9, where the client received 3 tool calls for a session whose own rollout recorded 8. So `log` is the record of the session as ACP reported it, and an audit that has to be exhaustive cannot end there.
-- **`--follow` ends exactly three ways**, and the exit code says which: the session finished (**0**, finished footer — following a stopped stream ends, the `logs -f` convention, so a session already finished at the call returns its replay at once); `--timeout` expired (**124**, still-running footer plus the `--wait-new` timeout note — the session is untouched and keeps running); `--max-output` ran out before either (**4**, the truncation marker on stdout and, on stderr, `-- stopped: --max-output <N> exhausted — resume with: acpc log <id> --follow --since <cursor>`). The third code exists because a cut stream is not a completed follow: with 0 or 124 alone a caller cannot tell "the run is still going" from "I stopped reading it". Every ending prints the footer, whose cursor covers exactly what stdout carried, so `--since <cursor>` resumes without a gap or a repeat.
-- **`--follow` is for one case**: supervising a run you intend to steer or stop mid-flight. It is not a live view — a foreground tool call returns its output when it exits, so what a caller gets is a bounded digest of what happened while it blocked. Checking in on a run is a plain `log` snapshot; waiting for a result is `wait`. Follow costs a blocked call and puts every event it collects into the caller's context, which is the expensive way to ask a question the other two answer for free.
+`log` is a read-only record stream.
+Its default non-follow window is the last 20 transcript events.
+`--since` selects events after a global cursor.
+`--limit N` then emits the first N records from that selected position in transcript order, while `--tail N` selects the last N matching records and emits them in transcript order.
+`--limit` and `--tail` conflict.
+With `--follow`, omitting both `--limit` and `--tail` starts after `--since`, or at the beginning of the transcript, without a default window.
+`--since X --follow` starts after X without a default window.
+`--tail N --follow` replays the last N records matching any `--since` selection in transcript order, then continues without a default window.
+An explicit `--limit` ends observation after N emitted records, including with `--follow`.
+`--prose` renders full agent messages with terminal control bytes escaped and their line breaks kept, retains error records, and is mutually exclusive with `--json` and `--format ndjson`.
+`--format ndjson` emits one transcript record per line, as stored, and is the stream format selected by `--json`. The one exception is a `usage` record: the adapter's `cost` and `meta` stay on disk and are not published, every other stored field is, a record written before 1.0 has its `tokens` published as `used`, and `size` is `null` when the record has none.
+
+`--wait-new` waits for activity.
+`--follow` collects transcript-order events until the session ends.
+They are mutually exclusive.
+A wait deadline leaves the session unchanged and exits 124.
+A follow stopped by `--max-output` exits 4.
+The cursor in the stderr footer covers exactly what stdout emitted, so a caller can resume with `--since CURSOR`.
+The footer, diagnostics and truncation note go to stderr.
+A truncation never fabricates a transcript record.
 
 ### `probe`
 
-```
-probe <entry> --discover [--json]
+```text
+probe ENTRY --discover [--format text|json]
 ```
 
-| Option | Purpose |
-|--------|---------|
-| `--discover` | Read the advertised mode catalogue. Zero turns |
-| `--json` | Emit the report as JSON |
-
-Report the modes an adapter advertises, and how they differ from the entry's recorded `[modes]`
-table, without editing anything.
-
-- **`probe` re-reads the adapter, because a `[modes]` table goes stale.** A `[modes]` entry records
-what an adapter was observed to allow, and observation ages: vendors change defaults, ship new modes,
-and rename old ones between releases. Nothing in the entry notices when that happens, so a table that
-was accurate when it was written keeps being trusted after it stops being true. `probe` asks the
-adapter directly.
-- **`--discover` costs nothing.** It opens a session, reads the advertised mode catalogue and
-releases it, running zero turns: enough to see a mode the adapter advertises that the entry does not
-list, and an entry mode the adapter no longer advertises, each shown with the description the adapter
-gives.
-- **`probe` reports; it does not edit the registry.** Output is the advertised catalogue and a diff
-against the entry's current table, stated from both sides — what the adapter advertises that the
-entry lacks, and what the entry records that the adapter no longer advertises. Applying any of it is
-a separate, explicit act.
-- **Measuring what a mode actually permits is not in this release.** What an adapter *advertises* and
-what it *allows* are different questions, and the second can only be answered by evidence read off
-disk after a real turn. `probe` invoked without `--discover` says so and is a usage error naming the
-flag, exit 2 — not an empty report, and not a silent success. A discovery report handed to a caller
-who expected a measurement would be the exact failure this command exists to prevent: an answer to a
-question nobody asked, presented as though it settled the one they did.
-
-```
-acpc probe claude --discover
-acpc probe codex --discover --json
-```
+`probe` reads the mode catalog advertised by an adapter, opens and releases one ACP session, sends zero turns, and reports a two-sided diff against the entry's `[modes]` table. It never edits the registry. Measuring what modes permit is outside this release, so `--discover` is required. The JSON report contains `entry`, `base_adapter`, `discover_only`, `turns`, `current_mode`, `advertised_modes`, `mode_reports`, `verdicts`, `refusal_violations`, `implied_modes`, `unmeasured`, `current_modes` and `diff`.
 
 ### `prune`
 
-```
-prune [--older-than D] [--dry-run]
-```
-
-| Option | Purpose |
-|--------|---------|
-| `--older-than <D>` | Age threshold, e.g. `7d` |
-| `--dry-run` | List what would go, delete nothing |
-
-Delete finished sessions older than the threshold — age measured from when the session finished, not when it started. Bare `prune` — no `--older-than` — uses the config `retention` threshold; it is never "delete everything". A retention that resolves to zero makes bare `prune` a usage error naming the config key and turns the auto-prune sweep off; deleting every finished session takes an explicit `--older-than 0d`. Auto-prune: the `retention` key in the global config (default `90d`) is applied opportunistically on `run`. Running sessions are never touched.
-
-```
-acpc prune --older-than 7d
+```text
+prune [--older-than D] [--dry-run] [--yes] [--format text|json]
 ```
 
-### `rm`
+`prune` clears only finished sessions whose age from `finished_at` exceeds the threshold and leaves a permanent identifier tombstone in each selected directory. Without `--older-than`, the session threshold is `config.toml`'s `retention`, default `90d`. A zero retention value requires an explicit `--older-than 0d`; active sessions are never candidates. Removing session data never releases its identifier. `prune` resolves its target set before the confirmation gate. When the set is empty it succeeds with `changed: false` and `requires_confirmation: false` without asking, because no protected effect remains; a failure to read the candidates still reports its own error rather than an empty success. When the set is not empty, the mutating call requires confirmation. After that gate, the full target set is locked by session id order and every session is read and verified again before any directory is cleared. A session that no longer qualifies reports `conflict`, and the call clears none of the set. `--dry-run` reports the same `targets`, `changed` and `requires_confirmation` without deleting and does not require `--yes`; `requires_confirmation` is `true` exactly when the target set is not empty. The result uses `targets`, `changed` and `requires_confirmation`, not a collection envelope.
 
-Delete one session's on-disk state. Errors on `running` — `stop` it first.
+### `resolve`
 
+```text
+resolve AGENT [--cwd DIR] [--model M] [--effort E] [--permissions P]
+    [--mode MODE] [--home DIR] [--format text|json]
 ```
-acpc rm x7k2
-```
+
+`resolve` previews the same call resolution that a later `run` would use. It creates no session, starts no daemon, and asks no question. The result contains `entry`, `base_adapter`, `command`, `cwd`, `env`, `env_passthrough` and `resolved`; each resolved field contains its value and provenance, with mode facts `grants`, `delegates` and `escalates` where applicable. A policy that cannot be served by a declared mode is `permission_denied` with exit 2.
 
 ### `run`
 
-Dispatch one agent. Blocks, prints the final answer on stdout, exits with a meaningful code. `--bg` returns a session ID immediately instead.
-
-```
-run <agent> (prompt | - | --prompt-file F) [--cwd DIR] [--model M] [--effort E] [--permissions P]
-    [--mode M] [--home DIR] [-o FILE] [--bg] [--timeout S] [--name ALIAS] [--dry-run]
-    [--max-output BYTES] [--quiet] [--json]
-```
-
-```
-acpc run codex "fix the failing test in tests/test_auth.py" --cwd ~/repo --permissions execute
-acpc run claude - --bg --name researcher --effort high <<'EOF'
-Research X. Write findings to ./findings.md.
-EOF
+```text
+run AGENT [PROMPT | -] [--prompt-file FILE] [--cwd DIR] [--model M]
+    [--effort E] [--permissions P] [--mode MODE] [--home DIR]
+    [--output-file FILE] [--format text|json] [--timeout S]
+    [--cancel-after S] [--name ALIAS]
+    [--max-output BYTES] [--background | --bg] [--quiet]
 ```
 
-```
-$ acpc run codex "probe" --permissions edit --cwd ~/repo --dry-run
-entry        codex (codex)
-command      codex-acp
-model        gpt-5.6-terra (adapter default)
-effort       xhigh (adapter default)
-mode         read-only (selected for permissions edit) · vendor-decided · escalates
-permissions  edit (call flag)
-home         ~/.codex (adapter default)
-cwd          ~/repo
-passthrough  CODEX_HOME · CODEX_PATH · CODEX_CONFIG · MODEL_PROVIDER · CODEX_API_KEY · OPENAI_API_KEY · INITIAL_AGENT_MODE
+`run` resolves an adapter or variant, creates a session, dispatches one turn and blocks by default. `--background` and its alias `--bg` dispatch and return the acceptance receipt without waiting for the answer: on a terminal the session id and its directory on two lines, on a non-terminal stdout the tagged document without an answer section (see *Text presentation*), and with `--json` the receipt document. The receipt is returned once the daemon has completed the adapter's `initialize` handshake, so it names the session's correction mode under `capabilities`; a warm daemon adds no delay, a cold one adds the adapter start. It does not wait for the prompt to be sent. The daemon bounds that handshake to 60 s: an adapter that has not answered `initialize` by then is torn down and the session ends as `failed` with `agent_error`, the way a crashed adapter does. Until the handshake completes, `status` and `list` show the accepted session as `preparing`. A blocking call prints an early session line to stderr before the turn starts so the caller can inspect or cancel it mid-run.
 
-$ acpc run codex "probe" --permissions edit --cwd ~/repo --dry-run --json
-{"entry": "codex", "base_adapter": "codex", "command": "codex-acp", "cwd": "~/repo", "env": {}, "env_passthrough": ["CODEX_HOME", "CODEX_PATH", "CODEX_CONFIG", "MODEL_PROVIDER", "CODEX_API_KEY", "OPENAI_API_KEY", "INITIAL_AGENT_MODE"], "resolved": {"model": {"value": "gpt-5.6-terra", "source": "adapter default"}, "effort": {"value": "xhigh", "source": "adapter default"}, "mode": {"value": "read-only", "source": "selected", "grants": "edit", "delegates": false, "escalates": true}, "permissions": {"value": "edit", "source": "call flag"}, "home": {"value": "~/.codex", "source": "adapter default"}}}
-```
+`--timeout` bounds only how long this client waits, counted from the call and covering acceptance by the daemon, the adapter handshake and the turn itself; absent, the wait is unbounded. It never cancels or changes accepted work. After the deadline the session remains alive under the daemon, or under a detached direct worker when the daemon fallback was used, and the command exits 124 with `kind: timeout`, an empty stdout and no result document, even when a partial answer has already been recorded. `context` carries `session_id`, `turn` and the observed `status`: `running` for an observed turn, `starting` or `preparing` when the deadline expired while a cold daemon was still starting the adapter. `retryable` is `false`, because repeating the call would start new work; `hint` points at `log --tail` for the progress so far and at `status`, and `next` is `acpc status <id>`. `--cancel-after` bounds the work itself. When it expires, ACP cancellation is sent and the observing command reports `operation_failed` with the observed `canceled` status and the partial answer on stdout.
 
-| Option | Purpose |
-|--------|---------|
-| prompt as arg, `-` (stdin), or `--prompt-file` | Heredoc/stdin for long prompts with quotes and backticks. Exactly one source — zero or two is a usage error naming the options; stdin is never read implicitly |
-| `--cwd <dir>` | Working directory of the callee. Long flag on purpose: `-C`/`-c` invites confusion with `continue` |
-| `--model <tier\|id>` | A tier (`fast`/`standard`/`max`, resolved through the adapter's preset table — see *Agent variants*) or a raw model ID from `agents <name> --models`. Explicit `--effort` overrides the preset's effort, and supplies one where the preset has none |
-| `--effort <level>` | Reasoning effort, orthogonal to `--model`. Two layers: a global scale (none/minimal/low/medium/high/xhigh/max/ultra), and an optional per-model `[effort_by_model]` table on the adapter. A level outside the global scale is a usage error listing that scale. When the resolved model has a row, the value must be in that row — an empty row means the model has no effort setting. When the model is unset or has no row and the table is non-empty, the value must be in the derived union of the table's non-empty rows (unique, global-scale order), and a model with no row prints a warning rather than failing. An empty table, or a table whose rows are all empty, is the global scale alone. Never a silent fallback |
-| `--permissions none\|read\|edit\|execute\|all\|ask` | Approval policy (defined below). Default: agent entry if set, else `ask` on a TTY and `read` otherwise; `--bg` counts as non-TTY (see *TTY vs non-TTY*). `write` and `prompt` are accepted as deprecated aliases for `execute` and `ask` |
-| `--mode <name>` | Vendor mode override; normally unnecessary, since `--permissions` selects the mode. Refused when the mode grants more than the policy, whichever of entry or flag set it, and when the adapter's `[modes]` omits it. Values via `agents` |
-| `--home <dir>` | Vendor home override (the dir with the vendor's config + credentials). The provider switch (see *Agent variants*); ad-hoc counterpart of a variant's `home` field |
-| `-o <file>` | Write the answer to the given path; stdout then carries only a short confirmation (path, size, session id). `answer.md` in the session dir is always written regardless |
-| `--bg` | Return immediately with session ID + session dir path. With `-o`, the file is written when the session finishes |
-| `--timeout <s>` | Cancels the session on expiry (state `timeout`, exit 124). No default — wall-clock limits belong to the calling harness. A bare number is seconds; a suffixed value is a duration (`90s`, `5m`, `1h`, `1h30m`), the vocabulary the config file already uses. Every `--timeout` in the CLI reads the same way |
-| `--name <alias>` | Human-typeable handle for `continue`/`status`/`log`. Reusing a name rebinds it to the new session with a warning — hard error while the old session is `running`. `last` is reserved |
-| `--dry-run` | Print what this call would resolve to (model, effort, mode, permissions, home, declared env, cwd — and where each value came from), then exit. The mode line names why that mode was selected, whether it delegates to acpc, and whether it escalates in-vendor |
-| `--max-output <bytes>` | Cap on stdout bytes (default 128 KiB, 0 disables). Truncation keeps the head, cuts on a UTF-8 boundary, and ends with a marker line naming the full answer path. The marker sits at the tail, which some harness previews clip — the stderr summary repeats the session dir, so the path always survives. Shapes stdout only: `-o` files and `answer.md` are always complete. With `--json`, truncation applies to the `answer` field and sets `truncated: true`; the envelope is always valid JSON |
-| `--quiet` | Suppress acpc's own stderr lines for this call — the early session line and the end-of-run summary (see *Output contract*) |
+A usage limit that blocks the turn is handled in the same turn. acpc recognizes it when the adapter fails `session/prompt` with a JSON-RPC error whose `data.errorKind` is `rate_limit`, or whose message is the vendor's usage-limit text, or when a preceding `usage_update` carried `_meta["_claude/rateLimit"]` with `status: rejected`; codex-acp reports no limit structurally, so its limits remain plain failures. The expected return time comes from `resetsAt` when the adapter sent it, otherwise from the `resets <time> (<zone>)` clause of the message, otherwise it is unknown. A limit whose return time is known and no further away than `limit_wait_max` moves the session to `waiting`: the turn stays open with the same number and files, `status` reports `waiting` with a `limit` object, and the daemon sends the prompt again to the same adapter session five seconds after the return time, the original prompt when the turn had recorded no assistant message or tool call yet, otherwise acpc's continuation instruction naming the usage limit as the cause. A second limit in the same turn waits again while the turn's total waiting stays within `limit_wait_max`. With an unknown return time, or beyond the cap, the turn ends `failed` with `stop_reason: rate_limit` and the same `limit` object; the answer recorded so far is kept. Waiting is never reported as a terminal outcome and repeating the prompt is the caller's decision, not acpc's.
 
-**Early session line.** A blocking `run` prints `-- session <id> | dir <path>` to stderr at
-dispatch, before the turn has produced anything, so the id is reachable mid-run — `log`,
-`stop` — from output the caller has already captured. See *Output contract*.
+`--timeout` is invalid with `--background`, because a background call does not wait. `--cancel-after` remains valid with `--background`. `--permissions` selects a ceiling and the adapter mode; absent, its value comes from the registry or the TTY rules below. Deprecated permission spellings remain accepted as aliases and are reported as such.
 
-**Permissions.** `--permissions` names a ceiling on one scale:
+`--output-file` writes exactly what stdout would have received and leaves stdout empty, on success and on a failure that returns a result; a call that returns no result creates no file. It expands a leading `~`, creates a missing parent directory and overwrites the target. The complete `answer.md` remains in the session directory. `--max-output` caps stdout bytes at 131 072 by default, preserves a UTF-8 boundary, sets `truncated: true` in a machine result and names the complete answer path.
 
-| Rung | Admits categories |
-|------|-------------------|
-| `none` | — |
-| `read` | read |
-| `edit` | read, edit |
-| `execute` | read, edit, execute |
-| `all` | everything, unknown included |
+### `skills`
 
-`ask` is not a point on the scale: read is auto-allowed, every other category asks the
-human on `/dev/tty`.
-
-Categories come from the ACP tool-call `kind`: `read`/`search`/`fetch`/`think` → read,
-`edit` → edit, `execute`/`delete`/`move` → execute, everything else — `other` and any kind
-outside the ACP enum — → unknown. `switch_mode` is not a category; it re-runs mode
-selection (below). Allowing answers `allow_once`; `allow_always` only under `all`;
-`reject_always` is never sent. Every decision lands in the transcript as a `permission`
-event.
-
-**Modes carry three facts**, none declared by ACP, all from probing the adapter.
-`grants` is the ceiling of what a mode permits with no request reaching acpc, by effect;
-`delegates` says whether anything above it arrives at all; `escalates` says whether an
-in-vendor auto-approver can raise that ceiling with no request reaching acpc either.
-
-`escalates` is optional and defaults to false where a mode is declared fresh; on a mode
-inherited through `extends`, omitting it keeps the parent's value rather than resetting it,
-so a variant cannot quietly drop the flag. It is informational: mode selection
-reads `grants` and `delegates` exactly as it always has, and an escalating mode is neither
-preferred nor discarded for it. What it records is that `grants` for that mode is a
-measurement and not a bound — codex's `read-only` runs writes that its own in-vendor
-reviewer approves, and claude's `auto` approves silently with no marker at all — so a caller reading
-`agents <name>` or `--dry-run` can see where the recorded ceiling is least trustworthy.
-It is a label on a measurement, not a second scale: a mode that escalates is one whose
-`grants` the next adapter release is most likely to move.
-
-```toml
-# claude.toml
-[modes]
-default           = { grants = "read",    delegates = true }
-plan              = { grants = "edit",    delegates = true }
-acceptEdits       = { grants = "execute", delegates = true }
-auto              = { grants = "all",     delegates = false, escalates = true }
-dontAsk           = { grants = "none",    delegates = false }
-bypassPermissions = { grants = "all",     delegates = false }
+```text
+skills list [--limit N] [--plain] [--format text|json|plain]
+skills get NAME [--format text|json]
 ```
 
-**Mode selection.** acpc always sends `session/set_mode`: a vendor default never silently
-overrides the policy. Two steps: discard every mode whose `grants` exceeds the policy,
-then among the rest prefer `delegates = true`, then the highest `grants`. A policy no mode
-satisfies is a usage error naming the adapter's modes, never a silent downgrade. A mode
-the adapter advertises but `[modes]` omits is refused unless the policy is `all`. `--mode`
-and an entry's `mode` override the second step, not the first. A policy that sits below every
-declared mode's grant is refused with the floor named and the flag that clears it — `the lowest
-policy grok runs under is execute; pass --permissions execute` — because the caller who hits this
-is one flag away from a working call, and a declared-modes dump alone makes them compute the floor
-by hand.
-
-**A runtime switch is a re-selection, not a permission.** acpc resolves a `switch_mode`
-target through `[modes]` under the same rules as dispatch: a target above the policy is
-refused, and one absent from `[modes]` is refused unless the policy is `all`. The refusal
-ends the turn, naming the requested mode and the policy that would admit it, so the caller
-can raise the ceiling and resume with `continue`.
-
-**Client methods carry the same policy.** ACP puts `fs/*` and `terminal/*` outside
-`request_permission`: the callee calls them, acpc executes them. They are classified
-like kinds — reads as read, `fs/write_text_file` as edit, terminal creation as execute; the
-creation gate ships, but `create_terminal` currently raises `NotImplementedError` and returns
-no id. Existing-terminal operations are not shipped yet, so no decision is stored; should
-terminal support ever ship, the inheritance rule for those operations is defined with it.
-Without the creation gate, an adapter routing edits through the filesystem callback would
-write to disk at any rung, `none` included.
-
-Where the model's edges are:
-
-- **The non-TTY default is a silent read-only trap**: absent `--permissions` and an entry default, writes are denied without an error and the turn ends at exit 0 having changed nothing. Pass `edit` for file work, `execute` for commands.
-- **Denials are always reported**, by category, in the end-of-run summary and the `--json` envelope, with the lowest policy that would have admitted them — defaulted or not. The exit code stays 0: a denial is a result, not a failure.
-- **`delegates` is not completeness, and the route sets the rung, not the effect**: a delegating mode asks only what the *vendor* thinks worth asking — Claude Code runs commands its own classifier calls read-only without emitting a request. `echo x > file` is `execute` where the edit tool is `edit`; deletes and renames are `execute` too, since adapters shell out and the `delete`/`move` kinds go unemitted in practice. `edit` therefore bounds what may change, not whether a shell ran: a callee under it cannot run tests or linters.
-- **`fetch` is network egress and it sits in `read`**: the lowest useful rung reaches the internet, which is why a research task needs nothing above it and where a callee processing untrusted input exfiltrates from. `none` is the only policy that closes it.
-- **An approval policy, not a sandbox**: with no delegating mode the policy only picks which vendor mode runs — nothing is asked, so acpc answers nothing and the boundary is the vendor's. A real boundary means confining the adapter: a container, a dedicated user, or the vendor's own sandbox.
-- **The ceiling is inherited across re-dispatch**: a callee permitted `execute` can run `acpc` itself, so its environment carries `ACPC_CEILING`, the parent's resolved rung (`read` when the parent was on `ask`). A nested call resolves to the lower of the two and reports the clamp. The environment is fixed at spawn while the policy varies per turn, so the resolved policy joins the daemon target key (see *Daemon*) — equal policies share a target, which is what keeps the inherited rung correct. Ancestry beyond the rung is not carried: one warm adapter serves many sessions, so a per-session value in that environment would be the first session's for every session after it. A guardrail against an orchestrator that has not noticed its child reaches higher, not a boundary: a callee with a shell can unset it.
-- **`ask` excludes the daemon**: it needs the calling terminal, which a daemon has not, so the call is a direct child and pays a cold adapter start (see *Daemon*).
-
-**Slash commands, skills and prompt-defined agents** need no flag: the callee resolves them from the prompt body — `run claude "/commit"` just works. They resolve against the vendor home the callee runs with (`--home`/entry), not against `--cwd`. The flip side: an unknown command comes back as ordinary agent output ("Unknown command: /x") with exit 0 — the exit code cannot tell the caller it never existed; `agents <name> --commands` shows what's advertised.
-
-Not needed: file-attachment flags (paths in the prompt suffice), system-prompt injection.
+`skills list` returns a bounded collection of bundled skills with `name`, `description` and `path`. Entries are ordered by name, ascending, and the default window is the first 20 of that order. `--plain` prints one name per line and requires an explicit limit. `skills get` prints the skill body in text mode and writes its source directory to stderr; its machine result contains `name`, `description`, `path` and `body`. Bundled skills are read-only package data.
 
 ### `status`
 
+```text
+status SELECTOR [--format text|json]
 ```
-status [id] [--all]
-```
 
-| Option | Purpose |
-|--------|---------|
-| `--all` | Every session, not just running + the 5 most recent finished; with an id it's a usage error |
-
-Without id: one line per session — id, the entry it ran on (variant or adapter), the model it resolved to, state, runtime, idle age, name, prompt snippet (five backgrounded codex runs must not look identical). Defaults to all running + the 5 most recent finished.
-
-The **resolved model** is the one the session actually ran on, read from the resolution stored in `meta.json` at dispatch. Entry names hide this: a variant inherits its model through `extends`, so `builder` and `explorer` can both be running `gpt-5.6-luna` while `reviewer` runs `gpt-5.6-terra`, and nothing in the entry name says so. Every session resolves a model — an adapter default counts — so the column is populated in practice; a session whose `meta.json` predates this field or lost it to a torn write renders `·` rather than failing the view.
-
-The **idle age** is the time since the session's newest transcript event, shown on active sessions and `·` on finished ones. Runtime alone cannot tell a slow turn from a hung one; an age that keeps growing while the state stays `running` is the signal that something is stuck. It is a fixed-cost read of the transcript's tail — the last complete line, never a parse of the stream — and it is read-only: a damaged or torn transcript yields no age rather than an error or a repair.
-
-With id: one session's vitals — state (exit code once finished), runtime, idle age while active, tokens/cost so far, the entry with its base adapter and resolved model, name, session dir and answer path. Cost accumulates across the session's turns: for adapters that report usage on the prompt response the per-turn charges are summed, and for adapters that stream cumulative usage the largest reported tally wins, so a cold resume never forgets earlier turns. Tokens are the latest reported figure — context occupancy for streaming adapters, the turn's replayed-context total for prompt-response reporters — and a turn that reports no usage at all leaves both untouched. A `failed` session's vitals also say why: a `failure` line carries the error event's `observation` — one line, ANSI-free, bounded, without the log tail — followed by the follow-up as `continue: acpc continue <id>`, the same vocabulary the end-of-run summary uses, because every finished state is resumable and a failure view that does not say so sends the reader off to discover what should be the next keystroke. The line exists only while the failure is current: rotation clears it with the rest of the per-turn state, so a session that failed and was then resumed shows the resumed turn's vitals, not a stale post-mortem.
-
-A pulse, not a dump: reads `meta.json`, process liveness and the transcript's last line — never the event stream, so the cost per session is fixed no matter how long the run got. "What is it doing right now" is still `log <id> --tail 1`; `status` answers only "is it still moving". State is verified, not trusted: a `running` session whose daemon or adapter is gone reports `orphaned`, never a stale `running` (see *Session states*).
-
-```
-$ acpc status
-ID    ENTRY     MODEL          STATE    RUNTIME  IDLE   NAME         PROMPT
-x7k2  codex     gpt-5.6-terra  running  3m12s    0m04s  ·            "Fix the failing test in tests/test_auth.py"
-p9d4  claude    claude-opus-5  running  0m41s    0m38s  researcher   "Research X and write findings to ./findings…"
-kq8w  reviewer  gpt-5.6-terra  done     12m40s   ·      spec-review  "Review the diff against the spec and report…"
-b3nn  codex     gpt-5.6-terra  failed   2m05s    ·      ·            "Summarize the repository changes"
-m2w7  claude    claude-opus-5  done     8m19s    ·      docs         "Update the README quick-start for the new CLI"
-ze6a  codex     gpt-5.6-terra  timeout  30m00s   ·      ·            "Migrate the config loader to TOML and run the…"
-q4hf  builder   gpt-5.6-luna   done     22m03s   ·      ·            "Implement the session lock and its tests per…"
--- 2 running · 5 recent · --all for all 17
-
-$ acpc status kq8w
-state    done · exit 0 · 12m40s · 41k tok
-agent    reviewer (codex) · model: gpt-5.6-terra · name: spec-review
-dir      ~/.acpc/sessions/kq8w · answer: answer.md
-```
+`status` reports one liveness-verified session without reading the transcript. Its detail result contains `session_id`, `status`, `pid`, `turns`, `entry`, `base_adapter`, `model`, `name`, `runtime_seconds`, `idle_seconds`, `context`, `exit_code`, `stop_reason`, `failure`, `capabilities`, `limit`, `permissions`, `pending_corrections`, `paths`, `created_at`, `started_at` and `finished_at`. `capabilities` holds `steer_mode` and `continue_without_message` as described under `steer`. `limit` is `null` unless a usage limit touched the current turn; otherwise it holds `reason` (`rate_limit`), `resume_at` (RFC 3339 or `null` when unknown), `auto_continue` (`true` while the session is `waiting`, `false` once the turn ended) and `source` (`error_kind`, `rate_limit_info` or `text`, where the return time and reason were observed). `context` is the session's context occupancy as last reported by the adapter: an object with `used` (tokens in the context at the last report), `size` (the context window, `null` when the adapter did not report it) and `peak` (the largest `used` observed over the session, earlier turns included); it is `null` as a whole until the adapter has reported usage for the session. It measures what the context holds, not what the session consumed. acpc reports no cost anywhere: the adapter's own cost figure, when it sends one, stays in the transcript's `usage` events and is never rendered. `permissions` shows the policy that applies to the session's work: `policy` (the effective permission policy), `mode` (the adapter mode serving it), `source` (where the policy came from: the flag, the registry, acpc's non-interactive default or the terminal question) and `clamp` (the requested policy, the ceiling and the effective policy when a clamp occurred, otherwise `null`). This is the non-interactive inspection of the policy for accepted work; `resolve` previews it before a `run`. `pending_corrections` is always `null`, as described under `steer`. Use `list` for the collection view. `status` follows the selector: each call reports the session's current turn at the time of the read, so a session that rotated to a newer turn is reported as that newer turn.
 
 ### `steer`
 
-```
-steer <id> (instruction | - | --prompt-file F) [-o FILE] [--bg] [--timeout S] [--max-output BYTES] [--quiet]
-```
-
-| Option | Purpose |
-|--------|---------|
-| instruction as arg, `-` (stdin), or `--prompt-file` | Exactly one source, as in `run` |
-| `-o` / `--bg` / `--timeout` / `--max-output` / `--quiet` | As in `continue` — same machinery, same semantics |
-
-Interrupt the turn a session is running and redirect it, as one verb: `session/cancel`, wait for the `cancelled` ack, then start the next turn carrying the instruction. A caller watching a callee drift off task would otherwise have to `stop` it, notice that it stopped, and `continue` it by hand — three calls with a race in the middle.
-
-- **Interrupt-based, because ACP has no mid-turn channel.** Turns are sequential and only `session/cancel` reaches a running one; `session/prompt` mid-turn is protocol-undefined. Vendor engines do support mid-task input internally, but adapters cannot expose it over ACP. Should ACP grow such a channel, `steer` keeps its name and swaps the composite for injection.
-- **The instruction is wrapped in a fixed preamble** naming the interruption, so the callee reads a redirect as a redirect and not as a fresh unrelated task:
-
-  ```
-  Your previous turn was interrupted by the operator; this instruction takes precedence:
-
-  <instruction>
-  ```
-
-  The wrapped text is what `prompt.md` stores, verbatim — what was sent is what is on disk.
-- **Nothing is lost**: the transcript keeps everything, and the interrupted turn's partial answer is parked as that turn's `answer.<n>.md` by the normal rotation. The session's stored resolution is reused, exactly as `continue` reuses it.
-- **A finished session is a usage error** naming `continue` — there is no turn to interrupt.
-- **Race with a natural finish**: a turn that ends on its own before the cancel lands degrades to a plain `continue` — no preamble, because nothing was interrupted — and says so on stderr.
-- **A turn is registered before its preparation begins, not after.** Routing, the session reservation, adapter startup and the restore all happen before a prompt is sent, and the restore is both the slowest phase of a `continue` and the one most likely to hang — so it is precisely when a caller reaches for `stop`. On the daemon path the daemon records the turn in memory as soon as it accepts it and before preparation starts, so `status` can say the session is preparing, `stop` can reach it, and `steer` has something to address. The record is in memory and nowhere else: a daemon that dies takes it with it, the session is then read as `orphaned` by the same liveness rule as everywhere else, and no crash can leave a durable preparation marker behind to be cleaned up. That is the whole reason it is not written down — durable preparation state would reintroduce the residue problem the ephemeral reservation exists to prevent.
-- **Cancelling during preparation cancels the preparation, and no turn ever runs against a partially restored session.** `stop` and Ctrl-C answer the same way in every phase before the prompt is sent as they do during the turn: the session ends `cancelled`, not `failed` — nothing failed, a caller changed their mind — and `answer.md` holds the placeholder rather than a diagnosis. SIGTERM keeps its own meaning throughout rather than borrowing Ctrl-C's: it detaches once a daemon owns the turn and otherwise ends the preparation, exiting 143 either way. What differs is what has to be undone: the session reservation is released, and the adapter session being restored is released along with the replay context collected for it, so nothing half-applied stays bound to the turn. What acpc cannot do is unsend the restore. ACP defines no request cancellation for `session/load` or `session/resume` — `session/cancel` ends prompts, not restores — so a restore acpc has cancelled may still run to completion inside the adapter, and acpc states that rather than implying it stopped it. The guarantee is therefore about what a turn runs against, not about what the adapter does: a later `continue` on that session waits for an in-flight restore to settle before preparing its own, so it begins against a whole state rather than racing a half-applied one. An external `stop` or `steer` aimed at a session whose turn no daemon has accepted yet finds nothing to address and says so; the Ctrl-C in the continuing process itself is not that case — it owns the turn it is cancelling, so it records one rather than pretending nothing happened.
-- **`steer` before the prompt is sent redirects rather than interrupts.** `steer` is `stop` plus `continue` with a preamble naming the interruption, and during preparation there is no turn to interrupt: the preamble would describe something that never happened. So a `steer` that lands before the prompt goes out cancels the preparation and dispatches its instruction as the turn's prompt, with no preamble, and says on stderr that nothing was interrupted. This is the same degradation the race with a natural finish already takes, for the same reason — the preamble is a description of an event, and acpc does not assert events that did not occur.
-
-**Checkpoint is a recipe, not a verb.** "Tell me where you are" needs no new surface:
-
-```
-acpc steer x7k2 "Summarize: done / hypothesis / next step / blockers — then stop"
+```text
+steer SELECTOR [INSTRUCTION | -] [--prompt-file FILE]
+    [--steer-mode in-place|cancel-then-start]
+    [--output-file FILE] [--format text|json] [--background]
+    [--timeout S] [--cancel-after S]
+    [--max-output BYTES] [--quiet]
 ```
 
-A dedicated verb would be speculative API, and the name would oversell: "checkpoint" sounds free while the mechanics still cancel work in flight. The zero-cost, read-only alternative is `log <id> --prose`, which asks the callee for nothing at all.
+`steer` delivers a correction to the session's active turn in one of two modes. `--steer-mode` selects the mode; without it acpc uses the session's default mode, published as `capabilities.steer_mode`: `in-place` when the session supports it, `cancel-then-start` otherwise. The capability object appears in `status` and in every result and receipt of `run`, `continue` and `steer`. It describes the session, not the turn: a finished session still reports the mode its next correction would use. The object also carries `continue_without_message`, `true` for every acpc session (see `continue`). `cancel-then-start` is always supported, so an explicit `--steer-mode cancel-then-start` never fails for lack of support. An explicit `--steer-mode in-place` on a session whose mode is `cancel-then-start` fails with `not_supported` before any effect; acpc never falls back to the other mode.
 
-```
-acpc steer x7k2 "Stop editing; diagnose only and report what you found"
-```
+`in-place` adds the instruction to the active turn through the adapter's `_session/steering` extension, at the next point the adapter supports, usually after the running tool call ends. The turn keeps its number, its prompt file and its answer file; nothing rotates and no preamble is added. Support is read from the adapter's `initialize` metadata (`_meta.steering.supported`) and recorded on the session as soon as the daemon has completed that handshake, before any receipt for the session is returned; every later turn served by the same daemon reads it again. A session served by a direct child records `cancel-then-start`, because no channel reaches its process. A session that reaches no adapter at all, because the start failed before the handshake, has no active turn to correct and reports `cancel-then-start`. acpc always asks the adapter not to start a turn of its own (`idleBehavior: promptRequired`); an adapter that starts one anyway is reported as such, never presented as in-place. Several in-place corrections queue in the adapter in the order acpc sent them.
 
-### `stop`
+`cancel-then-start` cancels the turn in flight, waits for its end and starts the next turn on the same session with the instruction under the fixed interruption preamble. During daemon-owned preparation there is no prompt to interrupt; acpc cancels preparation, reports that fact and sends the instruction plainly. `--cancel-after` bounds the new turn's work and is accepted only with `--steer-mode cancel-then-start`. A usage limit on the new turn of `cancel-then-start` is handled as for `run`. An `in-place` correction of a session in `waiting` fails with `conflict`, because nothing is in flight to correct; `cancel-then-start` cancels the wait, which stops the scheduled resumption, and starts the new turn.
 
-Stop a running session. Graceful (ACP `session/cancel`) with a bounded wait for the ack (10s) — if the callee doesn't wind down in time, the connection is torn down anyway. Transcript, meta and partial answer stay on disk for post-mortem. A stopped session is finished and resumable with `continue`, with the adapter context preserved. A hard variant, if ever needed, is `stop --force`, not a new verb.
+The cancellation step selects the turn active when `steer` started and waits up to 10 s for its end. If that turn is still running at the deadline, `steer` fails with `timeout`, `target_status: running` and `message_state: not_delivered`; the cancellation stays requested and no instruction is sent. If the turn ended on its own before the cancellation took effect, `steer` reports that terminal state as `target_status` and sends the instruction plainly, without the interruption preamble. If another call started a new turn before the instruction could be sent, `steer` fails with `conflict` and leaves that turn untouched. Every failure of the cancellation step carries `session_id`, `capabilities` and `correction_result` in `context`, like a failure after it.
 
-```
-acpc stop x7k2
-```
+A finished session is a `conflict` naming `continue` as the follow-up operation in either mode. A `starting` or `preparing` session is a `conflict` for `in-place`, because no prompt is in flight yet.
+
+Every `steer` result carries `turn`, the turn to observe next, `capabilities`, and `correction_result` with `steer_mode`, `target_turn`, `target_status` and `message_state`. `target_turn` is the turn the correction selected; for `in-place` it equals `turn`, for `cancel-then-start` `turn` is the new turn. `target_status` is the last state observed for the selected turn. `message_state` is `accepted` when the adapter acknowledged the instruction (`injected`) or acpc accepted the new turn, `not_delivered` when the instruction is known not to have reached the selected turn, and `unknown` when acpc cannot tell. acpc never reports `delivered`: an acknowledgement does not show that the model used the instruction. Every in-place correction is appended to the transcript as a `steer` event carrying `mode`, `text` and the adapter's `outcome`; a cancel-then-start correction is recorded by the new turn's prompt file and its state events.
+
+Without `--background`, `steer` blocks until the observed turn ends and prints its answer: the corrected turn's answer for `in-place`, the new turn's for `cancel-then-start`. With `--background` it returns after acceptance. `--timeout` only bounds this client's wait; absent, the wait is unbounded. On expiry `steer` exits 124 with `kind: timeout` and no result document, with the same `retryable: false`, `hint` and `next` as `run`, plus `capabilities` and `correction_result` in the error context. Ctrl-C during an `in-place` steer behaves like `wait`: exit 130 and the turn keeps running. Ctrl-C during `cancel-then-start` cancels the turn it started.
+
+A failure after the target was selected carries `session_id` and `correction_result` in `context`:
+
+| What acpc knows | `kind` | `message_state` |
+| --- | --- | --- |
+| The adapter answered `promptRequired`: the turn ended before the instruction arrived. | `conflict` | `not_delivered` |
+| The adapter answered `startedNewTurn`: it started a turn acpc does not own. acpc sends `session/cancel` for it and reports the outcome as unknown. | `outcome_unknown` | `unknown` |
+| The adapter rejected `_session/steering` despite declaring it. | `not_supported` | `not_delivered` |
+| The daemon serving the session could not be reached; nothing was sent. | `unavailable` | `not_delivered` |
+| The request was sent and no reply arrived within 10 s, or the connection was lost. | `outcome_unknown` | `unknown` |
+| The observed turn ended `failed` or `canceled` while `steer` was blocking after acceptance. | `operation_failed` | `accepted` |
+| The cancellation deadline passed with the selected turn still running (`cancel-then-start`); exit 1. | `timeout` | `not_delivered` |
+| The cancellation's effect could not be observed, or the session's process could not be signaled (`cancel-then-start`). | `outcome_unknown` or `unavailable` | `not_delivered` |
+| Another call started a new turn before the corrected turn could start (`cancel-then-start`). | `conflict` | `not_delivered` |
+
+A `not_delivered` or `unknown` outcome never triggers an automatic `cancel-then-start`; repeating the instruction is the caller's decision.
+
+**Pending input.** An in-place correction is forwarded to the adapter as soon as `steer` is called and acknowledged with `message_state: accepted`; the adapter delivers it before the model's next step in the same turn and acpc imposes no bound of its own on how many corrections it forwards. Whether a forwarded correction is still pending inside the adapter is not observable to acpc, so `status` reports `pending_corrections: null` rather than a count, always. A correction the adapter could not deliver because the turn ended is reported as `not_delivered`; a correction that made the adapter start a turn acpc does not own is canceled and reported as `outcome_unknown`, so an instruction never silently becomes input to a later turn. acpc offers no later per-instruction receipt: the transcript's `steer` event keeps the adapter's acknowledgement, and delivery to the model is never established by a successful turn.
 
 ### `wait`
 
-```
-wait <id> [--timeout S] [-o FILE] [--max-output BYTES] [--quiet]
+```text
+wait SELECTOR [--timeout S] [--output-file FILE]
+    [--format text|json] [--max-output BYTES] [--quiet]
 ```
 
-| Option | Purpose |
-|--------|---------|
-| `--timeout <s>` | Stops *waiting* only (exit 124): the session keeps running, unlike `run --timeout`, which cancels it — and the exit says so on stderr (`-- still running (gave up waiting after Ns) — session continues; acpc stop <id> to cancel`). Seconds or a suffixed duration, as in `run`; absent, it blocks indefinitely |
-| `-o` / `--max-output` / `--quiet` | As in `run` — `wait` prints an answer, so it shapes it the same way |
+`wait` selects the session's current turn when the call starts and observes that turn until it ends. It keeps that selection even when a later `continue` or `steer` opens a newer turn meanwhile, and its result names the observed turn in `turn`. A turn that has already finished is returned immediately, and its answer is returned on stdout whatever the terminal state was: exit 0 for `succeeded`, otherwise `operation_failed` with the session id and the observed status. `--timeout` stops waiting only, leaves the session unchanged and exits 124 with `kind: timeout` and no result document, even when a partial answer has been recorded; absent, the wait is unbounded. The error's `context` carries `session_id`, `turn` and the observed `status`, `retryable: true` with `retry_after_ms`, a `hint` pointing at `log --tail` and `status`, and `next` is `acpc status <id>`. `log <id> --since <cursor>` reads the progress a deadline interrupted without repeating it. A session in `waiting` is still active: `wait` keeps waiting through the limit and a deadline reports `timeout` with `error.context.status: waiting`. If the status cannot be observed, the result is `outcome_unknown` with `status: null` and no result document.
 
-Block until a background session finishes, then print its answer; exit code mirrors the session result. On an already-finished session it returns immediately — the free way to reprint an answer. When that session failed, the stderr summary carries a `failure:` segment with the recorded cause (see *Session states*), so a poller learns why without a second command.
+### `acpc schema`
 
+`schema` is the introspection interface. Bare `acpc schema` emits an index containing `schema_version`, `tool_version`, `global_flags`, `format_defaults`, `exit_codes`, `conformance` and sorted command entries. `acpc schema PATH` emits `name`, `description`, `args`, `flags`, `effects`, `confirm`, `interactive` and `output`, plus `output_description` for a command that returns results on failure or has success-only fields; `log` also has `stream: true`, and commands whose format differs from the index include `format_defaults`.
+
+The output field is a JSON Schema subset using only `type`, `enum`, `properties`, `required` and `items`. It describes one result document shared by the success and failure results, or one record for `log`. The generator walks the Click tree that actually parses the command. A group is indexed only when explicitly marked as dispatching useful work without a subcommand. An unknown schema path is an exit-2 usage error naming the nearest valid paths. Path segments are separate arguments.
+
+The installed binary currently publishes schema version `1`, tool version `1.0.0`, format defaults `{"tty": "text", "non_tty": "json"}`, and conformance name `cli-design-standard` at `0.2.0-draft.11` with extensions `["managed", "conversational"]`; `conversational` covers `run`, `continue`, `steer`, `wait` and the capability object. `tests/test_conformance.py` verifies the claim against the standard header and the behavior of every indexed command.
+
+## Output contract
+
+### Formats and streams
+
+The output format is selected by `--format` or the `--json` alias. The tool-wide default is text on a TTY and JSON on a non-TTY. `run`, `continue`, `steer`, `wait`, `log`, `resolve` and `skills get` explicitly default to text in both contexts. `log` uses `ndjson` as its machine format. Collections additionally offer `plain`, also selected by `--plain`; it requires an explicit `--limit` and emits one identifier per line.
+
+For `run`, `continue`, `steer` and `wait` the `text` format has two presentations selected by the stdout stream: the tagged document described under *Text presentation* when stdout is not a terminal, and the human layout when it is. `--output-file` receives the presentation stdout would have received. `--json` is a choice for programmatic parsing, not a prerequisite for reading an answer; it returns the original answer string and the complete document.
+
+The global `--color auto|always|never` policy affects human text only. The precedence is the explicit flag, `NO_COLOR`, `TERM=dumb`, then whether stdout is a terminal. Machine formats never contain ANSI or control bytes.
+
+stdout carries only the selected result: the answer, a machine document, a record stream, or the acceptance receipt from `--background`.
+`--output-file` leaves stdout empty and writes the exact payload of the selected format to the file, on success and on a failure that returns a result. A call that returns no result creates no file.
+stderr carries acpc metadata, summaries, footers, diagnostics and adapter noise according to the command.
+A log footer never contaminates a prose or NDJSON stdout stream.
+
+### Success documents
+
+Machine success documents are the shapes published by `acpc schema`. Collections use exactly `{"items": [...], "has_more": boolean}`. This applies to `agents list`, `agents check`, `skills list`, `list` and `daemon status`.
+
+`agents create` returns `name`, `extends`, `path` and `changed`. `agents delete` returns `name`, `path` and `changed`. `agents get` publishes the union of its detail, advertised, models and commands views and always requires `agent`. `cancel` returns `session_id`, `status`, `stop_reason` and `changed`. `install` returns `agent`, `ok`, `returncode` and `changed`, where `changed` may be null.
+
+`prune` and `daemon stop` return `targets`, `changed` and `requires_confirmation`; the same shape covers preview and mutation. `delete` returns `session_id`, `removed`, `changed` and `paths`. `resolve` returns its full resolution document. `probe` returns its discovery report. `log` returns one record at a time with required `i`, `ts` and `type`, plus event-specific fields.
+
+The shared answer result for `run` and `continue` has required `status`, `session_id`, `turn`, `created_at`, `started_at`, `finished_at`, `paths`, `truncated`, `partial`, `denied`, `permissions_clamp`, `capabilities` and `changed`. Foreground success adds `stop_reason`, `context` and `answer`; background success omits them and points `next` at `wait`. `context` is the context occupancy recorded for the session so far, the same object `status` shows; it is `null` until the adapter has reported usage for the session, never an object of zeros in that case, so a turn that ended before any usage arrived reports `null`. `resume`, `next`, `output_file` and `limit` are optional; `limit` appears when a usage limit touched the turn and has the shape described under `status`. `steer` uses the same document with `status` limited to `running` and `succeeded`, without `partial`, plus required `correction_result`. `capabilities` is the session-capability object described under `steer`, `{"steer_mode": "in-place" | "cancel-then-start", "continue_without_message": true}`, and is the same object in every command that carries it. `wait` is read-only, so its result has no `changed` field. `turn` is the one-based number of the turn the document describes. Each schema entry declares one `output` shared by the success and failure results of that command, and `run`, `continue` and `wait` state in `output_description` which failures return a result and which fields are required only on success. Every command with a conversation role names its identifier field `session_id`, its answer field `answer` and its capability object `capabilities` in `output_description`.
+
+`paths` contains `dir`, `prompt`, `transcript` and `answer`. `denied` records permission denials by category, and `permissions_clamp` records a requested policy, the entry ceiling and the effective policy when a clamp occurred. `run`, `continue` and `wait` return their result document on stdout when acpc observed the end of the turn and holds its content, including when the turn failed or was canceled. A client deadline never produces a result document: the answer recorded so far stays in the session files and `log` reads it. `partial` is `false` when the content is the complete answer for that call, a refusal included, and `true` when the turn ended before the answer did; a result carrying `partial: true` always exits non-zero. A call that never observed a turn — an unknown agent, a rejected flag combination, a session that does not exist, a start that failed — writes nothing to stdout. The structured error stays on stderr in every case.
+
+### Text presentation
+
+On a non-terminal stdout, `run`, `continue`, `steer` and `wait` print their result as one tagged document that acpc builds, never the agent:
+
+```text
+<result session_id="q7x2" status="succeeded" partial="false">
+<metadata>
+{"turn":1,"capabilities":{"steer_mode":"in-place","continue_without_message":true},"context":{"used":1834,"size":200000,"peak":1834},"stop_reason":"end_turn","next":["acpc","continue","q7x2"]}
+</metadata>
+<answer>
+The answer, verbatim Markdown.
+</answer>
+</result>
 ```
-acpc wait x7k2 --timeout 600
+
+The opening tag carries `session_id`, `status` and, for documents that have it, `partial`, with `&`, `<`, `>`, `"`, tab, CR and LF escaped as `&amp;`, `&lt;`, `&gt;`, `&quot;`, `&#9;`, `&#13;` and `&#10;`. `<metadata>` holds one JSON object on a single line with the fields the text keeps from the JSON document: `turn`, `capabilities`, `next`, `stop_reason`, `context` when known (omitted while it is `null`), `correction_result` for `steer`, `denied` when any denial was recorded, `permissions_clamp` and `resume` when present, `limit` when a usage limit touched the turn, and `truncated` with `output_file` when the answer was cut by `--max-output`. Timestamps, `paths`, `changed` and the untruncated answer stay in JSON. `<metadata>` always precedes the answer section. The answer section holds the answer text with its line breaks and Markdown as they are; terminal control bytes are escaped as in every text output and nothing else is replaced. Each tag sits on its own line: after an opening tag acpc writes one newline, then the content, then one newline, then the closing tag, so an answer that ends with a newline shows an empty line before its closing tag and an empty answer string is a section with one empty line. The answer tags are `<answer>` and `</answer>` unless the displayed answer contains one of the exact strings `<result>`, `</result>`, `<metadata>`, `</metadata>`, `<answer>` or `</answer>`; then acpc writes `<answer-N>` and `</answer-N>`, where N is one plus the number of LF characters in the displayed answer (a CR before an LF is answer text and is not counted), and the answer is exactly the N lines after the opening tag, validated by the matching closing tag on the line after them. A line inside those N lines that looks like a wrapper tag remains answer text. A background receipt is the same document without an answer section, with `paths` added to the metadata so the session directory stays visible. `--max-output` bounds the whole document; a truncated answer ends with the usual marker and the metadata names `output_file`. The document is a readable presentation, not strict XML: a caller that acts on `next` or other metadata programmatically uses `--json`, which returns the original answer string. The tags do not make an agent's answer trusted instructions.
+
+Example of the counted form, an answer of five lines whose code sample contains the wrapper's closing tag:
+
+````text
+<result session_id="q7x2" status="succeeded" partial="false">
+<answer-5>
+Close each section explicitly:
+
+```text
+</answer>
 ```
+</answer-5>
+</result>
+````
+
+On a terminal, the same fields are laid out for a person: the answer on stdout with terminal control bytes escaped exactly as in the tagged document, and the metadata on stderr, in the `--` summary line, which also names the steer mode, a partial answer, a usage limit and a `Next:` command. Reading the answer never reruns the agent.
+
+### Failures
+
+Every classified failure is one JSON document on stderr with exactly one top-level key, `error`. The nested object always has `kind` and `message`; optional fields are `retryable`, `action`, `hint` and `context`. The document is the last non-empty stderr line, including when stdout is machine-readable, stderr is not a terminal, or `--quiet` suppresses normal metadata. It never goes to stdout. In a human terminal without a machine format, acpc prints a one-line diagnostic and an optional recovery hint instead.
+
+The produced kinds are:
+
+| Kind | Meaning |
+| --- | --- |
+| `invalid_input` | The command, flag combination, value or prompt source is malformed. |
+| `not_found` | A named session, alias, agent or skill does not exist. |
+| `conflict` | Existing session state, a lock or a name binding rejects the operation. |
+| `permission_denied` | An entry policy or filesystem refused access. |
+| `timeout` | The observing client deadline expired without changing accepted work. |
+| `unavailable` | An adapter, installer, daemon, write or other dependency could not serve the request. |
+| `outcome_unknown` | Observation stopped without a reliable terminal outcome. |
+| `interrupted` | This client was interrupted, for example by Ctrl-C. |
+| `precondition_failed` | A documented condition that `--force` can override was not met. |
+| `operation_failed` | Work ended in a state other than the success the observing command expected. |
+| `confirmation_required` | A gated call lacked the required confirmation; exit code 1. |
+| `agent_error` | An external program reported an error that acpc cannot classify more narrowly. |
+| `corrupt_state` | State acpc owns exists but cannot be trusted. |
+| `not_supported` | The target exists but acpc does not offer the requested operation for it. |
+
+A `timeout` error of `run`, `continue`, `steer` or `wait` carries `hint` with the two commands that show what happened meanwhile, `acpc log <id> --tail 20` and `acpc status <id>`, and `next` with `acpc status <id>` as executable arguments. `retryable` is `true` only for `wait`, whose repetition observes the same turn again; it is `false` for `run`, `continue` and `steer`, whose repetition would start new work. In a human terminal the same recovery command is rendered as a `Next:` line.
+
+`stop_reason: rate_limit` marks a turn that ended because a usage limit blocked it and acpc did not wait; `wait` reports it as `operation_failed` with `error.context.status: failed`.
+
+A failure of `status`, `wait`, `cancel`, `steer`, `continue`, `log` or `delete` carries the session identifier in `error.context.session_id` whenever the caller supplied one or acpc resolved one. For a selector that matches no session, `context` holds the selector as supplied under `session_id` and `status: null`, because no state was observed. A selector that is an alias or `last` is reported as resolved when resolution succeeded and as supplied when it did not.
+
+`confirmation_required` is produced when a gated call reaches the confirmation step without the required consent.
+Target validation and documented preconditions happen before the confirmation question.
+`unauthenticated` and `cursor_unavailable` are reserved kinds, not currently produced.
+
+### Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Success, including an empty result or a data record with `ok: false`. |
+| 1 | Generic failure or a command that could not complete the requested operation. |
+| 2 | Usage error, including malformed flags and a policy no declared mode satisfies. |
+| 4 | `log --follow` reached its output budget before the session ended. |
+| 124 | An observing deadline expired and the observed work was left unchanged. |
+| 130 | The client was canceled by SIGINT or `cancel`; answer commands mirror a canceled session. |
+| 141 | SIGPIPE because a downstream reader closed the pipe. |
+| 143 | SIGTERM detached from daemon-owned work or ended a direct turn. |
+
+A `cancel-then-start` correction whose cancellation deadline passes exits 1, not 124: the deadline belonged to a request that changed the work, not to an observation. Missing named resources and session conflicts are exit 1, because the command was spelled correctly. Exit 2 is reserved for a call that cannot be accepted in the form given, including an unsupported permission policy for the selected entry.
+
+Ctrl-C always produces exit 130 with `kind: interrupted` for the command that was interrupted.
+Interrupting `wait` or `log` never changes the observed session.
+Interrupting `run`, `continue` or a `cancel-then-start` `steer` cancels the owned turn; an `in-place` `steer` owns no turn and leaves it running.
+A SIGTERM from a harness detaches a session already taken over by the daemon and ends a direct-worker turn.
+The client reports the id and the commands that can wait or cancel a detached session.
+
+## TTY vs non-TTY
+
+acpc classifies standard streams separately. stdin decides whether a question can be answered, stdout decides the selected output format and whether the default policy may ask, and stderr decides decoration and whether a failure uses the structured envelope.
+
+The interactive context is all of the following: stdin is a terminal, the selected output is human-readable rather than JSON, and `NO_INPUT` is empty or unset. acpc never asks outside that context. The default `ask` permission policy is narrower: stdout must also be a terminal. Redirecting stdout therefore changes an omitted permission default to `read`, but an explicit `--permissions ask` remains allowed when stdin can answer and the selected format is human-readable.
+
+`NO_INPUT` is a non-empty environment value that forces the non-interactive context. An empty value does not. This covers permission prompts, the install confirmation and the policy question for a terminal `run --background` without an explicit policy.
+
+| Invocation | Omitted permission default | Explicit `--permissions ask` |
+| --- | --- | --- |
+| stdin and stdout are terminals | `ask` | asks on the terminal |
+| stdout redirected, stdin terminal | `read` | asks on the terminal |
+| machine output selected | `read` | rejected |
+| stdin is a pipe, heredoc or `-` prompt | `read` | rejected |
+| `NO_INPUT` non-empty | `read` | rejected |
+| terminal `run --background` without a policy | asks once which detached policy to use | rejected |
+
+The background policy question offers `none`, `read`, `edit`, `execute` and `all`, defaulting to `read`; `ask` is not offered because no later caller is attached to answer. Silence or an invalid answer is a refusal. If no terminal can be opened, acpc takes the non-interactive `read` default instead of mistaking an unavailable question for consent. An explicit policy is recorded as `answered`, while an omitted non-interactive policy is recorded as acpc's `default`.
+
+`install` asks `Install AGENT? [Y/n]` at a terminal and requires `--yes` elsewhere. End of input is never consent. Windows has no `/dev/tty`, so it follows the non-interactive branch until console input support is added.
+
+The `last` selector is a convenience for the person at the keyboard and is rejected outside the interactive context. Use a session id or `--name` in scripts and agent calls.
+
+## State on disk
+
+`ACPC_HOME` is the acpc state root; it defaults to `~/.acpc` and is the only environment variable that selects that root. It is distinct from `--home`, which selects the vendor configuration directory passed to the adapter.
+
+```text
+ACPC_HOME/
+  config.toml
+  agents/<name>.toml
+  cache/<agent>/
+  daemon/<target>.log
+  sessions/<id>/
+    meta.json
+    prompt.md
+    prompt.<n>.md
+    transcript.ndjson
+    answer.md
+    answer.<n>.md
+    meta.<n>.json
+```
+
+The complete global config is:
+
+```toml
+retention = "90d"
+daemon_ttl = "30m"
+daemon_max_concurrent = 8
+limit_wait_max = "8h"
+```
+
+`limit_wait_max` caps how long one turn may wait for usage limits in total; a duration with the `--timeout` syntax, and `"0s"` disables waiting so that every recognized limit ends the turn `failed` at once. Unknown config keys are hard errors. Relative paths in `--cwd`, `--prompt-file` and `--output-file` resolve against the caller's working directory; a leading `~` is expanded. Directories are mode 0700 and files are mode 0600 where the platform supports those permissions. Metadata and cache writes are atomic, and transcript appends are whole lines.
+
+`meta.json` uses `status`, not a second state field, and stores the resolved invocation, timestamps, turn count, context occupancy (`context`, the object `status` reports), exit code, stop reason, failure observation, prompt snippet, adapter session id, target and the steer mode. Metadata written before 1.0 carried `tokens` and `cost` instead; on read, `tokens` becomes `context` with `used` and `peak` equal to it and `size` `null`, and `cost` is dropped. The adapter session id is recorded as soon as the adapter has accepted the session, before the prompt is sent, so a host process lost mid-turn leaves a session that can still be continued. Timestamps are RFC 3339 with a consistent microsecond precision. A per-session lock serializes turns, cleanup and metadata transitions.
+
+`transcript.ndjson` starts with `{"schema": "acpc.transcript/2"}`. Event records use a global one-based cursor `i`, an RFC 3339 timestamp and one of `msg`, `thought`, `tool`, `permission`, `error`, `state`, `usage`, `steer` or `limit`. A `limit` event records `reason`, `resume_at`, `action` (`wait` or `fail`), `source` and the adapter's text; the surrounding `state` events record `running → waiting` and `waiting → running`. A `usage` event records `used` and `size` as observed at that point, the adapter's own `cost` figure when it sent one, and the notification's `_meta` object under `meta` when present; a figure the adapter did not report is `null`, never `0`. Transcripts written before 1.0 record `tokens` in place of `used` and are read as such. `log` publishes a usage event as context occupancy only, in every format: the condensed view shows `used` and `size`, and the NDJSON stream carries the record without `cost` and `meta`. Unknown fields are preserved. A damaged or unsupported transcript is `corrupt_state`; an older transcript format is not silently upgraded and must be replaced by deleting the incompatible session state.
+
+Turn files rotate at the start of the next turn. The previous prompt and answer receive their fixed turn suffix once, the finished turn's metadata is parked as `meta.<n>.json` with the same suffix, then the new prompt is written. The parked metadata is what `wait` reports for a turn that ended before the session rotated; that document's `paths.prompt`, `paths.answer`, `output_file` and the truncation marker name the parked files of that turn (`prompt.<n>.md`, `answer.<n>.md`), never the files of the turn the session moved on to. `answer.md` exists for every finished state. A failed or canceled turn keeps its partial prose; when no prose exists, the recorded failure explains the file. If the host process disappears before the result is observed, acpc writes a placeholder that says the outcome is unknown.
+
+### Session states
+
+The public vocabulary is exactly:
+
+```text
+starting, running, preparing, waiting, succeeded, failed, canceled, unknown
+```
+
+`starting`, `running`, `preparing` and `waiting` are active; `waiting` is a turn holding for a usage limit that acpc will resume by itself. `preparing` is a daemon-only continuation phase before the new prompt is sent. `succeeded`, `failed`, `canceled` and `unknown` are finished for session management. `unknown` is therefore terminal for `wait`, `continue`, `delete` and `prune`, but it is not a claim about how the adapter operation ended: it records that acpc observed the host process disappear without observing a result. `wait` reports it as `operation_failed` with `error.context.status: "unknown"`.
+
+Liveness is checked whenever a command reports or gates on a session. A dead process changes an active session to `unknown`, sets `stop_reason` to `unknown`, uses exit code 1 for the session record, persists the transition and writes the placeholder. A 30-second startup grace applies when no process id has been recorded yet.
+
+Historical metadata is normalized when read. The former terminal deadline state is read as `failed`, with canonical `stop_reason: "error"` and `exit_code: 1`; client wait deadlines use `kind: timeout` and exit 124 but never become a session state. Historical state spellings are normalized to the public vocabulary before output and subsequent writes. A canceled turn records `stop_reason: canceled` whichever side canceled it, or `canceled during preparation` when the cancel landed before any prompt was sent; the adapter's `cancelled` stop reason is normalized when the turn ends and historical spellings of both reasons are normalized on read.
+
+`cancel` accepts active sessions and is a no-op on finished sessions. `continue` accepts finished sessions, including `unknown` on a session's first turn, and refuses active sessions. `delete` and `prune` remove only finished sessions. `status`, `list`, `log` and `wait` can observe any existing session.
+
+Retention is measured from `finished_at`.
+Auto-prune runs opportunistically after a run according to `retention`.
+Explicit delete always needs confirmation, while prune uses `--dry-run` to preview and `--yes` for the mutation. A prune that resolves an empty target set needs neither.
+Once allocated, a session id is never assigned to another session. The allocator reserves ids by creating their directories; delete and every prune path release session data but never the identifier reservation. If the finite id space is exhausted, allocation fails with `unavailable` and does not suggest that pruning will free an id.
 
 ## Agent variants
 
-A named agent entry can bundle model, effort, mode, permissions and environment, so `run builder "task"` replaces five flags. The one acceptable form of configuration, under one condition: resolution stays fully inspectable — `agents <name>` shows what an entry resolves to, `--dry-run` what a specific call resolves to and why.
+An adapter TOML shipped in the package or defined locally supplies `command`, optional `install_command` and `install_docs`, default `home`, `home_env`, modes, presets, effort tables, environment declarations, pass-through variable names and the model/effort application paths. A local file with `extends` is a variant; a local file with `command` and no `extends` is a new adapter; a local file under a shipped adapter name is an override.
 
-```
-# ~/.acpc/agents/builder.toml — hand-editable; `agents init` scaffolds this
+```toml
 extends = "codex"
-description = "Implements a task against a plan; writes code and runs commands."
 model = "gpt-5.6-luna"
 effort = "xhigh"
 permissions = "execute"
 home = "~/.codex-openrouter"
-env_passthrough = ["OPENROUTER_API_KEY"]   # names read from the caller's env at call time
+env_passthrough = ["OPENROUTER_API_KEY"]
 
-[env]                                      # literal values declared in the entry
+[env]
 MODEL_PROVIDER = "openrouter"
-
-$ acpc run builder "implement the parser per SPEC.md"
-# ≡ acpc run codex … --model gpt-5.6-luna --effort xhigh --permissions execute --home ~/.codex-openrouter
 ```
 
-A variant sets `permissions`, not `mode`: the policy selects the mode (see *Permissions*). An entry may still pin `mode` as an override, subject to the same ceiling as `--mode` — an entry cannot become the way around the policy.
+`acpc agents get NAME` shows each resolved field and its source. `resolve` shows one concrete call. The adapter environment is constructed from a base system set, declared variables and explicitly named pass-through variables; the rest of the caller environment is not inherited. Secrets are read at dispatch time and are never written to state.
 
-An adapter definition declares its modes in a `[modes]` table: for each vendor mode, what it permits with no request reaching acpc (`grants`), whether anything above that arrives at all (`delegates`), and optionally whether an in-vendor auto-approver can raise that ceiling unasked (`escalates`, default false — informational only, see *Permissions*). These are adapter facts established by probing the adapter; ACP declares none of them. A mode the running adapter advertises but the table omits is refused unless the policy is `all`, so a vendor that adds a mode cannot quietly widen what acpc allows.
+The permission scale is `none`, `read`, `edit`, `execute`, `all`, with `ask` as a separate policy that prompts for categories above read. `write` and `prompt` are deprecated aliases for `execute` and `ask`. Categories come from ACP tool-call kinds: reads, searches, fetches and thoughts are read; edits are edit; execute, delete and move are execute; unknown kinds are unknown. A mode is eligible only when its measured `grants` does not exceed the requested policy. Among eligible modes acpc prefers delegation and then the highest grant. `delegates` and `escalates` are descriptive facts, not extra policy levels.
 
-The `home` field is also the provider dimension: OpenAI vs OpenRouter vs a local endpoint is just a different vendor home (own config, own credentials). A variant is the named, permanent form; `--home` on `run` the one-off form.
-
-**`description`** is optional on any entry, adapter or variant, and takes any string the operator writes — any length, newlines included. A roster reading `builder`, `explorer`, `planner` says nothing about what any of them is *for*; that is the operator's knowledge, not inferable from `--help`, and it belongs in the entry rather than in external documentation that goes stale. **The config never rejects it and never truncates it on disk**: a purely informational field must not be able to break a working dispatch, so context protection lives in the view rather than in the parser. The `agents` list normalizes whitespace and cuts at a word boundary within an 80-character budget, the same cut the condensed `log` view uses; `agents <name>` shows the description verbatim and in full, and `--json` carries the whole value — truncation shapes the text list and nothing else. It is **not inherited through `extends`** — a variant's purpose is its own, and rendering the parent's text under a child's name would be a confident lie about what the child does. Absence renders as absence everywhere: nothing in the list row, no line in the detail view, `null` in `--json`.
-
-Presets are adapter-level: each adapter definition ships its `fast`/`standard`/`max` table — what `--model <tier>` resolves through and `agents <name> --models` prints. `model` is required; **`effort` is optional, because effort is a property of the model rather than of the tier.** A vendor may expose no effort setting for a given model — claude CLI ≥2.1.224 offers none for Haiku 4.5 while keeping it for Sonnet and Opus — and a tier that pins such a model omits `effort` entirely, meaning the model runs at its own built-in level. Where an effort is present it is validated against that model's `[effort_by_model]` row: Haiku's empty `[]` refuses any effort, grok-4.5's subset refuses `xhigh` while grok-4.6 accepts it. Overriding what a tier means uses the same mechanism as everything else — a `[presets]` table in a file under `agents/` for that adapter — never `config.toml`, so resolution stays inspectable with provenance like every other field. Tiers left out keep the adapter's shipped pair.
-
-A model with no effort setting is listed exactly that way: `agents <name> --models` and the cross-agent overview render `·` in the effort column and `--json` carries `null`, absence as absence. Asking for one anyway stays a loud failure rather than a silent downgrade — an explicit `--effort` the adapter rejects fails the turn, and the error names the resolved model as the likely reason it has no such setting. A preset effort the table rejects fails the same way: it means the entry TOML has gone stale against the vendor, and a one-line fix to a file beats a runtime capability probe that adapts silently.
-
-```toml
-# ~/.acpc/agents/codex.toml — same override mechanism, aimed at the base adapter
-[presets]
-fast = { model = "gpt-5.6-luna", effort = "high" }
-max  = { model = "gpt-5.6-sol",  effort = "xhigh" }
-# effort omitted: this model has no effort setting to give it
-turbo = { model = "gpt-5.6-nova" }
-```
-
-Resolved model and effort are applied on a path the entry names for that
-field — not a via table for arbitrary settings. Session RPCs run after
-`session/set_mode`. The default is ACP `session/set_config_option`: model
-under id `model`, effort under `effort_config_id` when the entry sets one
-(claude's is `effort`) and `reasoning_effort` otherwise. That is what shipped
-`claude` and `codex` do, and what a missing field means, including sessions
-stored before these fields existed.
-
-When a vendor does not implement that RPC, the entry names an alternate for
-**that field**:
-
-- `model_via`: `config_option` (default) or `set_model` — ACP
-  `session/set_model` with `modelId`.
-- `effort_via`: `config_option` (default) or `cli` — two spawn-argv tokens,
-  `effort_cli_flag` then the effort value (`--reasoning-effort` when the flag
-  is omitted), never `--flag=value`. Injected once, before a trailing
-  transport subcommand (`stdio`, `serve`, `headless`, `leader`) when the
-  command has one. CLI effort is not reapplied after `session/set_mode`.
-
-These are closed enums on two fields. `set_model` is not a road for effort;
-`cli` is not a road for model. An unknown value is a registry error. A new
-combination is a new enum member and the code that implements it, not an
-implied third column.
-
-`cli` effort is process-level: it cannot be changed on a live adapter, so the
-resolved effort and the flag name join the daemon target key. `--dry-run`
-shows the injected argv; the stored session keeps the base `command` string
-so `continue` re-injects once rather than stacking flags. The vias themselves
-are stored on the session's adapter block. A continue that does not re-select
-a mode reuses them on the direct-child path. A continue that rewrites that
-block (`--permissions`, a missing stored mode, a ceiling clamp) copies the
-vias from the live selection rather than dropping them back to
-`config_option`. A daemon-hosted turn re-resolves apply-path fields from the
-live entry — it does not ship the stored vias over the socket — so editing
-them can take effect on the next daemon turn.
-
-Shipped `grok` is the first adapter on the alternate pair
-(`model_via = "set_model"`, `effort_via = "cli"`). Variants inherit the vias.
-
-Environment is part of the entry, in two fields. An `[env]` table holds literal values declared in the entry (e.g. the vendor home path). `env_passthrough` lists variable *names* read from the caller's environment at call time — values are never stored on disk, which is how API keys travel. Both feed the daemon target key ("declared env"): `[env]` by name and value, `env_passthrough` by name *and the value read at call time* — hashed into the key, still never stored — so two entries with different env, or two callers holding different credentials, are separate targets that cannot serve each other's traffic (nobody silently rides on the first caller's API key). The resolved permission policy is part of the key too: an adapter's environment is fixed when it is spawned while the policy varies per turn, so one warm adapter cannot serve two policies without handing the later turn a stale `ACPC_CEILING`. When effort is applied on the CLI it joins the key for the same reason — it is fixed at spawn. That costs the fixed per-target overhead only — the adapter's per-session memory is paid however targets are keyed — and idle targets expire.
-
-The adapter's environment is constructed, not inherited — but not paranoid-empty either. Three layers reach it: a base system set (`HOME`, `PATH`, `USER`, `LOGNAME`, `SHELL`), capability variables passed through from the caller (`SSH_AUTH_SOCK`; `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` in both cases; `SSL_CERT_FILE`, `SSL_CERT_DIR`, `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`) so tools on PATH, proxies and ssh keep working, and the entry's declared env on top. The rest of the ambient environment never reaches the adapter. Capability variables are passed but not part of the target key — a long-lived daemon may hold the first caller's proxy or agent socket; stop the daemon when that must change.
-
-Entry TOMLs are trusted at the level of shell config: an adapter definition names the command acpc executes and the env delivered to it. Only place files you trust in `agents/`.
+`ACPC_CEILING` carries an inherited ceiling into nested dispatch. A child cannot request more authority than its parent. A denied category is recorded in the answer result and does not itself make the turn fail; the adapter can also suppress a request by handling an action internally.
 
 ## Bundled skills
 
-`acpc skills` lists the skills bundled in the package; `acpc skills <name>` prints one skill's body. The source is bundled-only: readable `SKILL.md` files directly under `data/skills/*` are served, and the directory name wins over any frontmatter `name` — it is what the filesystem can be trusted about, and it is what `skills <name>` takes. In the detail view the body is verbatim on stdout, byte-identical to the file below the frontmatter, and the skill directory rides on stderr as `-- skill <name> | dir <path>` — which is how a caller finds `references/` without a flag for it. Both views accept `--json`; the list emits `{"skills": [...]}` like every other list view, and the detail view adds `body`. An unknown name is a usage error (exit 2) pointing at `acpc skills`.
-
-## Output contract
-
-- **stdout carries exactly one thing, chosen by flags**: the answer (default), a short confirmation (`-o`), a JSON envelope (`--json`), a session ID + dir path (`--bg`). Never spinners, ANSI, logs or diagnostics — those go to stderr or the session log file.
-- **Every column is labeled, once — in a header or on the value, never nowhere.** A multi-row positional view prints one uppercase header line above its rows, on stdout with them (the `docker ps` prior — uppercase is what makes the label row readable as a label row at a glance; block labels like `presets` and inline-labeled values stay lowercase): `status`'s list, the `agents` list's variant rows, the preset table in `agents <name> --models`. A view that labels each value inline instead — `daemon status`'s `acpc 0.6.0  pid 728419  · up 36m53s  · idle 8m39s` — is already labeled and gets no header. What is never acceptable is a column whose meaning lives nowhere: a bare `·` in an unlabeled position is unreadable on first contact, and this tool's first-contact reader is usually an agent that cannot ask. Detail views are exempt (one labeled field per line already), as is the `log` stream (each event is self-describing).
-- **Column widths are computed from the rendered rows, never fixed.** Each view measures what it is about to print and pads to the widest value, header included. A hardcoded width is aligned only for the values that existed when it was written: a 26-character model id or a 14-character entry name shears every column after it, and the row that most needs reading — the unusual one — is the row that breaks. One long value widens the table; it never misaligns it.
-- **A *message boundary* is where one agent message ends and the next begins**: any non-message update — a tool call, a thought chunk, a usage report, anything that is not an `agent_message_chunk` — arriving between two message chunks. Chunks with nothing between them are one message being streamed, however long the pause. The rule reads the update stream and never the clock, so a slow adapter cannot invent a boundary and a fast one cannot lose a real one. Two views consume this one definition: the answer separates messages at a boundary (below), and the condensed `log` view marks the events that continue across one (see `log`).
-- **"The answer" is defined**: the turn's ACP agent-message content, chunks concatenated in stream order; thought chunks and tool output excluded; markdown passed through verbatim. Narration interleaved between tool calls is part of it — never silently dropped, and never silently glued to what follows: at every message boundary the answer carries a blank line. stdout and `answer.md` carry identical bytes; for a single-turn session, `log --prose --since 0` renders the same content.
-- **Fixed exit codes** (Unix conventions; finer-grained ACP `stop_reason` lives in `meta.json` and the `--json` envelope):
-
-  | Code | Meaning |
-  |------|---------|
-  | 0 | success (`end_turn`) |
-  | 1 | agent error — crash, `refusal`, `max_tokens`, missing auth |
-  | 2 | usage error — bad flags, unknown session, a mode that exceeds the policy, or a policy no mode satisfies |
-  | 4 | output budget exhausted — `log --follow` stopped because `--max-output` ran out before the session ended; the footer's cursor covers what was printed and `--since` resumes from it |
-  | 124 | timeout (`run`: session cancelled; `wait`/`log --wait-new`: nothing new within the window — a running session keeps running and the exit says so on stderr; a finished session returns at once) |
-  | 130 | cancelled — SIGINT or `stop`. Answer-printing commands mirror the session result, so `wait` on a cancelled session also exits 130, whoever cancelled it and whenever; the finer distinction lives in `stop_reason` |
-  | 141 / 143 | SIGPIPE / SIGTERM (SIGTERM detaches — see below) |
-
-- **Client death ≠ session death.** SIGINT (a human's Ctrl-C) cancels the session (`session/cancel`, state `cancelled`). SIGTERM (a harness killing the tool call on its own timeout — the *normal* case for an agent caller) detaches: the session keeps running under the daemon, and on the way out the client prints exactly `-- detached, still RUNNING: <id> — answer: acpc wait <id> · cancel: acpc stop <id>` to stderr, so the caller that killed the tool still learns both the id and its options. When the adapter ran as a direct child because the daemon couldn't start (see `daemon`), detach is impossible — SIGTERM cancels there too.
-- **`--json` means "this command's output as JSON"**, uniformly. Three shapes:
-  - **Answer-printing commands** (`run`, `continue`, `wait`): a result envelope — `state`, `session_id`, `stop_reason`, `paths`, `cost`, `answer`. Two flags reshape it: `--bg` leaves only what exists at dispatch time (`session_id`, `state`, `paths`); `-o` names the output file and omits `answer`.
-  - **Everything else** (`status`, `agents`, `daemon status`, `stop`, `rm`, `prune`, `install`, `probe`, `--dry-run`): the same data the text view shows, as JSON.
-  - **The one exception**: `log --json` emits raw transcript events (see `log`), not an envelope.
-- **End-of-run summary, one line, on stderr, prefixed `--`**: duration, tokens/cost, exit status, session ID, session dir, and the follow-up command as `continue: acpc continue <id>` — every finished state is resumable, and the caller reading this line is the one deciding whether to send another turn, so the id travels next to the verb that consumes it. Harnesses merge stderr into the same blob as the answer — the fixed prefix keeps it mechanically separable. The prefix only separates at a line boundary, and answers need not end with a newline, so when stdout's last line is unterminated the stderr metadata that follows leads with a newline of its own — on stderr, never appended to stdout, which stays byte-identical to `answer.md`. When permission denials occurred the summary adds a segment naming the count, the categories and the lowest policy that would have admitted them: `denied: 3 edit (pass --permissions edit)`. Reported whether the policy was defaulted or passed explicitly — an explicit policy set too low is the same mistake as an absent one, and the caller that passes flags is the one reading output mechanically; when it was defaulted the segment says so (`default read policy`), since that caller chose nothing. A refused mode switch is reported the same way, naming the mode. The tally is per turn and appears in `--json` as `denied`. `--quiet` suppresses it. A `--bg` dispatch prints none — nothing has finished; the finished `log` footer carries the same data. `log` footers follow the same rule — stderr, `--` prefix — the general principle being: when stdout carries agent content, acpc's own metadata goes to stderr; when stdout is acpc's own view (`status`, `agents`), the footer is part of the view and stays there.
-- **Early session line, on blocking `run`/`continue`**: at dispatch — before the turn has produced anything — one stderr line, `-- session <id> | dir <path>`. Its segments are identical in form to the end-of-run summary's own `session <id>` and `dir <path>` segments; harnesses merge both streams into one blob, so one spelling has to serve whether it is read at the start or at the end. It is what makes a blocking call self-sufficient: the id is in the captured output from the first moment, so `log` and `stop` work mid-run and a call the harness kills on its own timeout leaves a session the caller can still find rather than an orphan. The client prints it before the turn starts, so it is the same on the daemon path and on the direct-child fallback. `--bg` does not print it — stdout already carries the id and the dir — and `--quiet` suppresses it exactly as it suppresses the summary. stdout is untouched and stays byte-identical to `answer.md`.
-- **Errors are one line and actionable**: not a stack trace, but `codex: not authenticated, run 'codex login'`. Damaged state gets the same treatment — an unparseable `meta.json` or transcript produces one line naming the file and a non-zero exit, never a traceback. Known spellings from neighboring tools get the same treatment instead of a bare "no such option": `-d`/`--detach` → `--bg`, `-C` → `--cwd`, and the command `logs` → `log` — each a usage error naming the acpc spelling. `-f`/`--follow` is a real flag on `log`; on any other command it gets the same hint, pointing at `log --follow`. The `daemon` group answers the docker/systemctl vocabulary the same way: `daemon list`/`ls`/`ps` name `daemon status`; `daemon stop --all` says that bare `daemon stop` already addresses every daemon; `daemon start`/`restart` give the recipe instead — daemons start on first use, so `daemon stop <agent>` plus the next run is the restart. Hints, never working aliases: a second spelling that works is a second name for one operation, and the point of answering a wrong guess is to teach the right one.
-- **Never prompt interactively on stdin.** If something is missing, fail with instructions.
-
-## TTY vs non-TTY
-
-Behavior differs between a human at a terminal and an agent behind a shell tool in exactly these places. "TTY" means `isatty` on stdout. Redirection flips it: a human running `acpc run … > out.md` is non-TTY and gets the `read` default.
-
-| | TTY (human) | non-TTY (agent) |
-|---|-------------|-----------------|
-| `--permissions` default | `ask` | `read` |
-| Permission prompting | asks on `/dev/tty` | never; out-of-policy → denied. An `ask` policy — from the explicit flag or an entry's `permissions` — is a usage error (exit 2), not a silent downgrade |
-| `last` selector | works | rejected — a stale "last" misleads an agent; name sessions explicitly |
-
-`--bg` counts as non-TTY for permissions regardless of the terminal: once the client has returned, a prompt could never be answered — so the default is `read`, and explicit `--permissions ask --bg` is the same usage error. `ask` also excludes the daemon, which has no terminal to ask on, so such a call is always a direct child and pays a cold adapter start.
-
-## State on disk
-
-File-based state is a feature: the agent can grep it, read fragments selectively, and doesn't depend on the tool's own commands to inspect anything.
-
-```
-~/.acpc/                     # root; ACPC_HOME overrides it — the only env var that configures acpc itself
-  config.toml                # global knobs — the complete file just below
-  agents/<name>.toml         # variants, adapter overrides, new adapters — hand-editable; `agents init` is just a scaffold
-  cache/<agent>/             # advertised models, modes, commands
-  daemon/<entry>~<hash>.log  # adapter stderr per concrete target; daemon sockets and locks live here too
-  sessions/<id>/
-    meta.json                # resolved invocation + adapter vias + state, timing, tokens/cost, exit code, stop_reason, failure (latest turn's observation, cleared on rotation), prompt snippet, adapter session id (stored command is the entry's base string; --dry-run shows the spawn argv)
-    prompt.md                # the prompt as sent, latest turn; earlier turns: prompt.<n>.md
-    transcript.ndjson        # full event stream (this is where "streaming" lives)
-    answer.md                # final answer, latest turn; earlier turns: answer.<n>.md
-```
-
-```toml
-# ~/.acpc/config.toml — the complete configuration surface, deliberately
-retention = "90d"           # auto-prune finished sessions older than this
-daemon_ttl = "30m"          # idle daemon lifetime
-daemon_max_concurrent = 8   # concurrent turns per daemon target
-```
-
-That is the whole file. Anything that changes a call's behavior lives in flags or agent entries (see *Anti-features*) — in particular, the adapter env pass-through list is not configurable here: extensions go through an entry's `env_passthrough`.
-
-- **Adapter definitions are TOMLs shipped in the package**, one per adapter — the full contract: `command`, `install_command` (trusted one-liner for `acpc install`, optional), `install_docs` (vendor URL when there is no trusted installer), default `home`, `home_env` (the vendor variable the resolved home is exported as, e.g. `CODEX_HOME`), the `[modes]` table, `[presets]`, optional `[effort_by_model]` (per-model allowlists; the adapter's supported set is the derived union of those lists), `env_passthrough`, and the per-field apply paths `model_via` / `effort_via` / `effort_cli_flag` / `effort_config_id` (see *Agent variants*). A user file in `agents/` with `extends` is a variant; under an adapter's own name it overrides that adapter's fields (e.g. `[presets]`, one `[effort_by_model]` row); with a `command` and no `extends` it defines a new adapter. All at the trust level *Agent variants* states.
-- **`ACPC_HOME` ≠ `--home`**: the state root vs the vendor config dir a callee runs against — they share a word, nothing else.
-- **Owner-only**: 0700 dirs, 0600 files — prompts and transcripts routinely carry sensitive material.
-- **No torn reads**: `meta.json` is replaced atomically, `transcript.ndjson` grows by whole lines only, `cache/` files and `-o` targets are written atomically too — a mid-write reader never sees garbage. A per-session lock serializes turns, so `run`, `continue` and `stop` on one session never interleave.
-- **`answer.md` is written whatever the final state**: for `failed`/`timeout`/`cancelled` it holds the partial answer, and prose the adapter streamed before it died is kept rather than replaced by the diagnosis; for `failed` with nothing streamed it holds the recorded cause instead (see *Session states*); for `orphaned`, where the dead process wrote nothing, detection writes a one-line placeholder naming what died — the advertised path always exists and explains itself.
-- **Turn rotation happens at the *start* of the next turn**: `continue` renames the previous `prompt.md`/`answer.md` to their `.<n>` names, then writes the new `prompt.md` — one rename per file, ever (turn numbers are fixed, no logrotate-style cascade), so a mid-turn session has no `answer.md` until the turn produces one.
-- **The transcript is a public, versioned format**: a header line names the schema version (`acpc.transcript/1`); every event line carries a global 1-based index `i` (continuous across turns — this is the `log` cursor), a timestamp, and a `type` from `msg | thought | tool | permission | error | state | usage` plus type-specific fields; consumers ignore unknown fields. An event is a readable unit, not a wire chunk: adapters stream word-sized message fragments, and consecutive same-type fragments coalesce into one `msg`/`thought` event, cut by whatever comes first — a different event type, a pause in the stream, a bounded age (so a long uninterrupted message still surfaces while running), a size bound, or the end of the turn. It is the programmatic layer, not the reading path — for reading, `log`, `log --prose` and `answer.md` are markdown; raw JSON costs several times more tokens than the content it carries. The markdown views are rendered on demand from the transcript, never materialized as a second on-disk copy: the only per-turn artifacts are the answers (`acpc log <id> --prose > file.md` if a file is wanted).
-- **Relative paths** in flags (`--cwd`, `--prompt-file`, `-o`) resolve against the caller's working directory; `~` is expanded by acpc.
-
-**Session states** — one vocabulary, used verbatim by `status`, `log` footers and `meta.json`:
-
-```
-starting → running → done | failed | cancelled | timeout
-running → orphaned              # process behind it died; detected on any state read, never self-reported
-```
-
-- **Liveness is verified wherever state is read**, not only in `status`: every command that gates on or reports state checks the process behind a `running` session and treats a dead one as `orphaned` — a stale `running` in `meta.json` never blocks anything.
-- **Detected transitions are persisted**: whichever command observes the dead process writes `orphaned` back to `meta.json` (atomic replace, under the session lock), so later readers agree without re-probing.
-- **30s startup grace** from `started_at`: below it, a session with no live process still counts as `starting` — the process may not have recorded its pid yet — never a false `orphaned`.
-- **`cancelled` counts as finished and resumable**: `stop` → `continue` is the pause/resume path, and the adapter preserves the cancelled turn's context instead of dispatching from scratch.
-- **`orphaned` counts as finished**: `continue` resumes it on the cold path (see `continue`), `rm` and `prune` delete it, `wait` returns immediately with exit 1 and the reason.
-- **A `failed` session says why.** Every transition to `failed` records an `error` event in the transcript, whatever killed the turn — an adapter that exited, a connection torn mid-stream, a refused authentication, a command that was never installed. The event carries `observation`, what acpc itself saw; `next_step`, a single actionable instruction — the login command when the vendor refused credentials, a smaller turn when the adapter hit its own token or turn limit, otherwise the log to read; and `message`, the three of them joined into one line. On a turn that ran under a daemon it also carries `adapter_log` and `adapter_log_tail`: the per-target log's path, and the bytes *this turn* appended to it, bounded so one runaway line cannot flood a caller's context. That log is where the adapter's stderr is drained, so the tail is usually the adapter's own last words, but it also carries acpc's daemon lifecycle notes — hence the neutral name, because presenting an acpc line as something the adapter said would be the same dishonesty the transcript rules forbid. It is scoped to the turn for the same reason: the log is shared and append-only across every session the target ever ran, and quoting an earlier session's stderr would be a confident, wrong diagnosis. The tail is stored and quoted with ANSI escape sequences stripped — adapters style their stderr for a terminal, and a caller reading a transcript or an error message never is one; the raw bytes stay in the log file itself. Both fields are absent when the turn produced no log output of its own, and on a directly spawned adapter, whose stderr comes back on acpc's own stderr and reaches no log at all. A denied permission is not a failure of this kind and records no such event: acpc refused it, and the summary already names the policy that would admit it. The `message` is what `answer.md` falls back to when the turn produced no prose, so the promise that `answer.md` always explains itself holds for `failed` and not only for `orphaned`. Callers do not have to parse the transcript to get it: `log` renders error events like any other, `wait` appends the message to its stderr summary as a `failure:` segment, and `status <id>` shows the observation on its `failure` line for as long as the failed turn is the session's latest — the observation is written to `meta.json` at finalization precisely so that `status` can honor its fixed-cost promise without touching the event stream.
-- **Who accepts what**: `stop` acts on `starting`/`running`, is a no-op on finished states, errors on unknown IDs. `continue` accepts any finished state, errors on `running`. `rm` errors on `starting`/`running`; `prune` never touches them. `wait`/`log`/`status` accept everything.
+The package ships the skills `adapter-bringup`, `provider-bringup` and `refresh-adapter-models`. `skills list` provides their names, descriptions and package paths. `skills get NAME` prints the body and identifies the source directory on stderr. Bundled skills are not a user skill marketplace and are not installed into a harness-wide directory.
 
 ## `--help` as first-contact documentation
 
-The recommended primary channel for usage docs is a short snippet in the caller's own context (AGENTS.md or a skill) — but the tool cannot assume it's there, so `--help` is the self-contained fallback. Two levels, one source:
+`acpc --help` is a compact cheat sheet for the common blocking, background, wait, log, steering, continuation, maintenance and machine-readable paths. `acpc COMMAND --help` provides progressive disclosure for every command and group. Each option has a description and either a real default or a statement of where its value comes from. `-h` and `--help` are equivalent; `-V` and `--version` print only the version string, currently `1.0.0`.
 
-- **`acpc --help`** — the cheat sheet, ≤100 lines, complete for the 90% path on its own. Grouped by the decision the caller is actually making, in the order they make it: short task (blocking) · long or uncertain task (`--bg` + `wait`) · checking on a run · supervising one they intend to steer or stop (`--follow`) · steering · continuing · heredoc prompt · context care · maintenance and setup. Write-task examples carry `--permissions edit` or `--permissions execute`, and the sheet says which: `edit` writes files but runs nothing, so a callee under it cannot run the tests it just wrote. Each group names the cost or the failure it prevents, not just the syntax — the sheet is where an agent learns that `wait` already prints the answer and the file is the fallback for a truncated or huge one, that `--follow` is for one case, and that killing `acpc` does not stop the session. Ends with the command list and a flag → ACP mapping table, 3-4 lines (`--permissions` → `session/set_mode` *and* the `request_permission` answers, `--cwd` → `session/new`, …) — the sheet has to show that one flag drives both, or a reader will look for the second knob.
-- **`acpc <cmd> --help`** — progressive disclosure: that command's full reference — synopsis, options table, semantics, one example.
-- **Every command has a real page**: the short verbs too — `stop`, `rm` and `install` document their synopsis, the state rules that govern them, and one example; the root page keeps their one-liners so first contact never dead-ends.
-- **Every option documents itself**: a help string, always — no option is ever a bare metavar — plus its default. An option with a real default value shows it (`[default: 131072]`); an option whose *absence* means a behavior names that behavior instead (`--timeout` absent blocks indefinitely; `log` with no `--since`/`--tail` shows the last 20 events; `--permissions` absent applies the TTY/non-TTY rule). The bar this sets: a caller can price a call's context cost and predict its no-flag behavior from `-h` alone, without reading this document.
-- `--help`/`-h` and `--version`/`-V` both accepted.
+Help is generated from the parser's live surface. The schema includes flags that are accepted but deliberately not shown in human help only when the parser still accepts them; the current `continue` command has no hidden resolution flags. A migration hint for a removed spelling is part of the usage error whenever acpc can identify the replacement.
 
 ## Anti-features
 
-Out of scope — none of these deliver value to an agent caller:
+acpc does not provide a TUI, spinners, terminal streaming as the primary result, built-in pipelines or agent teams, a rich behavior-changing config file, a user skill marketplace or an MCP wrapper. The caller is the orchestrator. Live activity belongs in the transcript and is read through `log`; the terminal result remains bounded and machine-readable.
 
-- **TUI, colors, spinners.** The caller never sees them.
-- **Built-in orchestration** (pipelines, DAGs, agent teams). The caller *is* the orchestrator; loops, retries and fan-out happen in its shell.
-- **Terminal streaming as a primary mode.** Append to the transcript file; the terminal shows the final answer.
-- **Rich configuration system.** Anything important is a flag — flags are visible in `--help`, config state is not. `config.toml` holds housekeeping knobs only (retention, daemon TTL and capacity), never anything that changes a call's behavior.
-- **MCP server wrapping.** A plain CLI via shell is cheaper in context, standard, composable.
-- **No user skills directory, no install, no scopes, no marketplace.** `acpc` serves what it ships; a skill of the operator's own belongs in their harness's own skills directory. Adding a second source is a SPEC change, not an implementation detail.
-- **A bundled skill is not meant to be installed into a harness's global skills directory either.** It would then sit in every session's roster in every project, paying its description in context each time, for a task run a couple of times a year. This command exists so that trade never has to be made.
+## How an agent consumes a CLI
+
+The caller sees a shell-tool result once, so stdout is the answer or a bounded structured record stream, not progress noise. A result that may exceed the tool window belongs in `answer.md`, `transcript.ndjson` or an explicit `--output-file`. The session id and directory are available at dispatch for blocking calls and immediately for background calls.
+
+The caller should select `--permissions edit` for file changes and `--permissions execute` when the agent must also run commands. A non-TTY omitted policy defaults to `read`, so write-capable tasks must say what they need. The caller should use `wait` for a background result, `log` for progress or a cursor, `status` for fixed-cost metadata, and `continue` for a new turn with the same session context.

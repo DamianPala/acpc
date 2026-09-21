@@ -153,6 +153,29 @@ async def _drain_updates(predicate: Any) -> None:
         await asyncio.sleep(0)
 
 
+def test_tokens_default_to_none_not_zero(tmp_path: Path) -> None:
+    """SPEC.md V6c (draft.11): usage never observed is `None`, never `0`."""
+    client, _transcript = _make_client(tmp_path, PermissionLevel.READ)
+
+    assert client.context is None
+
+
+def test_tokens_carry_the_previous_turns_last_observed_value(tmp_path: Path) -> None:
+    state_root = tmp_path / "acpc-state"
+    transcript = Transcript(
+        state_root / "sessions" / "abcd" / "transcript.ndjson", clock=lambda: 100.0
+    )
+    client = AcpcClient(
+        transcript,
+        PermissionLevel.READ,
+        modes=MOCK_MODES,
+        clock=lambda: 100.0,
+        previous_context={"used": 1200, "size": None, "peak": 1200},
+    )
+
+    assert client.context == {"used": 1200, "size": None, "peak": 1200}
+
+
 def test_answer_is_only_agent_messages_and_transcript_keeps_stream_order(
     monkeypatch: Any, tmp_path: Path
 ) -> None:
@@ -265,11 +288,16 @@ def test_replay_is_silent_and_collects_user_messages_without_flushing_pending_pr
     messages, cursor_before = asyncio.run(scenario())
     assert messages == ["first message", "second", "anonymous run", "new run"]
     assert client.answer == "before"
-    assert client.tokens == 7
-    assert client.cost is None
+    assert client.context == {"used": 7, "size": 100, "peak": 7}
     events_after = transcript.read()
     assert events_after.events == [
-        {"type": "usage", "tokens": 7, "cost": None, "ts": 100.0, "i": 1}
+        {
+            "type": "usage",
+            "used": 7,
+            "size": 100,
+            "ts": "1970-01-01T00:01:40.000000Z",
+            "i": 1,
+        }
     ]
     assert events_after.next_cursor == cursor_before
     client.flush()
@@ -1127,7 +1155,7 @@ def test_answer_keeps_interleaved_narration_and_excludes_tool_events(
         "args_summary": "notes.md",
         "status": "completed",
         "duration_ms": 0,
-        "ts": 100.0,
+        "ts": "1970-01-01T00:01:40.000000Z",
         "i": 3,
     }
     assert "hidden tool output" not in client.answer
@@ -1369,7 +1397,9 @@ def test_tool_usage_and_advertised_data_are_captured(tmp_path: Path, monkeypatch
             session = await conn.new_session(cwd=str(tmp_path))
             client.capture_advertised(session)
             await conn.prompt(session_id=session.session_id, prompt=[text_block("ordinary task")])
-            await _drain_updates(lambda: client.tokens == 1200)
+            await _drain_updates(
+                lambda: client.context is not None and client.context["used"] == 1200
+            )
 
     asyncio.run(scenario())
 
@@ -1391,7 +1421,13 @@ def test_tool_usage_and_advertised_data_are_captured(tmp_path: Path, monkeypatch
     ]
     assert all(event["duration_ms"] == 0 for event in tools)
     assert [event for event in events if event["type"] == "usage"] == [
-        {"type": "usage", "tokens": 1200, "cost": None, "ts": 100.0, "i": 5}
+        {
+            "type": "usage",
+            "used": 1200,
+            "size": 200_000,
+            "ts": "1970-01-01T00:01:40.000000Z",
+            "i": 5,
+        }
     ]
     assert [event["i"] for event in events] == list(range(1, len(events) + 1))
 
@@ -1569,7 +1605,7 @@ def test_filesystem_refusal_is_an_acp_error_and_connection_survives(
     assert permission["kind"] == "fs/write_text_file"
     assert permission["decision"] == "deny"
     assert permission["auto"] is True
-    assert permission["ts"] == 100.0
+    assert permission["ts"] == "1970-01-01T00:01:40.000000Z"
     assert client.denial_details == {
         "edit": {
             "category": "edit",

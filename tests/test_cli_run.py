@@ -4,16 +4,20 @@ import json
 import os
 import pty
 import queue
+import re
+import select
+import signal
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
 
 from acpc import cli as cli_module
-from acpc import sessions, vocab
+from acpc import interaction, sessions, vocab
 from acpc.cli import main
 
 MOCK_AGENT_SCRIPT = str(Path(__file__).with_name("mock_agent.py"))
@@ -86,6 +90,22 @@ def fresh_permission_alias_warnings(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def invoke(cli: CliRunner, *args: str, stdin: str | None = None):
     return cli.invoke(main, list(args), input=stdin, catch_exceptions=False)
+
+
+def force_human_presentation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Force the terminal branch of `text` (V6a) under CliRunner's non-TTY pipes.
+
+    `CliRunner` gives every test a non-TTY stdout, which now defaults to the
+    tagged document; a handful of tests are specifically about the raw,
+    byte-identical-to-answer.md human presentation, so they select it directly.
+    """
+    monkeypatch.setattr(cli_module, "_stdout_is_tty", lambda: True)
+
+
+def error_envelope(result) -> dict:
+    """The structured failure: always the last non-empty line of stderr."""
+    lines = [line for line in result.stderr.splitlines() if line.strip()]
+    return json.loads(lines[-1])["error"]
 
 
 def wire_events(path: Path) -> list[dict]:
@@ -226,10 +246,13 @@ def test_an_unreadable_prompt_file_is_a_usage_error(cli: CliRunner, tmp_path: Pa
 # --- unknown agents and missing binaries ------------------------------------
 
 
-def test_an_unknown_agent_is_a_usage_error(cli: CliRunner) -> None:
+def test_an_unknown_agent_is_not_found(cli: CliRunner) -> None:
     result = invoke(cli, "run", "no-such-agent", "hello")
 
-    assert result.exit_code == vocab.EXIT_USAGE
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    envelope = json.loads(result.stderr)["error"]
+    assert envelope["kind"] == "not_found"
+    assert envelope["hint"] == "Run: acpc agents list"
 
 
 def test_a_missing_adapter_binary_exits_1_and_names_the_install(cli: CliRunner) -> None:
@@ -264,26 +287,26 @@ def test_a_missing_adapter_binary_creates_no_session(cli: CliRunner, state_root:
     assert not sessions_dir.exists() or not list(sessions_dir.iterdir())
 
 
-# --- --dry-run --------------------------------------------------------------
+# --- resolve -----------------------------------------------------------------
 
 
-def test_dry_run_shows_the_resolved_model_and_its_source(cli: CliRunner) -> None:
-    result = invoke(cli, "run", "mock", "probe", "--dry-run")
+def test_resolve_shows_the_resolved_model_and_its_source(cli: CliRunner) -> None:
+    result = invoke(cli, "resolve", "mock")
 
     assert result.exit_code == vocab.EXIT_OK
     assert "mock-sonnet-5" in result.stdout
     assert "adapter default" in result.stdout
 
 
-def test_dry_run_runs_nothing(cli: CliRunner, state_root: Path) -> None:
-    invoke(cli, "run", "mock", "probe", "--dry-run")
+def test_resolve_runs_nothing(cli: CliRunner, state_root: Path) -> None:
+    invoke(cli, "resolve", "mock")
 
     sessions_dir = state_root / "sessions"
     assert not sessions_dir.exists() or not list(sessions_dir.iterdir())
 
 
-def test_dry_run_json_is_machine_readable(cli: CliRunner) -> None:
-    result = invoke(cli, "run", "mock", "probe", "--dry-run", "--json")
+def test_resolve_json_is_machine_readable(cli: CliRunner) -> None:
+    result = invoke(cli, "resolve", "mock", "--json")
 
     payload = json.loads(result.stdout)
     assert payload["entry"] == "mock"
@@ -291,27 +314,25 @@ def test_dry_run_json_is_machine_readable(cli: CliRunner) -> None:
     assert "entry_definition" not in payload
 
 
-def test_dry_run_reports_mode_for_entry_flag_and_unset_sources(
+def test_resolve_reports_mode_for_entry_flag_and_unset_sources(
     cli: CliRunner, state_root: Path
 ) -> None:
     (state_root / "agents" / "pinned.toml").write_text(
         'extends = "mock"\nmode = "plan"\n', encoding="utf-8"
     )
 
-    entry = json.loads(invoke(cli, "run", "pinned", "probe", "--dry-run", "--json").stdout)
+    entry = json.loads(invoke(cli, "resolve", "pinned", "--json").stdout)
     flag = json.loads(
         invoke(
             cli,
-            "run",
+            "resolve",
             "pinned",
-            "probe",
             "--mode",
             "plan",
-            "--dry-run",
             "--json",
         ).stdout
     )
-    unset = json.loads(invoke(cli, "run", "mock", "probe", "--dry-run", "--json").stdout)
+    unset = json.loads(invoke(cli, "resolve", "mock", "--json").stdout)
 
     assert entry["resolved"]["mode"] == {
         "value": "plan",
@@ -336,8 +357,8 @@ def test_dry_run_reports_mode_for_entry_flag_and_unset_sources(
     }
 
 
-def test_dry_run_reports_the_permission_policy_it_would_use(cli: CliRunner) -> None:
-    result = invoke(cli, "run", "mock", "probe", "--dry-run", "--json")
+def test_resolve_reports_the_permission_policy_it_would_use(cli: CliRunner) -> None:
+    result = invoke(cli, "resolve", "mock", "--json")
 
     # Non-interactive stdout, no --permissions: SPEC's default is `read`.
     assert json.loads(result.stdout)["resolved"]["permissions"]["value"] == "read"
@@ -348,7 +369,7 @@ def test_inherited_ceiling_clamps_a_nested_all_policy_and_reports_it(
 ) -> None:
     monkeypatch.setenv("ACPC_CEILING", "edit")
 
-    result = invoke(cli, "run", "mock", "probe", "--permissions", "all", "--dry-run", "--json")
+    result = invoke(cli, "resolve", "mock", "--permissions", "all", "--json")
 
     permission = json.loads(result.stdout)["resolved"]["permissions"]
     assert permission["value"] == "edit"
@@ -365,7 +386,7 @@ def test_inherited_ceiling_keeps_a_lower_nested_policy(
 ) -> None:
     monkeypatch.setenv("ACPC_CEILING", "execute")
 
-    result = invoke(cli, "run", "mock", "probe", "--permissions", "read", "--dry-run", "--json")
+    result = invoke(cli, "resolve", "mock", "--permissions", "read", "--json")
 
     permission = json.loads(result.stdout)["resolved"]["permissions"]
     assert permission["value"] == "read"
@@ -394,7 +415,7 @@ def test_nested_ask_is_rejected_by_a_numeric_ceiling(
 ) -> None:
     monkeypatch.setenv("ACPC_CEILING", ceiling)
 
-    result = invoke(cli, "run", "mock", "probe", "--permissions", "ask", "--dry-run")
+    result = invoke(cli, "resolve", "mock", "--permissions", "ask")
 
     assert result.exit_code == vocab.EXIT_USAGE
     assert f"inherited ceiling {ceiling}" in result.stderr
@@ -405,12 +426,14 @@ def test_nested_ask_remains_ask_under_an_all_ceiling(
     cli: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("ACPC_CEILING", "all")
-    monkeypatch.setattr(cli_module, "_stdout_is_tty", lambda: True)
+    # `ask` needs the interactive context, which `--json` would revoke.
+    monkeypatch.setattr(interaction, "stdin_is_tty", lambda: True)
+    monkeypatch.setattr(interaction, "stdout_is_tty", lambda: True)
 
-    result = invoke(cli, "run", "mock", "probe", "--permissions", "ask", "--dry-run", "--json")
+    result = invoke(cli, "resolve", "mock", "--permissions", "ask")
 
     assert result.exit_code == vocab.EXIT_OK
-    assert json.loads(result.stdout)["resolved"]["permissions"]["value"] == "ask"
+    assert "permissions ask" in " ".join(result.stdout.split())
 
 
 def test_invalid_inherited_ceiling_is_a_usage_error(
@@ -418,7 +441,7 @@ def test_invalid_inherited_ceiling_is_a_usage_error(
 ) -> None:
     monkeypatch.setenv("ACPC_CEILING", "not-a-policy")
 
-    result = invoke(cli, "run", "mock", "probe", "--permissions", "all", "--dry-run")
+    result = invoke(cli, "resolve", "mock", "--permissions", "all")
 
     assert result.exit_code == vocab.EXIT_USAGE
     assert "ACPC_CEILING='not-a-policy' is invalid" in result.stderr
@@ -427,11 +450,9 @@ def test_invalid_inherited_ceiling_is_a_usage_error(
 def test_write_alias_matches_execute_and_warns_once_per_process(
     cli: CliRunner, fresh_permission_alias_warnings: None
 ) -> None:
-    first = invoke(cli, "run", "mock", "probe", "--permissions", "write", "--dry-run", "--json")
-    second = invoke(cli, "run", "mock", "probe", "--permissions", "write", "--dry-run", "--json")
-    canonical = invoke(
-        cli, "run", "mock", "probe", "--permissions", "execute", "--dry-run", "--json"
-    )
+    first = invoke(cli, "resolve", "mock", "--permissions", "write", "--json")
+    second = invoke(cli, "resolve", "mock", "--permissions", "write", "--json")
+    canonical = invoke(cli, "resolve", "mock", "--permissions", "execute", "--json")
 
     assert json.loads(first.stdout)["resolved"]["permissions"]["value"] == "execute"
     assert json.loads(first.stdout) == json.loads(canonical.stdout)
@@ -440,7 +461,7 @@ def test_write_alias_matches_execute_and_warns_once_per_process(
 
 
 def test_a_raw_model_id_on_the_call_is_labelled_as_a_call_flag(cli: CliRunner) -> None:
-    result = invoke(cli, "run", "mock", "probe", "--model", "mock-opus-5", "--dry-run", "--json")
+    result = invoke(cli, "resolve", "mock", "--model", "mock-opus-5", "--json")
 
     resolved = json.loads(result.stdout)["resolved"]
     assert resolved["model"]["value"] == "mock-opus-5"
@@ -448,7 +469,7 @@ def test_a_raw_model_id_on_the_call_is_labelled_as_a_call_flag(cli: CliRunner) -
 
 
 def test_a_tier_name_resolves_through_the_entry_preset_that_defines_it(cli: CliRunner) -> None:
-    result = invoke(cli, "run", "mock", "probe", "--model", "max", "--dry-run", "--json")
+    result = invoke(cli, "resolve", "mock", "--model", "max", "--json")
 
     resolved = json.loads(result.stdout)["resolved"]
     assert resolved["model"]["value"] == "mock-opus-5"
@@ -471,12 +492,13 @@ def test_prompt_alias_resolves_to_ask_on_a_tty(
     fresh_permission_alias_warnings: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(cli_module, "_stdout_is_tty", lambda: True)
+    monkeypatch.setattr(interaction, "stdin_is_tty", lambda: True)
+    monkeypatch.setattr(interaction, "stdout_is_tty", lambda: True)
 
-    result = invoke(cli, "run", "mock", "probe", "--permissions", "prompt", "--dry-run", "--json")
+    result = invoke(cli, "resolve", "mock", "--permissions", "prompt")
 
     assert result.exit_code == vocab.EXIT_OK
-    assert json.loads(result.stdout)["resolved"]["permissions"]["value"] == "ask"
+    assert "permissions ask" in " ".join(result.stdout.split())
     assert "--permissions prompt is deprecated; use --permissions ask" in result.stderr
 
 
@@ -620,16 +642,24 @@ def test_a_daemon_routed_failure_still_reports_the_result(
 ) -> None:
     """A turn that ran and failed is a result, not an aborted command.
 
-    The daemon has already finalized it on disk, so a blocking client must
-    mirror that — answer, summary line, `--json` envelope — instead of raising
-    the adapter's error and printing nothing an agent caller can parse.
+    The daemon has already finalized it on disk, so the failure is reported by
+    the shared error envelope on stderr and by the result document on stdout:
+    a refusal is a complete answer for the call, so `partial` stays false.
     """
     result = invoke(cli, "run", "mock", "auth:vendor rejected the request", "--json")
 
     assert result.exit_code == vocab.EXIT_AGENT_ERROR
-    payload = json.loads(result.stdout)
-    assert payload["state"] == "failed"
-    assert "mock login" in payload["answer"]
+    payload = error_envelope(result)
+    assert payload["kind"] == "operation_failed"
+    assert payload["context"]["status"] == "failed"
+    document = json.loads(result.stdout)
+    assert document["status"] == "failed"
+    assert document["partial"] is False
+    assert document["capabilities"] == {
+        "steer_mode": "cancel-then-start",
+        "continue_without_message": True,
+    }
+    assert document["answer"] != ""
     assert "-- failed" in result.stderr
 
 
@@ -726,6 +756,98 @@ def test_background_run_does_not_emit_the_early_line(cli: CliRunner, live_daemon
 
     assert result.exit_code == vocab.EXIT_OK
     assert "-- session " not in result.stderr
+    # Non-TTY stdout: the tagged receipt without an answer section (V6a).
+    lines = result.stdout.splitlines()
+    assert lines[0].startswith('<result session_id="') and lines[1] == "<metadata>"
+    assert "<answer" not in result.stdout and lines[-1] == "</result>"
+    metadata = json.loads(lines[2])
+    assert metadata["next"][:2] == ["acpc", "wait"] and "paths" in metadata
+
+
+def test_cold_background_receipt_waits_for_initialize(
+    cli: CliRunner, live_daemon: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ACPC_MOCK_STEERING", "1")
+    monkeypatch.setenv("ACPC_MOCK_INIT_DELAY", "1")
+
+    started_at = time.monotonic()
+    result = invoke(cli, "run", "mock", "echo:delayed receipt", "--bg", "--json")
+    elapsed = time.monotonic() - started_at
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    # Only the lower bound proves the receipt waited for `initialize`; the
+    # cold daemon and adapter start on a loaded host are not under test.
+    assert elapsed >= 0.9
+    document = json.loads(result.stdout)
+    assert document["capabilities"] == {
+        "steer_mode": "in-place",
+        "continue_without_message": True,
+    }
+    status = json.loads(invoke(cli, "status", document["session_id"], "--json").stdout)
+    assert status["capabilities"] == document["capabilities"]
+
+
+def test_cold_timeout_covers_initialize_and_leaves_turn_running(
+    cli: CliRunner, live_daemon: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ACPC_MOCK_INIT_DELAY", "8")
+
+    started_at = time.monotonic()
+    result = invoke(cli, "run", "mock", "echo:cold timeout", "--timeout", "2", "--json")
+    elapsed = time.monotonic() - started_at
+
+    assert result.exit_code == vocab.EXIT_TIMEOUT, result.stderr
+    assert elapsed < 5
+    assert result.stdout == ""
+    error = error_envelope(result)
+    assert error["kind"] == "timeout"
+    session_id = error["context"]["session_id"]
+    assert error["context"]["status"] in {"starting", "preparing"}
+
+    waited = invoke(cli, "wait", session_id, "--json")
+
+    assert waited.exit_code == vocab.EXIT_OK, waited.stderr
+    assert "cold timeout" in json.loads(waited.stdout)["answer"]
+
+
+def test_background_receipt_and_immediate_status_share_capabilities(
+    cli: CliRunner, live_daemon: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ACPC_MOCK_STEERING", "1")
+
+    result = invoke(cli, "run", "mock", "echo:matching capability", "--bg", "--json")
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    document = json.loads(result.stdout)
+    status = json.loads(invoke(cli, "status", document["session_id"], "--json").stdout)
+    assert document["capabilities"] == {
+        "steer_mode": "in-place",
+        "continue_without_message": True,
+    }
+    assert status["capabilities"] == document["capabilities"]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ("status", "missing", "--json"),
+        ("wait", "missing", "--json"),
+        ("cancel", "missing", "--json"),
+        ("steer", "missing", "x", "--json"),
+        ("continue", "missing", "x", "--json"),
+        ("log", "missing", "--json"),
+        ("delete", "missing", "--yes", "--json"),
+    ],
+)
+def test_missing_session_errors_identify_the_supplied_selector(
+    cli: CliRunner, command: tuple[str, ...]
+) -> None:
+    result = invoke(cli, *command)
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    error = error_envelope(result)
+    assert error["kind"] == "not_found"
+    assert error["context"] == {"session_id": "missing", "status": None}
 
 
 def test_quiet_suppresses_the_stderr_summary(cli: CliRunner) -> None:
@@ -744,8 +866,9 @@ def test_without_quiet_the_summary_is_exactly_one_stderr_line(cli: CliRunner) ->
 
 
 def test_early_line_segments_match_the_summary_and_stdout_matches_answer_file(
-    cli: CliRunner,
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    force_human_presentation(monkeypatch)
     result = invoke(cli, "run", "mock", "echo:format and bytes")
 
     metadata_lines = [line for line in result.stderr.splitlines() if line.startswith("-- ")]
@@ -762,8 +885,9 @@ def test_early_line_segments_match_the_summary_and_stdout_matches_answer_file(
 
 
 def test_stdout_bytes_match_answer_file_after_a_detectable_message_boundary(
-    cli: CliRunner,
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    force_human_presentation(monkeypatch)
     result = invoke(cli, "run", "mock", "separator contract probe")
 
     assert "\n\n## Answer" in result.stdout
@@ -773,10 +897,13 @@ def test_stdout_bytes_match_answer_file_after_a_detectable_message_boundary(
     assert result.stdout.encode("utf-8") == sessions.answer_path(session_id).read_bytes()
 
 
-def test_the_summary_starts_on_a_fresh_line_after_an_unterminated_answer(cli: CliRunner) -> None:
+def test_the_summary_starts_on_a_fresh_line_after_an_unterminated_answer(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """SPEC output contract: `--` separates only at a line boundary, and the
     compensating newline goes to stderr — stdout stays byte-identical to
     answer.md."""
+    force_human_presentation(monkeypatch)
     result = invoke(cli, "run", "mock", "echo:no trailing newline")
 
     assert result.stdout == "no trailing newline"
@@ -788,11 +915,60 @@ def test_the_summary_starts_on_a_fresh_line_after_an_unterminated_answer(cli: Cl
     assert lines[summary_index - 1] == ""
 
 
-def test_a_terminated_answer_gets_no_blank_line_before_the_summary(cli: CliRunner) -> None:
+def test_a_terminated_answer_gets_no_blank_line_before_the_summary(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    force_human_presentation(monkeypatch)
     result = invoke(cli, "run", "mock", "echo:ends with a newline\n")
 
     assert result.stdout == "ends with a newline\n"
     assert result.stderr.startswith("-- ")
+
+
+def test_run_human_presentation_escapes_control_bytes(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SPEC.md *Text presentation*: the terminal answer escapes control bytes
+    exactly as the tagged document does, keeping line breaks."""
+    force_human_presentation(monkeypatch)
+    result = invoke(cli, "run", "mock", "echo:safe\x1b[31mred\x1b[0m\nline\x9btwo")
+
+    assert "\x1b" not in result.stdout
+    assert "\x9b" not in result.stdout
+    assert "^[[31mred^[[0m" in result.stdout
+    assert "\\u009b" in result.stdout
+    assert "\nline" in result.stdout
+
+
+def test_run_output_file_on_a_terminal_gets_the_escaped_text(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`--output-file` on a terminal gets exactly what stdout would have."""
+    force_human_presentation(monkeypatch)
+    output_file = tmp_path / "answer.txt"
+
+    result = invoke(
+        cli, "run", "mock", "echo:danger\x1b[31mred\x1b[0m", "--output-file", str(output_file)
+    )
+
+    assert result.exit_code == vocab.EXIT_OK
+    written = output_file.read_text(encoding="utf-8")
+    assert "\x1b" not in written
+    assert "^[[31mred^[[0m" in written
+
+
+def test_wait_human_presentation_escapes_control_bytes(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch, live_daemon: None
+) -> None:
+    started = invoke(cli, "run", "mock", "echo:bg\x1b[31mred\x1b[0m", "--bg", "--json")
+    assert started.exit_code == vocab.EXIT_OK
+    session_id = json.loads(started.stdout)["session_id"]
+
+    force_human_presentation(monkeypatch)
+    result = invoke(cli, "wait", session_id)
+
+    assert "\x1b" not in result.stdout
+    assert "^[[31mred^[[0m" in result.stdout
 
 
 def test_the_direct_child_note_rides_the_one_summary_line(cli: CliRunner) -> None:
@@ -802,6 +978,53 @@ def test_the_direct_child_note_rides_the_one_summary_line(cli: CliRunner) -> Non
     assert len(summary_lines) == 2
     assert any("direct child" in line for line in summary_lines)
     assert any(line.startswith("-- session ") for line in summary_lines)
+
+
+def test_background_run_reports_unavailable_when_the_socket_path_is_too_long(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, live_daemon: None
+) -> None:
+    """SPEC.md `daemon`: a socket path that still exceeds the platform limit
+    even hashed starts no daemon — `run --bg` reports `unavailable` naming
+    the limit and `ACPC_HOME`, with no daemon lock or pid file left behind
+    (a spawn that was always going to fail never even starts)."""
+    long_home = tmp_path / ("x" * 150)
+    agents = long_home / "agents"
+    agents.mkdir(parents=True)
+    (agents / "mock.toml").write_text(MOCK_ENTRY, encoding="utf-8")
+    monkeypatch.setenv("ACPC_HOME", str(long_home))
+    cli = CliRunner()
+
+    result = cli.invoke(main, ["run", "mock", "echo:x", "--bg", "--json"], catch_exceptions=False)
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    envelope = error_envelope(result)
+    assert envelope["kind"] == "unavailable"
+    assert "ACPC_HOME" in envelope["message"]
+    assert "108" in envelope["message"] or "104" in envelope["message"]
+    daemon_dir = long_home / "daemon"
+    assert not daemon_dir.exists()
+
+
+def test_blocking_run_falls_back_direct_when_the_socket_path_is_too_long(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, live_daemon: None
+) -> None:
+    """Same over-long `ACPC_HOME`, but a blocking `run`: it takes the direct
+    path, as for any unavailable daemon, and names the cause in its stderr
+    summary rather than failing the call."""
+    long_home = tmp_path / ("x" * 150)
+    agents = long_home / "agents"
+    agents.mkdir(parents=True)
+    (agents / "mock.toml").write_text(MOCK_ENTRY, encoding="utf-8")
+    monkeypatch.setenv("ACPC_HOME", str(long_home))
+    cli = CliRunner()
+
+    result = cli.invoke(main, ["run", "mock", "echo:direct fallback"], catch_exceptions=False)
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    assert "direct child" in result.stderr
+    assert "ACPC_HOME" in result.stderr
+    daemon_dir = long_home / "daemon"
+    assert not daemon_dir.exists()
 
 
 def test_a_default_cwd_resolves_to_the_callers_absolute_directory(
@@ -814,7 +1037,7 @@ def test_a_default_cwd_resolves_to_the_callers_absolute_directory(
     caller_dir.mkdir()
     monkeypatch.chdir(caller_dir)
 
-    result = invoke(cli, "run", "mock", "echo:x", "--dry-run", "--json")
+    result = invoke(cli, "resolve", "mock", "--json")
 
     payload = json.loads(result.stdout)
     assert payload["cwd"] == str(caller_dir.resolve())
@@ -841,9 +1064,12 @@ def test_the_stored_resolution_carries_the_default_cwd(
 def test_output_file_receives_the_answer(cli: CliRunner, tmp_path: Path) -> None:
     target = tmp_path / "answer.md"
 
-    result = invoke(cli, "run", "mock", "echo:written to a file", "-o", str(target), "--quiet")
+    result = invoke(
+        cli, "run", "mock", "echo:written to a file", "--output-file", str(target), "--quiet"
+    )
 
     assert result.exit_code == vocab.EXIT_OK
+    assert result.stdout == ""
     assert "written to a file" in target.read_text(encoding="utf-8")
 
 
@@ -853,7 +1079,46 @@ def test_json_output_carries_the_session_id_and_paths(cli: CliRunner) -> None:
     payload = json.loads(result.stdout)
     assert payload["session_id"]
     assert payload["paths"]["answer"].endswith("answer.md")
+    assert payload["capabilities"] == {
+        "steer_mode": "cancel-then-start",
+        "continue_without_message": True,
+    }
     assert "as json" in payload["answer"]
+
+
+def test_unobserved_usage_reports_null_not_zero(cli: CliRunner) -> None:
+    """SPEC.md V6c (draft.11): usage the tool never observed is `null`, never `0`.
+
+    The `echo:` scenario answers without ever sending a `usage_update`, so
+    acpc has nothing to report.
+    """
+    result = invoke(cli, "run", "mock", "echo:hi", "--json", "--quiet")
+
+    payload = json.loads(result.stdout)
+    assert payload["context"] is None
+
+
+def test_unobserved_usage_is_absent_from_the_tagged_metadata(cli: CliRunner) -> None:
+    result = invoke(cli, "run", "mock", "echo:hi", "--quiet")
+
+    metadata_line = next(line for line in result.stdout.splitlines() if line.startswith("{"))
+    metadata = json.loads(metadata_line)
+    assert "context" not in metadata
+
+
+def test_unobserved_usage_shows_a_dot_in_the_stderr_summary(cli: CliRunner) -> None:
+    result = invoke(cli, "run", "mock", "echo:hi")
+
+    summary_line = next(line for line in result.stderr.splitlines() if "exit 0" in line)
+    assert "ctx ·" in summary_line
+
+
+def test_observed_usage_still_reports_the_real_count(cli: CliRunner) -> None:
+    """A scenario that streams `usage_update` keeps reporting an int (unchanged)."""
+    result = invoke(cli, "run", "mock", "meta:1200:1000000000:tokens present", "--json", "--quiet")
+
+    payload = json.loads(result.stdout)
+    assert payload["context"] == {"used": 1200, "size": None, "peak": 1200}
 
 
 def test_max_output_caps_stdout(cli: CliRunner) -> None:
@@ -880,21 +1145,267 @@ def test_a_negative_max_output_is_a_usage_error(cli: CliRunner) -> None:
 
 
 def test_a_refusal_exits_1(cli: CliRunner) -> None:
+    """A turn that ran to an end acpc did not ask for is a failed operation."""
     result = invoke(cli, "run", "mock", "please fail this on purpose", "--quiet")
 
     assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    envelope = error_envelope(result)
+    assert envelope["kind"] == "operation_failed"
+    assert envelope["context"]["session_id"]
+    assert envelope["context"]["status"] == "failed"
 
 
-def test_a_timeout_exits_124(cli: CliRunner) -> None:
-    result = invoke(cli, "run", "mock", "slow:30 cli timeout probe", "--timeout", "1", "--quiet")
+def test_cancel_after_exits_1_and_cancels(cli: CliRunner) -> None:
+    result = invoke(
+        cli, "run", "mock", "slow:30 cli timeout probe", "--cancel-after", "1", "--quiet"
+    )
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    envelope = error_envelope(result)
+    assert envelope["kind"] == "operation_failed"
+    assert envelope["context"]["status"] == "canceled"
+    assert sessions.read_meta(envelope["context"]["session_id"]).state == "canceled"
+
+
+def test_timeout_cannot_be_combined_with_background(cli: CliRunner) -> None:
+    result = invoke(cli, "run", "mock", "hello", "--background", "--timeout", "1")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert "--cancel-after" in result.stderr
+
+
+@pytest.mark.parametrize("deadline_flag", ["--timeout", "--cancel-after"])
+def test_resolve_rejects_deadlines_before_creating_a_session(
+    cli: CliRunner, state_root: Path, deadline_flag: str
+) -> None:
+    result = invoke(cli, "resolve", "mock", deadline_flag, "1", "--json")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    envelope = error_envelope(result)
+    assert envelope["kind"] == "invalid_input"
+    assert deadline_flag in envelope["message"]
+    assert not (state_root / "sessions").exists()
+
+
+def test_run_resolve_flag_names_the_new_command(cli: CliRunner) -> None:
+    result = invoke(cli, "run", "mock", "probe", "--resolve")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert "acpc resolve <agent>" in error_envelope(result)["message"]
+
+
+def test_timeout_only_stops_waiting_and_reports_observed_state(
+    cli: CliRunner, live_daemon: None
+) -> None:
+    result = invoke(cli, "run", "mock", "slow:30 wait only", "--timeout", "1", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_TIMEOUT, result.stderr
+    envelope = error_envelope(result)
+    assert envelope["kind"] == "timeout"
+    session_id = envelope["context"]["session_id"]
+    assert envelope["context"]["status"] in {"starting", "running"}
+    assert sessions.read_meta(session_id).state in {"starting", "running"}
+
+
+def test_timeout_direct_fallback_keeps_the_session_alive(cli: CliRunner) -> None:
+    result = invoke(cli, "run", "mock", "slow:2 direct wait only", "--timeout", "0.1", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_TIMEOUT, result.stderr
+    envelope = error_envelope(result)
+    session_id = envelope["context"]["session_id"]
+    assert sessions.load(session_id).state in {"starting", "running"}
+
+    # This deliberately exercises the direct fallback, where no daemon owns
+    # an await_turn event.  The only observable completion signal is the
+    # session state written by that child process, so polling is unavoidable.
+    # The child itself sleeps for two seconds; 15 seconds leaves scheduling
+    # room under the suite's 30-second per-test cap without changing the
+    # production timeout contract.
+    deadline = time.monotonic() + 15
+    while sessions.load(session_id).is_active and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert sessions.load(session_id).state == "succeeded"
+
+
+@pytest.mark.filterwarnings(
+    "ignore:This process .* is multi-threaded, use of forkpty\\(\\) may lead to deadlocks.*:DeprecationWarning"
+)
+def test_timeout_direct_worker_survives_closing_the_client_pty(state_root: Path) -> None:
+    # A file at the daemon directory makes the real subprocess take the
+    # direct fallback, without changing the production routing code.
+    (state_root / "daemon").write_text("direct fallback", encoding="utf-8")
+    argv = [
+        sys.executable,
+        "-c",
+        "from acpc.cli import main; main()",
+        "run",
+        "mock",
+        "slow:2 pty direct timeout",
+        "--permissions",
+        "read",
+        "--timeout",
+        "0.1",
+        "--quiet",
+        "--json",
+    ]
+    child_pid, master_fd = pty.fork()
+    if child_pid == 0:
+        signal.signal(signal.SIGHUP, signal.SIG_DFL)
+        os.environ["ACPC_HOME"] = str(state_root)
+        os.execve(sys.executable, argv, os.environ.copy())
+
+    output = bytearray()
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([master_fd], [], [], 0.2)
+            if not ready:
+                continue
+            try:
+                output.extend(os.read(master_fd, 4096))
+            except OSError:
+                break
+            if b'"kind": "timeout"' in output or b'"kind":"timeout"' in output:
+                break
+        rendered = output.decode(errors="replace")
+        match = re.search(r'"session_id"\s*:\s*"([a-z0-9]{4})"', rendered)
+        assert match is not None, rendered
+        session_id = match.group(1)
+        os.close(master_fd)
+        master_fd = -1
+
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            if sessions.load(session_id).state == "succeeded":
+                break
+            time.sleep(0.05)
+        assert sessions.load(session_id).state == "succeeded"
+    finally:
+        if master_fd >= 0:
+            os.close(master_fd)
+        waited_pid, _ = os.waitpid(child_pid, os.WNOHANG)
+        if waited_pid == 0:
+            os.kill(child_pid, signal.SIGKILL)
+            os.waitpid(child_pid, 0)
+
+
+def test_timeout_direct_fallback_can_still_be_canceled(cli: CliRunner) -> None:
+    result = invoke(cli, "run", "mock", "slow:30 cancel after wait", "--timeout", "0.1", "--quiet")
 
     assert result.exit_code == vocab.EXIT_TIMEOUT
+    session_id = error_envelope(result)["context"]["session_id"]
+    deadline = time.monotonic() + 5
+    while sessions.load(session_id).state == "starting" and time.monotonic() < deadline:
+        time.sleep(0.05)
+
+    canceled = invoke(cli, "cancel", session_id, "--json")
+
+    assert canceled.exit_code == vocab.EXIT_OK, canceled.stderr
+    assert json.loads(canceled.stdout)["status"] == "canceled"
+
+
+def test_a_direct_child_killed_during_turn_one_still_leaves_a_continuable_session(
+    cli: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SPEC.md *State on disk*: the adapter session id is recorded as soon as
+    the adapter has accepted the session, before the prompt is sent — so a
+    direct host killed mid-turn-1 still leaves `adapter_session_id` on disk
+    and `continue` takes the normal cold-resume path instead of
+    `corrupt_state`.
+
+    The child process below is a real subprocess, not `CliRunner` — the
+    autouse `no_daemon` stub in `conftest.py` only patches
+    `daemon_client.ensure_daemon` inside this test's own process, so a plain
+    `ACPC_HOME` would let the child spawn (and go through) a real daemon,
+    leaving `runner.py`'s direct-path write untested. An `ACPC_HOME` whose
+    socket path still exceeds the platform limit after hashing (item F) is
+    the same deterministic, daemon-free mechanism the item F tests use to
+    force the direct path, with no new test-only switch.
+    """
+    long_home = tmp_path / ("x" * 150)
+    agents = long_home / "agents"
+    agents.mkdir(parents=True)
+    (agents / "mock.toml").write_text(MOCK_ENTRY, encoding="utf-8")
+    monkeypatch.setenv("ACPC_HOME", str(long_home))
+    release = tmp_path / "release-before-prompt"
+    ready = tmp_path / "before-prompt-ready"
+    monkeypatch.setenv("ACPC_MOCK_BLOCK_BEFORE_PROMPT", str(release))
+    monkeypatch.setenv("ACPC_MOCK_BLOCK_BEFORE_PROMPT_READY", str(ready))
+    command = [
+        sys.executable,
+        "-c",
+        "from acpc.cli import main; raise SystemExit(main())",
+        "run",
+        "mock",
+        "turn one killed",
+        "--name",
+        "direct-turn-one-killed",
+        "--quiet",
+    ]
+    process = subprocess.Popen(
+        command,
+        env=os.environ.copy(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not ready.exists():
+            time.sleep(0.02)
+        assert ready.exists()
+
+        deadline = time.monotonic() + 5
+        session_id = None
+        while time.monotonic() < deadline:
+            try:
+                session_id = sessions.resolve_selector("direct-turn-one-killed")
+                break
+            except sessions.SessionError:
+                time.sleep(0.02)
+        assert session_id is not None
+
+        running = sessions.read_meta(session_id)
+        assert running.state == "running"
+        assert running.turns == 1
+        # The point of the long `ACPC_HOME` above: no daemon was started, so
+        # `adapter_session_id` below can only have come from the direct path.
+        # Without this the test would silently go back to proving the daemon's
+        # write if the socket-limit mechanism ever stopped forcing direct.
+        assert not (long_home / "daemon").exists()
+        assert running.adapter_session_id is not None
+        assert running.pid is not None
+
+        os.kill(process.pid, signal.SIGKILL)
+        os.kill(running.pid, signal.SIGKILL)
+        release.touch()
+        process.communicate(timeout=10)
+
+        deadline = time.monotonic() + 5
+        unknown = sessions.load(session_id)
+        while unknown.state == "running" and time.monotonic() < deadline:
+            time.sleep(0.05)
+            unknown = sessions.load(session_id)
+        assert unknown.state == "unknown"
+        assert sessions.read_meta(session_id).adapter_session_id is not None
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=10)
+
+    monkeypatch.delenv("ACPC_MOCK_BLOCK_BEFORE_PROMPT")
+    monkeypatch.delenv("ACPC_MOCK_BLOCK_BEFORE_PROMPT_READY")
+
+    resumed = invoke(cli, "continue", session_id, "again", "--quiet")
+
+    assert resumed.exit_code == vocab.EXIT_OK, resumed.stderr
+    assert sessions.load(session_id).state == "succeeded"
 
 
 def test_a_bare_integer_timeout_is_seconds(cli: CliRunner) -> None:
-    result = invoke(cli, "run", "mock", "slow:2 bare seconds", "--timeout", "1", "--quiet")
+    result = invoke(cli, "run", "mock", "slow:2 bare seconds", "--cancel-after", "1", "--quiet")
 
-    assert result.exit_code == vocab.EXIT_TIMEOUT
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
 
 
 def test_a_five_minute_timeout_is_not_five_seconds(cli: CliRunner) -> None:
@@ -908,15 +1419,15 @@ def test_an_invalid_timeout_has_the_pinned_duration_error(cli: CliRunner) -> Non
     result = invoke(cli, "run", "mock", "hello", "--timeout", "5x")
 
     assert result.exit_code == vocab.EXIT_USAGE
-    assert result.stderr == (
-        "Error: Invalid value for '--timeout': '5x' is not a duration — "
-        "use seconds (90) or a suffixed value (90s, 5m, 1h, 1h30m)\n"
-    )
+    envelope = json.loads(result.stderr)["error"]
+    assert envelope["kind"] == "invalid_input"
+    assert "'5x' is not a duration" in envelope["message"]
+    assert "90s, 5m, 1h, 1h30m" in envelope["message"]
 
 
 @pytest.mark.parametrize("value", ["-1", "-1m"])
 def test_negative_timeout_is_a_usage_error(cli: CliRunner, value: str) -> None:
-    result = invoke(cli, "run", "mock", "hello", "--timeout", value, "--dry-run")
+    result = invoke(cli, "run", "mock", "hello", "--timeout", value)
 
     assert result.exit_code == vocab.EXIT_USAGE
     assert "--timeout" in result.stderr
@@ -956,52 +1467,48 @@ def test_an_execute_floor_refuses_policies_below_execute(
     result = invoke(cli, "run", "grok-floor", "probe")
 
     assert result.exit_code == vocab.EXIT_USAGE
-    assert result.stderr == (
-        "Error: no mode on grok-floor grants at most permissions read — "
-        "the lowest policy grok-floor runs under is execute; pass --permissions execute; "
-        "declared modes: bypass (grants all), default (grants execute)\n"
-    )
+    envelope = error_envelope(result)
+    assert envelope["kind"] == "permission_denied"
+    assert "the lowest policy grok-floor runs under is execute" in envelope["message"]
+    assert "declared modes: bypass (grants all), default (grants execute)" in envelope["message"]
+    assert envelope["hint"] == "Run: acpc run grok-floor --permissions execute"
 
 
-def test_an_execute_floor_dry_run_refusal_names_the_permission_floor(
+def test_an_execute_floor_resolve_refusal_names_the_permission_floor(
     cli: CliRunner, grok_floor_entry: None
 ) -> None:
-    result = invoke(cli, "run", "grok-floor", "probe", "--dry-run")
+    result = invoke(cli, "resolve", "grok-floor")
 
     assert result.exit_code == vocab.EXIT_USAGE
-    assert result.stderr == (
-        "Error: no mode on grok-floor grants at most permissions read — "
-        "the lowest policy grok-floor runs under is execute; pass --permissions execute; "
-        "declared modes: bypass (grants all), default (grants execute)\n"
-    )
+    assert "the lowest policy grok-floor runs under is execute" in error_envelope(result)["message"]
 
 
 def test_an_execute_floor_ask_refusal_names_the_permission_floor(
     cli: CliRunner, grok_floor_entry: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(cli_module, "_stdout_is_tty", lambda: True)
+    monkeypatch.setattr(interaction, "stdin_is_tty", lambda: True)
+    monkeypatch.setattr(interaction, "stdout_is_tty", lambda: True)
 
     result = invoke(cli, "run", "grok-floor", "probe", "--permissions", "ask")
 
     assert result.exit_code == vocab.EXIT_USAGE
-    assert result.stderr == (
-        "Error: --permissions ask on grok-floor is not really asking anything: "
-        "no mode grants at most read, so no permission request can reach acpc — "
-        "the lowest policy grok-floor runs under is execute; pass --permissions execute; "
-        "declared modes: bypass (grants all), default (grants execute)\n"
-    )
+    # The terminal is stdout's; stderr is still a pipe, so the envelope goes out.
+    message = error_envelope(result)["message"]
+    assert "--permissions ask on grok-floor is not really asking anything" in message
+    assert "the lowest policy grok-floor runs under is execute" in message
 
 
 def test_real_grok_refusal_names_the_permission_floor(cli: CliRunner) -> None:
     result = invoke(cli, "run", "grok", "probe")
 
     assert result.exit_code == vocab.EXIT_USAGE
-    assert result.stderr == (
-        "Error: no mode on grok grants at most permissions read — the lowest policy grok runs "
-        "under is execute; pass --permissions execute; declared modes: default (grants execute), "
-        "acceptEdits (grants execute), plan (grants execute), auto (grants all), "
-        "dontAsk (grants execute), bypassPermissions (grants all)\n"
-    )
+    message = error_envelope(result)["message"]
+    assert "the lowest policy grok runs under is execute" in message
+    assert (
+        "declared modes: default (grants execute), acceptEdits (grants execute), "
+        "plan (grants execute), auto (grants all), dontAsk (grants execute), "
+        "bypassPermissions (grants all)"
+    ) in message
 
 
 def test_empty_modes_refusal_keeps_the_existing_message(cli: CliRunner, state_root: Path) -> None:
@@ -1012,10 +1519,7 @@ def test_empty_modes_refusal_keeps_the_existing_message(cli: CliRunner, state_ro
     result = invoke(cli, "run", "empty", "probe")
 
     assert result.exit_code == vocab.EXIT_USAGE
-    assert (
-        result.stderr
-        == "Error: no mode on empty grants at most permissions read; declared modes: none\n"
-    )
+    assert "declared modes: none" in error_envelope(result)["message"]
 
 
 def test_an_edit_floor_refusal_names_the_permission_floor(cli: CliRunner, state_root: Path) -> None:
@@ -1029,26 +1533,20 @@ def test_an_edit_floor_refusal_names_the_permission_floor(cli: CliRunner, state_
     result = invoke(cli, "run", "edit-floor", "probe")
 
     assert result.exit_code == vocab.EXIT_USAGE
-    assert result.stderr == (
-        "Error: no mode on edit-floor grants at most permissions read — the lowest policy "
-        "edit-floor runs under is edit; pass --permissions edit; declared modes: bypass "
-        "(grants all), default (grants edit)\n"
-    )
+    assert "the lowest policy edit-floor runs under is edit" in error_envelope(result)["message"]
 
 
-def test_unlisted_model_warns_on_dry_run(cli: CliRunner) -> None:
+def test_unlisted_model_warns_on_resolve(cli: CliRunner) -> None:
     result = invoke(
         cli,
-        "run",
+        "resolve",
         "grok",
-        "probe",
         "--model",
         "grok-4.7",
         "--effort",
         "xhigh",
         "--permissions",
         "execute",
-        "--dry-run",
     )
 
     assert result.exit_code == vocab.EXIT_OK
@@ -1079,19 +1577,17 @@ def test_unlisted_model_warns_on_run(cli: CliRunner, state_root: Path) -> None:
     assert "using adapter efforts low, medium, high" in result.stderr
 
 
-def test_listed_model_does_not_warn_on_dry_run(cli: CliRunner) -> None:
+def test_listed_model_does_not_warn_on_resolve(cli: CliRunner) -> None:
     result = invoke(
         cli,
-        "run",
+        "resolve",
         "grok",
-        "probe",
         "--model",
         "grok-4.6",
         "--effort",
         "high",
         "--permissions",
         "execute",
-        "--dry-run",
     )
 
     assert result.exit_code == vocab.EXIT_OK

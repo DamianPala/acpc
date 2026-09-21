@@ -4,7 +4,7 @@ description: >-
   Bring up a new base adapter for acpc: any ACP-speaking process registered with
   its own command (no extends). Use when adding a vendor agent that is not
   already shipped (or a local ACP binary), writing ~/.acpc/agents/<name>.toml
-  with command/home/modes, or when run/dry-run refuse because the modes table is
+  with command/home/modes, or when run/resolve refuse because the modes table is
   empty. Not for pointing an existing adapter at a new provider (provider-bringup)
   or retargeting presets when the vendor catalogue moved (refresh-adapter-models).
 ---
@@ -36,7 +36,7 @@ keyed by **filename**:
 | `<name>.toml` with `command`, no `extends` | **this** skill: new base adapter |
 | same name as a shipped adapter | field overrides; catalogue refresh is `refresh-adapter-models` |
 
-Read a shipped TOML only as a **field catalogue** (`acpc agents claude`), never
+Read a shipped TOML only as a **field catalogue** (`acpc agents get claude`), never
 as a modes or presets table to copy.
 
 ## Ladder
@@ -111,14 +111,14 @@ env_passthrough = [
 ```
 
 ```bash
-acpc agents "$NAME"
-acpc run "$NAME" "x" --dry-run   # must refuse: empty [modes] — that is correct
+acpc agents get "$NAME"
+acpc resolve "$NAME"              # must refuse: empty [modes] — that is correct
 acpc probe "$NAME" --discover    # works without [modes]; never edits the entry
 ```
 
 ### 4. Fill `[modes]` (assumed, not measured)
 
-acpc cannot select a mode over an empty table: `run` and `--dry-run` refuse.
+acpc cannot select a mode over an empty table: `run` and `resolve` refuse.
 Mode **ids** come from this binary, not from another adapter's table.
 
 **Path A — discovery non-empty.** Write every advertised id. Facts
@@ -200,8 +200,8 @@ When that fails (Method not found / unknown option), use entry overrides:
 ### 6. Dry-run, then a trivial turn
 
 ```bash
-acpc agents "$NAME"
-acpc run "$NAME" "x" --dry-run
+acpc agents get "$NAME"
+acpc resolve "$NAME"
 acpc run "$NAME" "Reply with exactly: OK" --timeout 180
 ```
 
@@ -212,8 +212,8 @@ name login / missing passthrough — fix env, do not widen permissions.
 
 ```bash
 acpc daemon status "$NAME"    # own target when home/env differ
-acpc agents --check "$NAME"   # live apply of resolved options; zero turns
-# (skip --check model/effort asserts if those options are unsupported)
+acpc agents check "$NAME"      # live apply of resolved options; zero turns
+# (skip model/effort assertions if those options are unsupported)
 ```
 
 - Own `home` ⇒ own daemon target.
@@ -245,7 +245,7 @@ Shape references (not values to copy): package `data/agents/claude.toml`,
 ## Traps
 
 - **UI ≠ adapter.** Wrong process, silent non-ACP.
-- **Empty `[modes]` blocks run/dry-run.** Expected until rung 4.
+- **Empty `[modes]` blocks run/resolve.** Expected until rung 4.
 - **Empty discovery ≠ "no modes exist".** May mean the agent does not advertise
   ACP modes; use Path B.
 - **`set_session_mode` OK on every string.** Acceptance ≠ measured ceiling.
@@ -260,11 +260,11 @@ Shape references (not values to copy): package `data/agents/claude.toml`,
 
 | Symptom | Actually means |
 |---|---|
-| `run` / `--dry-run` refuse; message about modes/policy | Empty or unusable `[modes]`, not a missing model. Rung 4. |
+| `run` / `resolve` refuse; message about modes/policy | Empty or unusable `[modes]`, not a missing model. Rung 4. |
 | `probe --discover` → 0 advertised | Catalogue missing on the wire — not proof the binary has no permission modes. Path B. |
 | Mode name from another adapter "should work" | Mode ids are vendor-local. |
 | `the adapter rejected model|effort '…'` with Method not found, Unknown config option, or similar | Config-option path missing — set `model_via` / `effort_via` after proving the alternate wire, or drop pins. |
-| `missing → acpc install …` | argv[0] not on PATH and the entry has `install_command`. |
+| `missing → acpc install … --yes` | argv[0] not on PATH and the entry has `install_command`. |
 | `missing → https://…` | argv[0] not on PATH; entry has `install_docs`, no `install_command`. Install the vendor CLI. |
 | Auth fails only under acpc | Passthrough or `home`/`home_env` wrong; re-run bare with the same env (rung 2). |
 | Daemon shares traffic with another entry | Same target key (agent + home + declared env + policy). Own `home`. |
@@ -273,7 +273,7 @@ Shape references (not values to copy): package `data/agents/claude.toml`,
 ## When you are done
 
 ```bash
-acpc agents "$NAME"
+acpc agents get "$NAME"
 acpc probe "$NAME" --discover
 acpc run "$NAME" "Reply with exactly: OK" --timeout 180
 ```

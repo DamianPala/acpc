@@ -65,7 +65,14 @@ def run_mock(
     """Run the real mock adapter and return its session id."""
     result = invoke(cli, "run", "mock", prompt, "--quiet", "--json")
     assert result.exit_code == expected_exit
-    return json.loads(result.stdout)["session_id"]
+    if expected_exit == vocab.EXIT_OK:
+        return json.loads(result.stdout)["session_id"]
+    lines = [line for line in result.stderr.splitlines() if line.strip()]
+    if lines and lines[-1].startswith("{"):
+        error = json.loads(lines[-1])["error"]
+        if session_id := error.get("context", {}).get("session_id"):
+            return session_id
+    return sessions.list_sessions()[0].session_id
 
 
 def finished_session(prompt: str = "finished session", *, clock_value: float = 100.0):
@@ -78,7 +85,7 @@ def finished_session(prompt: str = "finished session", *, clock_value: float = 1
     )
     return sessions.transition(
         meta.session_id,
-        "done",
+        "succeeded",
         exit_code=0,
         clock=lambda: clock_value + 1,
     )
@@ -114,22 +121,22 @@ def running_session(prompt: str = "running session"):
     )
 
 
-def test_status_hides_finished_sessions_beyond_the_recent_five(cli: CliRunner) -> None:
-    """The default status list contains only the five newest finished sessions."""
+def test_status_limit_hides_finished_sessions_beyond_the_bound(cli: CliRunner) -> None:
+    """A finite status limit bounds the collection and reports the rest."""
     for index in range(6):
         finished_session(f"old prompt {index}", clock_value=100 + index)
 
-    result = invoke(cli, "status")
+    result = invoke(cli, "list", "--limit", "5")
 
     assert "old prompt 0" not in result.stdout and "old prompt 5" in result.stdout
 
 
-def test_status_all_includes_older_finished_sessions(cli: CliRunner) -> None:
-    """Status --all includes finished sessions outside the recent window."""
+def test_status_limit_includes_older_finished_sessions(cli: CliRunner) -> None:
+    """A larger status limit includes finished sessions outside the small view."""
     for index in range(6):
         finished_session(f"old prompt {index}", clock_value=100 + index)
 
-    result = invoke(cli, "status", "--all")
+    result = invoke(cli, "list", "--limit", "6")
 
     assert "old prompt 0" in result.stdout
 
@@ -151,17 +158,101 @@ def test_status_json_with_an_id_reports_detail_fields(cli: CliRunner) -> None:
     result = invoke(cli, "status", meta.session_id, "--json")
 
     payload = json.loads(result.stdout)
-    assert payload["state"] == "done"
+    assert payload["status"] == "succeeded"
     assert payload["idle_seconds"] is None
+
+
+def test_status_reports_unobserved_usage_as_null_not_zero(cli: CliRunner) -> None:
+    """SPEC.md V6c (draft.11): `status` never reports a session's tokens as `0`
+    for usage acpc never observed; the `echo:` scenario sends no `usage_update`."""
+    session_id = run_mock(cli, "echo:no usage")
+
+    payload = json.loads(invoke(cli, "status", session_id, "--json").stdout)
+    text = invoke(cli, "status", session_id, "--format", "text").stdout
+
+    assert payload["context"] is None
+    assert "ctx ·" in text
+
+
+def test_status_renders_a_legacy_meta_json_tokens_field_as_context(
+    cli: CliRunner, state_root: Path
+) -> None:
+    """SPEC.md *State on disk*: a legacy `tokens` field reads as `context` with
+    `used` and `peak` equal to it and `size` `null`."""
+    session_id = run_mock(cli, "echo:legacy tokens")
+    meta_path = state_root / "sessions" / session_id / "meta.json"
+    payload = json.loads(meta_path.read_text(encoding="utf-8"))
+    del payload["context"]
+    payload["tokens"] = 38_259
+    payload["cost"] = 0.19
+    meta_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    text = invoke(cli, "status", session_id, "--format", "text").stdout
+
+    assert "ctx 38.3k, peak 38.3k" in text
+
+
+def test_status_json_reports_the_default_policy_and_no_pending_corrections(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R2d/V4c: status names the resolved policy; corrections stay unobservable."""
+    monkeypatch.delenv("ACPC_CEILING", raising=False)
+    session_id = run_mock(cli, "echo:policy")
+
+    payload = json.loads(invoke(cli, "status", session_id, "--json").stdout)
+
+    assert payload["capabilities"] == {
+        "steer_mode": "cancel-then-start",
+        "continue_without_message": True,
+    }
+    assert payload["pending_corrections"] is None
+    assert payload["permissions"] == {
+        "policy": "read",
+        "mode": "default",
+        "source": "default",
+        "clamp": None,
+    }
+    assert "permissions:" in invoke(cli, "status", session_id, "--format", "text").stdout
+
+
+def test_status_json_reports_a_requested_permission_policy(cli: CliRunner) -> None:
+    """R2d: an explicit `--permissions` flag is named as the policy's source."""
+    result = invoke(cli, "run", "mock", "echo:edit", "--permissions", "edit", "--quiet", "--json")
+    session_id = json.loads(result.stdout)["session_id"]
+
+    permissions = json.loads(invoke(cli, "status", session_id, "--json").stdout)["permissions"]
+
+    assert permissions["policy"] == "edit"
+    assert permissions["source"] == "call flag"
+    assert permissions["clamp"] is None
+
+
+def test_status_json_reports_a_clamped_permission(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R2d: a ceiling-clamped policy still names all three clamp fields."""
+    monkeypatch.setenv("ACPC_CEILING", "edit")
+
+    result = invoke(cli, "run", "mock", "echo:clamped", "--permissions", "all", "--json")
+    session_id = json.loads(result.stdout)["session_id"]
+
+    permissions = json.loads(invoke(cli, "status", session_id, "--json").stdout)["permissions"]
+
+    assert permissions["policy"] == "edit"
+    assert permissions["clamp"] == {
+        "requested": "all",
+        "ceiling": "edit",
+        "effective": "edit",
+    }
 
 
 def test_status_reports_the_model_a_real_dispatch_resolved(cli: CliRunner) -> None:
     """End to end: the column reads the resolution the dispatch actually stored."""
     session_id = run_mock(cli, "echo:which model")
 
-    text = invoke(cli, "status", session_id).stdout
+    text = invoke(cli, "status", session_id, "--format", "text").stdout
     detail = json.loads(invoke(cli, "status", session_id, "--json").stdout)
-    row = json.loads(invoke(cli, "status", "--json").stdout)["sessions"][0]
+    row = json.loads(invoke(cli, "list", "--json").stdout)["items"][0]
 
     assert detail["model"] == "mock-sonnet-5"
     assert row["model"] == "mock-sonnet-5"
@@ -180,7 +271,7 @@ def test_status_detail_surfaces_current_failure_and_json(cli: CliRunner) -> None
     stored = json.loads(sessions.meta_path(session_id).read_text(encoding="utf-8"))
     assert stored["failure"] == meta.failure
 
-    text_result = invoke(cli, "status", session_id)
+    text_result = invoke(cli, "status", session_id, "--format", "text")
     json_result = invoke(cli, "status", session_id, "--json")
 
     assert f"failure  {meta.failure} · continue: acpc continue {session_id}" in text_result.stdout
@@ -190,7 +281,7 @@ def test_status_detail_surfaces_current_failure_and_json(cli: CliRunner) -> None
 def test_status_detail_omits_failure_for_successful_turn(cli: CliRunner) -> None:
     session_id = run_mock(cli)
 
-    text_result = invoke(cli, "status", session_id)
+    text_result = invoke(cli, "status", session_id, "--format", "text")
     json_result = invoke(cli, "status", session_id, "--json")
 
     assert "failure  " not in text_result.stdout
@@ -226,13 +317,13 @@ def test_continue_clears_the_previous_failure_from_status(cli: CliRunner) -> Non
     assert json.loads(invoke(cli, "status", session_id, "--json").stdout)["failure"] is None
 
 
-def test_status_json_without_an_id_returns_a_session_list(cli: CliRunner) -> None:
-    """Status JSON without an id returns the list envelope."""
+def test_list_json_returns_a_session_collection(cli: CliRunner) -> None:
+    """The list command returns the bounded collection envelope."""
     meta = finished_session()
 
-    result = invoke(cli, "status", "--json")
+    result = invoke(cli, "list", "--json")
 
-    row = json.loads(result.stdout)["sessions"][0]
+    row = json.loads(result.stdout)["items"][0]
     assert row["session_id"] == meta.session_id
     assert row["idle_seconds"] is None
     assert result.stdout == json.dumps(json.loads(result.stdout), ensure_ascii=False) + "\n"
@@ -249,17 +340,14 @@ def test_status_without_a_transcript_is_clean_for_an_active_session(cli: CliRunn
     assert json.loads(json_result.stdout)["idle_seconds"] is None
 
 
-def test_status_rejects_all_with_a_session_id(cli: CliRunner) -> None:
-    """Status refuses --all when a particular session was selected."""
-    meta = finished_session()
-
-    result = invoke(cli, "status", meta.session_id, "--all")
+def test_status_rejects_collection_only_flags(cli: CliRunner) -> None:
+    result = invoke(cli, "status", "some-id", "--plain", "--limit", "1")
 
     assert result.exit_code == vocab.EXIT_USAGE
 
 
-def test_status_reports_a_dead_running_session_as_orphaned(cli: CliRunner) -> None:
-    """Status verifies liveness and creates no transcript for an orphan."""
+def test_status_reports_a_dead_running_session_as_unknown(cli: CliRunner) -> None:
+    """Status verifies liveness and creates no transcript for an unknown outcome."""
     meta = sessions.create_session(entry="mock", base_adapter="mock", prompt="live check")
     sessions.mark_running(
         meta.session_id,
@@ -269,7 +357,7 @@ def test_status_reports_a_dead_running_session_as_orphaned(cli: CliRunner) -> No
 
     result = invoke(cli, "status", meta.session_id, "--json")
 
-    assert json.loads(result.stdout)["state"] == "orphaned"
+    assert json.loads(result.stdout)["status"] == "unknown"
     assert not sessions.transcript_path(meta.session_id).exists()
 
 
@@ -285,7 +373,7 @@ def test_log_keeps_events_on_stdout_and_footer_on_stderr(cli: CliRunner) -> None
 def test_failed_log_and_wait_surface_the_recorded_cause(cli: CliRunner) -> None:
     run_result = invoke(cli, "run", "mock", "auth:missing credentials", "--quiet", "--json")
     assert run_result.exit_code == vocab.EXIT_AGENT_ERROR
-    session_id = json.loads(run_result.stdout)["session_id"]
+    session_id = sessions.list_sessions()[0].session_id
 
     log_result = invoke(cli, "log", session_id, "--quiet")
     wait_result = invoke(cli, "wait", session_id, "--quiet")
@@ -356,9 +444,12 @@ def test_log_since_a_group_cursor_resumes_after_the_collapsed_reads(cli: CliRunn
 def test_wait_accepts_a_suffixed_timeout_on_a_finished_session(cli: CliRunner) -> None:
     session_id = run_mock(cli)
 
+    started = time.monotonic()
     result = invoke(cli, "wait", session_id, "--timeout", "1m", "--quiet")
+    elapsed = time.monotonic() - started
 
     assert result.exit_code == vocab.EXIT_OK
+    assert elapsed < 5.0
 
 
 def test_log_accepts_a_suffixed_timeout_on_a_finished_session(cli: CliRunner) -> None:
@@ -390,13 +481,15 @@ def test_negative_timeout_is_a_usage_error_for_waiting_views(
     assert "--timeout" in result.stderr
 
 
-def test_log_tail_limits_the_selected_events(cli: CliRunner) -> None:
-    """Log --tail limits the number of rendered event lines."""
-    session_id = run_mock(cli)
+def test_log_limit_starts_at_the_selected_position(cli: CliRunner) -> None:
+    """Log --limit emits the first N events after the selected position."""
+    meta = session_with_messages(5)
 
-    result = invoke(cli, "log", session_id, "--tail", "1")
+    result = invoke(cli, "log", meta.session_id, "--limit", "2")
 
-    assert len(result.stdout.splitlines()) <= 1
+    assert "event-0" in result.stdout
+    assert "event-1" in result.stdout
+    assert "event-2" not in result.stdout
 
 
 def test_log_json_emits_indexed_ndjson(cli: CliRunner) -> None:
@@ -409,6 +502,66 @@ def test_log_json_emits_indexed_ndjson(cli: CliRunner) -> None:
     assert events and all(isinstance(event["i"], int) for event in events)
 
 
+def test_log_json_and_ndjson_drop_the_usage_event_cost_and_meta(
+    cli: CliRunner, state_root: Path
+) -> None:
+    """SPEC.md `log`: `--format ndjson`'s one exception is a `usage` record,
+    published with `used` and `size` only — the adapter's `cost` and `meta`
+    stay on disk, and every other stored key keeps its on-disk order.
+
+    SPEC.md *State on disk* also keeps unknown fields, so a key acpc does not
+    know about survives the same publication that drops `cost` and `meta`."""
+    session_id = run_mock(cli, "both:700:3000000000:cost and meta")
+    transcript_path = state_root / "sessions" / session_id / "transcript.ndjson"
+    lines = transcript_path.read_text(encoding="utf-8").splitlines()
+    usage_index = next(i for i, line in enumerate(lines) if json.loads(line).get("type") == "usage")
+    on_disk = json.loads(lines[usage_index])
+    assert on_disk["cost"] == pytest.approx(0.3)
+    on_disk["meta"] = {"_claude/rateLimit": {"status": "ok"}}
+    on_disk["future_field"] = {"written_by": "a later acpc"}
+    lines[usage_index] = json.dumps(on_disk)
+    transcript_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    expected = {key: value for key, value in on_disk.items() if key not in ("cost", "meta")}
+
+    for args in (("--json",), ("--format", "ndjson")):
+        result = invoke(cli, "log", session_id, *args)
+        events = [json.loads(line) for line in result.stdout.splitlines()]
+        usage_events = [event for event in events if event.get("type") == "usage"]
+        assert usage_events == [expected]
+        assert list(usage_events[0].keys()) == list(expected.keys())
+
+
+def test_log_json_and_ndjson_read_a_legacy_usage_events_tokens_as_used(
+    cli: CliRunner, state_root: Path
+) -> None:
+    """SPEC.md *State on disk*: transcripts written before 1.0 record `tokens`
+    in place of `used`, read as such; `log` renames it in place and reports
+    `size: null` when the legacy record has none."""
+    session_id = run_mock(cli, "echo:legacy usage event")
+    transcript_path = state_root / "sessions" / session_id / "transcript.ndjson"
+    existing = [
+        json.loads(line) for line in transcript_path.read_text(encoding="utf-8").splitlines()
+    ]
+    next_index = max(event["i"] for event in existing if "i" in event) + 1
+    legacy_event = {
+        "type": "usage",
+        "tokens": 1234,
+        "cost": 0.01,
+        "ts": "2026-01-01T00:00:00.000000Z",
+        "i": next_index,
+    }
+    with transcript_path.open("a", encoding="utf-8") as file:
+        file.write(json.dumps(legacy_event) + "\n")
+
+    for args in (("--json",), ("--format", "ndjson")):
+        result = invoke(cli, "log", session_id, *args)
+        events = [json.loads(line) for line in result.stdout.splitlines()]
+        usage_events = [event for event in events if event.get("i") == next_index]
+        assert usage_events == [
+            {"type": "usage", "used": 1234, "ts": legacy_event["ts"], "i": next_index, "size": None}
+        ]
+
+
 def test_log_prose_renders_markdown_without_tool_lines(cli: CliRunner) -> None:
     """Log --prose shows agent markdown and filters tool events."""
     session_id = run_mock(cli)
@@ -416,6 +569,20 @@ def test_log_prose_renders_markdown_without_tool_lines(cli: CliRunner) -> None:
     result = invoke(cli, "log", session_id, "--prose")
 
     assert "## Answer" in result.stdout and "tool" not in result.stdout
+
+
+def test_log_prose_escapes_control_bytes_and_keeps_line_breaks(cli: CliRunner) -> None:
+    """SPEC.md `log`: `--prose` escapes terminal control bytes and keeps line
+    breaks — O3d applied to the full-message view, not just the answer."""
+    session_id = run_mock(cli, "echo:line one\x1b[31mred\x1b[0m\nline two\x9btwo")
+
+    result = invoke(cli, "log", session_id, "--prose")
+
+    assert "\x1b" not in result.stdout
+    assert "\x9b" not in result.stdout
+    assert "^[[31mred^[[0m" in result.stdout
+    assert "\\u009b" in result.stdout
+    assert "line one" in result.stdout and "\nline two" in result.stdout
 
 
 def test_the_log_footer_starts_on_a_fresh_line_after_unterminated_prose(cli: CliRunner) -> None:
@@ -439,29 +606,51 @@ def test_log_quiet_suppresses_the_stderr_footer(cli: CliRunner) -> None:
 
 
 def test_log_max_output_truncates_between_events_and_names_the_transcript(cli: CliRunner) -> None:
-    """Log --max-output stops at an event boundary and names transcript.ndjson."""
+    """Log --max-output stops at an event boundary and diagnoses on stderr."""
     meta = session_with_texts("event-0", "x" * 1000, "event-2")
 
-    result = invoke(cli, "log", meta.session_id, "--since", "0", "--max-output", "300")
+    result = invoke(cli, "log", meta.session_id, "--since", "0", "--max-output", "250")
 
     assert (
         "event-0" in result.stdout
         and "event-2" not in result.stdout
-        and "transcript.ndjson" in result.stdout
+        and "transcript.ndjson" in result.stderr
     )
 
 
-def test_log_applies_tail_after_since(cli: CliRunner) -> None:
-    """Log combines --since and --tail by tailing the post-cursor events."""
+def test_log_limit_applies_after_since(cli: CliRunner) -> None:
+    """Log combines --since and --limit by taking the first post-cursor events."""
     meta = session_with_messages(5)
 
-    result = invoke(cli, "log", meta.session_id, "--since", "1", "--tail", "2")
+    result = invoke(cli, "log", meta.session_id, "--since", "1", "--limit", "2")
 
     assert (
-        "event-1" not in result.stdout
-        and "event-2" not in result.stdout
-        and "event-4" in result.stdout
+        "event-0" not in result.stdout
+        and "event-1" in result.stdout
+        and "event-2" in result.stdout
+        and "event-3" not in result.stdout
     )
+
+
+def test_log_tail_selects_the_last_matching_events(cli: CliRunner) -> None:
+    meta = session_with_messages(5)
+
+    result = invoke(cli, "log", meta.session_id, "--tail", "2")
+
+    assert "event-2" not in result.stdout
+    assert "event-3" in result.stdout
+    assert "event-4" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "args",
+    [("--tail", "2", "--limit", "2")],
+)
+def test_log_rejects_conflicting_tail_selectors(cli: CliRunner, args: tuple[str, ...]) -> None:
+    result = invoke(cli, "log", "does-not-exist", *args, "--json")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert json.loads(result.stderr)["error"]["kind"] == "invalid_input"
 
 
 def test_log_since_past_the_end_notes_highest_cursor(cli: CliRunner) -> None:
@@ -566,18 +755,19 @@ def test_log_rejects_a_negative_since_cursor(cli: CliRunner) -> None:
     assert result.exit_code == vocab.EXIT_USAGE
 
 
-def test_log_rejects_a_negative_tail_count(cli: CliRunner) -> None:
-    """Log rejects a negative --tail count as a usage error."""
-    result = invoke(cli, "log", "does-not-exist", "--tail", "-1")
+def test_log_rejects_a_negative_limit(cli: CliRunner) -> None:
+    """Log rejects a negative --limit count as a usage error."""
+    result = invoke(cli, "log", "does-not-exist", "--limit", "-1")
 
     assert result.exit_code == vocab.EXIT_USAGE
 
 
 def test_log_rejects_an_unknown_session(cli: CliRunner) -> None:
-    """Log reports an unknown session as a usage error."""
+    """Log reports an unknown session as a plain not-found failure."""
     result = invoke(cli, "log", "does-not-exist")
 
-    assert result.exit_code == vocab.EXIT_USAGE
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    assert json.loads(result.stderr)["error"]["kind"] == "not_found"
 
 
 def test_log_wait_new_timeout_prints_the_footer(cli: CliRunner) -> None:
@@ -598,7 +788,7 @@ def test_log_wait_new_timeout_prints_the_footer(cli: CliRunner) -> None:
 
     assert result.exit_code == vocab.EXIT_TIMEOUT
     assert result.stdout == ""
-    assert "-- done" in result.stderr
+    assert "-- succeeded" in result.stderr
     assert "cursor:" in result.stderr
 
 
@@ -611,7 +801,7 @@ def test_wait_new_footer_reports_the_state_reached_during_the_wait(cli: CliRunne
 
     def finish_session() -> None:
         time.sleep(0.05)
-        sessions.transition(meta.session_id, "done", exit_code=0, stop_reason="end_turn")
+        sessions.transition(meta.session_id, "succeeded", exit_code=0, stop_reason="end_turn")
         transcript_file.append("msg", text="the last word")
 
     writer = threading.Thread(target=finish_session)
@@ -622,7 +812,7 @@ def test_wait_new_footer_reports_the_state_reached_during_the_wait(cli: CliRunne
         writer.join(timeout=2)
 
     assert "the last word" in result.stdout
-    assert result.stderr.lstrip().startswith("-- done")
+    assert result.stderr.lstrip().startswith("-- succeeded")
 
 
 def test_log_rejects_timeout_without_wait_new(cli: CliRunner) -> None:
@@ -633,7 +823,7 @@ def test_log_rejects_timeout_without_wait_new(cli: CliRunner) -> None:
 
 
 def test_wait_new_on_a_finished_session_returns_at_once(cli: CliRunner) -> None:
-    """SPEC --wait-new, the `logs -f` convention: following a stopped stream
+    """SPEC --wait-new, the `log --follow` convention: following a stopped stream
     ends — the full-timeout block would read as a hang."""
     session_id = run_mock(cli)
 
@@ -642,7 +832,7 @@ def test_wait_new_on_a_finished_session_returns_at_once(cli: CliRunner) -> None:
 
     assert time.monotonic() - started < 5
     assert result.exit_code == vocab.EXIT_TIMEOUT
-    assert "-- done" in result.stderr
+    assert "-- succeeded" in result.stderr
 
 
 def test_wait_new_notes_only_an_explicit_past_end_cursor(cli: CliRunner) -> None:
@@ -677,7 +867,7 @@ def test_wait_new_timeout_on_a_running_session_says_it_still_runs(cli: CliRunner
 
     assert result.exit_code == vocab.EXIT_TIMEOUT
     assert "still running (gave up waiting after 0.2s)" in result.stderr
-    assert f"acpc stop {meta.session_id} to cancel" in result.stderr
+    assert f"acpc cancel {meta.session_id} to cancel" in result.stderr
 
 
 def test_wait_timeout_on_a_running_session_says_it_still_runs(cli: CliRunner) -> None:
@@ -688,7 +878,14 @@ def test_wait_timeout_on_a_running_session_says_it_still_runs(cli: CliRunner) ->
 
     assert result.exit_code == vocab.EXIT_TIMEOUT
     assert "still running (gave up waiting after 0.1s)" in result.stderr
-    assert f"acpc stop {meta.session_id} to cancel" in result.stderr
+    assert f"acpc cancel {meta.session_id} to cancel" in result.stderr
+    error = json.loads(result.stderr.splitlines()[-1])["error"]
+    assert error["context"] == {
+        "session_id": meta.session_id,
+        "turn": 1,
+        "status": "running",
+        "retry_after_ms": 100,
+    }
 
 
 def test_log_wait_new_returns_after_the_transcript_grows(cli: CliRunner) -> None:
@@ -733,23 +930,33 @@ def test_failed_log_expands_the_last_agent_message(cli: CliRunner) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_follow_replays_the_last_ten_events_by_default(cli: CliRunner) -> None:
-    """SPEC --follow: the start point is a bounded replay, for orientation."""
+def test_follow_without_a_selector_replays_every_event(cli: CliRunner) -> None:
+    """An unqualified follow starts at the transcript beginning without a hidden window."""
     meta = session_with_messages(25)
 
-    result = invoke(cli, "log", meta.session_id, "--follow")
+    result = invoke(cli, "log", meta.session_id, "--json", "--follow", "--quiet")
 
     assert result.exit_code == vocab.EXIT_OK
-    assert len(result.stdout.splitlines()) == 10
-    assert '"event-15"' in result.stdout
-    assert '"event-14"' not in result.stdout
+    records = [json.loads(line) for line in result.stdout.splitlines()]
+    assert [record["text"] for record in records] == [f"event-{index}" for index in range(25)]
 
 
-def test_follow_tail_zero_replays_nothing(cli: CliRunner) -> None:
-    """--tail 0 is the new-events-only start point."""
+def test_follow_tail_replays_the_selected_window_then_follows(cli: CliRunner) -> None:
+    """An explicit tail chooses the replay depth for the tail-follow form."""
+    meta = session_with_messages(25)
+
+    result = invoke(cli, "log", meta.session_id, "--json", "--tail", "3", "--follow", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_OK
+    records = [json.loads(line) for line in result.stdout.splitlines()]
+    assert [record["text"] for record in records] == ["event-22", "event-23", "event-24"]
+
+
+def test_follow_limit_zero_replays_nothing(cli: CliRunner) -> None:
+    """--limit 0 is the new-events-only start point."""
     meta = session_with_messages(5)
 
-    result = invoke(cli, "log", meta.session_id, "--follow", "--tail", "0")
+    result = invoke(cli, "log", meta.session_id, "--follow", "--limit", "0")
 
     assert result.exit_code == vocab.EXIT_OK
     assert result.stdout == ""
@@ -760,7 +967,7 @@ def test_follow_notes_only_an_explicit_past_end_cursor(cli: CliRunner) -> None:
     meta = session_with_messages(3)
 
     explicit = invoke(cli, "log", meta.session_id, "--follow", "--since", "999")
-    implicit = invoke(cli, "log", meta.session_id, "--follow", "--tail", "0")
+    implicit = invoke(cli, "log", meta.session_id, "--follow", "--limit", "0")
 
     assert explicit.exit_code == vocab.EXIT_OK
     assert explicit.stdout == ""
@@ -792,7 +999,7 @@ def test_follow_on_a_finished_session_returns_at_once(cli: CliRunner) -> None:
 
     assert time.monotonic() - started < 5
     assert result.exit_code == vocab.EXIT_OK
-    assert result.stderr.lstrip().startswith("-- done")
+    assert result.stderr.lstrip().startswith("-- succeeded")
 
 
 def test_follow_ends_when_the_session_finishes(cli: CliRunner) -> None:
@@ -806,7 +1013,7 @@ def test_follow_ends_when_the_session_finishes(cli: CliRunner) -> None:
         transcript_file.append("msg", text="mid-follow event")
         time.sleep(0.05)
         transcript_file.append("msg", text="the last word")
-        sessions.transition(meta.session_id, "done", exit_code=0, stop_reason="end_turn")
+        sessions.transition(meta.session_id, "succeeded", exit_code=0, stop_reason="end_turn")
 
     writer = threading.Thread(target=finish)
     writer.start()
@@ -818,7 +1025,7 @@ def test_follow_ends_when_the_session_finishes(cli: CliRunner) -> None:
     assert result.exit_code == vocab.EXIT_OK
     assert "mid-follow event" in result.stdout
     assert "the last word" in result.stdout
-    assert result.stderr.lstrip().startswith("-- done")
+    assert result.stderr.lstrip().startswith("-- succeeded")
 
 
 def test_follow_timeout_exits_124_and_leaves_the_session_alone(cli: CliRunner) -> None:
@@ -830,31 +1037,40 @@ def test_follow_timeout_exits_124_and_leaves_the_session_alone(cli: CliRunner) -
 
     assert result.exit_code == vocab.EXIT_TIMEOUT
     assert "still running (gave up waiting after 0.2s)" in result.stderr
-    assert f"acpc stop {meta.session_id} to cancel" in result.stderr
+    assert f"acpc cancel {meta.session_id} to cancel" in result.stderr
     assert "cursor:" in result.stderr
     assert sessions.load(meta.session_id).state == "running"
 
 
 def test_follow_budget_exhaustion_exits_four_and_says_how_to_resume(cli: CliRunner) -> None:
     """SPEC exit codes: a cut stream is not a completed follow, so it gets its
-    own code and a way back into the stream."""
+    own code and a way back into the stream.
+
+    It is not a failure either: the caller asked for at most this many bytes
+    and got them, so there is no failure object — only the footer's cursor.
+    """
     meta = session_with_messages(25)
 
-    result = invoke(cli, "log", meta.session_id, "--follow", "--since", "0", "--max-output", "300")
+    result = invoke(cli, "log", meta.session_id, "--follow", "--since", "0", "--max-output", "200")
 
     assert result.exit_code == vocab.EXIT_BUDGET
-    assert "output truncated" in result.stdout
-    assert "--max-output 300 exhausted" in result.stderr
+    assert "output truncated" not in result.stdout
+    assert "full transcript:" in result.stderr
+    assert "--max-output 200 exhausted" in result.stderr
     assert f"acpc log {meta.session_id} --follow --since" in result.stderr
+    assert "cursor:" in result.stderr
+    last = [line for line in result.stderr.splitlines() if line.strip()][-1]
+    assert not last.startswith("{")
 
 
 def test_follow_cursor_covers_exactly_what_was_printed(cli: CliRunner) -> None:
     """A caller resuming at the footer's cursor sees no gap and no repeat."""
     meta = session_with_messages(25)
 
-    cut = invoke(cli, "log", meta.session_id, "--follow", "--since", "0", "--max-output", "300")
+    cut = invoke(cli, "log", meta.session_id, "--follow", "--since", "0", "--max-output", "200")
     assert cut.exit_code == vocab.EXIT_BUDGET
-    cursor = int(cut.stderr.rsplit("cursor:", 1)[1].strip())
+    footer = next(line for line in cut.stderr.splitlines() if "cursor:" in line)
+    cursor = int(footer.rsplit("cursor:", 1)[1].strip())
     printed = [
         line
         for line in cut.stdout.splitlines()
@@ -891,8 +1107,6 @@ def test_follow_budget_spans_the_whole_stream(cli: CliRunner) -> None:
             "log",
             meta.session_id,
             "--follow",
-            "--tail",
-            "0",
             "--max-output",
             "200",
             "--timeout",
@@ -907,7 +1121,7 @@ def test_follow_budget_spans_the_whole_stream(cli: CliRunner) -> None:
 
 
 def test_follow_json_stays_valid_ndjson_under_the_budget(cli: CliRunner) -> None:
-    """The cut appears as the typed `truncated` event, never a bare marker."""
+    """The cut keeps stdout as valid transcript NDJSON and diagnoses on stderr."""
     meta = session_with_messages(25)
 
     result = invoke(
@@ -925,7 +1139,9 @@ def test_follow_json_stays_valid_ndjson_under_the_budget(cli: CliRunner) -> None
     assert result.exit_code == vocab.EXIT_BUDGET
     events = [json.loads(line) for line in result.stdout.splitlines()]
     assert all(isinstance(event, dict) for event in events)
-    assert events[-1]["type"] == "truncated"
+    assert events
+    assert all(event["type"] != "truncated" for event in events)
+    assert "full transcript:" in result.stderr
 
 
 def test_follow_prose_renders_full_messages(cli: CliRunner) -> None:
@@ -949,14 +1165,14 @@ def test_follow_and_wait_new_are_mutually_exclusive(cli: CliRunner) -> None:
     assert "mutually exclusive" in result.stderr
 
 
-def test_follow_accepts_the_short_flag(cli: CliRunner) -> None:
-    """-f is a real flag on `log` now, not an alias hint."""
+def test_follow_rejects_the_removed_short_flag(cli: CliRunner) -> None:
+    """-f is reserved for --force and log teaches the canonical spelling."""
     meta = session_with_messages(3)
 
     result = invoke(cli, "log", meta.session_id, "-f")
 
-    assert result.exit_code == vocab.EXIT_OK
-    assert '"event-2"' in result.stdout
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert "--follow" in result.stderr
 
 
 def test_follow_quiet_suppresses_the_footer(cli: CliRunner) -> None:

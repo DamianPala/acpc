@@ -87,7 +87,7 @@ Caveat for A2 on a *base adapter* name: on a fresh home a cache miss triggers th
 
 | # | Do | Expect |
 |---|---|---|
-| B1 | Time `acpc run lt "Reply with exactly: OK"` from the clean home | A daemon starts; stderr summary (one `--` line: duration, tokens, exit, id, dir); record wall time |
+| B1 | Time `acpc run lt "Reply with exactly: OK"` from the clean home | A daemon starts; stderr summary (one `--` line: duration, ctx, exit, id, dir); record wall time |
 | B2 | Repeat it | Faster; `acpc daemon status` shows the same PID; record the delta |
 | B3 | `acpc daemon status` | One concrete target per entry used so far, each with PID, uptime, log path |
 | B4 | `acpc run lt2 "Reply with exactly: OK"` | A **second** daemon; both alive in `daemon status` |
@@ -146,6 +146,8 @@ D2 shipped broken in 0.2 and was caught by review, not tests. Measure it.
 ## V. Vendor facts (tier 2 — real codex only)
 
 Verifies the shipped codex TOML against vendor reality, one trivial prompt per check. Last verified 2026-08-06: modes `read-only`/`agent`/`agent-full-access`, `bypass_modes = ["agent-full-access"]`, preset `[effort_by_model]` rows allow low/medium/high/xhigh and unlisted models use the derived union; vendor still rejects minimal/ultra with `Invalid params`.
+
+`gpt-6-astra` verified 2026-09-05 against codex-acp 1.10.0 / codex-cli 0.153.4: live turns accepted low/medium/high/xhigh and max, matching the model's API reference. The app-server catalogue (`model/list`) advertises a sixth level, `ultra`, described as maximum reasoning with automatic task delegation — a harness mode, absent from the API reference, so the row stops at max. Because that row carries max, the derived union unlisted codex models fall back to now reaches max as well; every preset model still refuses it.
 
 | # | Do | Expect / record |
 |---|---|---|

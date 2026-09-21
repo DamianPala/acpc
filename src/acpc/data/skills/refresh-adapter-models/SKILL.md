@@ -21,23 +21,24 @@ only target. Investigate first; write only after step 5 yes.
 ## 1. Update the adapter
 
 The advertised list is whatever `command` currently speaks. A stale
-binary cannot grow new ids. Update that process **before** `--check`.
+binary cannot grow new ids. Update that process **before** `agents check`.
 
-- Entry has `install_command` → propose `acpc install $NAME` (same
-  trusted one-liner). Ask, then run it.
+- Entry has `install_command` → propose `acpc install $NAME --yes` (same
+  trusted one-liner; `--yes` is what carries your ask into a call that
+  cannot ask again). Ask, then run it.
 - No `install_command` → vendor's own upgrade from `install_docs` (grok:
   the `grok` CLI). Ask; do not invent `curl | bash`.
 - Binary missing → same path, still ask. Do not silently install.
 
-Then `acpc agents --check "$NAME"`. If check still fails, stop — the
+Then `acpc agents check "$NAME"`. If check still fails, stop — the
 catalogue is not trustworthy.
 
 ## 2. Which entry
 
 ```bash
 NAME=<adapter>          # stem: acpc run $NAME
-acpc agents             # roster
-acpc agents "$NAME"     # resolved entry + base_adapter
+acpc agents list         # roster
+acpc agents get "$NAME"  # resolved entry + base_adapter
 OVERLAY="${ACPC_HOME:-$HOME/.acpc}/agents/${NAME}.toml"
 ```
 
@@ -53,16 +54,16 @@ into the package later.
 
 ## 3. Catalogue
 
-Read, do not edit: `acpc agents "$NAME"`, `$OVERLAY` if it exists. Record
+Read, do not edit: `acpc agents get "$NAME"`, `$OVERLAY` if it exists. Record
 current `fast` / `standard` / `max` and every `[effort_by_model]` key. Do
 not copy rows from another adapter's TOML.
 
 Stale cache is yesterday's list:
 
 ```bash
-acpc agents --check "$NAME"      # live probe; refreshes cache
-acpc agents "$NAME" --models     # advertised ids + current presets
-acpc run "$NAME" "x" --dry-run   # today's default (no --model)
+acpc agents check "$NAME"        # live probe; refreshes cache
+acpc agents get "$NAME" --models # advertised ids + current presets
+acpc resolve "$NAME"              # today's default (no --model)
 ```
 
 If resolve refuses because no mode grants the default policy (codex has
@@ -70,7 +71,7 @@ no `read` ceiling), retry with `--permissions edit` (live turns: `all`).
 That is not an overlay change.
 
 The advertised **models** list is the catalogue — not OpenRouter, a blog,
-or another entry. The dry-run `model` line is today's default id.
+or another entry. The `resolve` `model` line is today's default id.
 
 | Bucket | Meaning |
 |---|---|
@@ -89,10 +90,11 @@ per level — wait for yes on that grid, or omit those rows.
 A new id does not inherit a sibling's effort list. Advertised is not
 runnable: if this account / plan rejects the model itself, omit the row.
 
-`--dry-run` only checks acpc's table. A live turn that exits 0 is not
+`resolve` only checks acpc's table. A live turn that exits 0 is not
 enough: harnesses often fall back (unknown effort → default) and still
-answer. `meta.json` / `acpc status` record what acpc **sent**, not what
-the vendor applied.
+answer. `meta.json` / `acpc status <id>` record what acpc **sent**, not what
+the vendor applied. Use the `session_id` returned by the live `run` above,
+or find it with `acpc list`.
 
 For every **new** id, a level enters the row only from the **intersection**
 of docs and a live apply that did not reject:
@@ -177,14 +179,14 @@ key and comment. Date the catalogue comment.
 ## 6. Prove the overlay
 
 ```bash
-acpc agents "$NAME"
-acpc run "$NAME" "x" --dry-run
-acpc run "$NAME" --model fast --dry-run
-acpc run "$NAME" --model standard --dry-run
-acpc run "$NAME" --model max --dry-run
+acpc agents get "$NAME"
+acpc resolve "$NAME"
+acpc resolve "$NAME" --model fast
+acpc resolve "$NAME" --model standard
+acpc resolve "$NAME" --model max
 ```
 
-Each dry-run must resolve the models you proposed. A preset whose effort
+Each `resolve` call must resolve the models you proposed. A preset whose effort
 the new row rejects means the overlay is wrong — fix the approved patch
 (no new proposal). A different model or effort choice needs a new yes.
 Report `$OVERLAY` and the diff.
@@ -193,7 +195,7 @@ Report `$OVERLAY` and the diff.
 
 | Symptom | Actually means |
 |---|---|
-| `--models` without `--check` | Yesterday's catalogue. |
+| `agents get --models` without `agents check` | Yesterday's catalogue. |
 | Edit `src/acpc/data/agents/` | Wrong tree. Overlay only. |
 | Live turn exit 0, docs omit the level | Silent fallback. Do not write that level. |
 | First row on an empty map | Unlisted models leave the global scale. Name it. |

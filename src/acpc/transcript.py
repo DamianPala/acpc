@@ -9,19 +9,23 @@ shared by all :class:`Transcript` instances in this process.
 import json
 import math
 import os
+import re
 import threading
 import time
 from collections.abc import Callable, Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NamedTuple
 
 from acpc.paths import ensure_private_dir
 
-SCHEMA = "acpc.transcript/1"
+SCHEMA = "acpc.transcript/2"
 HEADER = {"schema": SCHEMA}
 HEADER_LINE = (json.dumps(HEADER, separators=(", ", ": ")) + "\n").encode("utf-8")
 
-EVENT_TYPES = frozenset({"msg", "thought", "tool", "permission", "error", "state", "usage"})
+EVENT_TYPES = frozenset(
+    {"msg", "thought", "tool", "permission", "error", "state", "usage", "steer", "limit"}
+)
 
 _REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "msg": ("text",),
@@ -30,10 +34,19 @@ _REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "permission": ("kind", "decision"),
     "error": ("message",),
     "state": ("from", "to"),
-    "usage": ("tokens", "cost"),
+    "usage": ("used", "size"),
+    # SPEC.md `steer`: every correction is recorded with what acpc sent and
+    # what the adapter answered, so the transcript says why a mode was chosen.
+    "steer": ("mode", "text", "outcome"),
+    # SPEC.md *State on disk*: a usage limit that touched the turn, recording
+    # why it was recognized, when it should clear, and what acpc did about it.
+    "limit": ("reason", "resume_at", "action", "source", "detail"),
 }
 
 _TAIL_READ_BYTES = 8192
+_RFC3339_TIMESTAMP = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$"
+)
 
 
 class _PathState:
@@ -49,7 +62,7 @@ _states: dict[Path, _PathState] = {}
 
 
 class TranscriptError(ValueError):
-    """Raised when a transcript is not a valid ``acpc.transcript/1`` file."""
+    """Raised when a transcript is not a valid ``acpc.transcript/2`` file."""
 
 
 class TranscriptPage(NamedTuple):
@@ -97,6 +110,46 @@ def _format_error(path: Path, detail: str) -> TranscriptError:
     return TranscriptError(f"invalid transcript '{path}': {detail}")
 
 
+def _format_timestamp(value: float) -> str:
+    try:
+        timestamp = datetime.fromtimestamp(value, tz=UTC)
+    except (OverflowError, OSError, ValueError) as error:
+        raise ValueError("timestamp is outside the supported range") from error
+    return timestamp.isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _timestamp_seconds(value: Any, path: Path, *, what: str) -> float:
+    if isinstance(value, bool):
+        raise _format_error(path, f"{what} is not RFC 3339")
+    if isinstance(value, (int, float)):
+        try:
+            timestamp = float(value)
+        except (OverflowError, ValueError) as error:
+            raise _format_error(path, f"{what} is outside the supported range") from error
+        if not math.isfinite(timestamp):
+            raise _format_error(path, f"{what} is not finite")
+        try:
+            datetime.fromtimestamp(timestamp, tz=UTC)
+        except (OverflowError, OSError, ValueError) as error:
+            raise _format_error(path, f"{what} is outside the supported range") from error
+        return timestamp
+    if not isinstance(value, str):
+        raise _format_error(path, f"{what} is not RFC 3339")
+    if _RFC3339_TIMESTAMP.fullmatch(value) is None:
+        raise _format_error(path, f"{what} is not RFC 3339")
+    candidate = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError as error:
+        raise _format_error(path, f"{what} is not RFC 3339") from error
+    if parsed.tzinfo is None:
+        raise _format_error(path, f"{what} has no timezone")
+    timestamp = parsed.timestamp()
+    if not math.isfinite(timestamp):
+        raise _format_error(path, f"{what} is not finite")
+    return timestamp
+
+
 def _decode_json(path: Path, raw: bytes, *, what: str) -> Any:
     try:
         text = raw.decode("utf-8")
@@ -109,8 +162,11 @@ def _decode_json(path: Path, raw: bytes, *, what: str) -> Any:
 
 
 def _validate_header(path: Path, value: Any) -> None:
-    if not isinstance(value, dict) or value.get("schema") != SCHEMA or "i" in value:
+    if not isinstance(value, dict) or "i" in value:
         raise _format_error(path, f"first line must be the {SCHEMA!r} header")
+    schema = value.get("schema")
+    if schema != SCHEMA:
+        raise _format_error(path, f"unsupported schema {schema!r}; expected {SCHEMA!r}")
 
 
 def _validate_read_event(path: Path, value: Any, line_number: int) -> dict[str, Any]:
@@ -120,6 +176,9 @@ def _validate_read_event(path: Path, value: Any, line_number: int) -> dict[str, 
     index = value.get("i")
     if isinstance(index, bool) or not isinstance(index, int):
         raise _format_error(path, f"line {line_number} has no integer index")
+    if "ts" in value:
+        seconds = _timestamp_seconds(value["ts"], path, what=f"line {line_number} timestamp")
+        value["ts"] = _format_timestamp(seconds)
     return value
 
 
@@ -152,13 +211,13 @@ def last_event_time(path: Path | str) -> float | None:
     if isinstance(index, bool) or not isinstance(index, int):
         return None
     timestamp = value.get("ts")
-    if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)):
+    if timestamp is None:
         return None
     try:
-        timestamp_float = float(timestamp)
-    except (OverflowError, ValueError):
+        timestamp_float = _timestamp_seconds(timestamp, target, what="timestamp")
+    except TranscriptError:
         return None
-    return timestamp_float if math.isfinite(timestamp_float) else None
+    return timestamp_float
 
 
 def _parse(
@@ -261,7 +320,10 @@ class Transcript:
         missing = [field for field in _REQUIRED_FIELDS[event_type] if field not in candidate]
         if missing:
             raise TranscriptError(f"event {event_type!r} is missing {', '.join(missing)}")
-        candidate.setdefault("ts", time.time() if self._clock is None else self._clock())
+        raw_timestamp = candidate.get("ts", time.time() if self._clock is None else self._clock())
+        candidate["ts"] = _format_timestamp(
+            _timestamp_seconds(raw_timestamp, self.path, what="event timestamp")
+        )
 
         with self._state.lock:
             if self._state.pending_truncate is not None:

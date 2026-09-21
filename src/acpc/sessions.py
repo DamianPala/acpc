@@ -8,10 +8,10 @@ Two invariants drive the shape of this module:
 
 - **No torn reads.** `meta.json` is replaced atomically (frozen `paths`), and
   every mutation runs under a per-session file lock, so `run`, `continue` and
-  `stop` on one session never interleave.
+  `cancel` on one session never interleave.
 - **State is verified, not trusted.** A stored `running` means nothing on its
   own: `load` re-checks the host process through the frozen `proc` identity
-  token and persists `orphaned` when it is gone, so every reader agrees
+  token and persists `unknown` when it is gone, so every reader agrees
   without re-probing. The 30 s startup grace covers only the window before a
   host process has been recorded — once `pid` is in `meta.json`, liveness
   decides immediately.
@@ -23,14 +23,16 @@ retention ages without sleeping.
 import contextlib
 import errno
 import json
+import math
 import os
 import random
 import re
 import sys
 import threading
 import time
-from collections.abc import AsyncIterator, Callable, Iterator, Mapping
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, fields
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +54,7 @@ STARTUP_GRACE_SECONDS = 30.0
 RESERVED_NAME = "last"
 
 META_NAME = "meta.json"
+TOMBSTONE_NAME = ".tombstone"
 PROMPT_NAME = "prompt.md"
 ANSWER_NAME = "answer.md"
 TRANSCRIPT_NAME = "transcript.ndjson"
@@ -63,9 +66,61 @@ _ID_ALLOCATION_ATTEMPTS = 64
 # SPEC.md *Session states*. Finished states are terminal for the current turn;
 # a new turn re-opens the session through `rotate_turn`.
 _ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
-    "starting": frozenset({"running", "done", "failed", "cancelled", "timeout", "orphaned"}),
-    "running": frozenset({"done", "failed", "cancelled", "timeout", "orphaned"}),
+    "starting": frozenset({"running", "succeeded", "failed", "canceled", "unknown"}),
+    "running": frozenset({"succeeded", "failed", "canceled", "unknown", "waiting"}),
+    # A turn holding for a usage limit either resumes on the same adapter
+    # session (back to `running`) or ends without ever resuming.
+    "waiting": frozenset({"running", "succeeded", "failed", "canceled", "unknown"}),
 }
+
+_TIMESTAMP_FIELDS = frozenset({"created_at", "started_at", "finished_at"})
+_RFC3339_TIMESTAMP = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$"
+)
+
+
+def format_timestamp(value: float) -> str:
+    """Render one timestamp precision everywhere acpc publishes time."""
+    try:
+        timestamp = datetime.fromtimestamp(value, tz=UTC)
+    except (OverflowError, OSError, ValueError) as error:
+        raise ValueError("timestamp is outside the supported range") from error
+    return timestamp.isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def parse_timestamp(value: Any, key: str, path: Path) -> float | None:
+    """Read RFC 3339 timestamps, tolerating numeric pre-1.0 metadata."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise CorruptSessionError(f"{path}: {key} is not a timestamp")
+    if isinstance(value, (int, float)):
+        try:
+            timestamp = float(value)
+        except (OverflowError, ValueError) as error:
+            raise CorruptSessionError(f"{path}: {key} is outside the supported range") from error
+        if not math.isfinite(timestamp):
+            raise CorruptSessionError(f"{path}: {key} is not finite")
+        try:
+            datetime.fromtimestamp(timestamp, tz=UTC)
+        except (OverflowError, OSError, ValueError) as error:
+            raise CorruptSessionError(f"{path}: {key} is outside the supported range") from error
+        return timestamp
+    if not isinstance(value, str):
+        raise CorruptSessionError(f"{path}: {key} is not a timestamp")
+    if _RFC3339_TIMESTAMP.fullmatch(value) is None:
+        raise CorruptSessionError(f"{path}: {key} is not RFC 3339")
+    candidate = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError as error:
+        raise CorruptSessionError(f"{path}: {key} is not RFC 3339") from error
+    if parsed.tzinfo is None:
+        raise CorruptSessionError(f"{path}: {key} has no timezone")
+    try:
+        return parsed.timestamp()
+    except (OverflowError, OSError, ValueError) as error:
+        raise CorruptSessionError(f"{path}: {key} is outside the supported range") from error
 
 
 class SessionError(Exception):
@@ -84,8 +139,35 @@ class SessionStateError(SessionError):
     """The session's state does not accept this operation."""
 
 
+class SessionBusy(SessionStateError):
+    """The session is mid-turn or its lock is held by someone else.
+
+    Separate from its parent because this is the only state conflict that
+    clears on its own: the same call works once the turn ends, which is what
+    lets the envelope say `retryable`.  Every other `SessionStateError` is an
+    invariant a repeat will never satisfy.
+    """
+
+
+class SessionIdsExhausted(SessionError):
+    """No free session id was found; finished sessions have to be cleared.
+
+    Not a bad argument and not a missing target: acpc's own id space could not
+    serve the request, and only deleting state frees it.
+    """
+
+
 class SessionNameError(SessionError):
     """A `--name` alias or selector cannot be used as asked."""
+
+
+class SessionNameTaken(SessionNameError):
+    """The name is bound to a session that is still active.
+
+    Separate from its parent because the two fail for different reasons: a
+    reserved or empty name is a bad argument, while a live holder is state
+    that conflicts with the requested binding and clears on its own.
+    """
 
 
 @dataclass(slots=True, kw_only=True)
@@ -111,18 +193,30 @@ class SessionMeta:
     exit_code: int | None = None
     stop_reason: str | None = None
     failure: str | None = None
-    tokens: int = 0
-    cost: float | None = None
+    # SPEC.md V6c: usage the tool never observed is `null`, never `0`.
+    context: vocab.ContextOccupancy | None = None
     denied: dict[str, int] = field(default_factory=dict)
     denial_details: dict[str, dict[str, Any]] = field(default_factory=dict)
     prompt_snippet: str = ""
     resolution: dict[str, Any] = field(default_factory=dict)
     adapter_session_id: str | None = None
     target: str | None = None
+    steer_mode: str | None = None
+    # SPEC.md `run`/*State on disk*: `limit` describes a usage limit that
+    # touched the current turn (`None` when none has). Whether it blocks the
+    # turn or is waited out is a config-time question (`limit_wait_max`), not
+    # session state.
+    limit: dict[str, Any] | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        data: dict[str, Any] = {name: getattr(self, name) for name in _META_FIELDS}
+        data: dict[str, Any] = {
+            ("status" if name == "state" else name): getattr(self, name) for name in _META_FIELDS
+        }
+        for name in _TIMESTAMP_FIELDS:
+            value = data.get(name)
+            if value is not None:
+                data[name] = format_timestamp(float(value))
         data.update(self.extra)
         return data
 
@@ -142,6 +236,7 @@ class SessionMeta:
         defensive: `meta.json` can come from an older writer or a torn write,
         and a status view must never be the thing that raises.
         """
+
         resolved = self.resolution.get("resolved")
         if not isinstance(resolved, dict):
             return None
@@ -181,6 +276,10 @@ def transcript_path(session_id: str) -> Path:
     return session_dir(session_id) / TRANSCRIPT_NAME
 
 
+def tombstone_path(session_id: str) -> Path:
+    return session_dir(session_id) / TOMBSTONE_NAME
+
+
 def session_paths(session_id: str) -> dict[str, str]:
     """The four advertised paths, as the `--json` envelope's `paths` object."""
     return {
@@ -191,9 +290,9 @@ def session_paths(session_id: str) -> dict[str, str]:
     }
 
 
-def turn_path(session_id: str, stem: str, turn: int) -> Path:
-    """Path of an earlier turn's artifact, e.g. `prompt.2.md`."""
-    return session_dir(session_id) / f"{stem}.{turn}.md"
+def turn_path(session_id: str, stem: str, turn: int, *, ext: str = "md") -> Path:
+    """Path of an earlier turn's artifact, e.g. `prompt.2.md` or `meta.2.json`."""
+    return session_dir(session_id) / f"{stem}.{turn}.{ext}"
 
 
 # --------------------------------------------------------------------------
@@ -259,11 +358,9 @@ def _try_acquire_file_lock(fd: int) -> bool:
     return True
 
 
-def _session_busy(session_id: str) -> SessionStateError:
+def _session_busy(session_id: str) -> SessionBusy:
     """Use continue's existing actionable message for a preparation collision."""
-    return SessionStateError(
-        f"session {session_id} is running — wait for the current turn to finish"
-    )
+    return SessionBusy(f"session {session_id} is running — wait for the current turn to finish")
 
 
 @contextlib.contextmanager
@@ -310,7 +407,7 @@ async def session_reservation(session_id: str) -> AsyncIterator[None]:
         _lock_depth.held.add(session_id)
         meta = read_meta(session_id)
         if meta.is_active:
-            raise SessionStateError(
+            raise SessionBusy(
                 f"session {session_id} is {meta.state} — wait for the current turn to finish"
             )
         yield
@@ -332,14 +429,6 @@ def _coerce_int(value: Any, key: str, path: Path) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         raise CorruptSessionError(f"{path}: {key} is not an integer")
     return value
-
-
-def _coerce_float(value: Any, key: str, path: Path) -> float | None:
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise CorruptSessionError(f"{path}: {key} is not a number")
-    return float(value)
 
 
 def _coerce_str(value: Any, key: str, path: Path) -> str | None:
@@ -365,6 +454,30 @@ def _coerce_denied(value: Any, key: str, path: Path) -> dict[str, int]:
     return denied
 
 
+def _coerce_steer_mode(value: Any, key: str, path: Path) -> str | None:
+    """Read the current correction mode from new or legacy session metadata."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        if not value:
+            raise CorruptSessionError(f"{path}: {key} has an invalid mode")
+        return value if value in vocab.STEER_MODES else vocab.STEER_CANCEL_THEN_START
+    if not isinstance(value, list):
+        raise CorruptSessionError(f"{path}: {key} is not a string")
+    for mode in value:
+        if not isinstance(mode, str) or not mode:
+            raise CorruptSessionError(f"{path}: {key} has an invalid mode")
+    return vocab.STEER_IN_PLACE if vocab.STEER_IN_PLACE in value else vocab.STEER_CANCEL_THEN_START
+
+
+def _coerce_limit(value: Any, key: str, path: Path) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise CorruptSessionError(f"{path}: {key} is not an object")
+    return dict(value)
+
+
 def _coerce_denial_details(value: Any, key: str, path: Path) -> dict[str, dict[str, Any]]:
     if value is None:
         return {}
@@ -380,27 +493,73 @@ def _coerce_denial_details(value: Any, key: str, path: Path) -> dict[str, dict[s
     return details
 
 
+def _coerce_context(
+    known: Mapping[str, Any], data: Mapping[str, Any], path: Path
+) -> vocab.ContextOccupancy | None:
+    """Read `context`, migrating a pre-1.0 `tokens`/`cost` pair on the way in.
+
+    SPEC.md *State on disk*: "Metadata written before 1.0 carried `tokens` and
+    `cost` instead; on read, `tokens` becomes `context` with `used` and `peak`
+    equal to it and `size` `null`, and `cost` is dropped." `"context" in known`
+    tells a migrated or fresh file (even one explicitly `null`) apart from an
+    old file that never had the key at all.
+    """
+    if "context" in known:
+        value = known.get("context")
+        if value is None:
+            return None
+        if not isinstance(value, dict):
+            raise CorruptSessionError(f"{path}: context is not an object")
+        used = _coerce_int(value.get("used"), "context.used", path)
+        size = _coerce_int(value.get("size"), "context.size", path)
+        peak = _coerce_int(value.get("peak"), "context.peak", path)
+        if used is None or peak is None:
+            raise CorruptSessionError(f"{path}: context is missing used or peak")
+        return {"used": used, "size": size, "peak": peak}
+    legacy_tokens = _coerce_int(data.get("tokens"), "tokens", path)
+    if legacy_tokens is None:
+        return None
+    return {"used": legacy_tokens, "size": None, "peak": legacy_tokens}
+
+
 def meta_from_dict(data: Mapping[str, Any], *, path: Path) -> SessionMeta:
     """Build a `SessionMeta` from parsed JSON, rejecting damaged state.
 
     `path` only shapes the error message: SPEC.md's output contract wants one
     actionable line naming the file, never a traceback.
     """
-    known = {key: value for key, value in data.items() if key in _META_FIELDS}
-    extra = {key: value for key, value in data.items() if key not in _META_FIELDS}
+    known = {key: value for key, value in data.items() if key in _META_FIELDS or key == "status"}
+    extra = {
+        key: value
+        for key, value in data.items()
+        if key not in _META_FIELDS
+        and key not in {"status", "state", "steer_modes", "tokens", "cost"}
+    }
 
     session_id = _coerce_str(known.get("session_id"), "session_id", path)
     entry = _coerce_str(known.get("entry"), "entry", path)
     if not session_id or not entry:
         raise CorruptSessionError(f"{path}: missing session_id or entry")
 
-    state = _coerce_str(known.get("state"), "state", path) or "starting"
+    raw_state = known.get("status", known.get("state"))
+    raw_state_text = _coerce_str(raw_state, "status", path) or "starting"
+    state = vocab.normalize_session_state(raw_state_text)
     if state not in vocab.SESSION_STATES:
-        raise CorruptSessionError(f"{path}: unknown session state {state!r}")
+        raise CorruptSessionError(f"{path}: unknown session status {state!r}")
 
     resolution = known.get("resolution") or {}
     if not isinstance(resolution, dict):
         raise CorruptSessionError(f"{path}: resolution is not an object")
+
+    exit_code = _coerce_int(known.get("exit_code"), "exit_code", path)
+    raw_stop_reason = _coerce_str(known.get("stop_reason"), "stop_reason", path)
+    stop_reason = vocab.normalize_stop_reason(raw_stop_reason)
+    if raw_state_text == "timeout":
+        # Legacy timeout was a terminal session state; in 1.0 only a client's
+        # wait deadline uses 124, so a migrated failed turn uses its canonical
+        # failure fields instead of publishing two incompatible stories.
+        exit_code = vocab.EXIT_AGENT_ERROR
+        stop_reason = "error"
 
     return SessionMeta(
         session_id=session_id,
@@ -410,35 +569,36 @@ def meta_from_dict(data: Mapping[str, Any], *, path: Path) -> SessionMeta:
         state=state,
         pid=_coerce_int(known.get("pid"), "pid", path),
         process_start_time=_coerce_str(known.get("process_start_time"), "process_start_time", path),
-        created_at=_coerce_float(known.get("created_at"), "created_at", path),
-        started_at=_coerce_float(known.get("started_at"), "started_at", path),
-        finished_at=_coerce_float(known.get("finished_at"), "finished_at", path),
+        created_at=parse_timestamp(known.get("created_at"), "created_at", path),
+        started_at=parse_timestamp(known.get("started_at"), "started_at", path),
+        finished_at=parse_timestamp(known.get("finished_at"), "finished_at", path),
         turns=_coerce_int(known.get("turns"), "turns", path) or 1,
-        exit_code=_coerce_int(known.get("exit_code"), "exit_code", path),
-        stop_reason=_coerce_str(known.get("stop_reason"), "stop_reason", path),
+        exit_code=exit_code,
+        stop_reason=stop_reason,
         failure=_coerce_str(known.get("failure"), "failure", path),
-        tokens=_coerce_int(known.get("tokens"), "tokens", path) or 0,
-        cost=_coerce_float(known.get("cost"), "cost", path),
+        context=_coerce_context(known, data, path),
         denied=_coerce_denied(known.get("denied"), "denied", path),
         denial_details=_coerce_denial_details(known.get("denial_details"), "denial_details", path),
         prompt_snippet=_coerce_str(known.get("prompt_snippet"), "prompt_snippet", path) or "",
         resolution=dict(resolution),
         adapter_session_id=_coerce_str(known.get("adapter_session_id"), "adapter_session_id", path),
         target=_coerce_str(known.get("target"), "target", path),
+        steer_mode=_coerce_steer_mode(
+            data.get("steer_mode") if "steer_mode" in data else data.get("steer_modes"),
+            "steer_mode" if "steer_mode" in data else "steer_modes",
+            path,
+        ),
+        limit=_coerce_limit(known.get("limit"), "limit", path),
         extra=extra,
     )
 
 
-def read_meta(session_id: str) -> SessionMeta:
-    """Read `meta.json` verbatim, without verifying liveness.
-
-    Use `load` for anything that reports or gates on state.
-    """
-    path = meta_path(session_id)
+def _read_meta_file(path: Path, *, not_found: Callable[[], SessionError]) -> SessionMeta:
+    """Read one metadata file verbatim, with `read_meta`'s normalization."""
     try:
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
-        raise SessionNotFound(f"unknown session {session_id!r}") from None
+        raise not_found() from None
     except OSError as error:
         raise CorruptSessionError(f"{path}: cannot be read ({error.strerror})") from None
     try:
@@ -450,6 +610,30 @@ def read_meta(session_id: str) -> SessionMeta:
     return meta_from_dict(data, path=path)
 
 
+def read_meta(session_id: str) -> SessionMeta:
+    """Read `meta.json` verbatim, without verifying liveness.
+
+    Use `load` for anything that reports or gates on state.
+    """
+    return _read_meta_file(
+        meta_path(session_id),
+        not_found=lambda: SessionNotFound(f"unknown session {session_id!r}"),
+    )
+
+
+def read_turn_meta(session_id: str, turn: int) -> SessionMeta:
+    """Read a finished turn's parked `meta.<n>.json`, with `read_meta`'s normalization.
+
+    SPEC.md *State on disk*: rotation parks the finished turn's metadata
+    alongside its prompt and answer, so `wait` can still describe a turn the
+    session has since rotated past.
+    """
+    return _read_meta_file(
+        turn_path(session_id, "meta", turn, ext="json"),
+        not_found=lambda: SessionNotFound(f"unknown turn {turn} for session {session_id!r}"),
+    )
+
+
 def write_meta(meta: SessionMeta) -> None:
     """Publish `meta.json` atomically. Callers hold the session lock."""
     paths.ensure_private_dir(session_dir(meta.session_id))
@@ -459,7 +643,7 @@ def write_meta(meta: SessionMeta) -> None:
 def load(session_id: str, *, clock: Clock | None = None) -> SessionMeta:
     """Read a session and verify the process behind an active state.
 
-    A dead host process is persisted as `orphaned` (atomic, under the session
+    A dead host process is persisted as `unknown` (atomic, under the session
     lock) together with the placeholder `answer.md`, so later readers agree
     without re-probing.
     """
@@ -483,36 +667,36 @@ def _verify_liveness(meta: SessionMeta, *, clock: Clock) -> SessionMeta:
         reason = f"the process hosting it (pid {meta.pid}) is gone"
     else:
         return meta
-    return _persist_orphaned(meta.session_id, reason, clock=clock)
+    return _persist_unknown(meta.session_id, reason, clock=clock)
 
 
-def _persist_orphaned(session_id: str, reason: str, *, clock: Clock) -> SessionMeta:
+def _persist_unknown(session_id: str, reason: str, *, clock: Clock) -> SessionMeta:
     with session_lock(session_id):
         current = read_meta(session_id)
         if not current.is_active:
             return current
-        current.state = "orphaned"
-        current.stop_reason = "orphaned"
+        current.state = "unknown"
+        current.stop_reason = "unknown"
         current.exit_code = vocab.EXIT_AGENT_ERROR
         if current.finished_at is None:
             current.finished_at = clock()
         write_meta(current)
-        _write_orphan_placeholder(current, reason)
+        _write_unknown_placeholder(current, reason)
     return current
 
 
-def _write_orphan_placeholder(meta: SessionMeta, reason: str) -> None:
+def _write_unknown_placeholder(meta: SessionMeta, reason: str) -> None:
     """Guarantee the advertised `answer.md` exists and explains itself.
 
-    SPEC.md *State on disk*: for `orphaned` the dead process wrote nothing, so
-    detection leaves a one-line placeholder naming what died.
+    SPEC.md *State on disk*: when the dead process wrote nothing, detection
+    leaves a one-line placeholder naming what died.
     """
     path = answer_path(meta.session_id)
     if path.exists():
         return
     paths.atomic_write(
         path,
-        f"Session {meta.session_id} was orphaned: {reason}; this turn produced no answer.\n",
+        f"Session {meta.session_id} is unknown: {reason}; this turn produced no answer.\n",
     )
 
 
@@ -545,9 +729,30 @@ def allocate_session_id(*, rng: random.Random | None = None) -> str:
             continue
         paths.ensure_private_dir(directory)
         return candidate
-    raise SessionError(
+    raise SessionIdsExhausted(
         f"could not allocate a free session id after {_ID_ALLOCATION_ATTEMPTS} attempts — "
-        f"run 'acpc prune' to clear finished sessions"
+        "the session id space is exhausted and allocated identifiers are permanently reserved"
+    )
+
+
+def _is_tombstone(directory: Path) -> bool:
+    return (directory / TOMBSTONE_NAME).is_file()
+
+
+def _clear_directory(directory: Path) -> None:
+    for child in sorted(directory.iterdir(), reverse=True):
+        if child.name == LOCK_NAME:
+            continue
+        if child.is_dir() and not child.is_symlink():
+            _remove_tree(child)
+        else:
+            child.unlink()
+
+
+def _write_tombstone(directory: Path, deleted_at: float) -> None:
+    paths.atomic_write(
+        directory / TOMBSTONE_NAME,
+        {"deleted_at": format_timestamp(deleted_at)},
     )
 
 
@@ -635,6 +840,16 @@ def update_meta(session_id: str, **changes: Any) -> SessionMeta:
     return meta
 
 
+def _close_limit(meta: "SessionMeta") -> None:
+    """Flip a turn's `limit.auto_continue` to `false` once the turn ends.
+
+    SPEC.md `status`: `auto_continue` is `true` while the session is
+    `waiting` and `false` once the turn ended, whichever way it ended.
+    """
+    if meta.limit is not None and meta.limit.get("auto_continue"):
+        meta.limit = {**meta.limit, "auto_continue": False}
+
+
 def transition(
     session_id: str,
     to_state: str,
@@ -648,8 +863,9 @@ def transition(
     entering any finished state stamps `finished_at`.
     """
     resolved_clock = _resolve_clock(clock)
+    to_state = vocab.normalize_session_state(to_state)
     if to_state not in vocab.SESSION_STATES:
-        raise ValueError(f"unknown session state {to_state!r}")
+        raise ValueError(f"unknown session status {to_state!r}")
     unknown = set(changes) - set(_META_FIELDS)
     if unknown:
         raise ValueError(f"unknown meta fields: {', '.join(sorted(unknown))}")
@@ -666,8 +882,10 @@ def transition(
         now = resolved_clock()
         if to_state == "running" and meta.started_at is None:
             meta.started_at = now
-        if to_state in vocab.FINISHED_STATES and meta.finished_at is None:
-            meta.finished_at = now
+        if to_state in vocab.FINISHED_STATES:
+            if meta.finished_at is None:
+                meta.finished_at = now
+            _close_limit(meta)
         write_meta(meta)
     return meta
 
@@ -690,8 +908,9 @@ def finalize_turn(
     owner from writing its answer into the replacement turn.
     """
     resolved_clock = _resolve_clock(clock)
+    to_state = vocab.normalize_session_state(to_state)
     if to_state not in vocab.SESSION_STATES:
-        raise ValueError(f"unknown session state {to_state!r}")
+        raise ValueError(f"unknown session status {to_state!r}")
     unknown = set(changes) - set(_META_FIELDS)
     if unknown:
         raise ValueError(f"unknown meta fields: {', '.join(sorted(unknown))}")
@@ -715,14 +934,16 @@ def finalize_turn(
         if delivery_record_incomplete:
             meta.extra[DELIVERY_RECORD_INCOMPLETE] = True
         for key, value in changes.items():
-            if key in {"tokens", "cost"} and value is None:
+            if key == "context" and value is None:
                 continue
             setattr(meta, key, value)
         now = resolved_clock()
         if to_state == "running" and meta.started_at is None:
             meta.started_at = now
-        if to_state in vocab.FINISHED_STATES and meta.finished_at is None:
-            meta.finished_at = now
+        if to_state in vocab.FINISHED_STATES:
+            if meta.finished_at is None:
+                meta.finished_at = now
+            _close_limit(meta)
         write_meta(meta)
         return meta
 
@@ -732,6 +953,7 @@ def mark_running(
     *,
     pid: int,
     process_start_time: str | None = None,
+    steer_mode: str | None = None,
     clock: Clock | None = None,
 ) -> SessionMeta:
     """Record the process hosting this session's turns and open the turn.
@@ -739,29 +961,30 @@ def mark_running(
     The recorded pid is the daemon on the daemon path and the acpc client on
     the direct path. Recording it ends the startup grace: from here on,
     liveness alone decides whether the session is still alive.
+
+    ``steer_mode`` is what the caller already knows about the turn it is
+    opening; the daemon path learns it from the adapter, so it passes nothing
+    and records the mode once `initialize` has answered.
     """
     token = process_start_time
     if token is None:
         token = proc.process_start_time(pid)
-    return transition(
-        session_id,
-        "running",
-        clock=clock,
-        pid=pid,
-        process_start_time=token,
-    )
+    changes: dict[str, Any] = {"pid": pid, "process_start_time": token}
+    if steer_mode is not None:
+        changes["steer_mode"] = steer_mode
+    return transition(session_id, "running", clock=clock, **changes)
 
 
 def rotate_turn(
     session_id: str,
     *,
     clock: Clock | None = None,
-    permissions_from_meta: Callable[[SessionMeta], str | None] | None = None,
     resolution_from_meta: Callable[[SessionMeta], Mapping[str, Any]] | None = None,
     target_from_meta: Callable[[SessionMeta], str] | None = None,
     prompt: str | None = None,
     resume_status: str | None = None,
     pid: int | None = None,
+    steer_mode: str | None = None,
 ) -> SessionMeta:
     """Open the next turn: park the finished turn's artifacts, reset per-turn state.
 
@@ -769,35 +992,33 @@ def rotate_turn(
     and renames each file exactly once, ever — turn numbers are fixed, so
     there is no logrotate-style cascade. A mid-turn session therefore has no
     `answer.md` until the turn produces one.
+
+    Support for in-place steering belongs to the turn, not the session, so it
+    is decided again here: a caller that already knows the answer passes
+    ``steer_mode``, and the daemon records its own once the adapter has
+    answered `initialize`.
     """
     resolved_clock = _resolve_clock(clock)
     with session_lock(session_id):
         meta = read_meta(session_id)
         if meta.is_active:
-            raise SessionStateError(
+            raise SessionBusy(
                 f"session {session_id} is {meta.state} — wait for the current turn to finish"
             )
+        turn = meta.turns
+        # SPEC.md *State on disk*: parked before anything below describes the
+        # next turn (the callbacks included), so the snapshot is exactly what
+        # `wait` reports for turn `turn` once the session has rotated past it.
+        parked_meta = turn_path(session_id, "meta", turn, ext="json")
+        if not parked_meta.exists():
+            paths.atomic_write(parked_meta, meta.to_dict())
         # Any value derived from session state must be a callback. The callback
         # receives this locked re-read, so a caller cannot accidentally compute
         # a snapshot value before the lock and write it after the lock.
-        if resolution_from_meta is not None and permissions_from_meta is not None:
-            raise SessionStateError(
-                f"session {session_id} received both resolution and permissions updates"
-            )
         if resolution_from_meta is not None:
             meta.resolution = dict(resolution_from_meta(meta))
-        elif permissions_from_meta is not None:
-            permissions = permissions_from_meta(meta)
-            if permissions is None:
-                raise SessionStateError(f"session {session_id} has no permission update")
-            resolved = meta.resolution.get("resolved")
-            if not isinstance(resolved, dict):
-                raise SessionStateError(f"session {session_id} has no stored permission resolution")
-            resolved["permissions"] = {"value": permissions, "source": "call flag"}
-            meta.resolution.pop("permissions_source", None)
         if target_from_meta is not None:
             meta.target = target_from_meta(meta)
-        turn = meta.turns
         for stem, current in (
             ("prompt", prompt_path(session_id)),
             ("answer", answer_path(session_id)),
@@ -816,6 +1037,10 @@ def rotate_turn(
         meta.failure = None
         meta.denied = {}
         meta.denial_details = {}
+        meta.steer_mode = steer_mode
+        # SPEC.md `run`: a usage limit belongs to the turn it touched, so a
+        # new turn starts clean.
+        meta.limit = None
         meta.extra.pop("failure", None)
         meta.extra.pop("resume", None)
         if prompt is not None:
@@ -863,6 +1088,8 @@ def list_sessions(*, clock: Clock | None = None, verify: bool = True) -> list[Se
     for directory in entries:
         if not directory.is_dir():
             continue
+        if _is_tombstone(directory):
+            continue
         try:
             meta = read_meta(directory.name)
         except SessionError:
@@ -882,14 +1109,17 @@ def resolve_selector(
 ) -> str:
     """Map a session id, a `--name` alias or `last` to a session id.
 
-    `last` is TTY-only (SPEC.md *TTY vs non-TTY*): a stale "last" misleads an
-    agent caller, so a non-TTY caller gets a reasoned rejection instead.
+    `last` resolves only in an interactive context, which the caller settles:
+    a stale "last" misleads a script or an agent, which cannot see that it
+    picked up somebody else's session.
     """
     resolved_clock = _resolve_clock(clock)
     if selector == RESERVED_NAME:
         if not allow_last:
             raise SessionNameError(
-                "`last` works on a TTY only — pass a session id, or name sessions with --name"
+                "`last` resolves only in an interactive context, and this call is not one "
+                "(a TTY on stdin, no --json, NO_INPUT unset) — pass a session id, or name "
+                "sessions with --name"
             )
         candidates = list_sessions(clock=resolved_clock, verify=False)
         if not candidates:
@@ -926,9 +1156,9 @@ def claim_name(name: str, *, clock: Clock | None = None) -> str | None:
         return None
     holder = _verify_liveness(holders[0], clock=resolved_clock)
     if holder.is_active:
-        raise SessionNameError(
+        raise SessionNameTaken(
             f"name {name!r} belongs to session {holder.session_id}, still {holder.state} — "
-            f"stop it first or pick another name"
+            f"cancel it first or pick another name"
         )
     return f"name {name!r} was bound to session {holder.session_id}; rebinding it to the new one"
 
@@ -947,17 +1177,43 @@ def _remove_tree(directory: Path) -> None:
     directory.rmdir()
 
 
+def ensure_deletable(meta: SessionMeta) -> None:
+    """Refuse an active session, so a caller can check before it commits.
+
+    SPEC.md `delete`: errors on `starting`/`running` — `cancel` it first. Split out
+    so the CLI can run this check before it asks for confirmation: a running
+    session is a conflict, not something a confirmation would resolve.
+    """
+    if meta.is_active:
+        raise SessionBusy(f"session {meta.session_id} is {meta.state} — cancel it before delete")
+
+
 def delete_session(session_id: str, *, clock: Clock | None = None) -> None:
     """Delete one session's on-disk state; active sessions are refused.
 
-    SPEC.md `rm`: errors on `starting`/`running` — `stop` it first. Liveness is
-    verified first, so a session whose process died is deletable.
+    Liveness is verified first, so a session whose process died is deletable.
     """
     resolved_clock = _resolve_clock(clock)
-    meta = load(session_id, clock=resolved_clock)
-    if meta.is_active:
-        raise SessionStateError(f"session {session_id} is {meta.state} — stop it before rm")
-    _remove_tree(session_dir(session_id))
+    with session_lock(session_id):
+        ensure_deletable(load(session_id, clock=resolved_clock))
+        directory = session_dir(session_id)
+        _clear_directory(directory)
+        _write_tombstone(directory, resolved_clock())
+
+
+def prune_candidates(*, older_than: float, clock: Clock | None = None) -> list[SessionMeta]:
+    """Resolve the finished sessions older than `older_than` seconds."""
+    resolved_clock = _resolve_clock(clock)
+    now = resolved_clock()
+    candidates: list[SessionMeta] = []
+    for meta in list_sessions(clock=resolved_clock):
+        if meta.is_active:
+            continue
+        reference = meta.finished_at if meta.finished_at is not None else meta.created_at
+        if reference is None or now - reference < older_than:
+            continue
+        candidates.append(meta)
+    return candidates
 
 
 def prune_sessions(
@@ -965,24 +1221,51 @@ def prune_sessions(
     older_than: float,
     dry_run: bool = False,
     clock: Clock | None = None,
+    candidates: Sequence[SessionMeta] | None = None,
 ) -> list[SessionMeta]:
-    """Delete finished sessions older than `older_than` seconds.
+    """Delete resolved finished sessions older than `older_than` seconds.
 
-    Age is measured from `finished_at` (SPEC.md `prune`), falling back to
-    `created_at` for a session that never recorded one. Active sessions are
-    never touched, and liveness is verified first so orphans do get collected.
+    When `candidates` is supplied, it is the target set already resolved by a
+    caller before a confirmation gate. Age is measured from `finished_at`,
+    falling back to `created_at`; active sessions are never selected. Before
+    the first deletion, every target is locked in session-id order and read
+    back; a changed target aborts the whole mutation.
     """
     resolved_clock = _resolve_clock(clock)
+    selected = (
+        list(candidates)
+        if candidates is not None
+        else prune_candidates(older_than=older_than, clock=resolved_clock)
+    )
+    if dry_run:
+        return selected
+    if not selected:
+        return selected
+
     now = resolved_clock()
-    removed: list[SessionMeta] = []
-    for meta in list_sessions(clock=resolved_clock):
-        if meta.is_active:
-            continue
-        reference = meta.finished_at if meta.finished_at is not None else meta.created_at
-        if reference is None or now - reference < older_than:
-            continue
-        removed.append(meta)
-        if not dry_run:
-            with contextlib.suppress(OSError):
-                _remove_tree(session_dir(meta.session_id))
-    return removed
+    with contextlib.ExitStack() as locks:
+        for session_id in sorted({meta.session_id for meta in selected}):
+            locks.enter_context(session_lock(session_id))
+
+        verified: list[SessionMeta] = []
+        for candidate in selected:
+            try:
+                current = load(candidate.session_id, clock=resolved_clock)
+            except SessionError as error:
+                raise SessionStateError(
+                    f"session {candidate.session_id} changed while pruning; retry"
+                ) from error
+            reference = (
+                current.finished_at if current.finished_at is not None else current.created_at
+            )
+            if current.is_active or reference is None or now - reference < older_than:
+                raise SessionStateError(
+                    f"session {candidate.session_id} changed while pruning; retry"
+                )
+            verified.append(current)
+
+        for meta in verified:
+            directory = session_dir(meta.session_id)
+            _clear_directory(directory)
+            _write_tombstone(directory, now)
+    return selected

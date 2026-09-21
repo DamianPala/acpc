@@ -24,6 +24,7 @@ import os
 import subprocess
 import sys
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Any, Protocol
@@ -50,16 +51,28 @@ class DaemonConnection(Protocol):
         """Hand a turn to the daemon and return as soon as it is accepted."""
         ...
 
-    async def await_turn(self, session_id: str) -> dict[str, Any]:
-        """Block until the turn finishes and return its outcome."""
+    async def await_turn(self, session_id: str, *, turn: int | None = None) -> dict[str, Any]:
+        """Block until the turn finishes and return its outcome.
+
+        ``turn`` pins the call to the turn active when the caller started
+        observing it; a daemon that has since moved the session onto a newer
+        turn answers `{"ok": true, "stale": true, "turn": <current>}` instead
+        of waiting, so the caller can read that turn's parked outcome. Omit it
+        to await whatever turn the daemon currently holds, as a call that just
+        started that turn itself does.
+        """
         ...
 
     async def await_preparation(self, session_id: str) -> dict[str, Any]:
         """Block until a deferred continuation has claimed its next turn."""
         ...
 
-    async def cancel(self, session_id: str) -> dict[str, Any]:
+    async def cancel(self, session_id: str, turn_token: int | None = None) -> dict[str, Any]:
         """Ask the daemon to cancel a session's in-flight turn."""
+        ...
+
+    async def steer(self, session_id: str, text: str) -> dict[str, Any]:
+        """Ask the daemon to add an instruction to a session's running turn."""
         ...
 
     async def status(self) -> dict[str, Any]:
@@ -97,14 +110,23 @@ class _SocketDaemon:
     async def start_turn(self, session_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         return await self.call({"op": "start", "session_id": session_id, "payload": payload})
 
-    async def await_turn(self, session_id: str) -> dict[str, Any]:
-        return await self.call({"op": "await", "session_id": session_id})
+    async def await_turn(self, session_id: str, *, turn: int | None = None) -> dict[str, Any]:
+        frame: dict[str, Any] = {"op": "await", "session_id": session_id}
+        if turn is not None:
+            frame["turn"] = turn
+        return await self.call(frame)
 
     async def await_preparation(self, session_id: str) -> dict[str, Any]:
         return await self.call({"op": "await_preparation", "session_id": session_id})
 
-    async def cancel(self, session_id: str) -> dict[str, Any]:
-        return await self.call({"op": "cancel", "session_id": session_id})
+    async def cancel(self, session_id: str, turn_token: int | None = None) -> dict[str, Any]:
+        frame: dict[str, Any] = {"op": "cancel", "session_id": session_id}
+        if turn_token is not None:
+            frame["turn_token"] = turn_token
+        return await self.call(frame)
+
+    async def steer(self, session_id: str, text: str) -> dict[str, Any]:
+        return await self.call({"op": "steer", "session_id": session_id, "text": text})
 
     async def status(self) -> dict[str, Any]:
         return await self.call({"op": "status"})
@@ -143,12 +165,42 @@ async def connect(target: str) -> _SocketDaemon | None:
     return daemon
 
 
+async def observe(target: str) -> _SocketDaemon | None:
+    """Open a connection that only looks, or return None.
+
+    `connect` greets with this build's version, and a daemon of another build
+    stands down on hearing it — taking its sessions with it. That is the right
+    answer for a caller about to run a turn and the wrong one for a caller
+    that only reports, so an observer skips the greeting. `status` needs none:
+    it answers on its own and its reply carries the daemon's version, which
+    lets a report show the skew instead of resolving it.
+    """
+    transport = ipc.UnixSocketTransport(target)
+    try:
+        conn = await transport.connect()
+    except (ConnectionError, OSError, ValueError):
+        with contextlib.suppress(Exception):
+            await transport.cleanup()
+        return None
+    return _SocketDaemon(target, transport, conn)
+
+
 async def ensure_daemon(target: str) -> DaemonConnection | DaemonUnavailable:
     """Connect to the daemon serving `target`, starting it if needed.
 
     Returns a live connection, or `DaemonUnavailable` naming why the direct
     path has to be used instead.
     """
+    try:
+        # SPEC.md `daemon`: a socket path that still exceeds the platform
+        # limit after hashing starts no daemon at all — resolved here, before
+        # any connect or spawn attempt, so the caller sees the real cause
+        # (the path limit and its `ACPC_HOME` remedy) instead of a generic
+        # "did not come up" from a spawn that was always going to fail.
+        ipc.socket_path_for_target(target)
+    except ValueError as error:
+        return DaemonUnavailable(str(error))
+
     existing = await connect(target)
     if existing is not None:
         return existing
@@ -261,20 +313,45 @@ def _unlock(handle: IO[bytes]) -> None:
         handle.close()
 
 
-async def cancel_turn(target: str, session_id: str) -> bool:
+async def cancel_turn(
+    target: str, session_id: str, turn_token: int | None = None
+) -> dict[str, Any] | DaemonUnavailable | None:
     """Cancel a turn over a connection of its own.
 
     A cancel has to overtake the `await` it is interrupting, and one
     connection serves one request at a time — sending it down the awaiting
     connection would queue behind the very reply it is meant to prevent.
+
+    ``turn_token`` selects the turn this call means to cancel (SPEC.md
+    `cancel`); omitting it cancels whatever turn the daemon currently holds,
+    which is what a caller with no token to pin does.
     """
+    return await _one_shot(target, lambda daemon: daemon.cancel(session_id, turn_token))
+
+
+async def steer_turn(
+    target: str, session_id: str, text: str
+) -> dict[str, Any] | DaemonUnavailable | None:
+    """Deliver an in-place correction over a connection of its own.
+
+    Same reason as a cancel: the client that dispatched `--background` is not
+    holding the daemon connection at all, and the one that is awaiting the
+    turn must not have this request queued behind its reply. `None` means the
+    request may have crossed and its answer never arrived.
+    """
+    return await _one_shot(target, lambda daemon: daemon.steer(session_id, text))
+
+
+async def _one_shot(
+    target: str, call: Callable[[_SocketDaemon], Awaitable[dict[str, Any]]]
+) -> dict[str, Any] | DaemonUnavailable | None:
+    """Run one request on a connection of its own and close it again."""
     daemon = await connect(target)
     if daemon is None:
-        return False
+        return DaemonUnavailable(f"no live daemon for {target}")
     try:
-        reply = await daemon.cancel(session_id)
+        return await call(daemon)
     except (ConnectionError, OSError):
-        return False
+        return None
     finally:
         await daemon.close()
-    return bool(reply.get("ok"))

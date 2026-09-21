@@ -111,8 +111,18 @@ def test_claude_selection_prefers_delegation_then_grants() -> None:
 
     assert select_mode(entry.modes, "read") == ("default", entry.modes["default"])
     assert select_mode(entry.modes, "execute")[0] == "acceptEdits"
-    assert select_mode(entry.modes, "none")[0] == "dontAsk"
     assert select_mode(entry.modes, "all")[0] == "acceptEdits"
+
+
+def test_claude_has_no_mode_for_a_ceiling_below_read() -> None:
+    # claude-agent-acp 0.75.1 dropped `dontAsk`; no remaining mode grants none.
+    entry = AgentRegistry().resolve("claude")
+
+    with pytest.raises(ModeSelectionError) as error:
+        select_mode(entry.modes, "none")
+
+    assert "default" in str(error.value)
+    assert "bypassPermissions" in str(error.value)
 
 
 @pytest.mark.parametrize("policy", ["read", "none", "ask"])

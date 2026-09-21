@@ -8,24 +8,31 @@ resolved call and a finished session:
   visible, folded into the single `--` stderr summary line, never silent.
 - **Signals.** SIGINT is a human's Ctrl-C and cancels the session (ACP
   `session/cancel`, bounded wait for the ack) → exit 130. SIGTERM is a harness
-  killing the tool call; on the daemon path it detaches, but a direct child
-  cannot outlive its parent, so there it cancels too → exit 143.
-- **Timeout.** `--timeout` cancels the session the same way, but the state is
-  `timeout` and the exit code 124.
+  killing the tool call; on the daemon path it detaches, while an ordinary
+  direct child cancels too → exit 143. A direct wait-deadline worker is an
+  accepted, detached owner just for the `--timeout` wait-only path.
+- **Timeout.** `--timeout` bounds the client's wait without canceling work;
+  the daemon keeps the session running and the client exits 124.
+- **Cancel-after.** `--cancel-after` cancels the session, which is a failed
+  operation for a waiting caller and exits 1.
 - **Finalization.** Whatever the outcome, `answer.md` and `meta.json` are
   written before the process exits: a partial answer is still an answer.
 """
 
 import asyncio
 import contextlib
+import json
 import os
 import re
 import shutil
 import signal
+import subprocess
 import sys
+import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -35,6 +42,8 @@ from acpc import (
     cache,
     daemon_client,
     environment,
+    errors,
+    limits,
     paths,
     sessions,
     targets,
@@ -43,10 +52,11 @@ from acpc import (
 )
 from acpc.client import AcpcClient
 from acpc.permissions import PermissionLevel
+from acpc.proc import process_group_kwargs
 from acpc.registry import AgentRegistry, CallResolution, ModeSpec, RegistryError, ResolvedEntry
 from acpc.spawn import spawn_adapter
 
-# SPEC.md `stop`: graceful cancel with a bounded wait for the ack (10s) — if
+# SPEC.md `cancel`: graceful cancellation with a bounded wait for the ack (10s) — if
 # the callee does not wind down in time, the connection is torn down anyway.
 CANCEL_ACK_TIMEOUT = 10.0
 
@@ -62,6 +72,12 @@ _ANSI_ESCAPE_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b\n]*(?:\x0
 # persisted failure observation in meta.json.
 MESSAGE_TAIL_CHARS = 300
 
+# A direct timeout worker owns the accepted turn after the observing client
+# exits.  The request is private session state and is removed after the worker
+# reads it; it is not part of the advertised session paths.
+_DIRECT_REQUEST_NAME = ".direct-request"
+_DIRECT_WORKER_ENV = "ACPC_DIRECT_WORKER"
+
 # ACP stop reasons that mean the turn failed rather than completed.
 _FAILURE_STOP_REASONS = frozenset({"refusal", "max_tokens", "max_turn_requests"})
 
@@ -70,11 +86,32 @@ _ADAPTER_LIMIT_STOP_REASONS = frozenset({"max_tokens", "max_turn_requests"})
 
 
 class RunnerError(Exception):
-    """A turn could not be started; the message is one actionable line."""
+    """A turn could not be started; the message is one actionable line.
+
+    `kind` is set when the refusal arrived already classified — a daemon that
+    refused the turn knows why, and the client must report that rather than
+    re-derive it from the message text it was handed.
+    """
+
+    def __init__(self, message: str, *, kind: str | None = None) -> None:
+        super().__init__(message)
+        self.kind = kind
+
+
+class AdapterUnavailable(RunnerError):
+    """The adapter this call needs cannot be reached at all.
+
+    Distinct from the rest because nothing about the call is wrong and the
+    adapter never answered: the caller has to install or start something, not
+    fix an argument or read a refusal.
+    """
 
 
 class ResumePreparationError(RunnerError):
     """A cold resume failed before acpc opened the next turn on disk."""
+
+    def __init__(self, message: str, *, kind: str | None = None) -> None:
+        super().__init__(message, kind=kind)
 
 
 class ResumeVerificationError(ResumePreparationError):
@@ -84,8 +121,10 @@ class ResumeVerificationError(ResumePreparationError):
 class ResumeRotationError(RunnerError):
     """The verified continuation could not be opened on the session store."""
 
-    def __init__(self, message: str, *, turn_token: int | None = None) -> None:
-        super().__init__(message)
+    def __init__(
+        self, message: str, *, turn_token: int | None = None, kind: str | None = None
+    ) -> None:
+        super().__init__(message, kind=kind)
         self.turn_token = turn_token
 
 
@@ -439,7 +478,11 @@ class TurnRequest:
     resolution: CallResolution
     prompt: str
     cwd: str | None = None
-    timeout: float | None = None
+    # ``wait_timeout`` belongs to the client observing the turn.  It must not
+    # be sent to the adapter or cancel work that the daemon has accepted.
+    wait_timeout: float | None = None
+    # ``cancel_after`` is the deadline that intentionally cancels this turn.
+    cancel_after: float | None = None
     permission_prompt: Callable[[str, str], bool] | None = None
     resume_adapter_session: str | None = None
     defer_rotation: bool = False
@@ -455,8 +498,7 @@ class TurnOutcome:
     state: str
     stop_reason: str | None
     answer: str
-    tokens: int | None = None
-    cost: float | None = None
+    context: vocab.ContextOccupancy | None = None
     denied: dict[str, int] = field(default_factory=dict)
     denial_details: dict[str, dict[str, Any]] = field(default_factory=dict)
     adapter_session_id: str | None = None
@@ -472,6 +514,18 @@ class TurnOutcome:
     finalized_elsewhere: bool = False
     queued: bool = False
     turn_token: int | None = None
+    # The daemon continues the accepted turn after this client stops waiting.
+    wait_timed_out: bool = False
+    # Set when a usage limit touched this turn; carried onto `meta.limit`.
+    limit: dict[str, Any] | None = None
+    # True when this process's own Ctrl-C ended the turn. A session that reads
+    # `cancelled` says nothing about who cancelled it, and the two answers need
+    # different failure kinds: the command was stopped, or it watched an
+    # operation end badly. Only the side that received the signal knows which.
+    interrupted: bool = False
+
+    def __post_init__(self) -> None:
+        self.state = vocab.normalize_session_state(self.state)
 
     @property
     def exit_code(self) -> int:
@@ -480,27 +534,26 @@ class TurnOutcome:
 
 def exit_code_for(state: str, stop_reason: str | None = None) -> int:
     """Map a finished session's state to SPEC's fixed exit codes."""
-    if state == "done":
+    state = vocab.normalize_session_state(state)
+    if state == "succeeded":
         return vocab.EXIT_OK
-    if state == "timeout":
-        return vocab.EXIT_TIMEOUT
-    if state == "cancelled":
-        return vocab.EXIT_CANCELLED
+    if state == "canceled":
+        return vocab.EXIT_AGENT_ERROR if stop_reason == "cancel_after" else vocab.EXIT_CANCELLED
     # Detached (daemon path) and terminated (direct path) are both "SIGTERM
     # ended this client"; they differ only in whether the session survives it.
     if state in {"detached", "terminated"}:
         return vocab.EXIT_SIGTERM
     if stop_reason == "permission_denied":
         return vocab.EXIT_USAGE
-    # failed and orphaned both mean the agent did not deliver an answer.
+    # failed and unknown both mean the agent did not deliver an answer.
     return vocab.EXIT_AGENT_ERROR
 
 
 def _state_for_stop_reason(stop_reason: str | None) -> str:
     if stop_reason == "end_turn":
-        return "done"
-    if stop_reason == "cancelled":
-        return "cancelled"
+        return "succeeded"
+    if stop_reason in ("cancelled", "canceled"):
+        return "canceled"
     if stop_reason in _FAILURE_STOP_REASONS:
         return "failed"
     return "failed"
@@ -518,7 +571,7 @@ def adapter_command(resolution: CallResolution) -> tuple[str, tuple[str, ...]]:
     except RegistryError as error:
         raise RunnerError(str(error)) from None
     if shutil.which(args[0]) is None:
-        raise RunnerError(entry.missing_binary_error())
+        raise AdapterUnavailable(entry.missing_binary_error())
     return args[0], args[1:]
 
 
@@ -600,7 +653,7 @@ class _CancelSignal:
 
     def _signal_state(self) -> str | None:
         if self.received_signal == signal.SIGINT:
-            return "cancelled"
+            return "canceled"
         if self.received_signal == signal.SIGTERM and self._daemon_routed is not None:
             return "detached" if self._daemon_routed else "terminated"
         return None
@@ -610,12 +663,16 @@ class _CancelSignal:
         self.request("failed", stop_reason="permission_denied")
 
 
-PREPARATION_CANCELLED_REASON = "cancelled during preparation"
+# SPEC.md *Session states*: "A canceled turn records `stop_reason: canceled`
+# whichever side canceled it, or `canceled during preparation` when the
+# cancel landed before any prompt was sent" — acpc's own public spelling
+# (slice 23 review debt: this used to be the ACP wire spelling `cancelled`).
+PREPARATION_CANCELLED_REASON = "canceled during preparation"
 
 
 def preparation_cancelled_answer(session_id: str) -> str:
     """Explain a cancellation for which no prompt crossed the ACP boundary."""
-    return f"Session {session_id} was cancelled during preparation; no prompt was sent.\n"
+    return f"Session {session_id} was canceled during preparation; no prompt was sent.\n"
 
 
 async def _drive_turn(
@@ -637,8 +694,7 @@ async def _drive_turn(
         end_turn=cancel.end_turn,
         cancellation_dispatched=cancel.cancellation_dispatched,
         permission_prompt=request.permission_prompt,
-        previous_tokens=stored.tokens,
-        previous_cost=stored.cost,
+        previous_context=stored.context,
     )
     turn_error: BaseException | None = None
 
@@ -672,7 +728,11 @@ async def _drive_turn(
                         raise ResumePreparationError(str(error)) from None
                     raise
                 request = _prepare_resumed_turn(
-                    session_id, request, events, resume_status=resume_status
+                    session_id,
+                    request,
+                    events,
+                    resume_status=resume_status,
+                    steer_mode=vocab.STEER_CANCEL_THEN_START,
                 )
                 client.permission_level = PermissionLevel(request.resolution.permissions or "read")
                 client.modes = request.resolution.entry.modes
@@ -680,22 +740,28 @@ async def _drive_turn(
                 session = await conn.new_session(cwd=request.cwd or os.getcwd(), mcp_servers=[])
                 adapter_session_id = session.session_id
                 client.capture_advertised(session)
+                # SPEC.md *State on disk*: recorded as soon as the adapter has
+                # accepted the session, before the prompt is sent, so a host
+                # process lost mid-turn still leaves a continuable session.
+                sessions.update_meta(session_id, adapter_session_id=adapter_session_id)
 
             # After the restore, never before it: codex-acp#343 resets model and
             # effort during session/load, so applying them first would be lost.
+            prompt_started = False
             try:
                 await apply_call_options(conn, adapter_session_id, request)
-                delivery = register_prompt_delivery(
-                    conn, session_id, adapter_session_id, request.prompt
-                )
-                prompt_task = asyncio.create_task(
-                    conn.prompt(
-                        session_id=adapter_session_id,
-                        prompt=[text_block(request.prompt)],
-                    )
+                prompt_started = True
+                stop_reason, turn_error, delivery, limit_record = await run_prompt_with_limits(
+                    conn,
+                    session_id,
+                    adapter_session_id,
+                    request,
+                    cancel,
+                    client,
+                    events,
                 )
             except BaseException as error:
-                if request.turn_token is None:
+                if prompt_started or request.turn_token is None:
                     raise
                 _finalize_claimed_setup_failure(
                     session_id, request.turn_token, error, adapter_session_id
@@ -705,38 +771,20 @@ async def _drive_turn(
                 raise ResumeSetupError(
                     describe_error(error), turn_token=request.turn_token
                 ) from None
-            try:
-                stop_reason = await _await_prompt(
-                    conn,
-                    adapter_session_id,
-                    prompt_task,
-                    request,
-                    cancel,
-                    usage_client=client,
-                )
-            except Exception as caught:  # noqa: BLE001
-                # The adapter failed the turn itself. Whatever prose it streamed
-                # first is still the answer SPEC promises for a failed session,
-                # so the cause travels on the outcome instead of unwinding here.
-                turn_error = caught
-                stop_reason = "error"
-            try:
-                await delivery.ensure_persisted(prompt_completed=turn_error is None)
-            except Exception as caught:  # noqa: BLE001
-                turn_error = caught if turn_error is None else turn_error
-                stop_reason = "error"
     finally:
         client.flush()
 
     if cancel.stop_reason is not None:
         stop_reason = cancel.stop_reason
     state = cancel.state if cancel.state is not None else _state_for_stop_reason(stop_reason)
+    # SPEC.md *Session states*: the adapter's `cancelled` stop reason is
+    # normalized to acpc's own `canceled` when the turn ends.
+    stop_reason = vocab.normalize_stop_reason(stop_reason)
     return TurnOutcome(
         state=state,
         stop_reason=stop_reason,
         answer=client.answer,
-        tokens=client.tokens,
-        cost=client.cost,
+        context=client.context,
         denied=client.denied,
         denial_details=client.denial_details,
         adapter_session_id=adapter_session_id,
@@ -744,6 +792,7 @@ async def _drive_turn(
         error=turn_error,
         delivery_record_incomplete=delivery.delivery_record_incomplete,
         turn_token=request.turn_token,
+        limit=limit_record,
     )
 
 
@@ -754,6 +803,7 @@ def _prepare_resumed_turn(
     *,
     resume_status: str | None = None,
     pid: int | None = None,
+    steer_mode: str | None = None,
 ) -> TurnRequest:
     """Atomically claim a verified continuation before it can prompt."""
     if not request.defer_rotation:
@@ -781,6 +831,7 @@ def _prepare_resumed_turn(
             prompt=request.prompt,
             resume_status=resume_status,
             pid=pid if pid is not None else _host_pid(),
+            steer_mode=steer_mode,
         )
     except (RunnerError, sessions.SessionError) as error:
         raise ResumeRotationError(str(error)) from None
@@ -943,15 +994,17 @@ async def _await_prompt(
     try:
         done, _pending = await asyncio.wait(
             {prompt_task, waiter},
-            timeout=request.timeout,
+            timeout=request.cancel_after,
             return_when=asyncio.FIRST_COMPLETED,
         )
         if prompt_task in done:
             return _stop_reason_of(prompt_task, usage_client=usage_client)
 
-        # Either the timeout expired or a signal asked us to wind down.
+        # Either the cancellation deadline expired or a signal asked us to
+        # wind down.  A client-side wait deadline is handled by the daemon
+        # route, because direct children cannot outlive this process.
         if not cancel.requested.is_set():
-            cancel.request("timeout")
+            cancel.request("canceled", stop_reason="cancel_after")
         cancel.cancellation_dispatched.set()
         with contextlib.suppress(Exception):
             await conn.cancel(session_id=adapter_session_id)
@@ -960,7 +1013,7 @@ async def _await_prompt(
         if prompt_task.done():
             return _stop_reason_of(prompt_task, usage_client=usage_client)
         prompt_task.cancel()
-        return "cancelled"
+        return "canceled"
     finally:
         waiter.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -975,7 +1028,7 @@ def _stop_reason_of(
     """Read a finished prompt task's stop reason, preserving adapter errors."""
     error = prompt_task.exception() if not prompt_task.cancelled() else None
     if prompt_task.cancelled():
-        return "cancelled"
+        return "canceled"
     if error is not None:
         raise error
     result = prompt_task.result()
@@ -986,14 +1039,223 @@ def _stop_reason_of(
     return getattr(result, "stop_reason", None)
 
 
+# SPEC.md `run`: sent instead of the original prompt when a limit interrupted
+# it after the turn had already recorded progress, so the adapter continues
+# the same task rather than restarting it. Shared with `continue` without a
+# message (slice 19), which names the actual cause instead of always blaming
+# a usage limit (slice 23 review debt).
+_CONTINUATION_TEXTS = {
+    "rate_limit": (
+        "acpc: the previous request in this turn was interrupted by a usage limit that has now "
+        "reset. Continue the task from where you stopped. Do not repeat work that is already "
+        "done; if the task was already complete, reply with the final answer."
+    ),
+    "canceled": (
+        "acpc: the previous turn of this session was canceled before it finished. Continue the "
+        "task from where it stopped. Do not repeat work that is already done; if the task was "
+        "already complete, reply with the final answer."
+    ),
+    "failed": (
+        "acpc: the previous turn of this session ended with an error before it finished. "
+        "Continue the task from where it stopped. Do not repeat work that is already done; if "
+        "the task was already complete, reply with the final answer."
+    ),
+    "unknown": (
+        "acpc: the previous turn of this session was interrupted and its outcome was not "
+        "observed. Continue the task from where it stopped. Do not repeat work that is already "
+        "done; if the task was already complete, reply with the final answer."
+    ),
+}
+
+
+def continuation_instruction(cause: str) -> str:
+    """SPEC.md `continue`: the fixed instruction naming how the previous turn ended.
+
+    `cause` is one of `rate_limit`, `canceled`, `failed` or `unknown` — the
+    limit resumption always passes `rate_limit`; `continue` without a message
+    passes the session's own last terminal state.
+    """
+    return _CONTINUATION_TEXTS[cause]
+
+
+# How long acpc waits past a limit's own reported reset before resuming: a
+# fixed cushion for clock skew against the vendor's clock.
+LIMIT_RESUME_FIXED_DELAY_SECONDS = 5.0
+
+
+def _limit_wait_max_seconds() -> float:
+    from acpc.config import load_config
+
+    return load_config().limit_wait_max_seconds
+
+
+def _limit_record(observation: Any, *, auto_continue: bool) -> dict[str, Any]:
+    resume_at = observation.resume_at
+    return {
+        "reason": observation.reason,
+        "resume_at": sessions.format_timestamp(resume_at.timestamp()) if resume_at else None,
+        "auto_continue": auto_continue,
+        "source": observation.source,
+    }
+
+
+def _limit_action(observation: Any, *, limit_waited_seconds: float, limit_wait_max: float) -> str:
+    """Decide whether to wait through a recognized limit or fail the turn now.
+
+    `limit_wait_max == 0` (SPEC.md *State on disk*: `limit_wait_max = "0s"`)
+    always fails, even when the reported reset is already due — a zero cap
+    means no wait was ever authorized, not a wait of length zero.
+    """
+    if observation.resume_at is None or limit_wait_max <= 0:
+        return "fail"
+    wait_needed = (observation.resume_at - datetime.now(UTC)).total_seconds()
+    if wait_needed > limit_wait_max - limit_waited_seconds:
+        return "fail"
+    return "wait"
+
+
+async def _sleep_through_limit(seconds: float, cancel: "_CancelSignal") -> bool:
+    """Sleep, interruptible by `cancel`. Returns True when canceled first."""
+    sleeper = asyncio.ensure_future(asyncio.sleep(max(0.0, seconds)))
+    waiter = asyncio.ensure_future(cancel.requested.wait())
+    try:
+        done, _pending = await asyncio.wait({sleeper, waiter}, return_when=asyncio.FIRST_COMPLETED)
+        return waiter in done
+    finally:
+        for task in (sleeper, waiter):
+            if not task.done():
+                task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+
+
+async def run_prompt_with_limits(
+    conn: Any,
+    session_id: str,
+    adapter_session_id: str,
+    request: TurnRequest,
+    cancel: "_CancelSignal",
+    client: "AcpcClient",
+    events: transcript.Transcript,
+    *,
+    on_delivered: Callable[[], None] | None = None,
+) -> tuple[str | None, BaseException | None, PromptDelivery, dict[str, Any] | None]:
+    """Send the prompt, waiting through recognized usage limits within `limit_wait_max`.
+
+    Replaces one bare ``_await_prompt`` call with a loop that recognizes a
+    vendor usage limit (SPEC.md `run`), and either fails the turn with
+    ``stop_reason: rate_limit`` or moves the session to ``waiting``, sleeps
+    past the reported reset, and resends on the same adapter session — the
+    original prompt if this turn recorded no progress yet, acpc's fixed
+    continuation instruction otherwise. Returns the same
+    ``(stop_reason, turn_error, delivery)`` shape the two callers previously
+    built inline, plus the final ``limit`` record for ``meta.json`` (``None``
+    when no limit ever touched this turn).
+    """
+    limit_wait_max = _limit_wait_max_seconds()
+    limit_waited_seconds = 0.0
+    limit_record: dict[str, Any] | None = None
+    prompt_text = request.prompt
+    delivered_on_first_send = on_delivered
+
+    while True:
+        # A rejection's rate-limit metadata describes that one send; carrying
+        # it into the next send's classification would misread a genuine
+        # success as a repeat of the limit that already resolved.
+        client.clear_rate_limit_info()
+        delivery = register_prompt_delivery(
+            conn, session_id, adapter_session_id, prompt_text, on_delivered=delivered_on_first_send
+        )
+        # Only the very first send in a turn reaches the daemon's "running"
+        # phase callback; a resend after a limit is still the same turn.
+        delivered_on_first_send = None
+        prompt_task = asyncio.create_task(
+            conn.prompt(session_id=adapter_session_id, prompt=[text_block(prompt_text)])
+        )
+        turn_error: BaseException | None = None
+        try:
+            stop_reason = await _await_prompt(
+                conn, adapter_session_id, prompt_task, request, cancel, usage_client=client
+            )
+        except Exception as caught:  # noqa: BLE001
+            turn_error = caught
+            stop_reason = "error"
+        try:
+            await delivery.ensure_persisted(prompt_completed=turn_error is None)
+        except Exception as caught:  # noqa: BLE001
+            turn_error = caught if turn_error is None else turn_error
+            stop_reason = "error"
+
+        # SPEC.md `run`: a limit is recognized on a failed `session/prompt`; a
+        # prompt the adapter completed is never reclassified from metadata.
+        if cancel.requested.is_set() or not isinstance(turn_error, RequestError):
+            return stop_reason, turn_error, delivery, limit_record
+
+        observation = limits.classify_limit(turn_error, client.rate_limit_info, datetime.now(UTC))
+        if observation is None:
+            return stop_reason, turn_error, delivery, limit_record
+
+        action = _limit_action(
+            observation,
+            limit_waited_seconds=limit_waited_seconds,
+            limit_wait_max=limit_wait_max,
+        )
+        if action == "fail":
+            limit_record = _limit_record(observation, auto_continue=False)
+            events.append(
+                "limit",
+                reason=observation.reason,
+                resume_at=limit_record["resume_at"],
+                action="fail",
+                source=observation.source,
+                detail=observation.detail,
+            )
+            return "rate_limit", turn_error, delivery, limit_record
+
+        limit_record = _limit_record(observation, auto_continue=True)
+        events.append(
+            "limit",
+            reason=observation.reason,
+            resume_at=limit_record["resume_at"],
+            action="wait",
+            source=observation.source,
+            detail=observation.detail,
+        )
+        events.append("state", **{"from": "running", "to": "waiting"})
+        sessions.transition(session_id, "waiting", limit=limit_record)
+        now = datetime.now(UTC)
+        assert observation.resume_at is not None  # action == "wait" guarantees this
+        delay = (
+            max(0.0, (observation.resume_at - now).total_seconds())
+            + LIMIT_RESUME_FIXED_DELAY_SECONDS
+        )
+        started = time.monotonic()
+        canceled = await _sleep_through_limit(delay, cancel)
+        limit_waited_seconds += time.monotonic() - started
+        if canceled:
+            # SPEC.md `cancel`: a session in `waiting` is canceled without
+            # contacting the adapter — the scheduled resumption is dropped.
+            limit_record = {**limit_record, "auto_continue": False}
+            sessions.update_meta(session_id, limit=limit_record)
+            return "canceled", turn_error, delivery, limit_record
+
+        events.append("state", **{"from": "waiting", "to": "running"})
+        sessions.transition(session_id, "running", limit=limit_record)
+        prompt_text = (
+            request.prompt
+            if not client.has_recorded_progress
+            else continuation_instruction("rate_limit")
+        )
+
+
 def _install_signal_handlers(
     loop: asyncio.AbstractEventLoop,
     cancel: _CancelSignal,
 ) -> None:
     """Route SIGINT/SIGTERM into the turn's cancel path.
 
-    SIGTERM detaches only when the daemon owns the session; a direct child
-    dies with its parent, so there it cancels (SPEC.md *Output contract*).
+    SIGTERM detaches only when the daemon owns the session; an ordinary direct
+    child dies with its parent, so there it cancels (SPEC.md *Output contract*).
     """
     if sys.platform == "win32":
         return
@@ -1022,7 +1284,7 @@ def daemon_payload(request: TurnRequest) -> dict[str, Any]:
         "permissions": resolution.permissions,
         "home": resolution.home,
         "cwd": request.cwd,
-        "timeout": request.timeout,
+        "cancel_after": request.cancel_after,
         "prompt": request.prompt,
         "resume_adapter_session": request.resume_adapter_session,
         "defer_rotation": request.defer_rotation,
@@ -1040,6 +1302,8 @@ def routes_direct(request: TurnRequest) -> str | None:
     An `ask` policy needs a terminal to ask on and the daemon has none, so
     such a call stays a direct child even when a daemon is available.
     """
+    if os.environ.get(_DIRECT_WORKER_ENV) == "1":
+        return "the detached direct worker owns this session"
     if request.permission_prompt is not None or request.resolution.permissions == "ask":
         return "--permissions ask needs this terminal"
     return None
@@ -1057,7 +1321,16 @@ async def _route(request: TurnRequest) -> tuple[Any | None, str | None]:
 
 
 async def _execute(session_id: str, request: TurnRequest) -> TurnOutcome:
+    """Run the turn and record whether this process's Ctrl-C ended it."""
     cancel = _CancelSignal()
+    outcome = await _execute_routed(session_id, request, cancel)
+    outcome.interrupted = cancel.received_signal == signal.SIGINT
+    return outcome
+
+
+async def _execute_routed(
+    session_id: str, request: TurnRequest, cancel: _CancelSignal
+) -> TurnOutcome:
     loop = asyncio.get_running_loop()
     _install_signal_handlers(loop, cancel)
 
@@ -1084,12 +1357,21 @@ async def _execute(session_id: str, request: TurnRequest) -> TurnOutcome:
         target = daemon_target(request.resolution)
         return await _execute_via_daemon(session_id, request, daemon, cancel, target)
 
+    if request.wait_timeout is not None:
+        return await _execute_direct_with_wait_timeout(
+            session_id,
+            request,
+            route_note=route_note,
+        )
+
     if request.defer_rotation:
         try:
             async with sessions.session_reservation(session_id):
                 return await _execute_direct(session_id, request, cancel, route_note=route_note)
         except sessions.SessionStateError as error:
-            raise ResumePreparationError(str(error)) from None
+            # Same classification as the daemon's: a held session is a conflict
+            # the caller can retry, not an adapter failure.
+            raise ResumePreparationError(str(error), kind=errors.CONFLICT) from None
 
     return await _execute_direct(session_id, request, cancel, route_note=route_note)
 
@@ -1108,12 +1390,13 @@ async def _cancel_before_route_acceptance(
                     request,
                     events,
                     pid=_host_pid(),
+                    steer_mode=vocab.STEER_CANCEL_THEN_START,
                 )
         except (ResumeRotationError, sessions.SessionError) as error:
             raise ResumePreparationError(str(error)) from None
 
     outcome = TurnOutcome(
-        state=cancel.state or "cancelled",
+        state=cancel.state or "canceled",
         stop_reason=PREPARATION_CANCELLED_REASON,
         answer=preparation_cancelled_answer(session_id),
         turn_token=request.turn_token,
@@ -1132,11 +1415,91 @@ async def _execute_direct(
     """Run the direct path after routing and, for continue, reservation."""
     events = transcript.Transcript(sessions.transcript_path(session_id))
     if not request.defer_rotation:
-        sessions.mark_running(session_id, pid=_host_pid())
+        sessions.mark_running(
+            session_id,
+            pid=_host_pid(),
+            steer_mode=vocab.STEER_CANCEL_THEN_START,
+        )
         events.append("state", **{"from": "starting", "to": "running"})
     outcome = await _drive_turn(session_id, request, events, cancel)
     outcome.route_note = route_note
     return outcome
+
+
+def _direct_request_path(session_id: str) -> Path:
+    return sessions.session_dir(session_id) / _DIRECT_REQUEST_NAME
+
+
+def _write_direct_request(session_id: str, request: TurnRequest) -> None:
+    """Persist the direct worker's request before detaching it."""
+    worker_request = replace(request, wait_timeout=None)
+    paths.atomic_write(
+        _direct_request_path(session_id),
+        json.dumps(daemon_payload(worker_request), ensure_ascii=False),
+    )
+
+
+def start_direct_worker(session_id: str, request: TurnRequest) -> int:
+    """Start a detached direct worker and return its process id.
+
+    The worker gets a new process session or group and no terminal streams, so
+    closing the observing client's terminal cannot signal the accepted turn.
+    """
+    _write_direct_request(session_id, request)
+    argv = (sys.executable, "-m", "acpc.direct_worker", session_id)
+    env = dict(os.environ)
+    env[_DIRECT_WORKER_ENV] = "1"
+    process = subprocess.Popen(
+        argv,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        **process_group_kwargs(),
+    )
+    return process.pid
+
+
+async def _execute_direct_with_wait_timeout(
+    session_id: str,
+    request: TurnRequest,
+    *,
+    route_note: str | None,
+) -> TurnOutcome:
+    """Observe a detached direct worker until it finishes or the wait expires."""
+    initial_turns = sessions.read_meta(session_id).turns
+    try:
+        start_direct_worker(session_id, request)
+    except OSError as error:
+        raise RunnerError(f"could not start the direct timeout worker: {error}") from None
+
+    wait_timeout = request.wait_timeout
+    if wait_timeout is None:
+        raise RunnerError("direct timeout worker started without a wait timeout")
+    deadline = asyncio.get_running_loop().time() + wait_timeout
+    while True:
+        current = sessions.load(session_id)
+        turn_started = not request.defer_rotation or current.turns > initial_turns
+        if turn_started and current.is_finished:
+            return TurnOutcome(
+                state=current.state,
+                stop_reason=current.stop_reason,
+                answer=_answer_on_disk(session_id),
+                context=current.context,
+                finalized_elsewhere=True,
+                route_note=route_note,
+            )
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            return TurnOutcome(
+                state=current.state,
+                stop_reason=current.stop_reason,
+                answer="",
+                finalized_elsewhere=True,
+                wait_timed_out=True,
+                route_note=route_note,
+            )
+        await asyncio.sleep(min(0.02, remaining))
 
 
 async def _execute_via_daemon(
@@ -1152,20 +1515,76 @@ async def _execute_via_daemon(
     finalizes `meta.json`, so this side must not finalize again. A SIGTERM
     detaches — the client stops watching and the turn carries on.
     """
+    deadline = (
+        None
+        if request.wait_timeout is None
+        else asyncio.get_running_loop().time() + request.wait_timeout
+    )
+    starting = asyncio.ensure_future(daemon.start_turn(session_id, daemon_payload(request)))
+    signalled = asyncio.ensure_future(cancel.requested.wait())
     try:
-        started = await daemon.start_turn(session_id, daemon_payload(request))
-        if not started.get("ok"):
-            if started.get("preserve_session"):
-                raise ResumePreparationError(
-                    str(started.get("error", "the daemon refused the turn"))
+        done, _pending = await asyncio.wait(
+            {starting, signalled},
+            timeout=_remaining_wait(deadline),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if starting not in done:
+            if signalled in done and cancel.state == "detached":
+                try:
+                    await asyncio.wait_for(asyncio.shield(starting), timeout=CANCEL_ACK_TIMEOUT)
+                except TimeoutError:
+                    starting.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await starting
+                return TurnOutcome(
+                    state="detached",
+                    stop_reason=None,
+                    answer="",
+                    finalized_elsewhere=True,
                 )
-            raise RunnerError(str(started.get("error", "the daemon refused the turn")))
+            starting.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await starting
+            if signalled in done and cancel.state != "detached":
+                await _cancel_daemon_turn(target, session_id)
+                return TurnOutcome(
+                    state="canceled",
+                    stop_reason=cancel.stop_reason or "canceled",
+                    answer="",
+                    finalized_elsewhere=True,
+                )
+            return TurnOutcome(
+                state=cancel.state or "running",
+                stop_reason=cancel.stop_reason,
+                answer="",
+                finalized_elsewhere=True,
+                wait_timed_out=signalled not in done,
+            )
+        started = starting.result()
+        if not started.get("ok"):
+            reason = str(started.get("error", "the daemon refused the turn"))
+            refused_as = started.get("kind")
+            kind = str(refused_as) if isinstance(refused_as, str) else None
+            if started.get("preserve_session"):
+                raise ResumePreparationError(reason, kind=kind)
+            raise RunnerError(reason, kind=kind)
         queued = bool(started.get("queued"))
+        remaining = _remaining_wait(deadline)
+        if remaining is not None and remaining <= 0:
+            return TurnOutcome(
+                state="starting",
+                stop_reason=None,
+                answer="",
+                finalized_elsewhere=True,
+                queued=queued,
+                wait_timed_out=True,
+            )
 
         waiting = asyncio.ensure_future(daemon.await_turn(session_id))
-        signalled = asyncio.ensure_future(cancel.requested.wait())
         done, _pending = await asyncio.wait(
-            {waiting, signalled}, return_when=asyncio.FIRST_COMPLETED
+            {waiting, signalled},
+            timeout=remaining,
+            return_when=asyncio.FIRST_COMPLETED,
         )
 
         if waiting not in done:
@@ -1179,8 +1598,19 @@ async def _execute_via_daemon(
                     finalized_elsewhere=True,
                     queued=queued,
                 )
-            await daemon_client.cancel_turn(target, session_id)
-        signalled.cancel()
+            if not cancel.requested.is_set():
+                waiting.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await waiting
+                return TurnOutcome(
+                    state="running",
+                    stop_reason=None,
+                    answer="",
+                    finalized_elsewhere=True,
+                    queued=queued,
+                    wait_timed_out=True,
+                )
+            await _cancel_daemon_turn(target, session_id)
         reply = await waiting
         outcome = reply.get("outcome") or {}
         if error := outcome.get("error"):
@@ -1193,8 +1623,35 @@ async def _execute_via_daemon(
             queued=queued,
         )
     finally:
+        signalled.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await signalled
         with contextlib.suppress(Exception):
             await daemon.close()
+
+
+def _remaining_wait(deadline: float | None) -> float | None:
+    """Return the remaining client wait, or ``None`` for an unbounded wait."""
+    if deadline is None:
+        return None
+    return deadline - asyncio.get_running_loop().time()
+
+
+async def _cancel_daemon_turn(target: str, session_id: str) -> sessions.SessionMeta | None:
+    """Cancel a daemon turn without using the connection stuck in ``start``."""
+    with contextlib.suppress(TimeoutError, Exception):
+        await asyncio.wait_for(
+            daemon_client.cancel_turn(target, session_id), timeout=CANCEL_ACK_TIMEOUT
+        )
+    deadline = asyncio.get_running_loop().time() + CANCEL_ACK_TIMEOUT
+    while True:
+        try:
+            current = sessions.load(session_id)
+        except sessions.SessionError:
+            return None
+        if not current.is_active or asyncio.get_running_loop().time() >= deadline:
+            return current
+        await asyncio.sleep(0.02)
 
 
 def _daemon_log_note(target: str) -> str:
@@ -1221,19 +1678,24 @@ def _answer_on_disk(session_id: str) -> str:
         return ""
 
 
-async def dispatch_background(session_id: str, request: TurnRequest) -> str | None:
+async def dispatch_background(
+    session_id: str, request: TurnRequest
+) -> str | daemon_client.DaemonUnavailable | None:
     """Start a turn the caller will not wait for; None on success.
 
-    `--bg` needs an owner that outlives this process, which is exactly what the
+    `--background` needs an owner that outlives this process, which is exactly what the
     daemon is. Without one there is nobody to hand the session to, so this
-    reports why instead of silently running a child that dies on exit.
+    reports why instead of silently running a child that dies on exit — as a
+    `DaemonUnavailable` (SPEC.md `daemon`: reported to the caller as
+    `unavailable`), kept apart from a plain string once the daemon accepted
+    the turn and then refused it, which is an ordinary agent failure.
     """
     forced = routes_direct(request)
     if forced is not None:
-        return f"--bg needs the daemon, and {forced}"
+        return daemon_client.DaemonUnavailable(f"--background needs the daemon, and {forced}")
     routed = await daemon_client.ensure_daemon(daemon_target(request.resolution))
     if isinstance(routed, daemon_client.DaemonUnavailable):
-        return f"--bg needs the daemon: {routed.reason}"
+        return daemon_client.DaemonUnavailable(f"--background needs the daemon: {routed.reason}")
     try:
         started = await routed.start_turn(session_id, daemon_payload(request))
         if not started.get("ok"):
@@ -1303,6 +1765,45 @@ def execute_turn(session_id: str, request: TurnRequest) -> TurnOutcome:
     return outcome
 
 
+def _direct_worker_request(session_id: str) -> TurnRequest:
+    """Read a detached direct request from its owner-only session file."""
+    request_path = _direct_request_path(session_id)
+    try:
+        payload = json.loads(request_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise TypeError("direct worker request has an invalid shape")
+        meta = sessions.read_meta(session_id)
+        request = TurnRequest(
+            resolution=resolution_from_session(meta),
+            prompt=payload.get("prompt", ""),
+            cwd=payload.get("cwd"),
+            cancel_after=payload.get("cancel_after"),
+            resume_adapter_session=payload.get("resume_adapter_session"),
+            defer_rotation=bool(payload.get("defer_rotation", False)),
+            rotation_resolution=payload.get("rotation_resolution"),
+            resume_prepared=bool(payload.get("resume_prepared", False)),
+            turn_token=payload.get("turn_token"),
+        )
+        return request
+    except (OSError, ValueError, TypeError, KeyError, RunnerError, sessions.SessionError) as error:
+        failure = RunnerError(f"cannot read the direct worker request: {error}")
+        _finalize(
+            session_id,
+            TurnOutcome(state="failed", stop_reason="error", answer=""),
+            error=failure,
+        )
+        raise failure from None
+    finally:
+        with contextlib.suppress(OSError):
+            request_path.unlink()
+
+
+def run_direct_worker(session_id: str, request: TurnRequest | None = None) -> None:
+    """Run a detached direct request from its owner-only session file."""
+    request = request or _direct_worker_request(session_id)
+    execute_turn(session_id, request)
+
+
 def _finalize(
     session_id: str,
     outcome: TurnOutcome,
@@ -1343,7 +1844,7 @@ def _finalize(
         outcome.answer = answer
     state = outcome.state
     if state == "terminated":
-        state = "cancelled"
+        state = "canceled"
     if state == "detached":
         state = "running"
 
@@ -1367,8 +1868,7 @@ def _finalize(
             expected_turn=expected_turn,
             exit_code=outcome.exit_code,
             stop_reason=outcome.stop_reason,
-            tokens=outcome.tokens,
-            cost=outcome.cost,
+            context=outcome.context,
             denied=outcome.denied,
             denial_details=outcome.denial_details,
             error_event=error_event,
@@ -1382,6 +1882,13 @@ def _finalize(
                 outcome.adapter_session_id
                 if outcome.adapter_session_id is not None
                 else (current.adapter_session_id if current is not None else None)
+            ),
+            # A turn ended from outside the prompt loop (daemon stop, a setup
+            # failure) carries no record of its own; the one on disk stays.
+            limit=(
+                outcome.limit
+                if outcome.limit is not None
+                else (current.limit if current is not None else None)
             ),
         )
     except sessions.SessionError:
@@ -1569,8 +2076,15 @@ def auto_prune(retention_seconds: float) -> None:
         sessions.prune_sessions(older_than=retention_seconds)
 
 
-def resolution_payload(resolution: CallResolution, *, cwd: str | None) -> dict[str, Any]:
-    """The `--dry-run` view: every resolved value and where it came from."""
+def resolution_payload(
+    resolution: CallResolution, *, cwd: str | None, permissions_source: str | None = None
+) -> dict[str, Any]:
+    """The `--resolve` view: every resolved value and where it came from.
+
+    `permissions_source` names an origin provenance cannot see, because the
+    policy did not come from the entry, a flag or acpc's own default — it was
+    typed at a prompt, or it will be, once this call is really dispatched.
+    """
     entry = resolution.entry
     provenance: Mapping[str, Any] = resolution.provenance
     fields: dict[str, Any] = {
@@ -1587,6 +2101,8 @@ def resolution_payload(resolution: CallResolution, *, cwd: str | None) -> dict[s
         }
         for name, value in fields.items()
     }
+    if permissions_source is not None:
+        resolved["permissions"]["source"] = permissions_source
     if resolution.permissions_clamp is not None:
         requested, ceiling = resolution.permissions_clamp
         permissions = resolved["permissions"]
@@ -1646,7 +2162,7 @@ def session_resolution(
     cwd: str | None,
     permissions_source: str | None = None,
 ) -> dict[str, Any]:
-    """The persisted session shape, distinct from the printed dry-run view.
+    """The persisted session shape, distinct from the printed `--resolve` view.
 
     Stores the entry's **base** command (not CLI-injected spawn argv) so
     effort_via=cli can re-inject on continue without doubling flags.
@@ -1792,7 +2308,8 @@ def continue_request(
     meta: sessions.SessionMeta,
     prompt: str,
     *,
-    timeout: float | None = None,
+    wait_timeout: float | None = None,
+    cancel_after: float | None = None,
     permissions: str | None = None,
     permission_prompt: Callable[[str, str], bool] | None = None,
     resolution: CallResolution | None = None,
@@ -1815,7 +2332,8 @@ def continue_request(
         resolution=resolution,
         prompt=prompt,
         cwd=cwd,
-        timeout=timeout,
+        wait_timeout=wait_timeout,
+        cancel_after=cancel_after,
         permission_prompt=permission_prompt,
         resume_adapter_session=meta.adapter_session_id,
         defer_rotation=defer_rotation,
@@ -1825,7 +2343,7 @@ def continue_request(
 
 
 def _source_label(source: Any) -> str:
-    """Render a `FieldSource` the way `--dry-run` and `agents <name>` show it."""
+    """Render a `FieldSource` the way `--resolve` and `agents get` show it."""
     if source is None:
         return "unset"
     kind = getattr(source, "kind", "unset")
@@ -1848,53 +2366,75 @@ def _source_label(source: Any) -> str:
 WAIT_POLL_INTERVAL = 0.1
 
 
-async def _await_session(session_id: str, target: str | None, timeout: float | None) -> str | None:
-    """Block until the session finishes; None means the wait timed out.
+async def _await_session(
+    session_id: str, target: str | None, timeout: float | None, turn: int
+) -> str | None:
+    """Block until turn `turn` ends; None means the wait timed out.
 
     Asks the owning daemon when there is one, because that returns the moment
     the turn ends. A session with no daemon (direct path, or a daemon that has
-    since gone) is watched through `meta.json` instead.
+    since gone) is watched through `meta.json` instead. Either path can find
+    the session already past `turn` when a `continue` or `steer` rotated it in
+    the meantime (M1g): the daemon then answers `stale` and the fallback sees
+    `meta.turns` ahead of `turn`, and both read the turn's own parked outcome
+    (SPEC.md *State on disk*) rather than the session's current one.
     """
     deadline = None if timeout is None else asyncio.get_running_loop().time() + timeout
     daemon = None
+    waiting: asyncio.Task[Any] | None = None
     if target is not None:
         routed = await daemon_client.connect(target)
         daemon = routed
 
     try:
         if daemon is not None:
-            waiting = asyncio.ensure_future(daemon.await_turn(session_id))
+            waiting = asyncio.ensure_future(daemon.await_turn(session_id, turn=turn))
             try:
                 reply = await asyncio.wait_for(asyncio.shield(waiting), timeout=timeout)
             except TimeoutError:
                 waiting.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await waiting
                 return None
+            if reply.get("stale"):
+                return sessions.read_turn_meta(session_id, turn).state
             outcome = reply.get("outcome") or {}
             return str(outcome.get("state", "failed"))
 
         while True:
             meta = sessions.load(session_id)
-            if meta.is_finished:
+            if meta.turns > turn:
+                return sessions.read_turn_meta(session_id, turn).state
+            if meta.turns == turn and meta.is_finished:
                 return meta.state
             if deadline is not None and asyncio.get_running_loop().time() >= deadline:
                 return None
             await asyncio.sleep(WAIT_POLL_INTERVAL)
     finally:
+        if waiting is not None and not waiting.done():
+            waiting.cancel()
+        if waiting is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await waiting
         if daemon is not None:
             with contextlib.suppress(Exception):
                 await daemon.close()
 
 
-def wait_for_session(session_id: str, *, timeout: float | None = None) -> str | None:
-    """Block until a session finishes, returning its state or None on timeout.
+def wait_for_session(session_id: str, *, timeout: float | None = None) -> tuple[int, str | None]:
+    """Block until the session's turn selected at call start ends.
 
-    SPEC.md `wait`: the timeout stops *waiting* only — unlike `run --timeout`,
-    the session is left running.
+    SPEC.md `wait`/M1g: the turn observed is the session's current one when
+    this call starts, kept even if a later `continue` or `steer` opens a newer
+    turn while waiting. Returns the selected turn and its terminal state, or
+    `None` for the state when the timeout stopped waiting — the session is
+    left running either way.
     """
     meta = sessions.load(session_id)
+    turn = meta.turns
     if meta.is_finished:
-        return meta.state
-    return asyncio.run(_await_session(session_id, meta.target, timeout))
+        return turn, meta.state
+    return turn, asyncio.run(_await_session(session_id, meta.target, timeout, turn))
 
 
 def daemon_targets_for(agent: str) -> list[str]:

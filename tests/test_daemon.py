@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 import json
 import sys
+import threading
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -22,12 +23,27 @@ import pytest
 from acp import text_block
 from acp.client import ClientSideConnection
 from acp.schema import AgentMessageChunk
+from click.testing import CliRunner
 
-from acpc import daemon, daemon_client, ipc, output, proc, runner, sessions, vocab
+from acpc import (
+    __version__,
+    daemon,
+    daemon_client,
+    errors,
+    ipc,
+    output,
+    proc,
+    runner,
+    sessions,
+    vocab,
+)
+from acpc.cli import main
 from acpc.client import REPLAY_GENERATION_KEY, AcpcClient
 from acpc.permissions import PermissionLevel, select_mode
 from acpc.registry import AgentRegistry
 from acpc.transcript import Transcript
+
+pytestmark = pytest.mark.timeout(120)
 
 MOCK_AGENT_SCRIPT = str(Path(__file__).with_name("mock_agent.py"))
 
@@ -120,6 +136,101 @@ def dispatch_payload(prompt: str = "x") -> dict:
 
 def rebuild(payload: dict) -> runner.TurnRequest:
     return daemon.Daemon(target())._rebuild_request(payload)
+
+
+def test_hung_initialize_fails_the_session_with_a_handshake_diagnosis(
+    state_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    del state_root
+    monkeypatch.setenv("ACPC_MOCK_INIT_HANG", "1")
+    monkeypatch.setattr(daemon, "HOST_START_TIMEOUT", 0.2)
+    session_id = new_session("handshake timeout")
+    instance = daemon.Daemon(target())
+
+    async def start() -> dict[str, Any]:
+        try:
+            return await instance._start(
+                {"session_id": session_id, "payload": dispatch_payload("handshake timeout")}
+            )
+        finally:
+            await instance.host.close()
+
+    async def start_with_test_deadline() -> dict[str, Any]:
+        return await asyncio.wait_for(start(), timeout=2)
+
+    started_at = time.monotonic()
+    reply = asyncio.run(start_with_test_deadline())
+    elapsed = time.monotonic() - started_at
+    meta = sessions.read_meta(session_id)
+
+    assert elapsed < 2
+    assert reply["ok"] is False
+    assert reply["kind"] == errors.AGENT_ERROR
+    assert "handshake" in reply["error"]
+    assert meta.state == "failed"
+    assert meta.stop_reason == "error"
+    assert "handshake" in (meta.failure or "")
+    assert meta.steer_mode == vocab.STEER_CANCEL_THEN_START
+
+
+def test_handshake_failure_still_finalizes_when_mode_metadata_fails(
+    state_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    del state_root
+    monkeypatch.setenv("ACPC_MOCK_INIT_HANG", "1")
+    monkeypatch.setattr(daemon, "HOST_START_TIMEOUT", 0.2)
+    session_id = new_session("metadata write failure")
+    instance = daemon.Daemon(target())
+
+    def fail_mode_write(session: str, **changes: Any) -> Any:
+        del session, changes
+        raise OSError("metadata write failed")
+
+    monkeypatch.setattr(sessions, "update_meta", fail_mode_write)
+
+    async def start() -> dict[str, Any]:
+        try:
+            return await instance._start(
+                {"session_id": session_id, "payload": dispatch_payload("metadata write failure")}
+            )
+        finally:
+            await instance.host.close()
+
+    asyncio.run(start())
+
+    assert sessions.read_meta(session_id).state == "failed"
+
+
+def test_a_stop_during_the_handshake_records_the_stop_reason(
+    state_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    del state_root
+    monkeypatch.setenv("ACPC_MOCK_INIT_HANG", "1")
+    session_id = new_session("stopped during handshake")
+    instance = daemon.Daemon(target())
+
+    async def start_then_stop() -> dict[str, Any]:
+        starting = asyncio.create_task(
+            instance._start(
+                {"session_id": session_id, "payload": dispatch_payload("stopped during handshake")}
+            )
+        )
+        try:
+            while session_id not in instance.turns or not instance.host._starting.locked():
+                await asyncio.sleep(0.02)
+            await instance._shut_down_sessions("the daemon was stopped")
+            return await asyncio.wait_for(starting, timeout=2)
+        finally:
+            await instance.host.close()
+
+    reply = asyncio.run(start_then_stop())
+    meta = sessions.read_meta(session_id)
+
+    assert reply["ok"] is False
+    assert reply["error"] == "the daemon was stopped"
+    assert meta.state == "failed"
+    assert meta.stop_reason == "the daemon was stopped"
+    assert "the daemon was stopped" in (meta.failure or "")
 
 
 @asynccontextmanager
@@ -246,6 +357,29 @@ def test_daemon_acceptance_has_a_running_disk_claim_before_the_turn_task_runs(
     asyncio.run(scenario())
 
 
+def test_daemon_status_leaves_a_daemon_of_another_build_running(
+    state_root: Path, live_daemon: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A read-only command reports a version it does not share; it does not resolve it.
+
+    Greeting is what stands a daemon of another build down, taking its
+    sessions with it, so the observing path must not greet.
+    """
+    session_id = new_session("a daemon turn")
+    run_turn(session_id, "a daemon turn")
+    monkeypatch.setattr(daemon_client, "__version__", "0.0.0-another-build")
+    cli = CliRunner()
+
+    first = cli.invoke(main, ["daemon", "status", "--json"], catch_exceptions=False)
+    second = cli.invoke(main, ["daemon", "status", "--json"], catch_exceptions=False)
+
+    reported = json.loads(first.stdout)["items"]
+    assert [entry["target"] for entry in reported] == [target()]
+    assert reported[0]["version"] == __version__
+    # Still there for the next look: the first one changed nothing.
+    assert json.loads(second.stdout)["items"][0]["pid"] == reported[0]["pid"]
+
+
 # --- routing ----------------------------------------------------------------
 
 
@@ -256,9 +390,9 @@ def test_a_turn_runs_on_the_daemon_and_finishes_the_session(
 
     outcome = run_turn(session_id, "a daemon turn")
 
-    assert outcome.state == "done"
+    assert outcome.state == "succeeded"
     assert outcome.route_note is None
-    assert sessions.read_meta(session_id).state == "done"
+    assert sessions.read_meta(session_id).state == "succeeded"
 
 
 def test_warm_daemon_rejects_a_changed_spawn_argv(
@@ -281,7 +415,7 @@ def test_warm_daemon_rejects_a_changed_spawn_argv(
     monkeypatch.setenv("ACPC_MOCK_EVENT_FILE", str(event_file))
     run_turn(meta.session_id, "first")
     first = sessions.read_meta(meta.session_id)
-    sessions.update_meta(meta.session_id, tokens=1234, cost=0.5)
+    sessions.update_meta(meta.session_id, context={"used": 1234, "size": None, "peak": 1234})
     assert first.target is not None
     old_target = first.target
 
@@ -312,8 +446,7 @@ def test_warm_daemon_rejects_a_changed_spawn_argv(
     assert outcome["state"] == "failed"
     failed = sessions.read_meta(meta.session_id)
     assert failed.state == "failed"
-    assert failed.tokens == 1234
-    assert failed.cost == pytest.approx(0.5)
+    assert failed.context == {"used": 1234, "size": None, "peak": 1234}
     answer = sessions.answer_path(meta.session_id).read_text(encoding="utf-8")
     assert "argv mismatch" in answer
     assert "--mock-effort high" in answer
@@ -351,7 +484,50 @@ def test_cancel_before_daemon_acceptance_is_the_no_such_turn_case(
 
     assert reply["ok"] is False
     assert "not running here" in reply["error"]
-    assert sessions.read_meta(session_id).state == "done"
+    assert sessions.read_meta(session_id).state == "succeeded"
+
+
+def test_cancel_with_a_stale_turn_token_is_a_conflict_that_leaves_the_turn_running(
+    state_root: Path, live_daemon: None
+) -> None:
+    """SPEC.md `cancel`: a request naming an older token than the one this
+    daemon now holds does not touch the turn actually running."""
+    session_id = new_session("slow:1 daemon token race")
+    first = run_turn(session_id, "slow:1 daemon token race")
+    assert first.state == "succeeded"
+    stale_token = sessions.read_meta(session_id).turns
+
+    second_holder: list[runner.TurnOutcome] = []
+    second = threading.Thread(
+        target=lambda: second_holder.append(next_turn(session_id, "slow:2 daemon token race next")),
+        daemon=True,
+    )
+    second.start()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and sessions.load(session_id).state != "running":
+        time.sleep(0.02)
+    assert sessions.load(session_id).state == "running"
+
+    async def cancel_stale() -> dict[str, Any]:
+        connection = await daemon_client.connect(target())
+        assert connection is not None
+        try:
+            return await connection.cancel(session_id, turn_token=stale_token)
+        finally:
+            await connection.close()
+
+    reply = asyncio.run(cancel_stale())
+
+    assert reply == {
+        "ok": False,
+        "kind": errors.CONFLICT,
+        "stale": True,
+        "turn_token": stale_token + 1,
+    }
+    assert sessions.load(session_id).state == "running"
+
+    second.join(timeout=15)
+    assert second_holder and second_holder[0].state == "succeeded"
 
 
 def test_daemon_replay_tag_survives_restore_client_release_and_live_rebind(
@@ -744,7 +920,7 @@ def test_a_turn_is_not_started_if_daemon_task_registration_fails(
 
     assert reply["ok"] is False
     failed = sessions.read_meta(session_id)
-    assert failed.state == "done"
+    assert failed.state == "succeeded"
     assert failed.turns == 1
 
 
@@ -785,8 +961,8 @@ def test_a_refused_switch_leaves_the_daemon_warm_for_continue(
     continued = next_turn(session_id, "multi:after the refused switch")
 
     assert continued.route_note is None
-    assert continued.state == "done"
-    assert sessions.read_meta(session_id).state == "done"
+    assert continued.state == "succeeded"
+    assert sessions.read_meta(session_id).state == "succeeded"
     assert "turn 2: after the refused switch" in sessions.answer_path(session_id).read_text()
 
 
@@ -852,11 +1028,11 @@ def test_daemon_carries_incomplete_delivery_into_a_cold_resume(
 
     first, resume_status, second = asyncio.run(run_daemon_turns())
 
-    assert first.state == "done"
+    assert first.state == "succeeded"
     assert first.delivery_record_incomplete is True
     assert sessions.read_meta(session_id).extra[sessions.DELIVERY_RECORD_INCOMPLETE] is True
     assert resume_status == "unverified — delivery record incomplete"
-    assert second["state"] == "done"
+    assert second["state"] == "succeeded"
 
 
 def test_daemon_keeps_a_pre_send_failure_record_complete_on_cold_resume(
@@ -912,12 +1088,119 @@ def test_daemon_keeps_a_pre_send_failure_record_complete_on_cold_resume(
             await instance._await_preparation({"session_id": session_id})
             resume_status = sessions.read_meta(session_id).extra["resume"]
             outcome = await instance._await({"session_id": session_id})
-            assert outcome["outcome"]["state"] == "done"
+            assert outcome["outcome"]["state"] == "succeeded"
             return resume_status
         finally:
             await instance.host.close()
 
     assert asyncio.run(run_cold_resume()) == "verified"
+
+
+def test_await_with_a_stale_turn_returns_the_in_flight_turns_own_token(
+    state_root: Path,
+) -> None:
+    """M1g: a caller pinned to a turn the daemon has already rotated past gets
+    `stale` at once, naming the turn actually in flight, instead of waiting on
+    a turn that will never end from under it."""
+    session_id = new_session("stale in-flight")
+    instance = daemon.Daemon(target())
+    instance.turns[session_id] = daemon._Turn(
+        session_id=session_id,
+        task=None,
+        cancel=runner._CancelSignal(),
+        turn_token=2,
+    )
+
+    reply = asyncio.run(instance._await({"session_id": session_id, "turn": 1}))
+
+    assert reply == {"ok": True, "stale": True, "turn": 2}
+
+
+def test_await_with_a_stale_turn_and_no_in_flight_reads_the_current_turn_from_disk(
+    state_root: Path,
+) -> None:
+    """The daemon has no turn of its own in flight — the session already
+    finished and rotated (direct path, or after this daemon restarted) — so
+    the mismatch is detected from `meta.json` instead."""
+    session_id = new_session("stale on disk")
+    sessions.mark_running(session_id, pid=1, process_start_time="tok")
+    sessions.transition(session_id, "succeeded", exit_code=0)
+    sessions.rotate_turn(session_id)
+    instance = daemon.Daemon(target())
+
+    reply = asyncio.run(instance._await({"session_id": session_id, "turn": 1}))
+
+    assert reply == {"ok": True, "stale": True, "turn": 2}
+
+
+def test_await_with_an_untokened_in_flight_turn_reads_the_current_turn_from_disk(
+    state_root: Path,
+) -> None:
+    """A turn `_start` has claimed but not yet assigned a token to (backend
+    initialization still running) must not silently attach the caller as a
+    waiter on the wrong turn; the on-disk turn count still tells `stale`
+    from current, the same source `_start` itself falls back to once the
+    token becomes available."""
+    session_id = new_session("no token yet")
+    sessions.mark_running(session_id, pid=1, process_start_time="tok")
+    sessions.transition(session_id, "succeeded", exit_code=0)
+    sessions.rotate_turn(session_id)
+    instance = daemon.Daemon(target())
+    instance.turns[session_id] = daemon._Turn(
+        session_id=session_id,
+        task=None,
+        cancel=runner._CancelSignal(),
+    )
+
+    reply = asyncio.run(instance._await({"session_id": session_id, "turn": 1}))
+
+    assert reply == {"ok": True, "stale": True, "turn": 2}
+
+
+def test_await_with_an_untokened_in_flight_turn_still_waits_for_that_same_turn(
+    state_root: Path,
+) -> None:
+    """The other side of the untokened window: the pinned turn is the one in
+    flight (a cold `run --bg` still initializing), so the caller must wait for
+    it and be woken by its outcome, not be told `stale` or left hanging."""
+    session_id = new_session("cold start, no token yet")
+    sessions.mark_running(session_id, pid=1, process_start_time="tok")
+    instance = daemon.Daemon(target())
+    instance.turns[session_id] = daemon._Turn(
+        session_id=session_id,
+        task=None,
+        cancel=runner._CancelSignal(),
+    )
+
+    async def scenario() -> tuple[bool, dict[str, Any]]:
+        pending = asyncio.ensure_future(instance._await({"session_id": session_id, "turn": 1}))
+        await asyncio.sleep(0.2)
+        still_waiting = not pending.done()
+        instance._finish(
+            session_id, runner.TurnOutcome(state="succeeded", stop_reason="end_turn", answer="done")
+        )
+        return still_waiting, await asyncio.wait_for(pending, timeout=5)
+
+    still_waiting, reply = asyncio.run(scenario())
+
+    assert still_waiting
+    assert "stale" not in reply
+    assert reply["outcome"]["state"] == "succeeded"
+
+
+def test_await_with_no_turn_argument_behaves_as_before(state_root: Path) -> None:
+    """Omitting `turn` keeps the pre-M1g leniency: serve whatever this daemon
+    currently holds, or the on-disk outcome when it holds nothing."""
+    session_id = new_session("no turn pin")
+    sessions.mark_running(session_id, pid=1, process_start_time="tok")
+    sessions.transition(session_id, "succeeded", exit_code=0)
+    instance = daemon.Daemon(target())
+
+    reply = asyncio.run(instance._await({"session_id": session_id}))
+
+    assert reply["ok"] is True
+    assert "stale" not in reply
+    assert reply["outcome"]["state"] == "succeeded"
 
 
 def test_one_daemon_serves_several_sessions(state_root: Path, live_daemon: None) -> None:
@@ -936,8 +1219,8 @@ def test_one_daemon_serves_several_sessions(state_root: Path, live_daemon: None)
             await connection.close()
 
     assert asyncio.run(pids()) > 0
-    assert sessions.read_meta(first).state == "done"
-    assert sessions.read_meta(second).state == "done"
+    assert sessions.read_meta(first).state == "succeeded"
+    assert sessions.read_meta(second).state == "succeeded"
 
 
 # --- warm versus cold, the contract `continue` depends on -------------------
@@ -1002,6 +1285,82 @@ def test_a_daemon_cold_resume_prefers_session_resume(
     assert 'You asked: "turn two"' in answer
 
 
+# --- cancellation spelling ---------------------------------------------------
+
+
+def test_an_adapter_side_cancel_normalizes_the_stop_reason_spelling(
+    state_root: Path, live_daemon: None
+) -> None:
+    """SPEC.md *Session states*: `stop_reason: canceled` whichever side
+    canceled it. The mock adapter itself reports the ACP wire spelling
+    `cancelled` in its `PromptResponse` once acpc's `cancel` reaches it
+    (`tests/mock_agent.py`'s `slow:` scenario); acpc's own `stop_reason`
+    normalizes that to `canceled` — never the raw ACP literal.
+    """
+    session_id = new_session("slow:30 adapter cancel")
+    problem = asyncio.run(
+        runner.dispatch_background(
+            session_id, runner.TurnRequest(resolution=resolve(), prompt="slow:30 adapter cancel")
+        )
+    )
+    assert problem is None
+    _assert_state(session_id, "running")
+
+    cli = CliRunner()
+    canceled = cli.invoke(main, ["cancel", session_id, "--json"], catch_exceptions=False)
+    assert canceled.exit_code == vocab.EXIT_OK, canceled.stderr
+    cancel_payload = json.loads(canceled.stdout)
+    assert cancel_payload["status"] == "canceled"
+    assert cancel_payload["stop_reason"] == "canceled"
+
+    meta = _wait_for_finished(session_id)
+    assert meta.state == "canceled"
+    assert meta.stop_reason == "canceled"
+
+    status = cli.invoke(main, ["status", session_id, "--json"], catch_exceptions=False)
+    assert json.loads(status.stdout)["stop_reason"] == "canceled"
+
+    waited = cli.invoke(main, ["wait", session_id, "--json"], catch_exceptions=False)
+    assert json.loads(waited.stdout)["stop_reason"] == "canceled"
+
+    transcript_text = sessions.transcript_path(session_id).read_text(encoding="utf-8")
+    assert '"cancelled"' not in transcript_text
+
+
+def test_a_legacy_meta_json_cancelled_stop_reason_reads_back_normalized(
+    state_root: Path,
+) -> None:
+    session_id = new_session("legacy cancelled spelling")
+    meta_path = sessions.session_dir(session_id) / "meta.json"
+    raw = json.loads(meta_path.read_text(encoding="utf-8"))
+    raw["status"] = "canceled"
+    raw["stop_reason"] = "cancelled"
+    meta_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    meta = sessions.read_meta(session_id)
+
+    assert meta.stop_reason == "canceled"
+
+
+def test_a_legacy_meta_json_preparation_cancelled_spelling_reads_back_normalized(
+    state_root: Path,
+) -> None:
+    """Slice 23 round 2: `cancelled during preparation` was acpc's own
+    pre-slice-23 spelling of the no-prompt-sent reason, and is normalized on
+    read the same way the ACP wire spelling `cancelled` is."""
+    session_id = new_session("legacy preparation-cancelled spelling")
+    meta_path = sessions.session_dir(session_id) / "meta.json"
+    raw = json.loads(meta_path.read_text(encoding="utf-8"))
+    raw["status"] = "canceled"
+    raw["stop_reason"] = "cancelled during preparation"
+    meta_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    meta = sessions.read_meta(session_id)
+
+    assert meta.stop_reason == "canceled during preparation"
+    assert meta.stop_reason == runner.PREPARATION_CANCELLED_REASON
+
+
 # --- stopping ---------------------------------------------------------------
 
 
@@ -1015,7 +1374,7 @@ def test_daemon_stop_fails_its_active_sessions_rather_than_orphaning_them(
         )
     )
     assert problem is None
-    _wait_for(session_id, "running")
+    _assert_state(session_id, "running")
 
     asyncio.run(_stop_target())
 
@@ -1044,7 +1403,7 @@ def test_killed_adapter_records_a_failure_event(state_root: Path, live_daemon: N
         )
     )
     assert problem is None
-    _wait_for(session_id, "running")
+    _assert_state(session_id, "running")
 
     daemon_pid = asyncio.run(_daemon_pid())
     children_path = Path(f"/proc/{daemon_pid}/task/{daemon_pid}/children")
@@ -1063,17 +1422,94 @@ def test_killed_adapter_records_a_failure_event(state_root: Path, live_daemon: N
     assert error_events[-1]["next_step"].startswith("inspect the daemon log at")
 
 
+def test_a_daemon_killed_during_turn_one_still_leaves_a_continuable_session(
+    state_root: Path, live_daemon: None
+) -> None:
+    """SPEC.md *State on disk*: the adapter session id is recorded as soon as
+    the adapter has accepted the session, before the prompt is sent — so a
+    daemon killed mid-turn-1 still leaves `adapter_session_id` on disk and
+    `continue` takes the normal cold-resume path instead of `corrupt_state`.
+    """
+    import os
+    import signal
+
+    # `new_session`'s inline `resolution_payload` lacks the `adapter`/full
+    # `command` fields `continue` needs (they only land through a real CLI
+    # dispatch's `session_resolution`), so this session is started for real.
+    cli = CliRunner()
+    started = cli.invoke(
+        main,
+        ["run", "mock", "slow:30 daemon killed turn one", "--bg", "--json"],
+        catch_exceptions=False,
+    )
+    assert started.exit_code == vocab.EXIT_OK, started.stderr
+    session_id = json.loads(started.stdout)["session_id"]
+    _assert_state(session_id, "running")
+
+    # `running` is marked before `session/new` returns, so poll rather than
+    # assume: once the adapter has accepted the session (still well inside
+    # `slow:`'s own wait), its id must already be on disk.
+    deadline = time.monotonic() + 10
+    adapter_session_id = None
+    while time.monotonic() < deadline:
+        adapter_session_id = sessions.read_meta(session_id).adapter_session_id
+        if adapter_session_id is not None:
+            break
+        time.sleep(0.05)
+    assert adapter_session_id is not None
+
+    daemon_pid = asyncio.run(_daemon_pid())
+    os.kill(daemon_pid, signal.SIGKILL)
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline and _pid_alive(daemon_pid):
+        time.sleep(0.1)
+    assert not _pid_alive(daemon_pid)
+
+    # An exiting process drops its cmdline before it reaches the zombie state
+    # liveness reads, so `_pid_alive` can go false a moment before `load`
+    # calls the host dead. Poll instead of racing that window.
+    deadline = time.monotonic() + 20
+    observed = sessions.load(session_id)
+    while observed.state == "running" and time.monotonic() < deadline:
+        time.sleep(0.05)
+        observed = sessions.load(session_id)
+    assert observed.state == "unknown"
+    assert sessions.read_meta(session_id).adapter_session_id is not None
+
+    continued = cli.invoke(
+        main, ["continue", session_id, "again", "--json"], catch_exceptions=False
+    )
+
+    assert continued.exit_code == vocab.EXIT_OK, continued.stderr
+    document = json.loads(continued.stdout)
+    assert document["turn"] == 2
+    assert document.get("resume")
+
+
 def test_authentication_refusal_records_the_remedy_even_with_an_empty_log(
     state_root: Path, live_daemon: None
 ) -> None:
-    session_id = new_session("auth:vendor needs credentials")
-    # "Empty log" is the condition under test, so establish it rather than
-    # inherit it: an earlier daemon in this root leaves its own shutdown note
-    # behind, and the assertion below would then be measuring test order.
     resolution = resolve()
     log_file = daemon.log_path_for_target(runner.call_target(resolution))
     log_file.parent.mkdir(parents=True, exist_ok=True)
+    warm_session = new_session("warm the daemon before testing an empty log")
+    warm_problem = asyncio.run(
+        runner.dispatch_background(
+            warm_session,
+            runner.TurnRequest(
+                resolution=resolution,
+                prompt="warm the daemon before testing an empty log",
+            ),
+        )
+    )
+    assert warm_problem is None
+    assert runner.wait_for_session(warm_session, timeout=5) == (1, "succeeded")
+
+    # The daemon starts and its adapter initializes before the log is cleared.
+    # The test now owns the empty-log precondition for the following auth
+    # request rather than racing daemon startup and adapter initialization.
     log_file.write_bytes(b"")
+    session_id = new_session("auth:vendor needs credentials")
     problem = asyncio.run(
         runner.dispatch_background(
             session_id,
@@ -1082,7 +1518,8 @@ def test_authentication_refusal_records_the_remedy_even_with_an_empty_log(
     )
     assert problem is None
 
-    meta = _wait_for_finished(session_id)
+    assert runner.wait_for_session(session_id, timeout=5) == (1, "failed")
+    meta = sessions.read_meta(session_id)
     assert meta.state == "failed"
     error_events = [event for event in _events(session_id) if event.get("type") == "error"]
     assert error_events
@@ -1235,7 +1672,7 @@ def test_daemon_stop_leaves_an_already_finished_session_alone(
 
     asyncio.run(_stop_target())
 
-    assert sessions.read_meta(session_id).state == "done"
+    assert sessions.read_meta(session_id).state == "succeeded"
 
 
 async def _stop_target() -> None:
@@ -1252,7 +1689,7 @@ def test_the_target_heals_after_its_adapter_dies(state_root: Path, live_daemon: 
     import signal
 
     first = new_session("warm the adapter")
-    assert run_turn(first, "warm the adapter").state == "done"
+    assert run_turn(first, "warm the adapter").state == "succeeded"
 
     daemon_pid = asyncio.run(_daemon_pid())
     children_path = Path(f"/proc/{daemon_pid}/task/{daemon_pid}/children")
@@ -1268,7 +1705,7 @@ def test_the_target_heals_after_its_adapter_dies(state_root: Path, live_daemon: 
     while time.monotonic() < deadline:
         session_id = new_session("after the crash")
         try:
-            if run_turn(session_id, "after the crash").state == "done":
+            if run_turn(session_id, "after the crash").state == "succeeded":
                 return
         except runner.RunnerError:
             pass  # the daemon may still be tearing the dead turn down
@@ -1308,7 +1745,7 @@ def test_a_turn_past_the_slot_limit_is_reported_as_queued(
             blocker, runner.TurnRequest(resolution=resolve(), prompt="slow:30 slot holder")
         )
     )
-    _wait_for(blocker, "running")
+    _assert_state(blocker, "running")
 
     second = new_session("waiting for a slot")
     outcome = asyncio.run(_start_and_report(second, "waiting for a slot"))
@@ -1347,7 +1784,7 @@ def test_status_reports_the_pid_uptime_and_log_path(state_root: Path, live_daemo
     reply = asyncio.run(status())
 
     assert reply["pid"] > 0
-    assert reply["uptime"] >= 0
+    assert reply["uptime_seconds"] >= 0
     assert reply["log"] == str(daemon.log_path_for_target(target()))
 
 
@@ -1407,7 +1844,10 @@ def test_concurrent_sessions_never_land_on_each_others_transcripts(
         for session_id in ids:
             _wait_for_finished(session_id)
 
-    assert [sessions.read_meta(session_id).state for session_id in ids] == ["done", "done"]
+    assert [sessions.read_meta(session_id).state for session_id in ids] == [
+        "succeeded",
+        "succeeded",
+    ]
 
 
 async def _start_together(work: list[tuple[str, str]]) -> None:
@@ -1435,7 +1875,7 @@ def _count_messages(session_id: str, needle: str) -> int:
     return sum(needle in event.get("text", "") for event in _messages(session_id))
 
 
-def _wait_for_message(session_id: str, needle: str, timeout: float = 20.0) -> None:
+def _wait_for_message(session_id: str, needle: str, timeout: float = 90.0) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if _count_messages(session_id, needle):
@@ -1458,23 +1898,16 @@ def _events(session_id: str) -> list[dict]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
 
 
-def _wait_for(session_id: str, state: str, timeout: float = 20.0) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if sessions.read_meta(session_id).state == state:
-            return
-        time.sleep(0.1)
-    pytest.fail(f"session {session_id} never reached {state}")
+def _assert_state(session_id: str, state: str) -> None:
+    assert sessions.read_meta(session_id).state == state
 
 
 def _wait_for_finished(session_id: str, timeout: float = 20.0) -> sessions.SessionMeta:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        meta = sessions.read_meta(session_id)
-        if meta.is_finished:
-            return meta
-        time.sleep(0.1)
-    pytest.fail(f"session {session_id} never finished")
+    _turn, state = runner.wait_for_session(session_id, timeout=timeout)
+    assert state is not None
+    meta = sessions.read_meta(session_id)
+    assert meta.is_finished
+    return meta
 
 
 def test_a_daemon_whose_socket_is_gone_stops_itself(state_root: Path, live_daemon: None) -> None:
@@ -1534,3 +1967,100 @@ def test_a_daemon_that_loses_the_endpoint_retires(state_root: Path, live_daemon:
             return
         time.sleep(0.25)
     pytest.fail("the displaced daemon kept running")
+
+
+# --- in-place steering -------------------------------------------------------
+
+
+async def _wait_for_delivered_prompt(session_id: str, timeout: float = 30.0) -> None:
+    """Wait on the disk record, which is written after the phase turns running."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        meta = sessions.read_meta(session_id)
+        delivered = meta.extra.get("delivered_prompts")
+        if isinstance(delivered, list) and any(
+            isinstance(entry, dict) and entry.get("turn") == meta.turns for entry in delivered
+        ):
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError("the prompt never reached the adapter")
+
+
+def _steer_during_a_turn(
+    prompt: str,
+    *,
+    monkeypatch: pytest.MonkeyPatch,
+    timeout: float | None = None,
+) -> tuple[dict[str, Any], str]:
+    """Start one daemon turn, let its prompt land, then steer it."""
+    session_id = new_session(prompt)
+    instance = daemon.Daemon(target())
+    if timeout is not None:
+        monkeypatch.setattr(daemon, "STEER_REQUEST_TIMEOUT", timeout)
+
+    async def scenario() -> dict[str, Any]:
+        try:
+            reply = await instance._start(
+                {"session_id": session_id, "payload": dispatch_payload(prompt)}
+            )
+            assert reply["ok"] is True
+            await _wait_for_delivered_prompt(session_id)
+            return await instance._steer({"session_id": session_id, "text": "stop"})
+        finally:
+            await instance._shut_down_sessions("test cleanup")
+            await instance.host.close()
+
+    return asyncio.run(scenario()), session_id
+
+
+def test_steering_a_turn_that_is_not_running_is_a_conflict(state_root: Path) -> None:
+    """SPEC `steer`: only a turn in flight has an adapter session to correct."""
+    session_id = new_session("nothing in flight")
+
+    reply = asyncio.run(daemon.Daemon(target())._steer({"session_id": session_id, "text": "stop"}))
+
+    assert reply["ok"] is False
+    assert reply["kind"] == "conflict"
+
+
+def test_steering_an_adapter_without_the_capability_is_not_supported(
+    state_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The refusal comes from the capability the daemon stored, not a failed send."""
+    reply, session_id = _steer_during_a_turn("chunkslow:30 plain", monkeypatch=monkeypatch)
+
+    assert reply["ok"] is False
+    assert reply["kind"] == "not_supported"
+    assert sessions.read_meta(session_id).turns == 1
+
+
+def test_a_steering_request_that_is_never_answered_is_an_unknown_outcome(
+    state_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SPEC `steer`: the request crossed and the reply never did, so the outcome
+    is unknown — and the daemon answers instead of hanging its client on it."""
+    monkeypatch.setenv("ACPC_MOCK_STEERING", "1")
+    monkeypatch.setenv("ACPC_MOCK_STEERING_HANG", "1")
+
+    reply, session_id = _steer_during_a_turn(
+        "chunkslow:30 hang", monkeypatch=monkeypatch, timeout=0.5
+    )
+
+    assert reply == {"ok": False, "kind": "outcome_unknown", "sent": True}
+    assert sessions.read_meta(session_id).turns == 1
+
+
+def test_steering_a_turn_still_preparing_is_a_conflict(state_root: Path) -> None:
+    """SPEC `steer`: a preparing turn has sent no prompt, so there is nothing
+    for the adapter to add the instruction to — the gate is the phase, not the
+    turn's mere presence."""
+    session_id = new_session("still preparing")
+    instance = daemon.Daemon(target())
+    instance.turns[session_id] = daemon._Turn(
+        session_id=session_id, task=None, cancel=runner._CancelSignal()
+    )
+
+    reply = asyncio.run(instance._steer({"session_id": session_id, "text": "stop"}))
+
+    assert reply["ok"] is False
+    assert reply["kind"] == "conflict"

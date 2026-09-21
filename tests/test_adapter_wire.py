@@ -308,20 +308,27 @@ def test_set_session_model_rejects_a_connection_without_a_raw_path() -> None:
 
 
 def test_record_prompt_usage_reads_prompt_response_meta(tmp_path: Path) -> None:
+    """`record_prompt_usage` never parses cost (Grok's `costUsdTicks` heuristic is gone);
+    it only sets `used`/`peak` from `totalTokens`, with `size` `null`."""
     client, transcript = _client(tmp_path)
     prompt = SimpleNamespace(
         stop_reason="end_turn",
         field_meta={
             "totalTokens": 120,
-            "usage": {"costUsdTicks": 1_000_000_000},  # 0.1 USD
+            "usage": {"costUsdTicks": 1_000_000_000},
         },
     )
     client.record_prompt_usage(prompt)
-    assert client.tokens == 120
-    assert client.cost == pytest.approx(0.1)
+    assert client.context == {"used": 120, "size": None, "peak": 120}
     events = transcript.read().events
     assert [e for e in events if e.get("type") == "usage"] == [
-        {"type": "usage", "tokens": 120, "cost": 0.1, "ts": 1.0, "i": 1}
+        {
+            "type": "usage",
+            "used": 120,
+            "size": None,
+            "ts": "1970-01-01T00:00:01.000000Z",
+            "i": 1,
+        }
     ]
 
 
@@ -335,7 +342,7 @@ def test_record_prompt_usage_does_not_duplicate_when_unchanged(tmp_path: Path) -
     client.record_prompt_usage(prompt)
     usage_events = [e for e in transcript.read().events if e.get("type") == "usage"]
     assert len(usage_events) == 1
-    assert usage_events[0]["tokens"] == 50
+    assert usage_events[0]["used"] == 50
 
 
 def test_models_from_session_meta_xai_session_config(tmp_path: Path) -> None:

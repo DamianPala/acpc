@@ -52,7 +52,7 @@ def make_session(
     )
 
 
-def finished_session(*, state: str = "done", finished_offset: float = 60.0) -> str:
+def finished_session(*, state: str = "succeeded", finished_offset: float = 60.0) -> str:
     meta = make_session(clock=at())
     sessions.mark_running(meta.session_id, pid=1, process_start_time="token", clock=at(1.0))
     sessions.transition(meta.session_id, state, exit_code=0, clock=at(finished_offset))
@@ -102,7 +102,7 @@ class TestCreateSession:
             "name",
             "entry",
             "base_adapter",
-            "state",
+            "status",
             "pid",
             "process_start_time",
             "created_at",
@@ -111,20 +111,78 @@ class TestCreateSession:
             "turns",
             "exit_code",
             "stop_reason",
-            "tokens",
-            "cost",
+            "context",
             "prompt_snippet",
             "resolution",
             "adapter_session_id",
             "target",
         ):
             assert key in on_disk, key
-        assert on_disk["state"] == "starting"
-        assert on_disk["state"] in vocab.SESSION_STATES
+        assert on_disk["status"] == "starting"
+        assert on_disk["status"] in vocab.SESSION_STATES
         assert on_disk["turns"] == 1
-        assert on_disk["created_at"] == BASE_TIME
+        assert on_disk["created_at"] == "2025-10-09T08:53:20.000000Z"
         assert on_disk["started_at"] is None
         assert on_disk["name"] == "researcher"
+
+    @pytest.mark.parametrize(
+        ("legacy_state", "canonical_state"),
+        [
+            ("done", "succeeded"),
+            ("cancelled", "canceled"),
+            ("timeout", "failed"),
+        ],
+    )
+    def test_legacy_meta_is_read_and_rewritten_with_canonical_fields(
+        self, legacy_state: str, canonical_state: str
+    ) -> None:
+        meta = make_session()
+        path = sessions.meta_path(meta.session_id)
+        payload = json.loads(path.read_text())
+        payload["state"] = legacy_state
+        payload.pop("status")
+        payload["created_at"] = BASE_TIME
+        if legacy_state == "timeout":
+            payload["exit_code"] = vocab.EXIT_TIMEOUT
+            payload["stop_reason"] = "timeout"
+        path.write_text(json.dumps(payload))
+
+        loaded = sessions.read_meta(meta.session_id)
+        assert loaded.state == canonical_state
+        if legacy_state == "timeout":
+            assert loaded.stop_reason == "error"
+            assert loaded.exit_code == vocab.EXIT_AGENT_ERROR
+
+        sessions.update_meta(meta.session_id, name="rewritten")
+        rewritten = json.loads(path.read_text())
+        assert rewritten["status"] == canonical_state
+        assert "state" not in rewritten
+        assert rewritten["created_at"] == "2025-10-09T08:53:20.000000Z"
+
+    @pytest.mark.parametrize("legacy_cost", [None, 0.19])
+    def test_legacy_tokens_and_cost_become_context_and_cost_is_dropped(
+        self, legacy_cost: float | None
+    ) -> None:
+        """SPEC.md *State on disk*: metadata written before 1.0 carried `tokens`
+        and `cost`; on read, `tokens` becomes `context` with `used` and `peak`
+        equal to it and `size` `null`, and `cost` is dropped — whether or not
+        the legacy file had one."""
+        meta = make_session()
+        path = sessions.meta_path(meta.session_id)
+        payload = json.loads(path.read_text())
+        del payload["context"]
+        payload["tokens"] = 38_259
+        payload["cost"] = legacy_cost
+        path.write_text(json.dumps(payload))
+
+        loaded = sessions.read_meta(meta.session_id)
+        assert loaded.context == {"used": 38_259, "size": None, "peak": 38_259}
+
+        sessions.update_meta(meta.session_id, name="rewritten")
+        rewritten = json.loads(path.read_text())
+        assert rewritten["context"] == {"used": 38_259, "size": None, "peak": 38_259}
+        assert "tokens" not in rewritten
+        assert "cost" not in rewritten
 
     def test_a_fresh_session_has_no_answer_yet(self) -> None:
         meta = make_session()
@@ -169,19 +227,19 @@ class TestTransitions:
         sessions.mark_running(meta.session_id, pid=4711, process_start_time="tok", clock=at(1.0))
         done = sessions.transition(
             meta.session_id,
-            "done",
+            "succeeded",
             exit_code=0,
             stop_reason="end_turn",
-            tokens=41_000,
+            context={"used": 41_000, "size": None, "peak": 41_000},
             clock=at(90.0),
         )
-        assert done.state == "done"
+        assert done.state == "succeeded"
         assert done.finished_at == BASE_TIME + 90.0
         assert done.exit_code == 0
         assert done.stop_reason == "end_turn"
-        assert done.tokens == 41_000
+        assert done.context == {"used": 41_000, "size": None, "peak": 41_000}
 
-    @pytest.mark.parametrize("final", ["done", "failed", "cancelled", "timeout", "orphaned"])
+    @pytest.mark.parametrize("final", ["succeeded", "failed", "canceled", "unknown"])
     def test_every_final_state_is_reachable_from_running(self, final: str) -> None:
         meta = make_session()
         sessions.mark_running(meta.session_id, pid=1, process_start_time="tok", clock=at(1.0))
@@ -189,7 +247,7 @@ class TestTransitions:
 
     def test_a_finished_session_cannot_transition_again(self) -> None:
         session_id = finished_session()
-        with pytest.raises(sessions.SessionStateError, match="done"):
+        with pytest.raises(sessions.SessionStateError, match="succeeded"):
             sessions.transition(session_id, "running", clock=at(120.0))
 
     def test_a_running_session_cannot_go_back_to_starting(self) -> None:
@@ -200,7 +258,7 @@ class TestTransitions:
 
     def test_an_unknown_state_is_rejected(self) -> None:
         meta = make_session()
-        with pytest.raises(ValueError, match="unknown session state"):
+        with pytest.raises(ValueError, match="unknown session status"):
             sessions.transition(meta.session_id, "wedged", clock=at(1.0))
 
     def test_update_meta_refuses_to_move_state(self) -> None:
@@ -215,10 +273,14 @@ class TestTransitions:
 
     def test_update_meta_persists_known_fields(self) -> None:
         meta = make_session()
-        sessions.update_meta(meta.session_id, adapter_session_id="acp-123", cost=0.42)
+        sessions.update_meta(
+            meta.session_id,
+            adapter_session_id="acp-123",
+            context={"used": 100, "size": None, "peak": 100},
+        )
         stored = sessions.read_meta(meta.session_id)
         assert stored.adapter_session_id == "acp-123"
-        assert stored.cost == 0.42
+        assert stored.context == {"used": 100, "size": None, "peak": 100}
 
 
 class TestLivenessAndOrphans:
@@ -232,29 +294,29 @@ class TestLivenessAndOrphans:
         )
         assert sessions.load(meta.session_id, clock=at(600.0)).state == "running"
 
-    def test_a_dead_host_process_is_reported_and_persisted_as_orphaned(self) -> None:
+    def test_a_dead_host_process_is_reported_and_persisted_as_unknown(self) -> None:
         meta = make_session()
         sessions.mark_running(
             meta.session_id, pid=_dead_pid(), process_start_time="tok", clock=at(1.0)
         )
 
-        assert sessions.load(meta.session_id, clock=at(2.0)).state == "orphaned"
+        assert sessions.load(meta.session_id, clock=at(2.0)).state == "unknown"
         on_disk = json.loads(sessions.meta_path(meta.session_id).read_text())
-        assert on_disk["state"] == "orphaned"
-        assert on_disk["stop_reason"] == "orphaned"
+        assert on_disk["status"] == "unknown"
+        assert on_disk["stop_reason"] == "unknown"
         assert on_disk["exit_code"] == vocab.EXIT_AGENT_ERROR
-        assert on_disk["finished_at"] == BASE_TIME + 2.0
+        assert on_disk["finished_at"] == "2025-10-09T08:53:22.000000Z"
 
-    def test_orphan_detection_does_not_wait_for_the_startup_grace(self) -> None:
+    def test_unknown_outcome_detection_does_not_wait_for_the_startup_grace(self) -> None:
         # Once a pid is recorded, liveness decides immediately — smoke kills a
-        # freshly started session and expects `orphaned` within seconds.
+        # freshly started session and expects `unknown` within seconds.
         meta = make_session()
         sessions.mark_running(
             meta.session_id, pid=_dead_pid(), process_start_time="tok", clock=at(1.0)
         )
-        assert sessions.load(meta.session_id, clock=at(1.5)).state == "orphaned"
+        assert sessions.load(meta.session_id, clock=at(1.5)).state == "unknown"
 
-    def test_orphan_detection_writes_the_placeholder_answer(self) -> None:
+    def test_unknown_outcome_detection_writes_the_placeholder_answer(self) -> None:
         meta = make_session()
         dead = _dead_pid()
         sessions.mark_running(meta.session_id, pid=dead, process_start_time="tok", clock=at(1.0))
@@ -266,7 +328,7 @@ class TestLivenessAndOrphans:
         assert meta.session_id in placeholder
         assert placeholder.count("\n") == 1
 
-    def test_a_partial_answer_survives_orphan_detection(self) -> None:
+    def test_a_partial_answer_survives_unknown_outcome_detection(self) -> None:
         meta = make_session()
         sessions.write_answer(meta.session_id, "partial work\n")
         sessions.mark_running(
@@ -287,9 +349,9 @@ class TestLivenessAndOrphans:
             process_start_time="0",
             clock=at(1.0),
         )
-        assert sessions.load(meta.session_id, clock=at(2.0)).state == "orphaned"
+        assert sessions.load(meta.session_id, clock=at(2.0)).state == "unknown"
 
-    def test_a_killed_process_flips_every_reader_to_orphaned(self) -> None:
+    def test_a_killed_process_flips_every_reader_to_unknown(self) -> None:
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
         try:
             meta = make_session()
@@ -303,8 +365,8 @@ class TestLivenessAndOrphans:
             child.kill()
             child.wait(timeout=10)
 
-            assert sessions.load(meta.session_id, clock=at(3.0)).state == "orphaned"
-            assert sessions.list_sessions(clock=at(3.0))[0].state == "orphaned"
+            assert sessions.load(meta.session_id, clock=at(3.0)).state == "unknown"
+            assert sessions.list_sessions(clock=at(3.0))[0].state == "unknown"
             assert sessions.answer_path(meta.session_id).exists()
         finally:
             child.kill()
@@ -314,20 +376,20 @@ class TestLivenessAndOrphans:
         meta = make_session()
         assert sessions.load(meta.session_id, clock=at(29.0)).state == "starting"
 
-    def test_past_the_startup_grace_a_pidless_session_is_orphaned(self) -> None:
+    def test_past_the_startup_grace_a_pidless_session_is_unknown(self) -> None:
         meta = make_session()
-        assert sessions.load(meta.session_id, clock=at(31.0)).state == "orphaned"
+        assert sessions.load(meta.session_id, clock=at(31.0)).state == "unknown"
 
     def test_the_grace_window_runs_from_started_at_when_present(self) -> None:
         meta = make_session()
         sessions.update_meta(meta.session_id, started_at=BASE_TIME + 100.0)
         assert sessions.load(meta.session_id, clock=at(120.0)).state == "starting"
-        assert sessions.load(meta.session_id, clock=at(140.0)).state == "orphaned"
+        assert sessions.load(meta.session_id, clock=at(140.0)).state == "unknown"
 
     def test_a_finished_session_is_never_re_probed(self) -> None:
         session_id = finished_session()
         sessions.update_meta(session_id, pid=_dead_pid())
-        assert sessions.load(session_id, clock=at(9999.0)).state == "done"
+        assert sessions.load(session_id, clock=at(9999.0)).state == "succeeded"
 
     def test_read_meta_reports_the_stored_state_verbatim(self) -> None:
         meta = make_session()
@@ -335,7 +397,51 @@ class TestLivenessAndOrphans:
             meta.session_id, pid=_dead_pid(), process_start_time="tok", clock=at(1.0)
         )
         assert sessions.read_meta(meta.session_id).state == "running"
-        assert sessions.load(meta.session_id, clock=at(2.0)).state == "orphaned"
+        assert sessions.load(meta.session_id, clock=at(2.0)).state == "unknown"
+
+
+class TestSteerModeMetadata:
+    @pytest.mark.parametrize(
+        ("legacy", "expected"),
+        [
+            (["in-place", "cancel-then-start"], "in-place"),
+            (["cancel-then-start"], "cancel-then-start"),
+        ],
+    )
+    def test_legacy_mode_lists_are_read_as_one_mode(self, legacy: list[str], expected: str) -> None:
+        meta = make_session()
+        path = sessions.meta_path(meta.session_id)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data.pop("steer_mode", None)
+        data["steer_modes"] = legacy
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+        loaded = sessions.read_meta(meta.session_id)
+
+        assert loaded.steer_mode == expected
+        sessions.write_meta(loaded)
+        written = json.loads(path.read_text(encoding="utf-8"))
+        assert written["steer_mode"] == expected
+        assert "steer_modes" not in written
+
+    def test_missing_mode_is_read_as_none_and_published_as_legacy_default(self) -> None:
+        meta = make_session()
+
+        assert meta.steer_mode is None
+        assert "steer_mode" in json.loads(
+            sessions.meta_path(meta.session_id).read_text(encoding="utf-8")
+        )
+
+    def test_unknown_string_mode_is_read_as_the_safe_default(self) -> None:
+        meta = make_session()
+        path = sessions.meta_path(meta.session_id)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["steer_mode"] = "bogus"
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+        loaded = sessions.read_meta(meta.session_id)
+
+        assert loaded.steer_mode == vocab.STEER_CANCEL_THEN_START
 
 
 class TestTurnRotation:
@@ -366,7 +472,7 @@ class TestTurnRotation:
         sessions.rotate_turn(session_id, clock=at(100.0))
         sessions.write_prompt(session_id, "second prompt")
         sessions.mark_running(session_id, pid=1, process_start_time="tok", clock=at(101.0))
-        sessions.transition(session_id, "done", exit_code=0, clock=at(102.0))
+        sessions.transition(session_id, "succeeded", exit_code=0, clock=at(102.0))
         sessions.write_answer(session_id, "answer two")
         sessions.rotate_turn(session_id, clock=at(200.0))
 
@@ -386,6 +492,45 @@ class TestTurnRotation:
         sessions.rotate_turn(session_id, clock=at(100.0))
 
         assert sessions.turn_path(session_id, "answer", 1).read_text() == "already parked"
+
+    def test_rotation_parks_a_snapshot_of_the_finished_turns_meta(self) -> None:
+        # SPEC.md *State on disk*: `wait` reports a rotated-past turn from this
+        # snapshot, so it has to describe turn 1 exactly as it stood right
+        # before the fields below were reset for turn 2.
+        session_id = finished_session()
+        before = sessions.read_meta(session_id)
+
+        rotated = sessions.rotate_turn(
+            session_id, clock=at(100.0), target_from_meta=lambda _meta: "next~target"
+        )
+
+        parked = sessions.read_turn_meta(session_id, 1)
+        assert parked.turns == 1
+        assert parked.state == "succeeded"
+        assert parked.session_id == session_id
+        # The next turn's own values (here its target) never leak into the
+        # finished turn's snapshot.
+        assert parked.target == before.target
+        assert rotated.turns == 2
+        assert rotated.state == "starting"
+        assert rotated.target == "next~target"
+
+    def test_rotation_never_overwrites_an_earlier_turns_parked_meta(self) -> None:
+        session_id = finished_session()
+        sessions.turn_path(session_id, "meta", 1, ext="json").write_text(
+            json.dumps({"already": "parked"}), encoding="utf-8"
+        )
+
+        sessions.rotate_turn(session_id, clock=at(100.0))
+
+        raw = sessions.turn_path(session_id, "meta", 1, ext="json").read_text(encoding="utf-8")
+        assert json.loads(raw) == {"already": "parked"}
+
+    def test_read_turn_meta_raises_session_not_found_for_a_turn_never_parked(self) -> None:
+        session_id = finished_session()
+
+        with pytest.raises(sessions.SessionNotFound):
+            sessions.read_turn_meta(session_id, 1)
 
     def test_rotation_is_refused_while_the_session_is_active(self) -> None:
         meta = make_session()
@@ -427,7 +572,7 @@ class TestTurnRotation:
 
         rotated = sessions.rotate_turn(
             session_id,
-            permissions_from_meta=lambda meta: meta.resolution["resolved"]["permissions"]["value"],
+            resolution_from_meta=lambda meta: meta.resolution,
             clock=at(100.0),
         )
 
@@ -443,7 +588,7 @@ class TestTurnRotation:
 
         finalized = sessions.finalize_turn(
             session_id,
-            "done",
+            "succeeded",
             answer="stale answer",
             expected_turn=1,
             exit_code=0,
@@ -467,7 +612,7 @@ class TestNamesAndSelectors:
     def test_rebinding_off_a_finished_session_warns(self) -> None:
         meta = make_session(name="researcher")
         sessions.mark_running(meta.session_id, pid=1, process_start_time="tok", clock=at(1.0))
-        sessions.transition(meta.session_id, "done", exit_code=0, clock=at(2.0))
+        sessions.transition(meta.session_id, "succeeded", exit_code=0, clock=at(2.0))
 
         warning = sessions.claim_name("researcher", clock=at(3.0))
 
@@ -512,7 +657,7 @@ class TestNamesAndSelectors:
     def test_a_rebound_name_resolves_to_the_newest_session(self) -> None:
         old = make_session(name="researcher", clock=at())
         sessions.mark_running(old.session_id, pid=1, process_start_time="tok", clock=at(1.0))
-        sessions.transition(old.session_id, "done", exit_code=0, clock=at(2.0))
+        sessions.transition(old.session_id, "succeeded", exit_code=0, clock=at(2.0))
         new = make_session(name="researcher", clock=at(10.0))
 
         assert sessions.resolve_selector("researcher", clock=at(11.0)) == new.session_id
@@ -553,7 +698,7 @@ class TestListing:
         sessions.mark_running(
             meta.session_id, pid=_dead_pid(), process_start_time="tok", clock=at(1.0)
         )
-        assert sessions.list_sessions(clock=at(2.0))[0].state == "orphaned"
+        assert sessions.list_sessions(clock=at(2.0))[0].state == "unknown"
 
     def test_a_damaged_session_does_not_hide_the_others(self) -> None:
         healthy = make_session(clock=at())
@@ -587,7 +732,7 @@ class TestDamagedState:
     def test_a_state_outside_the_vocabulary_is_damage(self) -> None:
         meta = make_session()
         payload = json.loads(sessions.meta_path(meta.session_id).read_text())
-        payload["state"] = "confused"
+        payload["status"] = "confused"
         sessions.meta_path(meta.session_id).write_text(json.dumps(payload))
         with pytest.raises(sessions.CorruptSessionError, match="confused"):
             sessions.read_meta(meta.session_id)
@@ -616,11 +761,11 @@ class TestDamagedState:
         payload["future_field"] = {"kept": True}
         sessions.meta_path(meta.session_id).write_text(json.dumps(payload))
 
-        sessions.update_meta(meta.session_id, tokens=7)
+        sessions.update_meta(meta.session_id, context={"used": 7, "size": None, "peak": 7})
 
         reread = json.loads(sessions.meta_path(meta.session_id).read_text())
         assert reread["future_field"] == {"kept": True}
-        assert reread["tokens"] == 7
+        assert reread["context"] == {"used": 7, "size": None, "peak": 7}
 
 
 class TestLocking:
@@ -628,12 +773,14 @@ class TestLocking:
         meta = make_session()
         session_id = meta.session_id
         rounds = 40
+        sessions.update_meta(session_id, context={"used": 0, "size": None, "peak": 0})
 
         def bump() -> None:
             for _ in range(rounds):
                 with sessions.session_lock(session_id):
                     current = sessions.read_meta(session_id)
-                    current.tokens += 1
+                    used = (current.context["used"] if current.context else 0) + 1
+                    current.context = {"used": used, "size": None, "peak": used}
                     sessions.write_meta(current)
 
         workers = [threading.Thread(target=bump) for _ in range(2)]
@@ -642,13 +789,15 @@ class TestLocking:
         for worker in workers:
             worker.join(timeout=20)
 
-        assert sessions.read_meta(session_id).tokens == 2 * rounds
+        final_context = sessions.read_meta(session_id).context
+        assert final_context is not None
+        assert final_context["used"] == 2 * rounds
 
     def test_the_lock_is_re_entrant_within_a_thread(self) -> None:
         meta = make_session()
         with sessions.session_lock(meta.session_id), sessions.session_lock(meta.session_id):
-            sessions.update_meta(meta.session_id, tokens=3)
-        assert sessions.read_meta(meta.session_id).tokens == 3
+            sessions.update_meta(meta.session_id, context={"used": 3, "size": None, "peak": 3})
+        assert sessions.read_meta(meta.session_id).context == {"used": 3, "size": None, "peak": 3}
 
     def test_meta_is_never_read_torn(self) -> None:
         meta = make_session()
@@ -658,7 +807,9 @@ class TestLocking:
 
         def write() -> None:
             for index in range(200):
-                sessions.update_meta(session_id, tokens=index)
+                sessions.update_meta(
+                    session_id, context={"used": index, "size": None, "peak": index}
+                )
             stop.set()
 
         def read() -> None:
@@ -683,7 +834,9 @@ class TestDeletion:
     def test_a_finished_session_is_deletable(self) -> None:
         session_id = finished_session()
         sessions.delete_session(session_id, clock=at(100.0))
-        assert not sessions.session_dir(session_id).exists()
+        assert sessions.session_dir(session_id).is_dir()
+        assert sessions.tombstone_path(session_id).is_file()
+        assert not sessions.meta_path(session_id).exists()
 
     def test_a_running_session_is_refused(self) -> None:
         meta = make_session()
@@ -693,17 +846,18 @@ class TestDeletion:
             process_start_time=proc.process_start_time(),
             clock=at(1.0),
         )
-        with pytest.raises(sessions.SessionStateError, match="stop it before rm"):
+        with pytest.raises(sessions.SessionStateError, match="cancel it before delete"):
             sessions.delete_session(meta.session_id, clock=at(2.0))
         assert sessions.session_dir(meta.session_id).exists()
 
-    def test_an_orphaned_session_is_deletable(self) -> None:
+    def test_an_unknown_session_is_deletable(self) -> None:
         meta = make_session()
         sessions.mark_running(
             meta.session_id, pid=_dead_pid(), process_start_time="tok", clock=at(1.0)
         )
         sessions.delete_session(meta.session_id, clock=at(2.0))
-        assert not sessions.session_dir(meta.session_id).exists()
+        assert sessions.tombstone_path(meta.session_id).is_file()
+        assert not sessions.meta_path(meta.session_id).exists()
 
     def test_deleting_an_unknown_session_is_not_found(self) -> None:
         with pytest.raises(sessions.SessionNotFound):
@@ -715,7 +869,43 @@ class TestPrune:
         old = finished_session()
         removed = sessions.prune_sessions(older_than=86_400.0, clock=at(200_000.0))
         assert [meta.session_id for meta in removed] == [old]
-        assert not sessions.session_dir(old).exists()
+        assert sessions.session_dir(old).is_dir()
+        assert sessions.tombstone_path(old).is_file()
+        assert not sessions.meta_path(old).exists()
+
+    def test_rechecks_all_candidates_before_deleting_after_a_race(self) -> None:
+        first = finished_session()
+        second = finished_session()
+        candidates = sessions.prune_candidates(older_than=86_400.0, clock=at(200_000.0))
+
+        sessions.rotate_turn(second, clock=at(200_001.0))
+
+        with pytest.raises(sessions.SessionStateError, match="changed while pruning"):
+            sessions.prune_sessions(
+                older_than=86_400.0,
+                candidates=candidates,
+                clock=at(200_000.0),
+            )
+
+        for session_id in (first, second):
+            assert sessions.meta_path(session_id).exists()
+            assert not sessions.tombstone_path(session_id).exists()
+        assert sessions.read_meta(second).state == "starting"
+
+    def test_a_failed_removal_is_not_reported_as_removed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        old = finished_session()
+
+        def refuse_removal(directory: object) -> None:
+            del directory
+            raise OSError("read-only session directory")
+
+        monkeypatch.setattr(sessions, "_clear_directory", refuse_removal)
+
+        with pytest.raises(OSError, match="read-only session directory"):
+            sessions.prune_sessions(older_than=86_400.0, clock=at(200_000.0))
+        assert sessions.session_dir(old).exists()
 
     def test_recent_sessions_stay(self) -> None:
         recent = finished_session()
@@ -726,7 +916,7 @@ class TestPrune:
         # Created long ago, finished just now: the threshold must spare it.
         session_id = make_session(clock=at()).session_id
         sessions.mark_running(session_id, pid=1, process_start_time="tok", clock=at(1.0))
-        sessions.transition(session_id, "done", exit_code=0, clock=at(500_000.0))
+        sessions.transition(session_id, "succeeded", exit_code=0, clock=at(500_000.0))
 
         assert sessions.prune_sessions(older_than=86_400.0, clock=at(500_100.0)) == []
         assert sessions.session_dir(session_id).exists()
@@ -748,20 +938,22 @@ class TestPrune:
         assert sessions.prune_sessions(older_than=1.0, clock=at(500_000.0)) == []
         assert sessions.session_dir(meta.session_id).exists()
 
-    def test_orphaned_sessions_are_collected(self) -> None:
+    def test_unknown_sessions_are_collected(self) -> None:
         meta = make_session()
         sessions.mark_running(
             meta.session_id, pid=_dead_pid(), process_start_time="tok", clock=at(1.0)
         )
         # Detection is what ends the session, so its age runs from there.
-        assert sessions.load(meta.session_id, clock=at(2.0)).state == "orphaned"
+        assert sessions.load(meta.session_id, clock=at(2.0)).state == "unknown"
 
         removed = sessions.prune_sessions(older_than=86_400.0, clock=at(500_000.0))
 
         assert [entry.session_id for entry in removed] == [meta.session_id]
-        assert not sessions.session_dir(meta.session_id).exists()
+        assert sessions.session_dir(meta.session_id).is_dir()
+        assert sessions.tombstone_path(meta.session_id).is_file()
+        assert not sessions.meta_path(meta.session_id).exists()
 
-    def test_a_just_detected_orphan_is_not_old_enough_to_prune(self) -> None:
+    def test_a_just_detected_unknown_outcome_is_not_old_enough_to_prune(self) -> None:
         meta = make_session()
         sessions.mark_running(
             meta.session_id, pid=_dead_pid(), process_start_time="tok", clock=at(1.0)

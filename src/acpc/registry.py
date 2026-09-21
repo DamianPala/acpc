@@ -85,6 +85,32 @@ class RegistryError(ValueError):
     """A registry entry cannot be parsed or resolved."""
 
 
+class AgentNotFound(RegistryError):
+    """The named agent has no entry, here or in an entry's `extends` chain.
+
+    Separate from its parent so a caller can tell "you named something that
+    does not exist" from "the entry that does exist is malformed"; the two
+    need different fixes and the envelope has to say which.
+    """
+
+
+class CorruptEntry(RegistryError):
+    """An entry file on disk cannot be parsed; the message names the file.
+
+    This is state acpc reads, not an argument a caller typed, so it must not
+    be reported as a usage error: nothing about the call was wrong and no
+    rewriting of the call fixes it.
+    """
+
+
+class InstallNotSupported(RegistryError):
+    """The entry resolves but carries no trusted `install_command`.
+
+    A documented refusal rather than a defect: the entry exists, the call is
+    well formed, and the next step is the vendor's own instructions.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class FieldSource:
     """Where a resolved field value came from."""
@@ -231,7 +257,7 @@ class ResolvedEntry:
     def install_next_step(self) -> str:
         """Actionable next step when the adapter binary is not on PATH."""
         if self.install_command:
-            return f"run 'acpc install {self.base_adapter}'"
+            return f"run 'acpc install {self.base_adapter} --yes'"
         if self.install_docs:
             return f"adapter is already registered; install the vendor CLI from {self.install_docs}"
         return f"install '{self.command_head}' from the vendor"
@@ -245,7 +271,7 @@ class ResolvedEntry:
         if self.installed:
             return "installed"
         if self.install_command:
-            return f"missing → acpc install {self.entry}"
+            return f"missing → acpc install {self.entry} --yes"
         if self.install_docs:
             return f"missing → {self.install_docs}"
         return "missing"
@@ -469,7 +495,7 @@ def _parse_entry(
     except OSError as exc:
         raise RegistryError(f"{path}: cannot read agent definition: {exc}") from None
     except tomllib.TOMLDecodeError as exc:
-        raise RegistryError(f"{path}: invalid TOML: {exc}") from None
+        raise CorruptEntry(f"{path}: invalid TOML: {exc}") from None
     unknown = sorted(set(raw) - _ENTRY_KEYS)
     if unknown:
         names = ", ".join(repr(key) for key in unknown)
@@ -754,6 +780,11 @@ class AgentRegistry:
         return tuple(sorted(self._entries))
 
     @property
+    def shipped_names(self) -> frozenset[str]:
+        """Names acpc ships, as opposed to entries this machine wrote."""
+        return frozenset(self._shipped_names)
+
+    @property
     def adapters(self) -> tuple[ResolvedEntry, ...]:
         return tuple(entry for entry in self if entry.is_adapter)
 
@@ -771,7 +802,7 @@ class AgentRegistry:
     def permission_alias(self, name: str) -> str | None:
         """Return the deprecated permissions alias declared by an entry, if any."""
         if name not in self._entries:
-            raise RegistryError(f"unknown agent '{name}'")
+            raise AgentNotFound(f"unknown agent '{name}'")
         parsed = self._entries[name]
         if "permissions" in parsed.data:
             return parsed.permission_alias
@@ -784,8 +815,8 @@ class AgentRegistry:
         if name not in self._entries:
             if stack:
                 parent = stack[-1]
-                raise RegistryError(f"agent '{parent}': missing base '{name}'")
-            raise RegistryError(f"unknown agent '{name}'")
+                raise AgentNotFound(f"agent '{parent}': missing base '{name}'")
+            raise AgentNotFound(f"unknown agent '{name}'")
         if name in stack:
             cycle = " -> ".join((*stack, name))
             raise RegistryError(f"agent inheritance cycle: {cycle}")
@@ -855,7 +886,7 @@ class AgentRegistry:
         entry = self.resolve(name)
         command = entry.install_command
         if not command:
-            raise RegistryError(
+            raise InstallNotSupported(
                 f"agent '{name}' has no install_command — {entry.install_next_step()}"
             )
         return command

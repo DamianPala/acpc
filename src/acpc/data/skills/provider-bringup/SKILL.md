@@ -41,7 +41,7 @@ and 5**, nothing else: the plumbing is proven, the model is not.
 
 **On a miss**, climb all seven rungs. `references/openrouter.md`, in this skill's
 directory, carries both pairs anonymized plus what differs between the two
-harnesses; `acpc skills <name>` prints that directory on stderr.
+harnesses; `acpc skills get <name>` prints that directory on stderr.
 
 Keep the convention when you add a combination: the next agent should find
 comments in your entry, not a longer version of this table.
@@ -118,15 +118,15 @@ URL, and a doubled segment comes back as a 404 dressed up as a model error.
 Only if you need to watch a whole exchange rather than one request is a
 forwarding proxy worth writing.
 
-### 5. Write the entry, dry-run before you run it
+### 5. Write the entry, resolve it before you run it
 
 Entry format and its traps are in *The entry* below. This skill assumes a
 variant (`extends`); a base adapter with `command` and no `extends` is
 `adapter-bringup` (empty `[modes]`, discovery, first mode table).
 
 ```bash
-acpc agents <name>              # what the entry resolves to, with provenance
-acpc run <name> "x" --dry-run   # what this call resolves to, incl. env
+acpc agents get <name>          # what the entry resolves to, with provenance
+acpc resolve <name>              # what this call resolves to, incl. env
 acpc run <name> "Reply with exactly: OK" --timeout 180
 ```
 

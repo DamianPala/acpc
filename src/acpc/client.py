@@ -53,6 +53,7 @@ from acpc.permissions import (
 )
 from acpc.registry import ModeSpec
 from acpc.transcript import Transcript
+from acpc.vocab import ContextOccupancy
 
 _Clock = Callable[[], float]
 _PermissionPrompt = Callable[[str, str], bool | Awaitable[bool]]
@@ -71,11 +72,6 @@ _CHUNK_MAX_AGE_SECONDS = 2.0
 _CHUNK_MAX_CHARS = 4096
 # A broken cancellation watcher must not hold an ACP permission response forever.
 _CANCELLATION_DISPATCH_TIMEOUT = 1.0
-
-# Inferred from the vendor display: 241394560 ticks for a 35.5k-token Grok-4.5
-# turn implies about $0.024, consistent with its per-turn cost; 1e9 or 1e11
-# would instead put that turn at $0.24 or $0.0024.
-_COST_USD_TICKS_DIVISOR = 10_000_000_000
 
 
 @dataclass(slots=True)
@@ -515,8 +511,7 @@ class AcpcClient:
         cancellation_dispatched: asyncio.Event | None = None,
         permission_prompt: _PermissionPrompt | None = None,
         clock: _Clock | None = None,
-        previous_tokens: int = 0,
-        previous_cost: float | None = None,
+        previous_context: ContextOccupancy | None = None,
     ) -> None:
         self.transcript = transcript
         self.permission_level = permission_level
@@ -529,10 +524,11 @@ class AcpcClient:
         self._answer_parts: list[str] = []
         self._answer_boundary_pending = False
         self._tool_calls: dict[str, _ToolCall] = {}
-        self._tokens = previous_tokens
-        self._cost = previous_cost
+        self._context: ContextOccupancy | None = previous_context
         self._usage_update_seen = False
         self._meta_usage_recorded = False
+        self._rate_limit_info: dict[str, Any] | None = None
+        self._recorded_progress = False
         self._denied: dict[str, int] = {}
         self._denial_details: dict[str, dict[str, Any]] = {}
         self._replay_sink: ReplaySink | None = None
@@ -550,14 +546,33 @@ class AcpcClient:
         return "".join(self._answer_parts)
 
     @property
-    def tokens(self) -> int:
-        """Return the latest token figure reported by the adapter."""
-        return self._tokens
+    def context(self) -> ContextOccupancy | None:
+        """Return the context occupancy last reported by the adapter, or `None`."""
+        return self._context
 
     @property
-    def cost(self) -> float | None:
-        """Return the cumulative cost reported by the adapter."""
-        return self._cost
+    def rate_limit_info(self) -> dict[str, Any] | None:
+        """The last `_meta["_claude/rateLimit"]` seen on a `usage_update`, if any."""
+        return dict(self._rate_limit_info) if self._rate_limit_info is not None else None
+
+    def clear_rate_limit_info(self) -> None:
+        """Drop the last-seen `_meta["_claude/rateLimit"]` before a resend.
+
+        It is a per-prompt signal, not a session fact: without this, a
+        rejection observed on one `session/prompt` would still be sitting
+        here on the next call's success and would be misread as a fresh
+        rejection of a prompt that never happened.
+        """
+        self._rate_limit_info = None
+
+    @property
+    def has_recorded_progress(self) -> bool:
+        """Whether this turn has recorded an assistant `msg` or a finished `tool`.
+
+        Used to choose, on a limit resumption, between the original prompt
+        (nothing recorded yet) and acpc's fixed continuation instruction.
+        """
+        return self._recorded_progress
 
     @property
     def denied(self) -> dict[str, int]:
@@ -590,44 +605,39 @@ class AcpcClient:
         self._advertised["models"] = models
 
     def record_prompt_usage(self, prompt_result: Any) -> None:
-        """Record tokens/cost from a prompt response when usage_update is absent.
+        """Record context occupancy from a prompt response when usage_update is absent.
 
         Some agents (Grok Build) put totals on PromptResponse ``_meta`` instead
-        of streaming ACP ``usage_update`` notifications.
+        of streaming ACP ``usage_update`` notifications. This path never learns
+        a context window size, so `size` stays `None`; acpc reports no cost
+        anywhere, so this path never parses one either.
         """
         if self._usage_update_seen or self._meta_usage_recorded:
             return
         meta = self._prompt_meta(prompt_result)
         if not meta:
             return
-        previous_tokens, previous_cost = self._tokens, self._cost
+        previous_context = self._context
         # Measured 2026-08-25 with Grok CLI 1.0.4: numTurns=1 on both turns;
-        # totalTokens was 35570 then 35854, while costUsdTicks was 241394560
-        # then 39157120 (turn 2 had cachedReadTokens=35456). Both are per-turn:
-        # tokens are the latest replayed-context total, while charges are summed.
+        # totalTokens was 35570 then 35854 — the latest replayed-context total.
         tokens = meta.get("totalTokens")
         if tokens is None:
             usage = meta.get("usage")
             if isinstance(usage, Mapping):
                 tokens = usage.get("totalTokens") or usage.get("total_tokens")
         if isinstance(tokens, (int, float)) and tokens > 0:
-            self._tokens = int(tokens)
-        cost = meta.get("costUsd")
-        if cost is None:
-            usage = meta.get("usage")
-            if isinstance(usage, Mapping):
-                ticks = usage.get("costUsdTicks")
-                if isinstance(ticks, (int, float)):
-                    cost = float(ticks) / _COST_USD_TICKS_DIVISOR
-                else:
-                    cost = usage.get("costUsd") or usage.get("cost_usd")
-        if isinstance(cost, (int, float)):
-            amount = float(cost)
-            self._cost = amount if self._cost is None else self._cost + amount
+            used = int(tokens)
+            previous_peak = previous_context["peak"] if previous_context is not None else 0
+            self._context = ContextOccupancy(used=used, size=None, peak=max(previous_peak, used))
         self._meta_usage_recorded = True
-        if self._tokens != previous_tokens or self._cost != previous_cost:
+        if self._context != previous_context:
             self.flush()
-            self.transcript.append("usage", tokens=self._tokens, cost=self._cost)
+            context = self._context
+            self.transcript.append(
+                "usage",
+                used=context["used"] if context is not None else None,
+                size=context["size"] if context is not None else None,
+            )
 
     @asynccontextmanager
     async def replaying(
@@ -723,6 +733,7 @@ class AcpcClient:
                     self._answer_parts.append("\n\n")
                 self._answer_parts.append(text)
                 self._answer_boundary_pending = False
+                self._recorded_progress = True
                 self._buffer_chunk("msg", text)
             return
 
@@ -1090,14 +1101,28 @@ class AcpcClient:
         )
         current.status = status
         current.finished = True
+        self._recorded_progress = True
 
     def _record_usage(self, update: UsageUpdate) -> None:
         self._usage_update_seen = True
-        self._tokens = update.used
+        previous_peak = self._context["peak"] if self._context is not None else 0
+        self._context = ContextOccupancy(
+            used=update.used, size=update.size, peak=max(previous_peak, update.used)
+        )
+        event_fields: dict[str, Any] = {"used": update.used, "size": update.size}
         if update.cost is not None:
-            amount = update.cost.amount
-            self._cost = amount if self._cost is None else max(self._cost, amount)
-        self.transcript.append("usage", tokens=self._tokens, cost=self._cost)
+            event_fields["cost"] = update.cost.amount
+        if update.field_meta:
+            event_fields["meta"] = update.field_meta
+        self.transcript.append("usage", **event_fields)
+        # SPEC.md `run`: claude-agent-acp carries the structural reset time on
+        # this notification, ahead of the JSON-RPC error a limit ends the
+        # prompt with, but only once this session has already sent one
+        # assistant message with usage — a fresh session has none yet.
+        meta = self._prompt_meta(update)
+        rate_limit_info = meta.get("_claude/rateLimit")
+        if isinstance(rate_limit_info, Mapping):
+            self._rate_limit_info = dict(rate_limit_info)
 
     async def _ask_permission(self, kind: str, title: str) -> bool:
         if self.permission_prompt is None:
