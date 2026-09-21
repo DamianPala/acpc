@@ -19,6 +19,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Exported so the exported `acpc` function below still resolves it inside `bash -c`.
 export SCRIPT_DIR
 
+# discard <path>... -- remove throwaway files: to the trash where trash-cli is
+# installed (a developer's box), plainly where it is not (the CI runners).
+discard() {
+    if command -v trash-put >/dev/null 2>&1; then
+        trash-put "$@"
+    else
+        rm -r -- "$@"
+    fi
+}
+
 # ==============================================================================
 # Section readiness -- the PLAN.md slice map. Stage 2 flips values to "ready".
 # ==============================================================================
@@ -166,7 +176,7 @@ run_acpc() {
     LAST_OUT="$(cat "$out")"
     LAST_ERR="$(cat "$err")"
     LAST_RC=$rc
-    trash-put "$out" "$err" 2>/dev/null || true
+    discard "$out" "$err" 2>/dev/null || true
 }
 
 json_field() {
@@ -233,7 +243,7 @@ cleanup() {
             fi
         done
     fi
-    trash-put "$ACPC_HOME" "$SCRATCH" 2>/dev/null || true
+    discard "$ACPC_HOME" "$SCRATCH" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -1060,7 +1070,7 @@ if begin_section S10-agents "agents views, variants, advertised data, install"; 
     assert_eq "a malformed entry file is corrupt_state" "corrupt_state" \
         "$(jq -r '.error.kind' <<<"$(tail -n1 <<<"$LAST_ERR")")"
     assert_not_contains "malformed entry error has no traceback" "$LAST_ERR" "Traceback"
-    trash-put "${ACPC_HOME}/agents/broken.toml"
+    discard "${ACPC_HOME}/agents/broken.toml"
     run_acpc agents list --format text
     assert_eq "agents recovers once the malformed entry is removed" "0" "$LAST_RC"
 
@@ -1426,7 +1436,7 @@ PYEOF
     run_acpc log "$HOSTILE_ID"
     assert_eq "a truncated trailing transcript line does not crash log" "0" "$LAST_RC"
     assert_not_contains "truncated transcript line: no traceback" "$LAST_ERR" "Traceback"
-    trash-put "${ACPC_HOME:?}/sessions/${HOSTILE_ID:?}"
+    discard "${ACPC_HOME:?}/sessions/${HOSTILE_ID:?}"
 
     run_acpc run mock "" --quiet
     assert_eq "an empty prompt does not crash run" "0" "$LAST_RC"
