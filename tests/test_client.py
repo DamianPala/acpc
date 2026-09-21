@@ -187,6 +187,15 @@ def test_answer_is_only_agent_messages_and_transcript_keeps_stream_order(
             await conn.initialize(protocol_version=PROTOCOL_VERSION)
             session = await conn.new_session(cwd=str(tmp_path))
             client.capture_advertised(session)
+            # The mock advertises its commands from a task it starts in
+            # session/new. Let that update land before the prompt: between the
+            # two burst chunks it would count as a boundary and put a paragraph
+            # break in the answer (seen once on the macOS runner).
+            for _ in range(500):
+                if client.advertised["commands"]:
+                    break
+                await asyncio.sleep(0.01)
+            assert client.advertised["commands"], "the mock never advertised its commands"
             await client.session_update(
                 session.session_id,
                 AgentThoughtChunk(
