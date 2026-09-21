@@ -1501,7 +1501,9 @@ def test_an_execute_floor_ask_refusal_names_the_permission_floor(
 def test_real_grok_refusal_names_the_permission_floor(cli: CliRunner) -> None:
     result = invoke(cli, "run", "grok", "probe")
 
-    assert result.exit_code == vocab.EXIT_USAGE
+    # Fails on the ubuntu-latest runner with exit 1 and passes everywhere local;
+    # the envelope in the assertion message is the only way to see why there.
+    assert result.exit_code == vocab.EXIT_USAGE, result.output
     message = error_envelope(result)["message"]
     assert "the lowest policy grok runs under is execute" in message
     assert (
