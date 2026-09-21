@@ -48,7 +48,7 @@ default = {{ grants = "read", delegates = true }}
 
 STANDARD_SNAPSHOT = Path(__file__).with_name("fixtures") / "cli-design-standard.md"
 STANDARD_METADATA = STANDARD_SNAPSHOT.with_suffix(".meta.json")
-EXPECTED_TOOL_VERSION = "1.0.0"
+EXPECTED_TOOL_VERSION = "1.0.1"
 EXPECTED_STANDARD_NAME = "cli-design-standard"
 EXPECTED_STANDARD_VERSION = "0.2.0-draft.11"
 EXPECTED_EXTENSIONS = ["managed", "conversational"]

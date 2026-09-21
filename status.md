@@ -2,10 +2,12 @@
 
 ## Now
 
-**1.0.1 in progress (2026-09-21): the first CI run of 1.0.0 failed 20 of 1383 tests on
-`macos-latest`, all from one root: `proc.py` identified processes through `/proc` only, so on
-macOS `cancel` could not identify a direct worker, PID reuse was never caught and a worker killed
-mid-turn was never seen as dead.** Slice 26 (`fix(proc)`, branch `fix/macos-process-identity`,
+**1.0.1 bumped and tagged locally (2026-09-21): the gate is green on `ubuntu-latest` and
+`macos-latest` at `b241de8`; Damian's `git push origin main v1.0.1` and the release page (notes
+from 0.7.1 to 1.0.1, `v1.0.0` has no page) are what is left.** The first CI run of 1.0.0 failed
+20 of 1383 tests on `macos-latest`, all from one root: `proc.py` identified processes through
+`/proc` only, so on macOS `cancel` could not identify a direct worker, PID reuse was never caught
+and a worker killed mid-turn was never seen as dead. Slice 26 (`fix(proc)`, branch `fix/macos-process-identity`,
 Sonnet builder plus Opus reviewer, two rounds each) adds a darwin backend over BSD `ps` with the
 Linux contract: `lstart` as the start token (second resolution, `LC_ALL=C` so the token does not
 vary with the caller's locale), `command` for the argument list, `stat` for zombies, and a `ps`
@@ -16,9 +18,18 @@ the `macos-latest` run after the push. Two pty tests are skipped on darwin with 
 the reason (the closed-terminal install gate hangs there; the pty half of F2b/F5 reads an empty
 stderr), the pipe half of F2b/F5 still runs, and both pty drain loops now fail loudly past a
 10 s deadline instead of masking a hang. Gate: 1399 tests with `ACPC_STANDARD_CHECKOUT`,
-ruff/pyright clean, smoke 605/605. Next: merge to `main`, Damian pushes, read the `macos-latest`
-run and the ubuntu grok envelope (`315d7c8` prints it), then bump 1.0.1, tag, release page on
-his go (notes cover 0.7.1 to 1.0.1, since `v1.0.0` has no page).
+ruff/pyright clean, smoke 605/605. Four CI laps after the merge (`1e9a494`), each one
+test-side: the grok floor test depended on the host having the vendor CLI, because the install
+check runs before the floor check (`d7eb301`, a stand-in `grok` on PATH); the O1 stream test read
+the pty master only after `communicate()`, and a BSD pty discards the queue once the slave's last
+descriptor closes (same commit, concurrent drain with the parent's slave held open, which
+confirms the theory behind the F2b/F5 skip); `smoke.sh` called `trash-put` (`bc4c0ba`, a
+`discard` helper) and `setsid` (`e48df43`, a Python child with `start_new_session`), neither on
+the runners; and the mock's `available_commands_update`, sent from a task after `session/new`,
+once landed between two chunks of one message on macOS and became a paragraph break
+(`b241de8`, the test waits for it; whether such updates should be boundaries is a 1.1 question).
+macOS runs 1387 tests and skips 12 (procfs, inotify, the two pty cases). 1.1 leftovers from the
+slice reviews and the laps are in `docs/plans/1.1/backlog.md` under macOS.
 
 1.0.0 is merged to `main` with `--no-ff` (`6f47d46`, 2026-09-21), tagged `v1.0.0`, pushed with
 the tag the same day and installed on the host; the release page waits for 1.0.1.
