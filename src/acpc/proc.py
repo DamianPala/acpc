@@ -27,16 +27,95 @@ class ProcessIdentityError(RuntimeError):
     """Raised when a recorded process identity cannot be re-established."""
 
 
+class _PsUnavailableError(Exception):
+    """Raised internally when ``ps`` itself could not be run.
+
+    This is an infrastructure failure (missing binary, or a transient
+    ``fork``/``posix_spawn`` failure such as ``EAGAIN`` under
+    ``RLIMIT_NPROC``), not evidence that the pid is gone. Never leaves
+    ``proc.py``: every caller either maps it to ``None``/``unverifiable``
+    (the same outcome Linux's ``except OSError`` produces when ``/proc``
+    can't be read) or lets it fall through to a ``None`` fields result,
+    depending on how much that caller cares about the distinction.
+    """
+
+
 def process_identity_supported() -> bool:
     """Return whether this platform exposes the kernel token used for PID checks."""
-    return sys.platform == "linux"
+    return sys.platform in ("linux", "darwin")
+
+
+def _ps_fields(pid: int, *columns: str) -> list[str] | None:
+    """Return one ``ps -o <col>= -p <pid>`` value per requested column.
+
+    Each column is fetched with its own ``ps`` invocation (rather than a
+    single comma-joined ``-o`` list) for two reasons: ``lstart`` and
+    ``command`` both contain internal whitespace, which a shared,
+    whitespace-split parse of a combined line would corrupt; and on macOS,
+    BSD `ps`'s ``command`` column (``adv_cmds/ps/print.c``,
+    ``p_command_and_or_args``) only prints the full, unabbreviated command
+    when ``command`` is the *last* (and here, only) requested column --
+    combined with another column it is truncated to its 16-character
+    keyword width. BSD `ps` (macOS) and procps `ps` (Linux) both accept this
+    spelling for ``lstart``, ``stat``, and ``command``, which is what lets
+    the darwin backend be exercised on Linux by tests. ``LC_ALL=C`` pins the
+    locale ``ps`` renders ``lstart`` in, so the token doesn't vary with the
+    caller's environment (the reuse guard compares it byte for byte later,
+    possibly from a different process).
+
+    Returns ``None`` when the pid is gone (``ps`` exits non-zero, prints
+    nothing, or a column comes back short). Raises `_PsUnavailableError`
+    when ``ps`` itself could not be run at all; callers decide how to map
+    that.
+    """
+    fields: list[str] = []
+    for column in columns:
+        try:
+            completed = subprocess.run(
+                ["ps", "-o", f"{column}=", "-p", str(pid)],
+                capture_output=True,
+                check=False,
+                env={**os.environ, "LC_ALL": "C"},
+            )
+        except OSError as error:
+            raise _PsUnavailableError(str(error)) from error
+        if completed.returncode != 0:
+            return None
+        value = completed.stdout.decode("utf-8", errors="surrogateescape").strip()
+        if not value:
+            return None
+        fields.append(value)
+    if len(fields) != len(columns):
+        return None
+    return fields
 
 
 def process_start_time(pid: int | None = None) -> str | None:
-    """Return the kernel process-start token used for PID-reuse checks."""
+    """Return the kernel process-start token used for PID-reuse checks.
+
+    On macOS this is BSD `ps`'s ``lstart`` (e.g. ``Mon Sep 21 09:45:08
+    2026``), which only has second resolution; that is enough for the
+    reuse guard, but two processes started within the same second cannot be
+    told apart by this token alone.
+    """
     if not process_identity_supported():
         return None
     process_id = os.getpid() if pid is None else pid
+    if sys.platform == "darwin":
+        try:
+            fields = _ps_fields(process_id, "lstart")
+        except _PsUnavailableError:
+            # Infrastructure failure, not proof the pid is gone. Absorbed to
+            # `None` here (rather than propagated): every caller of
+            # `process_start_time` already treats a `None` token as "cannot
+            # verify" and refuses to act on it (`_check_process_identity`
+            # refuses to kill; `_verified_or_dead` reports `unverifiable`),
+            # which is the same safe outcome Linux reaches when `/proc`
+            # can't be read.
+            return None
+        if fields is None:
+            return None
+        return " ".join(fields[0].split())
     try:
         stat = Path(f"/proc/{process_id}/stat").read_text(encoding="utf-8")
     except (FileNotFoundError, OSError):
@@ -48,15 +127,38 @@ def process_start_time(pid: int | None = None) -> str | None:
 
 
 def process_cmdline(pid: int | None = None) -> list[str] | None:
-    """Return the process command line from procfs, if available."""
+    """Return the process command line, if available.
+
+    On macOS this is BSD `ps`'s ``command`` column split on whitespace,
+    which loses argument boundaries (an argument containing a space is
+    indistinguishable from two arguments); callers only test list
+    membership of single tokens, so that is enough.
+    """
+    process_id = os.getpid() if pid is None else pid
+    if sys.platform == "darwin":
+        try:
+            fields = _ps_fields(process_id, "command")
+        except _PsUnavailableError:
+            # Same as the Linux branch below on an OSError: an infrastructure
+            # failure reads as "cannot tell", not as a specific command line.
+            return None
+        if fields is None:
+            return None
+        return fields[0].split()
     if sys.platform != "linux":
         return None
-    process_id = os.getpid() if pid is None else pid
     try:
         data = Path(f"/proc/{process_id}/cmdline").read_bytes()
     except (FileNotFoundError, OSError):
         return None
     return [part.decode("utf-8", errors="surrogateescape") for part in data.split(b"\0") if part]
+
+
+def _verified_or_dead(current_token: str | None, process_token: str | None) -> ProcessLiveness:
+    """Shared token-comparison tail: the last step of every liveness branch."""
+    if process_token is None or current_token is None:
+        return "unverifiable"
+    return "verified" if current_token == process_token else "dead"
 
 
 def process_liveness(pid: int, process_token: str | None = None) -> ProcessLiveness:
@@ -81,19 +183,23 @@ def process_liveness(pid: int, process_token: str | None = None) -> ProcessLiven
             return "unverifiable"
         if state == "Z":
             return "dead"
-        if process_token is None:
-            return "unverifiable"
+        current_token = fields[19] if len(fields) > 19 else None
+        return _verified_or_dead(current_token, process_token)
+    if sys.platform == "darwin":
         try:
-            current_token = fields[19]
-        except IndexError:
+            stat_fields = _ps_fields(pid, "stat")
+        except _PsUnavailableError:
+            # `ps` itself failed to run: an infrastructure failure, not proof
+            # the pid is gone. Mirrors Linux's `except OSError: return
+            # "unverifiable"` a few lines up -- `"dead"` here would make
+            # `sessions.py` persist a live session as permanently `unknown`.
             return "unverifiable"
-        return "verified" if current_token == process_token else "dead"
-    if process_token is None:
-        return "unverifiable"
-    current_token = process_start_time(pid)
-    if current_token is None:
-        return "unverifiable"
-    return "verified" if current_token == process_token else "dead"
+        if stat_fields is None:
+            return "dead"
+        if stat_fields[0].startswith("Z"):
+            return "dead"
+        return _verified_or_dead(process_start_time(pid), process_token)
+    return _verified_or_dead(process_start_time(pid), process_token)
 
 
 def is_process_alive(pid: int, process_token: str | None = None) -> bool:
@@ -183,8 +289,9 @@ def kill_process_tree(
     Linux/macOS: killpg sends SIGKILL to the entire process group.
     Windows: taskkill /T recursively kills the process tree.
 
-    When an expected Linux process-start token is supplied, identity is checked
-    here immediately before signalling rather than trusted from the caller.
+    When an expected process-start token is supplied, identity is checked here
+    immediately before signalling rather than trusted from the caller (Linux
+    and macOS only; Windows has no equivalent kernel token to check against).
 
     The result distinguishes a successful signal, a process that was already
     gone, and a refusal to signal. ``process_group_id`` is used by the spawn
@@ -217,7 +324,7 @@ def kill_process_tree(
             if group_id != pid:
                 return "refused"
 
-        if expected_process_start_time is not None and sys.platform == "linux":
+        if expected_process_start_time is not None and sys.platform in ("linux", "darwin"):
             _check_process_identity(pid, expected_process_start_time)
             # This check cannot be atomic with killpg: if the PID exits and is
             # reused afterward, killpg can kill an unrelated group owned by the user.
