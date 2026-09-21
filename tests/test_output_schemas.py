@@ -476,7 +476,7 @@ def test_real_document_payloads_match_their_published_schemas(
     daemon_status = [
         {
             "target": "mock~target",
-            "version": "0.7.1",
+            "version": "1.0.0",
             "pid": 123,
             "uptime_seconds": 4.5,
             "log": "/tmp/mock.log",

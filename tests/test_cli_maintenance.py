@@ -169,7 +169,7 @@ def test_daemon_status_reports_has_more_past_the_default_limit(
     entries = [
         {
             "target": f"mock~target-{index:02d}",
-            "version": "0.7.1",
+            "version": "1.0.0",
             "pid": 1000 + index,
             "uptime_seconds": 4.5,
             "log": "/tmp/mock.log",

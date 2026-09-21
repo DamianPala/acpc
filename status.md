@@ -2,6 +2,40 @@
 
 ## Now
 
+**1.0.0 is built on `feat/cli-design-conformance` (2026-09-21) and waits for Damian's push, PR
+merge without squash and tag `v1.0.0`.** Three closing slices after the alignment, one commit
+each, Sonnet builder plus Opus reviewer with mutation testing on a `git archive` copy: 22
+`4ecad7e` (`refactor(cli)`: duplicate JSON emitters merged, `output.collection_envelope` and
+`_emit_maintenance_result`, `_render_log_page` and `steer_command` split under 100 lines, the
+unreachable `repeatable` schema branch dropped, `acpc schema` byte-identical; the four
+`test_slice*_contract.py` files renamed after their contract; test hygiene from the pre-1.0 audit:
+a real subprocess broken-pipe test, `has_more: true` cases for four collections, text receipts of
+`cancel`/`delete`/`prune`, the `steer --background --timeout` conflict, looser wall-clock and
+retry budgets; two review rounds), 23 `6cff36e` (`fix`: the six review debts below the line, each
+with its SPEC sentence, O3d now true on a terminal and in `log --prose`; two rounds, live on
+claude-agent-acp: `cancel` then `continue` with no message sends the `canceled` text and the essay
+continues, `adapter_session_id` is on disk while turn 1 runs, an over-long `ACPC_HOME` reports
+`unavailable` naming the remedy and spawns nothing), 24 `32630d5` (`fix(agents)`: the 2026-09-08
+adapter facts ported from the `main` worktree, claude without `dontAsk`, codex `gpt-6-astra` up
+to `max`; live on codex-acp: astra resolves at `max`, `ultra` and a preset at `max` are refused
+naming the levels, `cancel` then a message-less `continue` sends the `canceled` text and the
+essay finishes `succeeded`). Then the bump to 1.0.0 (`pyproject.toml`, `uv.lock`, SPEC, the
+conformance pin). Final gate on the 1.0.0 tree: 1378 tests with `ACPC_STANDARD_CHECKOUT`,
+ruff/pyright clean, smoke 603/603. The `main` worktree still holds the uncommitted 2026-09-08 change set (six files);
+slice 24 carries its facts, so those files are to be reverted there before the merge (Damian's
+call). After the merge: `docs/plans/1.0/close/host-migration-checklist.md` (five host files read
+the old surface), `acpc daemon stop`, reinstall from `main`, `acpc -V`.
+
+Left for 1.1 (from the recon in `docs/plans/1.0/recon/` and the reviews): `--max-output` below the
+wrapper's fixed overhead; the clamp suffix in `permissions.source` and the doubled clamp in the
+text view; `_dispatch_follow_up` at 101 lines and the `cli.py` package split; the `daemon status`
+`has_more` test on a stub (a live variant needs 21 daemons); the D6c oracle warning instead of
+failing offline; `docs/manual-test-plan.md` and `docs/live-test-plan.md` still say `acpc stop`
+and the states `cancelled`/`timeout`; two O3d notes for the standard's author (whether
+`--output-file` on a terminal takes the terminal or the non-TTY representation; that structural
+whitespace is not a terminal sequence). CI on three OSes is still unverified; the socket-length
+tests are the first thing that breaks on Windows.
+
 **Phase 0.2 of the standard alignment is complete on `feat/cli-design-conformance` (2026-09-20,
 slices 14-19, HEAD `279ff97`).** The tool now claims `cli-design-standard` 0.2.0-draft.10 with
 extensions `managed` and `conversational`; the fixture snapshot is pinned to haz-skills `53f4f92`.
@@ -53,18 +87,17 @@ observations: `--background` on a home whose daemon socket path exceeds 108 byte
 clearer error is a small debt); Claude Code's `haiku` alias rejects any `effort`, so an entry
 on it must not inherit one. Next: the black-box probe the standard's session designs.
 
-Debts found in review, none blocking: the TTY `human` presentation still prints the raw answer
-without control-byte escaping (O3d asks for it; a small separate slice); `continue` after
-`unknown` on turn 1 is `corrupt_state` because the daemon stores `adapter_session_id` only at the
-end of the turn (turn 2+ works); `CONTINUATION_INSTRUCTION` says "interrupted by a usage limit",
-which is untrue after cancel/failed/unknown (text change was out of scope, check on a real adapter
-before release); `stop_reason` spells `canceled` after an acpc cancel and `cancelled` after an
-adapter cancel; the `continue` conflict hint omits `--steer-mode cancel-then-start`, so on an
-in-place session the suggested `steer` conflicts; `--max-output` below the wrapper's fixed
-overhead exceeds the budget (same as JSON); the `permissions.source` string carries the clamp
-suffix from provenance and the text view repeats the clamp. After reinstall, anything reading the
-session id from `run --bg | head -1` breaks (MIGRATION covers `--json | jq -r .session_id`);
-skills and wrappers calling the installed `acpc` need a pass before `uv tool install`.
+Debts found in review, closed by slice 23 (`6cff36e`) unless noted: the TTY `human` presentation
+printed the raw answer without control-byte escaping; `continue` after `unknown` on turn 1 was
+`corrupt_state` because `adapter_session_id` reached disk only at the end of the turn; the
+continuation instruction always said "interrupted by a usage limit"; `stop_reason` spelled
+`canceled` after an acpc cancel and `cancelled` after an adapter cancel; the `continue` conflict
+hint omitted `--steer-mode cancel-then-start`; an over-long daemon socket path surfaced only as
+"did not come up". Still open, 1.1: `--max-output` below the wrapper's fixed overhead exceeds the
+budget (same as JSON); the `permissions.source` string carries the clamp suffix from provenance
+and the text view repeats the clamp. After reinstall, anything reading the session id from
+`run --bg | head -1` breaks (MIGRATION covers `--json | jq -r .session_id`); the host checklist in
+`docs/plans/1.0/close/` lists the five files to edit before `uv tool install`.
 
 **In-place steering lands on `feat/cli-design-conformance` (2026-09-14, slice 13).** `acpc steer`
 has two modes: `in-place` forwards the instruction to the turn in flight through the adapters'
@@ -80,8 +113,9 @@ by deepseek-flash-ds (session ry5x), reviewed by Opus (approve, one Ctrl-C conte
 review), live-verified on Luna and Haiku: one turn, `corrected.txt` present, `original.txt`
 absent, the nonce from the original prompt in the answer. Gates: 1236 tests, ruff/pyright clean,
 smoke 604/604. Not declared: the standard's `conversational` extension (`--turn`, queued turns).
-Known: `test_slice12_contract.py::test_an_expired_deadline_returns_the_observed_session_as_partial`
-flakes under load (0.5 s first-chunk budget), pre-existing.
+Known then: a slice-12 deadline test flaked under load (0.5 s first-chunk budget); that test no
+longer exists (slice 16 rewrote the deadline contract, slice 22 renamed the file to
+`test_result_on_failure.py`).
 
 **0.7.1 is built, tagged and installed live (2026-08-27): failure ergonomics.** Born from the same
 day's real grok dispatch (session 8rin: a mid-turn xAI inference stall, killed correctly by the 600s
@@ -443,6 +477,8 @@ Release: bump `0.4.0` → `0.4.1` (the pending `uv.lock` version line rides here
 
 ## Decisions
 
+- 2026-09-21 (1.0 closing, slice 23): **A cancel that lands before any prompt keeps its own stop reason, `canceled during preparation`, in the public spelling.** SPEC's new "one spelling of a canceled turn" sentence would have folded it into `canceled`, but the distinction is observable and load-bearing: the answer file is a placeholder, and `steer --steer-mode cancel-then-start` reports "nothing was interrupted" off it. Both historical spellings are normalized on read; the ACP wire literal `cancelled` stays in protocol objects only.
+- 2026-09-21 (1.0 closing): **The branch is merged as-is, version 1.0.0, no squash.** The refactor of `cli.py` stayed at consolidation (helpers, two function splits) rather than a package split, because the structure recon found duplication, not architecture; the version jump records the surface break MIGRATION.md describes (`status`→`list`, `rm`→`delete`, `stop`→`cancel`, `-o`→`--output-file`, tagged text off a terminal, exit 124 without a result).
 - 2026-09-20 (phase 0.2, slices 16-19): **A client deadline returns no result and creates no file; `wait` reports the turn it started on.** Before, `--timeout` printed a partial document and could describe a newer turn than the one the caller watched. Both are false reports; the answer so far is in the session files and `log --tail` reads it.
 - 2026-09-20 (slice 17): **A usage limit is waited out inside the same acpc turn.** ACP has no continuation, so the resumption is a second `session/prompt` on the same adapter session; the turn number, answer file and token count stay one turn's, and `cancel` in `waiting` drops the resumption without contacting the adapter.
 - 2026-09-20 (slice 18): **Off a terminal, `text` is a tagged document; the answer is never escaped, only bounded by counted tags.** Escaping the six wrapper tags inside the answer (draft.9) altered the agent's words; draft.10's `<answer-N>` keeps them verbatim and lets a reader validate the boundary by line count. `next` is always the last metadata key so it lands after `truncated`/`output_file`.

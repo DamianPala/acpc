@@ -296,7 +296,7 @@ wait SELECTOR [--timeout S] [--output-file FILE]
 
 The output field is a JSON Schema subset using only `type`, `enum`, `properties`, `required` and `items`. It describes one result document shared by the success and failure results, or one record for `log`. The generator walks the Click tree that actually parses the command. A group is indexed only when explicitly marked as dispatching useful work without a subcommand. An unknown schema path is an exit-2 usage error naming the nearest valid paths. Path segments are separate arguments.
 
-The installed binary currently publishes schema version `1`, tool version `0.7.1`, format defaults `{"tty": "text", "non_tty": "json"}`, and conformance name `cli-design-standard` at `0.2.0-draft.11` with extensions `["managed", "conversational"]`; `conversational` covers `run`, `continue`, `steer`, `wait` and the capability object. `tests/test_conformance.py` verifies the claim against the standard header and the behavior of every indexed command.
+The installed binary currently publishes schema version `1`, tool version `1.0.0`, format defaults `{"tty": "text", "non_tty": "json"}`, and conformance name `cli-design-standard` at `0.2.0-draft.11` with extensions `["managed", "conversational"]`; `conversational` covers `run`, `continue`, `steer`, `wait` and the capability object. `tests/test_conformance.py` verifies the claim against the standard header and the behavior of every indexed command.
 
 ## Output contract
 
@@ -521,7 +521,7 @@ The package ships the skills `adapter-bringup`, `provider-bringup` and `refresh-
 
 ## `--help` as first-contact documentation
 
-`acpc --help` is a compact cheat sheet for the common blocking, background, wait, log, steering, continuation, maintenance and machine-readable paths. `acpc COMMAND --help` provides progressive disclosure for every command and group. Each option has a description and either a real default or a statement of where its value comes from. `-h` and `--help` are equivalent; `-V` and `--version` print only the version string, currently `0.7.1`.
+`acpc --help` is a compact cheat sheet for the common blocking, background, wait, log, steering, continuation, maintenance and machine-readable paths. `acpc COMMAND --help` provides progressive disclosure for every command and group. Each option has a description and either a real default or a statement of where its value comes from. `-h` and `--help` are equivalent; `-V` and `--version` print only the version string, currently `1.0.0`.
 
 Help is generated from the parser's live surface. The schema includes flags that are accepted but deliberately not shown in human help only when the parser still accepts them; the current `continue` command has no hidden resolution flags. A migration hint for a removed spelling is part of the usage error whenever acpc can identify the replacement.
 
