@@ -21,7 +21,14 @@ to `max`; live on codex-acp: astra resolves at `max`, `ultra` and a preset at `m
 naming the levels, `cancel` then a message-less `continue` sends the `canceled` text and the
 essay finishes `succeeded`). Then the bump to 1.0.0 (`pyproject.toml`, `uv.lock`, SPEC, the
 conformance pin). Final gate on the 1.0.0 tree: 1378 tests with `ACPC_STANDARD_CHECKOUT`,
-ruff/pyright clean, smoke 603/603. The `main` worktree still holds the uncommitted 2026-09-08 change set (six files);
+ruff/pyright clean, smoke 603/603. Then a blind cold-start probe of the 1.0.0 tree by four
+independent evaluators (Opus 31/35, Sonnet 4.1/5, Terra 3.7/5, Luna 27/35; synthesis in
+`docs/plans/1.0/close/sonda-1.0/SYNTEZA.md`): zero wrong commands on cold start for all four,
+every complaint aimed at help prose, none at behavior. Fixed the same day in text only: the root
+cheat sheet no longer promises `--dry-run` on `delete`, says `steer` blocks until the turn ends
+and that `wait` prints the tagged document; the three `--background` descriptions and the README
+say a receipt names the id (`--json` carries `session_id`), and the global `--json` description
+says which commands already answer JSON off a TTY. The `main` worktree still holds the uncommitted 2026-09-08 change set (six files);
 slice 24 carries its facts, so those files are to be reverted there before the merge (Damian's
 call). After the merge: `docs/plans/1.0/close/host-migration-checklist.md` (five host files read
 the old surface), `acpc daemon stop`, reinstall from `main`, `acpc -V`.
@@ -33,7 +40,11 @@ text view; `_dispatch_follow_up` at 101 lines and the `cli.py` package split; th
 failing offline; `docs/manual-test-plan.md` and `docs/live-test-plan.md` still say `acpc stop`
 and the states `cancelled`/`timeout`; two O3d notes for the standard's author (whether
 `--output-file` on a terminal takes the terminal or the non-TTY representation; that structural
-whitespace is not a terminal sequence). CI on three OSes is still unverified; the socket-length
+whitespace is not a terminal sequence). From the cold-start probe: `log --prose` glues turn and
+message boundaries (`waited 20sWorking through`; the renderer breaks a line only before an
+`error` event, a blank line between turns needs a SPEC sentence and a test); `probe` needs
+`--discover` and the root help does not say so; `delete` is the one irreversible session command
+without a preview (design call, not a bug). CI on three OSes is still unverified; the socket-length
 tests are the first thing that breaks on Windows.
 
 **Phase 0.2 of the standard alignment is complete on `feat/cli-design-conformance` (2026-09-20,

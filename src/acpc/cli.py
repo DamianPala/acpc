@@ -586,11 +586,11 @@ Global flags:
 __GLOBAL_FLAGS__
 
 Short task: acpc run <agent> "Explain this code" --permissions execute
-Long or uncertain task: acpc run <agent> "Run the tests" --background --json; acpc wait <id> --quiet block until done, prints the answer.
+Long or uncertain task: acpc run <agent> "Run the tests" --background --json; acpc wait <id> --quiet blocks until done and prints the tagged answer document (--json | jq -r .answer for the bare text).
 Checking on a run: acpc log <id> --tail 10 --follow --timeout 60
-Steering a running session: acpc steer <id> "Stop editing; diagnose only"   in place when the adapter supports it; --steer-mode cancel-then-start to interrupt
+Steering a running session: acpc steer <id> "Stop editing; diagnose only"   in place when the adapter supports it; --steer-mode cancel-then-start to interrupt; blocks until the turn ends unless --background
 Context care: log is condensed by default; use --prose for the full answer.
-Maintenance and setup: delete, prune and bare daemon stop explain their gates; --dry-run previews.
+Maintenance and setup: delete, prune and bare daemon stop explain their gates; prune and daemon stop preview with --dry-run, resolve previews a dispatch.
   Truncated or huge answer? Read <dir>/answer.md selectively — always complete.
   SIGINT cancels the turn owned by this command. SIGTERM detaches work already taken over by the daemon.
   acpc continue <id> "Now fix what you found"
@@ -4298,8 +4298,9 @@ def _run_foreground(
     "background",
     is_flag=True,
     help=(
-        "Dispatch and return the session id; without --permissions it first asks at the "
-        "terminal which policy to detach with, and it refuses --permissions ask."
+        "Dispatch and print a receipt naming the session id (--json carries it as "
+        "session_id); without --permissions it first asks at the terminal which policy "
+        "to detach with, and it refuses --permissions ask."
     ),
 )
 @click.option("--quiet", is_flag=True, help="Suppress the stderr summary line.")
@@ -4641,8 +4642,9 @@ def _continuation_prompt(meta: sessions.SessionMeta) -> str:
     "background",
     is_flag=True,
     help=(
-        "Dispatch and return the session id; refused while the policy in effect is ask, "
-        "which needs someone still attached to answer."
+        "Dispatch and print a receipt naming the session id (--json carries it as "
+        "session_id); refused while the policy in effect is ask, which needs someone "
+        "still attached to answer."
     ),
 )
 @click.option(
@@ -5050,7 +5052,7 @@ def _load_steerable_session(selector: str, steer_mode: str | None) -> sessions.S
     "--bg",
     "background",
     is_flag=True,
-    help="Dispatch and return the session id.",
+    help="Dispatch and print a receipt naming the session id (--json carries it as session_id).",
 )
 @click.option(
     "--timeout",

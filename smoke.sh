@@ -1260,8 +1260,12 @@ if begin_section S12-cli "help contract, -V, TTY rules, hostile inputs"; then
     assert_contains "cheat sheet names the agents list command" "$HELP_MAIN" "agents list"
     assert_contains "cheat sheet names the skills list command" "$HELP_MAIN" "skills list"
     assert_contains "cheat sheet names the daemon status command" "$HELP_MAIN" "daemon status"
-    assert_contains "cheat sheet says wait already prints the answer" \
-        "$HELP_MAIN" "block until done, prints the answer"
+    assert_contains "cheat sheet says wait already prints the answer document" \
+        "$HELP_MAIN" "blocks until done and prints the tagged answer document"
+    assert_contains "cheat sheet does not promise --dry-run on delete" \
+        "$HELP_MAIN" "prune and daemon stop preview with --dry-run"
+    assert_contains "cheat sheet says steer blocks until the turn ends" \
+        "$HELP_MAIN" "blocks until the turn ends unless --background"
     assert_contains "cheat sheet frames the file read as the fallback" \
         "$HELP_MAIN" "Truncated or huge answer?"
     assert_contains "cheat sheet distinguishes SIGINT from SIGTERM" \
