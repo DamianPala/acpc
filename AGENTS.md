@@ -47,7 +47,7 @@ Dispatched implementers get target doc wording verbatim in spec; orchestrating a
 
 ## Release page
 
-Only on Damian's explicit go, after he pushed main + tag. `gh release create v<x> --title "acpc <x>" --notes-file <file>`. Notes very concise: one opening line naming the release's theme (+ PR ref if any), then `### Added` / `### Changed` / `### Fixed` — one line per item, only sections that apply. Breaking changes prefixed `**BREAKING:**` under Changed. What it does now, never process/journey. Model: v0.7.0 and v0.7.1 pages.
+Every release goes through the `release-create` skill, only on Damian's explicit go. Run it before tagging: it writes the `CHANGELOG.md` section, the annotated tag and the release page in one pass (title, section layout, links and the fresh-eye review come from the skill); pushing the tag and creating the page stay Damian's go, the skill asks. A tag that already exists takes the skill's page-only path (the changelog commit then lands after the tag). Notes very concise: one line per item, only sections that apply, what it does now, never process/journey.
 
 ## Project
 
