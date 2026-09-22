@@ -2,9 +2,11 @@
 
 ## Now
 
-**1.0.1 bumped and tagged locally (2026-09-21): the gate is green on `ubuntu-latest` and
-`macos-latest` at `b241de8`; Damian's `git push origin main v1.0.1` and the release page (notes
-from 0.7.1 to 1.0.1, `v1.0.0` has no page) are what is left.** The first CI run of 1.0.0 failed
+**1.0.1 released (2026-09-22): tag `v1.0.1` (`5a6186e`) and main are on origin with the gate
+green on `ubuntu-latest` and `macos-latest`, and the release page
+<https://github.com/DamianPala/acpc/releases/tag/v1.0.1> covers 0.7.1 → 1.0.1 (`v1.0.0` has no
+page). `CHANGELOG.md` was started after the tag on Damian's choice (`a170444`, not pushed yet;
+the page's Full changelog link resolves once it is).** The first CI run of 1.0.0 failed
 20 of 1383 tests on `macos-latest`, all from one root: `proc.py` identified processes through
 `/proc` only, so on macOS `cancel` could not identify a direct worker, PID reuse was never caught
 and a worker killed mid-turn was never seen as dead. Slice 26 (`fix(proc)`, branch `fix/macos-process-identity`,
