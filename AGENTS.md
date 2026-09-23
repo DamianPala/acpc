@@ -17,9 +17,10 @@
 
 ## Build contract
 
-Roles and loop per `~/ai/lab/knowledge/build-contract.md` (main session briefs, builder implements, reviewer verifies on a fresh context, max 2 rounds). Local mapping, in force since slice 15 of the 1.0 alignment (2026-09-19):
+Roles and loop per `~/ai/lab/knowledge/build-contract.md` (main session briefs, builder implements, reviewer verifies on a fresh context, max 2 rounds). Local mapping, in force since the 1.1 cycle (2026-09-23):
 
-- builder = Agent tool `builder` (Sonnet, high); reviewer = Agent tool `reviewer` (Opus, high, adversarial with mutation testing on a `git archive` copy — never in the worktree); explorer = `explorer` (Sonnet). acpc dispatch (`builder-sub`, `codex`) only for vendor-specific or heavier slices, on Damian's call.
+- builder = `acpc run builder` (Codex, gpt-6-luna, effort max); explorer = `acpc run explorer` (same model, read-only work); reviewer = Agent tool `reviewer` (Opus, high, adversarial with mutation testing on a `git archive` copy — never in the worktree). Hard design or diagnosis questions: Agent tool on Fable 5.1 or `acpc run expert-astra`, one question per dispatch.
+- acpc dispatches run `--bg` with `--prompt-file` and `--cwd` of the slice worktree; the orchestrator arms `acpc wait <id> --output-file <file>` in the background in the same turn. After `git worktree remove` of a tree an entry ran in, `acpc daemon stop <entry>` before its next dispatch (the warm daemon keeps the dead cwd and Codex fails to load its configuration).
 - Brief, builder report, reviewer verdicts and SPEC delta live as files under `docs/plans/<version>/` (`slice-N.md`, `slice-N-report.md`, `slice-N-review-<round>.md`, `slice-N-spec-delta.md`). Agents return a few lines; the file is the record.
 - SPEC/README/help wording is authored by the orchestrator before dispatch and pasted verbatim into the brief; builders never edit `SPEC.md`.
 - One commit per slice. After `approve` plus green gate (`pytest` with `ACPC_STANDARD_CHECKOUT` set, ruff, pyright, `smoke.sh`) and the orchestrator's own diff read, commit without asking; pushing stays Damian's act.
