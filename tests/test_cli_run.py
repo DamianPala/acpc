@@ -1123,16 +1123,61 @@ def test_observed_usage_still_reports_the_real_count(cli: CliRunner) -> None:
 
 def test_max_output_caps_stdout(cli: CliRunner) -> None:
     result = invoke(
-        cli, "run", "mock", "trigger the huge scenario", "--quiet", "--max-output", "512"
+        cli, "run", "mock", "trigger the huge scenario", "--quiet", "--max-output", "4096"
     )
 
-    assert len(result.stdout) < 4096
+    assert len(result.stdout.encode("utf-8")) <= 4096
 
 
 def test_max_output_zero_disables_the_cap(cli: CliRunner) -> None:
     result = invoke(cli, "run", "mock", "trigger the huge scenario", "--quiet", "--max-output", "0")
 
     assert len(result.stdout) > 131072
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("run", "mock", "echo:valid"),
+        ("continue", "missing", "message"),
+        ("steer", "missing", "instruction"),
+        ("wait", "missing"),
+    ],
+    ids=("run", "continue", "steer", "wait"),
+)
+@pytest.mark.parametrize("value", ["1", "4095"])
+def test_answer_commands_reject_max_output_below_4096(
+    cli: CliRunner, args: tuple[str, ...], value: str
+) -> None:
+    result = invoke(cli, *args, "--max-output", value)
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert "4096" in result.stderr
+    assert "--max-output" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("run", "mock", "echo:valid", "--quiet"),
+        ("continue", "missing", "message"),
+        ("steer", "missing", "instruction"),
+        ("wait", "missing"),
+    ],
+    ids=("run", "continue", "steer", "wait"),
+)
+def test_answer_commands_accept_max_output_4096(cli: CliRunner, args: tuple[str, ...]) -> None:
+    result = invoke(cli, *args, "--max-output", "4096")
+
+    assert result.exit_code != vocab.EXIT_USAGE, result.stderr
+    assert "--max-output must" not in result.stderr
+
+
+def test_log_keeps_its_per_record_max_output_minimum(cli: CliRunner) -> None:
+    result = invoke(cli, "log", "missing", "--since", "0", "--max-output", "1")
+
+    assert result.exit_code != vocab.EXIT_USAGE
+    assert "4096" not in result.stderr
 
 
 def test_a_negative_max_output_is_a_usage_error(cli: CliRunner) -> None:

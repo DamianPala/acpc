@@ -1347,7 +1347,6 @@ async def _execute_routed(
             return await _cancel_before_route_acceptance(session_id, request, cancel)
         daemon, route_note = routing.result()
         cancel.resolve_route(daemon_routed=daemon is not None)
-        _install_signal_handlers(loop, cancel)
     finally:
         signalled.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):

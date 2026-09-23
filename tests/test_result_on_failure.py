@@ -453,8 +453,8 @@ def test_wait_via_the_no_daemon_fallback_pins_the_turn_across_a_rotation(
 def test_wait_via_the_no_daemon_fallback_names_the_parked_turns_file_when_truncated(
     cli: CliRunner,
 ) -> None:
-    """Same rotation as above, but with `--max-output` small enough to force
-    truncation: the marker and `output_file` must both name the parked
+    """Same rotation as above, using the smallest legal cap and a long answer
+    to force truncation: the marker and `output_file` must name the parked
     turn's own `answer.1.md`, not the session's current `answer.md`."""
     session_id = running()
 
@@ -467,7 +467,7 @@ def test_wait_via_the_no_daemon_fallback_names_the_parked_turns_file_when_trunca
             session_id,
             "--json",
             "--max-output",
-            "64",
+            "4096",
         ],
         env=os.environ.copy(),
         stdout=subprocess.PIPE,
@@ -479,7 +479,7 @@ def test_wait_via_the_no_daemon_fallback_names_the_parked_turns_file_when_trunca
         time.sleep(2.0)
 
         wait_process.send_signal(signal.SIGSTOP)
-        sessions.write_answer(session_id, "first answer " * 20)
+        sessions.write_answer(session_id, "first answer " * 400)
         sessions.transition(session_id, "canceled", stop_reason="cancelled")
         sessions.rotate_turn(session_id)
         sessions.mark_running(session_id, pid=os.getpid())
@@ -656,7 +656,7 @@ def test_partial_true_always_exits_non_zero(cli: CliRunner) -> None:
 
 
 def test_truncation_and_partial_are_separate_markers(cli: CliRunner) -> None:
-    result = invoke(cli, "run", "mock", "huge", "--max-output", "512", "--json", "--quiet")
+    result = invoke(cli, "run", "mock", "huge", "--max-output", "4096", "--json", "--quiet")
 
     assert result.exit_code == vocab.EXIT_OK
     payload = document(result)

@@ -78,7 +78,7 @@ stdout is the answer, stderr is acpc metadata prefixed `--`; redirect them separ
 | A1 | `acpc agents` | Every adapter with install status; variants indented showing only their delta; `missing → acpc install <name>` only for absent adapters that define `install_command` (else `install_docs` URL or bare `missing`) |
 | A2 | `acpc agents lt` | Field-by-field resolution with provenance (`(entry)`, `(adapter default)`, …); ends with a pointer to the parent's catalogs, no cache footer |
 | A3 | `acpc run lt "x" --dry-run` | The call's full resolution incl. declared env and cwd, each value sourced; no adapter contacted, no session dir created |
-| A4 | `acpc --help`, then `acpc log --help` | Cheat sheet ≤100 lines with grouped examples + flag→ACP table; per-command page is the full reference; `acpc stop --help` prints the root page (no stubs) |
+| A4 | `acpc --help`, then `acpc log --help` and `acpc cancel --help` | Cheat sheet ≤100 lines with grouped examples + flag→ACP table; per-command page is the full reference; `cancel` has its own help page. The former `stop --help` stub check is obsolete in 1.0. |
 | A5 | `acpc run lt "x" --effort ultra --dry-run` | Hard usage error listing the levels the resolved model supports — never a silent fallback |
 
 Caveat for A2 on a *base adapter* name: on a fresh home a cache miss triggers the automatic live probe — that is a live call and belongs to tier 1/2, not here. `lt` (a variant of an uncached parent) should end with the pointer without probing; if it probes instead, record that as a finding.
@@ -104,9 +104,9 @@ If B4 lands both calls on one daemon, stop and report it. That is credential cro
 | C3 | `acpc daemon stop lt`, then `continue <id>` again | The cold path: `session/load` resume — context still present. This is the S09 warm-vs-cold contract measured live |
 | C4 | `acpc continue last "x"` non-TTY | Rejected, exit 2 — `last` is TTY-only |
 | C5 | `acpc run lt "Reply: OK" --bg`, then `acpc wait <id>` | `--bg` prints id + dir only, no summary; `wait` prints the answer, exit mirrors the result |
-| C6 | Slow prompt `--bg`, then `acpc stop <id>` | Graceful cancel; state `cancelled`; `wait <id>` exits 130; partial transcript on disk |
+| C6 | Slow prompt `--bg`, then `acpc cancel <id>` | Graceful cancel; state `canceled`; `wait <id>` exits 130; partial transcript on disk |
 | C7 | Slow prompt in foreground, SIGTERM the client (PID of the `acpc run` process, not the daemon) | Client exits 143 printing the id to stderr; session keeps running under the daemon; `wait <id>` collects the answer |
-| C8 | Same, SIGINT instead | Session cancelled (state `cancelled`), exit 130 |
+| C8 | Same, SIGINT instead | Session canceled (state `canceled`), exit 130 |
 
 C7 is the single most load-bearing behavior for the primary consumer (a harness killing the tool call on its own timeout). If detach does not survive on a real adapter, that is a stop-everything finding.
 
@@ -141,7 +141,7 @@ D2 shipped broken in 0.2 and was caught by review, not tests. Measure it.
 | F5 | `acpc status zzzz` / corrupt a copy of `meta.json` and read it | One line naming the file/id, non-zero exit, no traceback, other state intact |
 | F6 | Two concurrent runs on one target | Both complete; queueing noted on stderr if slots exhausted |
 | F7 | Make the daemon unable to start (e.g. unwritable `$ACPC_HOME/daemon/`) | Visible direct-child fallback in the stderr summary; SIGTERM then cancels instead of detaching |
-| F8 | `acpc run lt "slow task" --timeout 5` | Session cancelled, state `timeout`, exit 124; `wait --timeout` on a running session exits 124 but leaves it running |
+| F8 | `acpc run lt "slow task" --timeout 5` | Work continues and the session stays active (`running`, or `starting`/`preparing` during startup); the client exits 124 with `kind: timeout`. `wait --timeout` on a running session also exits 124 and leaves it running |
 
 ## V. Vendor facts (tier 2 — real codex only)
 

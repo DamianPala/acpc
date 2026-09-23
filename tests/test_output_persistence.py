@@ -3,8 +3,10 @@
 import json
 import os
 import pty
+import queue
 import subprocess
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -13,7 +15,7 @@ import pytest
 from click.testing import CliRunner
 
 from acpc import cli as cli_module
-from acpc import sessions, transcript, vocab
+from acpc import paths, sessions, transcript, vocab
 from acpc.cli import main
 
 MOCK_AGENT_SCRIPT = str(Path(__file__).with_name("mock_agent.py"))
@@ -211,7 +213,7 @@ def test_every_answer_command_reports_truncation_and_answer_file(cli: CliRunner)
         "--quiet",
         "--json",
         "--max-output",
-        "512",
+        "4096",
     )
     run_payload = json.loads(run_result.stdout)
     _assert_truncated(run_payload, run_payload["session_id"])
@@ -226,11 +228,11 @@ def test_every_answer_command_reports_truncation_and_answer_file(cli: CliRunner)
         "--quiet",
         "--json",
         "--max-output",
-        "512",
+        "4096",
     )
     _assert_truncated(json.loads(continue_result.stdout), session_id)
 
-    wait_result = invoke(cli, "wait", session_id, "--quiet", "--json", "--max-output", "512")
+    wait_result = invoke(cli, "wait", session_id, "--quiet", "--json", "--max-output", "4096")
     _assert_truncated(json.loads(wait_result.stdout), session_id)
 
     steer_session = _make_mid_turn_session(cli)
@@ -242,7 +244,7 @@ def test_every_answer_command_reports_truncation_and_answer_file(cli: CliRunner)
         "--quiet",
         "--json",
         "--max-output",
-        "512",
+        "4096",
     )
     _assert_truncated(json.loads(steer_result.stdout), steer_session)
 
@@ -266,6 +268,108 @@ def test_json_output_file_is_exact_stdout_payload_and_stdout_stays_empty(
     payload = json.loads(target.read_text(encoding="utf-8"))
     assert payload["answer"].strip() == "json file"
     assert payload["truncated"] is False
+
+
+@pytest.mark.skipif(not Path("/dev/null").exists(), reason="requires /dev/null")
+def test_run_can_write_its_output_file_to_dev_null(cli: CliRunner) -> None:
+    result = invoke(
+        cli,
+        "run",
+        "mock",
+        "echo:discarded",
+        "--quiet",
+        "--output-file",
+        "/dev/null",
+    )
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    assert result.stdout == ""
+
+
+@pytest.mark.skipif(not Path("/dev/null").exists(), reason="requires /dev/null")
+def test_wait_can_write_its_output_file_to_dev_null(cli: CliRunner) -> None:
+    run_result = invoke(cli, "run", "mock", "echo:done", "--quiet", "--json")
+    session_id = json.loads(run_result.stdout)["session_id"]
+
+    result = invoke(cli, "wait", session_id, "--quiet", "--output-file", "/dev/null")
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    assert result.stdout == ""
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="requires FIFO support")
+def test_output_file_writes_to_an_existing_fifo_in_place(cli: CliRunner, tmp_path: Path) -> None:
+    target = tmp_path / "result.fifo"
+    os.mkfifo(target)
+    reader_fd = os.open(target, os.O_RDONLY | os.O_NONBLOCK)
+    writer_fd = os.open(target, os.O_WRONLY | os.O_NONBLOCK)
+    os.set_blocking(reader_fd, True)
+    received: queue.Queue[str] = queue.Queue()
+
+    def read_fifo() -> None:
+        with os.fdopen(reader_fd, "r", encoding="utf-8") as fifo:
+            received.put(fifo.read())
+
+    reader = threading.Thread(target=read_fifo, daemon=True)
+    reader.start()
+    try:
+        result = invoke(
+            cli,
+            "run",
+            "mock",
+            "echo:fifo content",
+            "--quiet",
+            "--output-file",
+            str(target),
+        )
+    finally:
+        os.close(writer_fd)
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    assert result.stdout == ""
+    assert "fifo content" in received.get(timeout=5)
+    assert target.is_fifo()
+
+
+def test_output_file_permission_error_names_the_path_without_acpc_home(
+    cli: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from acpc import errors
+
+    output_dir = tmp_path / "read-only"
+    output_dir.mkdir()
+    output_dir.chmod(0o500)
+    target = output_dir / "nested" / "answer.json"
+    original_atomic_write = paths.atomic_write
+
+    def deny_output(path: Path, data: dict[str, Any] | str, *, exclusive: bool = False) -> None:
+        if path == target:
+            raise PermissionError(13, "Permission denied", str(path.parent))
+        original_atomic_write(path, data, exclusive=exclusive)
+
+    monkeypatch.setattr(paths, "atomic_write", deny_output)
+    try:
+        result = invoke(
+            cli,
+            "run",
+            "mock",
+            "echo:cannot write",
+            "--quiet",
+            "--json",
+            "--output-file",
+            str(target),
+        )
+    finally:
+        output_dir.chmod(0o700)
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    problem = json.loads(result.stderr)["error"]
+    assert problem["kind"] == errors.PERMISSION_DENIED
+    assert problem["action"] == "user"
+    assert str(target) in problem["message"]
+    assert "writable directory" in problem["hint"]
+    assert "ACPC_HOME" not in problem["message"]
+    assert "ACPC_HOME" not in problem["hint"]
 
 
 def test_output_file_mirrors_text_and_json_wait_output_byte_for_byte(

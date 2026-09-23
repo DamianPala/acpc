@@ -89,7 +89,7 @@ the system keyring and does not follow `--home` — so the variant's *turn* may 
 | C3 | `acpc daemon stop <target>`, then `acpc continue <id> "..."` | A cold resume through a fresh daemon reattaches to the same conversation; `answer.md` holds only the new turn, never replayed history |
 | C4 | `acpc continue last "..."` with stdout redirected to a file | Rejected, exit 2 — `last` is TTY-only, and a stale "last" misleads an agent |
 | C5 | `acpc status`, then `acpc status <id>` | Listed with resolved model and idle age; then that session's vitals |
-| C6 | `acpc stop <id>` on a running session | State `cancelled`, **still listed**, and resumable with `continue` — cancelled counts as finished, not deleted |
+| C6 | `acpc cancel <id>` on a running session | State `canceled`, **still listed**, and resumable with `continue` — canceled counts as finished, not deleted |
 | C7 | `acpc steer <id> "Stop that; reply with exactly STEERED"` mid-turn | The turn is interrupted, the instruction lands under the fixed preamble, the interrupted turn's partial answer is kept as `answer.<n>.md` |
 | C8 | `acpc steer <id> "..."` on a finished session | Usage error naming `continue` |
 

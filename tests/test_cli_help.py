@@ -1,7 +1,9 @@
 """Behavioral tests for first-contact help and CLI hardening."""
 
 import json
+import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -452,6 +454,50 @@ def test_short_version_matches_long_version(runner: CliRunner) -> None:
     # The version string alone: a caller that reads it should not have to
     # strip a tool name off the front of it.
     assert short_version.stdout.strip() == __version__
+
+
+@pytest.mark.parametrize("module", ["acpc", "acpc.cli"])
+def test_python_module_entry_points_print_the_version(module: str) -> None:
+    environment = os.environ.copy()
+    environment.pop("ACPC_CEILING", None)
+    result = subprocess.run(
+        [sys.executable, "-m", module, "--version"],
+        cwd=Path(__file__).resolve().parents[1],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == vocab.EXIT_OK, result.stderr
+    assert result.stdout.strip() == __version__
+
+
+@pytest.mark.parametrize("module", ["acpc", "acpc.cli"])
+def test_python_module_entry_points_keep_usage_exit_code(module: str) -> None:
+    environment = os.environ.copy()
+    environment.pop("ACPC_CEILING", None)
+    result = subprocess.run(
+        [sys.executable, "-m", module, "not-a-command"],
+        cwd=Path(__file__).resolve().parents[1],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == vocab.EXIT_USAGE
+
+
+def test_answer_command_help_states_the_max_output_floor(runner: CliRunner) -> None:
+    for command in ("run", "continue", "steer", "wait"):
+        result = invoke(runner, command, "--help")
+
+        assert result.exit_code == vocab.EXIT_OK
+        assert "Cap on stdout bytes, at least 4096; 0 disables the cap." in " ".join(
+            result.stdout.split()
+        )
+        assert "x=0 or x>=4096" in result.stdout
 
 
 def test_background_prompt_policy_is_rejected_on_a_tty(

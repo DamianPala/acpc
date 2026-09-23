@@ -530,7 +530,7 @@ if begin_section S06-run "run sync + session dir layout + output contract + exit
         fail "truncated stdout must be valid UTF-8 at the cut: $(cat "${SCRATCH}/utf8_err")"
     fi
 
-    run_acpc run mock "trigger the huge scenario" --quiet --json --max-output 2000
+    run_acpc run mock "trigger the huge scenario" --quiet --json --max-output 4096
     assert_json_valid "--json truncation envelope is valid JSON" "$LAST_OUT"
     assert_eq "--json truncation sets truncated: true" "true" \
         "$(json_field "$LAST_OUT" '.truncated')"

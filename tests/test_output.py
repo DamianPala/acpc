@@ -112,6 +112,39 @@ def test_json_envelope_has_pinned_fields_and_truncates_answer_only() -> None:
     assert result.text.encode("utf-8").decode("utf-8")
 
 
+def test_json_keeps_an_oversized_envelope_and_only_the_truncation_marker() -> None:
+    meta = make_session(Path("."))
+    meta.context = {"used": 10**4000, "size": None, "peak": 1}
+    marker = f"\n[output truncated; full answer: {sessions.answer_path(meta.session_id)}]\n"
+
+    result = output.render_result(meta, "answer must be omitted", json_mode=True, max_output=4096)
+    payload = json.loads(result.text)
+
+    assert result.truncated is True
+    assert result.size_bytes > 4096
+    assert payload["context"] == meta.context
+    assert payload["answer"] == marker
+
+
+def test_tagged_text_keeps_an_oversized_envelope_and_only_the_marker() -> None:
+    meta = make_session(Path("."))
+    meta.context = {"used": 10**4000, "size": None, "peak": 1}
+    marker = f"\n[output truncated; full answer: {sessions.answer_path(meta.session_id)}]\n"
+
+    result = output.render_result(meta, "answer must be omitted", tagged=True, max_output=4096)
+    metadata_text = result.text.split("<metadata>\n", maxsplit=1)[1].split(
+        "\n</metadata>", maxsplit=1
+    )[0]
+    metadata = json.loads(metadata_text)
+
+    assert result.truncated is True
+    assert result.size_bytes > 4096
+    assert metadata["context"] == meta.context
+    assert metadata["truncated"] is True
+    assert marker in result.text
+    assert "answer must be omitted" not in result.text
+
+
 def test_background_and_output_file_shapes_are_separate(tmp_path: Path) -> None:
     meta = make_session(tmp_path)
     answer = "complete answer\n"

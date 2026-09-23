@@ -34,6 +34,14 @@ class OutputResult:
     output_file: str | None = None
 
 
+class OutputFilePermissionError(PermissionError):
+    """A permission refusal while writing a caller-selected result path."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        super().__init__(f"cannot write output file {path}")
+
+
 def _validate_max_output(max_output: int) -> None:
     if isinstance(max_output, bool) or not isinstance(max_output, int) or max_output < 0:
         raise ValueError("max_output must be a non-negative integer")
@@ -266,9 +274,16 @@ def _json_answer(
 
 
 def write_output_file(path: Path | str, answer: str) -> int:
-    """Atomically write the exact stdout representation to a destination."""
+    """Write the exact stdout representation, replacing regular files atomically."""
     target = Path(path).expanduser()
-    paths.atomic_write(target, answer)
+    try:
+        if target.exists() and not target.is_file():
+            with target.open("w", encoding="utf-8") as file:
+                file.write(answer)
+        else:
+            paths.atomic_write(target, answer)
+    except PermissionError as error:
+        raise OutputFilePermissionError(target) from error
     return len(answer.encode("utf-8"))
 
 

@@ -12,6 +12,7 @@ would hide the parser contract without reducing risk.
 ## Layers
 
 ```
+__main__.py                     `python -m acpc` delegates to `cli.main`
 cli.py                          argument parsing, verbs, help, exit codes, TTY detection
   │
   ├── registry.py               entry resolution (adapter TOMLs + user entries, provenance)
@@ -49,7 +50,8 @@ vocab.py (frozen)               efforts, permission values, session states, exit
 
 | Module | Owns | SPEC.md sections |
 |--------|------|------------------|
-| `cli.py` | Verb surface, flag parsing, two-level `--help`, `-V`, TTY vs non-TTY rules, `last` selector, read-only `resolve` previews and session `status`/`list` views, and the one place every failure is reported: it classifies what the layers below raise and renders it through `errors` | *Command surface*, *`--help`*, *TTY vs non-TTY* |
+| `__main__.py` | Package module entry point, delegates to `cli.main` so `python -m acpc` uses the console CLI's error handling | *Command surface* |
+| `cli.py` | Verb surface, flag parsing, two-level `--help`, `-V`, TTY vs non-TTY rules, `last` selector, read-only `resolve` previews and session `status`/`list` views, and the one place every failure is reported: it classifies what the layers below raise and renders it through `errors`; `python -m acpc.cli` calls this same `main` | *Command surface*, *`--help`*, *TTY vs non-TTY* |
 | `errors.py` | The failure envelope: the `kind` vocabulary, `AcpcError` and its optional recovery fields, the rule that decides envelope vs one-line diagnostic (machine format or piped stderr), and the per-raise exit status. Depends on nothing above `vocab`, so any layer can raise a classified failure | *Output contract* (errors, exit codes) |
 | `interaction.py` | Whether acpc may ask the caller anything — the stdin/stdout terminal seams, `NO_INPUT`, and the one definition of an interactive context — plus the `/dev/tty` question and the confirmation gate every `--yes` command runs. Sits beside `errors`, below the command layer, so a gate is one call and one answer everywhere | *Output contract* (never asks on stdin), *Permissions* (the prompt) |
 | `effects.py` | The `read_only` / `idempotent` / `non_idempotent` declaration, attached to the Click command it describes so it can be read off the tree without running anything | *Command surface* |
@@ -65,7 +67,7 @@ vocab.py (frozen)               efforts, permission values, session states, exit
 | `daemon.py` | Daemon process per target: in-memory turn registration and preparation phase, pre-slot resume preparation with in-memory rollback for failed verification, keeps one adapter warm, serves sessions, generation-aware callback demultiplexing, `daemon_max_concurrent` prompt slots + queueing, idle TTL expiry, version-skew self-restart, per-target log (adapter stderr), `daemon stop` state transitions, `initialize` steering capability retained per warm adapter and an in-place `steer` operation that forwards `_session/steering` to the active turn's adapter session | *`daemon`* |
 | `daemon_client.py` | Client side of the daemon protocol: ensure-running (spawn+connect race-safe via lock, refusing to spawn at all when the target's socket path exceeds the platform limit and reporting that as unavailable), request/response framing over `ipc`, preparation-only waits, generation-bearing cancellation acknowledgements, in-place steering requests over their own connection, and rules preventing a stale daemon from claiming a session | *`daemon`*, *Session states* |
 | `render.py` | Condensed event lines, `--prose` view (message text escaped through `output.escape_answer_controls`, line breaks kept), collection footers on the view stream (`--` prefix, `|`/`·` separators), `--max-output` truncation (UTF-8 boundary, stderr diagnostic, event-granular for `log`), status line/detail views with idle age | *`log`*, *`status`*, *Output contract* |
-| `output.py` | stdout discipline (answer / confirmation / JSON envelope / id+dir), stderr summary line, `--json` shapes, `--output-file` atomic write, and the shared control-byte escape table (`escape_answer_controls`) the tagged document, the human answer and `log --prose` all render through | *Output contract* |
+| `output.py` | stdout discipline (answer / confirmation / JSON envelope / id+dir), stderr summary line, `--json` shapes, `--output-file` atomic replacement for regular files and in-place writes for existing special files, and the shared control-byte escape table (`escape_answer_controls`) the tagged document, the human answer and `log --prose` all render through | *Output contract* |
 | `probe.py` | Direct adapter mode discovery: one ACP connection, one session opened and released, the advertised catalogue and a two-sided diff against the entry's `[modes]`; never writes registry entries. Measuring what a mode permits is 0.7 work and lives on `probe-engine-r13` | *`probe`* |
 | `cache.py` | `cache/<agent>/` advertised data (models/modes/commands), refresh on every run, cache-age footers, `commands.md` full-text render | *`agents get`* (advertised data) |
 

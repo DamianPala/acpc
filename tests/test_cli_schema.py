@@ -401,6 +401,15 @@ def test_run_time_resolved_values_are_not_published_as_defaults(runner: CliRunne
     assert flags["max-output"]["default"] == 131072
 
 
+@pytest.mark.parametrize("command", ["run", "continue", "steer", "wait"])
+def test_answer_commands_publish_the_max_output_floor(runner: CliRunner, command: str) -> None:
+    flags = {flag["name"]: flag for flag in read_detail(runner, command)["flags"]}
+
+    assert flags["max-output"]["description"] == (
+        "Cap on stdout bytes, at least 4096; 0 disables the cap."
+    )
+
+
 def test_permissions_enum_lists_the_deprecated_aliases(runner: CliRunner) -> None:
     flags = {flag["name"]: flag for flag in read_detail(runner, "run")["flags"]}
     permissions = flags["permissions"]

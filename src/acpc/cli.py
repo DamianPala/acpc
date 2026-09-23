@@ -575,6 +575,31 @@ class TimeoutParamType(click.ParamType):
             self.fail(f"{text!r} is not a duration — {self._ERROR}", param, ctx)
 
 
+class ResultMaxOutputParamType(click.IntRange):
+    """Accept an uncapped result or a document budget of at least 4096 bytes."""
+
+    def __init__(self) -> None:
+        super().__init__(min=0)
+
+    def convert(
+        self,
+        value: Any,
+        param: click.Parameter | None,
+        ctx: click.Context | None,
+    ) -> int:
+        parsed = super().convert(value, param, ctx)
+        if 0 < parsed < 4096:
+            self.fail("--max-output must be 0 (no cap) or at least 4096 bytes", param, ctx)
+        return parsed
+
+    def _describe_range(self) -> str:
+        # Click would print the IntRange floor `x>=0`, contradicting the help text.
+        return "x=0 or x>=4096"
+
+
+_RESULT_MAX_OUTPUT_TYPE = ResultMaxOutputParamType()
+
+
 _ROOT_HELP = """acpc — dispatch coding agents over ACP.
 
 Usage:
@@ -740,6 +765,13 @@ def _unclassified_problem(error: Exception) -> AcpcError:
     `action: user` is what says so.
     """
     if isinstance(error, PermissionError):
+        if isinstance(error, output.OutputFilePermissionError):
+            return AcpcError(
+                f"cannot write output file {error.path}",
+                kind=errors.PERMISSION_DENIED,
+                action="user",
+                hint="Choose an output path in a writable directory.",
+            )
         return AcpcError(
             f"acpc was refused access it needed ({type(error).__name__})",
             kind=errors.PERMISSION_DENIED,
@@ -4287,10 +4319,10 @@ def _run_foreground(
 )
 @click.option(
     "--max-output",
-    type=click.IntRange(min=0),
+    type=_RESULT_MAX_OUTPUT_TYPE,
     default=output.DEFAULT_MAX_OUTPUT,
     metavar="BYTES",
-    help="Cap on stdout bytes; 0 disables the cap.",
+    help="Cap on stdout bytes, at least 4096; 0 disables the cap.",
 )
 @click.option(
     "--background",
@@ -4664,10 +4696,10 @@ def _continuation_prompt(meta: sessions.SessionMeta) -> str:
 )
 @click.option(
     "--max-output",
-    type=click.IntRange(min=0),
+    type=_RESULT_MAX_OUTPUT_TYPE,
     default=output.DEFAULT_MAX_OUTPUT,
     metavar="BYTES",
-    help="Cap on stdout bytes; 0 disables the cap.",
+    help="Cap on stdout bytes, at least 4096; 0 disables the cap.",
 )
 @click.option("--quiet", is_flag=True, help="Suppress the stderr summary line.")
 @_json_option(_JSON_CHOICE_HELP)
@@ -5071,10 +5103,10 @@ def _load_steerable_session(selector: str, steer_mode: str | None) -> sessions.S
 )
 @click.option(
     "--max-output",
-    type=click.IntRange(min=0),
+    type=_RESULT_MAX_OUTPUT_TYPE,
     default=output.DEFAULT_MAX_OUTPUT,
     metavar="BYTES",
-    help="Cap on stdout bytes; 0 disables the cap.",
+    help="Cap on stdout bytes, at least 4096; 0 disables the cap.",
 )
 @click.option("--quiet", is_flag=True, help="Suppress the stderr summary line.")
 @_json_option(_JSON_CHOICE_HELP)
@@ -5627,10 +5659,10 @@ def _observe_steered_turn(
 )
 @click.option(
     "--max-output",
-    type=click.IntRange(min=0),
+    type=_RESULT_MAX_OUTPUT_TYPE,
     default=output.DEFAULT_MAX_OUTPUT,
     metavar="BYTES",
-    help="Cap rendered output bytes; 0 disables the cap.",
+    help="Cap on stdout bytes, at least 4096; 0 disables the cap.",
 )
 @click.option("--quiet", is_flag=True, help="Suppress the stderr summary line.")
 @_json_option(_JSON_CHOICE_HELP)
@@ -6007,3 +6039,7 @@ async def _stop_daemons(targets: Sequence[str]) -> list[str]:
         if reply.get("ok"):
             reached.append(target)
     return reached
+
+
+if __name__ == "__main__":
+    main()
