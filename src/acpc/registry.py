@@ -28,6 +28,10 @@ _MODE_KEYS: Final = frozenset({"grants", "delegates", "escalates"})
 _MODE_GRANTS: Final = frozenset(PERMISSION_VALUES[:-1])
 _MODEL_VIA_VALUES: Final = frozenset({"config_option", "set_model"})
 _EFFORT_VIA_VALUES: Final = frozenset({"config_option", "cli"})
+_USAGE_PROFILES: Final = frozenset(
+    {"claude_model_usage", "codex_usage_updates", "grok_meta_usage", "none"}
+)
+_BILLING_VALUES: Final = frozenset({"subscription", "api"})
 _ENTRY_KEYS: Final = frozenset(
     {
         "name",
@@ -42,6 +46,8 @@ _ENTRY_KEYS: Final = frozenset(
         "effort_via",
         "effort_cli_flag",
         "model_via",
+        "usage_profile",
+        "billing",
         "env_passthrough",
         "extends",
         "description",
@@ -68,6 +74,8 @@ _FIELD_NAMES: Final = (
     "effort_via",
     "effort_cli_flag",
     "model_via",
+    "usage_profile",
+    "billing",
     "env_passthrough",
     "description",
     "model",
@@ -203,6 +211,8 @@ class ResolvedEntry:
     model_via: str
     effort_via: str
     effort_cli_flag: str | None
+    usage_profile: str
+    billing: str | None
     env_passthrough: tuple[str, ...]
     description: str | None
     model: str | None
@@ -530,6 +540,16 @@ def _parse_entry(
         if value not in _EFFORT_VIA_VALUES:
             supported = ", ".join(sorted(_EFFORT_VIA_VALUES))
             raise RegistryError(f"{path}: key 'effort_via' must be one of: {supported}")
+    if "usage_profile" in raw:
+        value = _expect_string(path, "usage_profile", raw["usage_profile"])
+        if value not in _USAGE_PROFILES:
+            supported = ", ".join(sorted(_USAGE_PROFILES))
+            raise RegistryError(f"{path}: key 'usage_profile' must be one of: {supported}")
+    if "billing" in raw:
+        value = _expect_string(path, "billing", raw["billing"])
+        if value not in _BILLING_VALUES:
+            supported = ", ".join(sorted(_BILLING_VALUES))
+            raise RegistryError(f"{path}: key 'billing' must be one of: {supported}")
     if "effort_cli_flag" in raw:
         _expect_string(path, "effort_cli_flag", raw["effort_cli_flag"])
     permission_alias: str | None = None
@@ -710,6 +730,7 @@ def _to_resolved(
         "presets",
         "model_via",
         "effort_via",
+        "usage_profile",
     }
     for field_name in _FIELD_NAMES:
         if field_name not in provenance:
@@ -730,6 +751,8 @@ def _to_resolved(
         model_via=string_or_none("model_via") or "config_option",
         effort_via=string_or_none("effort_via") or "config_option",
         effort_cli_flag=string_or_none("effort_cli_flag"),
+        usage_profile=string_or_none("usage_profile") or "none",
+        billing=string_or_none("billing"),
         env_passthrough=strings("env_passthrough"),
         description=string_or_none("description"),
         model=string_or_none("model"),

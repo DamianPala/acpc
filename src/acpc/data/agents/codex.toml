@@ -4,6 +4,7 @@ command = "codex-acp"
 install_command = "npm install -g @agentclientprotocol/codex-acp"
 home = "~/.codex"
 home_env = "CODEX_HOME"
+usage_profile = "codex_usage_updates"
 env_passthrough = [
     "CODEX_HOME",
     "CODEX_PATH",

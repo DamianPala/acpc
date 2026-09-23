@@ -4,6 +4,7 @@ command = "claude-agent-acp"
 install_command = "npm install -g @agentclientprotocol/claude-agent-acp"
 home = "~/.claude"
 home_env = "CLAUDE_CONFIG_DIR"
+usage_profile = "claude_model_usage"
 env_passthrough = [
     "CLAUDE_CONFIG_DIR",
     "CLAUDE_CODE_EXECUTABLE",

@@ -53,6 +53,7 @@ from acpc.permissions import (
 )
 from acpc.registry import ModeSpec
 from acpc.transcript import Transcript
+from acpc.usage import accumulate_turn
 from acpc.vocab import ContextOccupancy
 
 _Clock = Callable[[], float]
@@ -171,6 +172,15 @@ _STATE_REPORT_UPDATES = frozenset(
         "config_option_update",
         "current_mode_update",
         "session_info_update",
+    }
+)
+_USAGE_ACTIVITY_UPDATES = frozenset(
+    {
+        "agent_message_chunk",
+        "agent_thought_chunk",
+        "tool_call",
+        "tool_call_update",
+        "usage_update",
     }
 )
 
@@ -530,6 +540,11 @@ class AcpcClient:
         permission_prompt: _PermissionPrompt | None = None,
         clock: _Clock | None = None,
         previous_context: ContextOccupancy | None = None,
+        previous_usage: Mapping[str, Any] | None = None,
+        usage_profile: str = "none",
+        billing: str | None = None,
+        resolved_model: str | None = None,
+        prompt: str = "",
     ) -> None:
         self.transcript = transcript
         self.permission_level = permission_level
@@ -543,7 +558,18 @@ class AcpcClient:
         self._answer_boundary_pending = False
         self._transcript_boundary_pending = False
         self._tool_calls: dict[str, _ToolCall] = {}
+        self._previous_context = previous_context
         self._context: ContextOccupancy | None = previous_context
+        self._previous_usage = previous_usage
+        self._usage_profile = usage_profile
+        self._billing = billing
+        self._resolved_model = resolved_model
+        self._prompt = prompt
+        self._turn_used: list[int] = []
+        self._usage_activity_count = 0
+        self._limit_usage_gaps = 0
+        self._known_limit_rejection = False
+        self._prompt_response: dict[str, Any] | None = None
         self._usage_update_seen = False
         self._meta_usage_recorded = False
         self._adapter_info: dict[str, str | None] = {"name": None, "version": None}
@@ -575,6 +601,11 @@ class AcpcClient:
         """The last `_meta["_claude/rateLimit"]` seen on a `usage_update`, if any."""
         return dict(self._rate_limit_info) if self._rate_limit_info is not None else None
 
+    @property
+    def adapter_identity(self) -> dict[str, str | None]:
+        """Return the adapter's identity reported by ACP initialize."""
+        return dict(self._adapter_info)
+
     def clear_rate_limit_info(self) -> None:
         """Drop the last-seen `_meta["_claude/rateLimit"]` before a resend.
 
@@ -593,6 +624,23 @@ class AcpcClient:
         (nothing recorded yet) and acpc's fixed continuation instruction.
         """
         return self._recorded_progress
+
+    @property
+    def usage_activity_count(self) -> int:
+        """Count usage-relevant updates seen in the current turn."""
+        return self._usage_activity_count
+
+    def begin_prompt_send(self) -> int:
+        """Mark a new prompt attempt and return its starting activity count."""
+        self._known_limit_rejection = False
+        return self._usage_activity_count
+
+    def record_limit_rejection(self, activity_before: int) -> None:
+        """Record one active, unanswered limit send for Claude or Grok."""
+        active = self._usage_activity_count > activity_before
+        if active and self._usage_profile in {"claude_model_usage", "grok_meta_usage"}:
+            self._limit_usage_gaps += 1
+        self._known_limit_rejection = True
 
     @property
     def denied(self) -> dict[str, int]:
@@ -663,6 +711,10 @@ class AcpcClient:
             self._meta_usage_recorded = True
 
         context = self._context
+        self._prompt_response = {
+            "usage": self._raw_prompt_usage(prompt_result),
+            "_meta": self._raw_response_meta(prompt_result),
+        }
         self.flush()
         self.transcript.append(
             "usage",
@@ -670,12 +722,29 @@ class AcpcClient:
             size=context["size"] if context is not None else None,
             meta={
                 "prompt_usage": {
-                    "usage": self._raw_prompt_usage(prompt_result),
-                    "meta": self._raw_response_meta(prompt_result),
+                    "usage": self._prompt_response["usage"],
+                    "meta": self._prompt_response["_meta"],
                 },
                 "adapter": dict(self._adapter_info),
                 "scope": "turn",
             },
+        )
+
+    def finish_usage(self) -> dict[str, Any] | None:
+        """Compute cumulative usage even when the adapter sent no response."""
+        return accumulate_turn(
+            self._previous_usage,
+            used=self._turn_used,
+            prompt_response=self._prompt_response,
+            prompt=self._prompt,
+            previous_context=self._previous_context,
+            profile=self._usage_profile,
+            adapter_name=self._adapter_info["name"],
+            adapter_version=self._adapter_info["version"],
+            resolved_model=self._resolved_model,
+            billing=self._billing,
+            limit_gaps=self._limit_usage_gaps,
+            missing_response_is_gap=not self._known_limit_rejection,
         )
 
     @asynccontextmanager
@@ -773,6 +842,8 @@ class AcpcClient:
                 self._replay_sink.consume(update)
             return
         update_type = getattr(update, "session_update", None)
+        if update_type in _USAGE_ACTIVITY_UPDATES:
+            self._usage_activity_count += 1
 
         if update_type == "agent_message_chunk" and isinstance(update, AgentMessageChunk):
             text = getattr(update.content, "text", None)
@@ -1165,6 +1236,7 @@ class AcpcClient:
 
     def _record_usage(self, update: UsageUpdate) -> None:
         self._usage_update_seen = True
+        self._turn_used.append(update.used)
         previous_peak = self._context["peak"] if self._context is not None else 0
         self._context = ContextOccupancy(
             used=update.used, size=update.size, peak=max(previous_peak, update.used)

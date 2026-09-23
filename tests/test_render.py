@@ -728,6 +728,34 @@ def test_status_views_show_a_dot_for_unobserved_tokens() -> None:
     assert render.status_detail_json(meta, clock=lambda: 120.0)["context"] is None
 
 
+def test_usage_text_shows_known_counts_with_compact_million_units() -> None:
+    text = render.format_usage(
+        {
+            "quality": "estimate",
+            "gaps": 0,
+            "calls": 283,
+            "models": {"model": {"total_tokens": 34_900_000}},
+            "compactions": {"count": 0},
+        }
+    )
+
+    assert text == "usage 283 calls · 34.9M tokens (estimate)"
+
+
+def test_usage_text_names_one_gap_and_one_compaction_in_the_singular() -> None:
+    text = render.format_usage(
+        {
+            "quality": "estimate",
+            "gaps": 1,
+            "calls": None,
+            "models": {"model": {"total_tokens": 1_500}},
+            "compactions": {"count": 1},
+        }
+    )
+
+    assert text == "usage 1.5k tokens · 1 gap · 1 compaction (estimate)"
+
+
 def test_status_json_carries_the_resolved_model_in_both_shapes() -> None:
     meta = make_session(model="gpt-5.6-terra")
 

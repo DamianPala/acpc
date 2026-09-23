@@ -143,7 +143,7 @@ _ANSWER_OUTPUT_LEAD = (
     "including one whose --timeout deadline expired (`error.context.status` can be `waiting` "
     "when a usage limit was holding the turn) or whose watch ended in a detach. "
     "`session_id` names the session and `capabilities` the session-capability object; "
-    "`stop_reason`, `context` and `answer` are present on every foreground result "
+    "`stop_reason`, `context`, cumulative `usage` and `answer` are present on every foreground result "
     "and omitted by `--background`. "
 )
 _ANSWER_OUTPUT_DESCRIPTION = _ANSWER_OUTPUT_LEAD + _TEXT_PRESENTATION_NOTE
@@ -163,18 +163,19 @@ _WAIT_OUTPUT_DESCRIPTION = (
     "returns no result when a --timeout deadline expires first, with `error.context.status` "
     "naming the turn's status at the deadline, `waiting` included. `session_id` names "
     "the session, `capabilities` the session-capability object and `answer` the answer "
-    "text. "
+    "text; `usage` is cumulative consumption, the same object `status` shows. "
 ) + _TEXT_PRESENTATION_NOTE
 _STEER_OUTPUT_DESCRIPTION = (
     "Returns the answer result for the turn the correction landed on, or the acceptance "
     "receipt under `--background`; `session_id` names the session, and `capabilities` and "
-    "`correction_result` are always present, and `stop_reason`, `context` and "
+    "`correction_result` are always present, and `stop_reason`, `context`, cumulative `usage` and "
     "`answer` join them on every foreground result. "
 ) + _TEXT_PRESENTATION_NOTE
 _STATUS_OUTPUT_DESCRIPTION = (
     "Follows the selector: reports the session's current turn at the time of the call, "
     "so a session that rotated to a newer turn since is reported as that newer turn. "
-    "`session_id` names the session and `capabilities` the session-capability object. "
+    "`session_id` names the session, `capabilities` the session-capability object, and `usage` "
+    "is cumulative adapter-reported consumption, or `null` when none is available. "
     "`limit` is `null` unless a usage limit touched that turn; its `source` is one of "
     "`error_kind`, `rate_limit_info` or `text`. Whether a forwarded correction is still "
     "pending inside the adapter is not observable to acpc, so `pending_corrections` is "
@@ -1287,7 +1288,13 @@ def _continue_selection(
         explicit_mode = stored.mode if stored.mode is not None and source != "selected" else None
         # Live [effort_by_model] must not reject a stored model/effort pair.
         # Mode/permissions re-read the current table; effort stays as persisted.
-        resolution = replace(entry, effort_by_model={}).resolve_call(
+        entry = replace(
+            entry,
+            effort_by_model={},
+            usage_profile=stored.entry.usage_profile,
+            billing=stored.entry.billing,
+        )
+        resolution = entry.resolve_call(
             model=stored.model,
             effort=stored.effort,
             mode=explicit_mode,
@@ -1336,7 +1343,11 @@ def _updated_session_resolution(
     # Rebuild adapter from the live selection so wire vias (model_via /
     # effort_via / effort_cli_flag) survive continue --permissions. A hard
     # allowlist used to drop those fields and force config_option defaults.
-    payload["adapter"] = runner.session_resolution(resolution, cwd=None)["adapter"]
+    adapter = runner.session_resolution(resolution, cwd=None)["adapter"]
+    stored_adapter = payload.get("adapter")
+    if isinstance(stored_adapter, Mapping) and "usage_identity" in stored_adapter:
+        adapter["usage_identity"] = stored_adapter["usage_identity"]
+    payload["adapter"] = adapter
     return payload
 
 

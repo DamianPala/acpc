@@ -112,7 +112,15 @@ EXPECTED_EXIT_DESCRIPTIONS = {
     "141": "SIGPIPE: a downstream reader closed the pipe.",
     "143": "SIGTERM: the client detached from a daemon-owned session, or ended the turn.",
 }
-SCHEMA_KEYS = {"type", "enum", "properties", "required", "items"}
+SCHEMA_KEYS = {
+    "type",
+    "enum",
+    "properties",
+    "required",
+    "items",
+    "additionalProperties",
+    "minimum",
+}
 EXPECTED_REQUIRED_FIELDS = {
     "agents check": {"items", "has_more"},
     "agents create": {"name", "extends", "path", "changed"},
@@ -187,6 +195,7 @@ EXPECTED_REQUIRED_FIELDS = {
         "runtime_seconds",
         "idle_seconds",
         "context",
+        "usage",
         "exit_code",
         "stop_reason",
         "failure",
@@ -223,6 +232,7 @@ EXPECTED_REQUIRED_FIELDS = {
         "finished_at",
         "stop_reason",
         "context",
+        "usage",
         "answer",
         "paths",
         "truncated",
@@ -249,7 +259,7 @@ _ANSWER_OUTPUT_LEAD = (
     "including one whose --timeout deadline expired (`error.context.status` can be `waiting` "
     "when a usage limit was holding the turn) or whose watch ended in a detach. "
     "`session_id` names the session and `capabilities` the session-capability object; "
-    "`stop_reason`, `context` and `answer` are present on every foreground result "
+    "`stop_reason`, `context`, cumulative `usage` and `answer` are present on every foreground result "
     "and omitted by `--background`. "
 )
 
@@ -270,13 +280,14 @@ EXPECTED_OUTPUT_DESCRIPTIONS = {
         "returns no result when a --timeout deadline expires first, with `error.context.status` "
         "naming the turn's status at the deadline, `waiting` included. `session_id` names "
         "the session, `capabilities` the session-capability object and `answer` the answer "
-        "text. "
+        "text; `usage` is cumulative consumption, the same object `status` shows. "
     )
     + _TEXT_PRESENTATION_NOTE,
     "status": (
         "Follows the selector: reports the session's current turn at the time of the call, "
         "so a session that rotated to a newer turn since is reported as that newer turn. "
-        "`session_id` names the session and `capabilities` the session-capability object. "
+        "`session_id` names the session, `capabilities` the session-capability object, and `usage` "
+        "is cumulative adapter-reported consumption, or `null` when none is available. "
         "`limit` is `null` unless a usage limit touched that turn; its `source` is one of "
         "`error_kind`, `rate_limit_info` or `text`. Whether a forwarded correction is still "
         "pending inside the adapter is not observable to acpc, so `pending_corrections` is "
@@ -287,13 +298,13 @@ EXPECTED_OUTPUT_DESCRIPTIONS = {
     "steer": (
         "Returns the answer result for the turn the correction landed on, or the acceptance "
         "receipt under `--background`; `session_id` names the session, and `capabilities` and "
-        "`correction_result` are always present, and `stop_reason`, `context` and "
+        "`correction_result` are always present, and `stop_reason`, `context`, cumulative `usage` and "
         "`answer` join them on every foreground result. "
     )
     + _TEXT_PRESENTATION_NOTE,
 }
 
-EXPECTED_OUTPUT_ENUMS = {
+EXPECTED_OUTPUT_ENUMS: dict[str, set[Any]] = {
     "agents list.output.items[].kind": {"adapter", "variant"},
     "cancel.output.status": {"running", "succeeded", "failed", "canceled", "unknown"},
     "continue.output.status": {"running", "succeeded", "failed", "canceled", "unknown"},
@@ -349,6 +360,9 @@ EXPECTED_OUTPUT_ENUMS = {
     },
     "wait.output.capabilities.steer_mode": {"in-place", "cancel-then-start"},
 }
+for _name in ("continue", "run", "status", "steer", "wait"):
+    EXPECTED_OUTPUT_ENUMS[f"{_name}.output.usage.quality"] = {"exact", "estimate"}
+    EXPECTED_OUTPUT_ENUMS[f"{_name}.output.usage.billing"] = {None, "subscription", "api"}
 
 EXPECTED_EFFECTS = {
     "agents check": "read_only",
@@ -395,6 +409,7 @@ _SESSION_OUTPUT_PROPERTIES = frozenset(
         "status",
         "stop_reason",
         "context",
+        "usage",
         "paths",
         "answer",
         "truncated",
@@ -419,6 +434,13 @@ _LIMIT_PROPERTIES = frozenset({"reason", "resume_at", "auto_continue", "source"}
 # SPEC.md `status`: the session's context occupancy, the same object on every
 # result that carries it (`run`, `continue`, `wait`, `steer`, `status`).
 _CONTEXT_PROPERTIES = frozenset({"used", "size", "peak"})
+_USAGE_PROPERTIES = frozenset(
+    {"quality", "gaps", "calls", "models", "compactions", "source", "billing"}
+)
+_USAGE_MODEL_PROPERTIES = frozenset(
+    {"total_tokens", "input_tokens", "cache_read_tokens", "cache_write_tokens", "output_tokens"}
+)
+_COMPACTIONS_PROPERTIES = frozenset({"count", "unaccounted", "context_before", "context_after"})
 # R2d's inspection object `status` reports: policy, mode, source and clamp, all required.
 _STATUS_PERMISSIONS_PROPERTIES = frozenset({"policy", "mode", "source", "clamp"})
 _RESOLUTION_PROPERTIES = frozenset({"model", "effort", "mode", "permissions", "home"})
@@ -449,6 +471,10 @@ def _session_output_oracle(
         "output": (properties, frozenset(required)),
         "output.capabilities": (_STEER_CAPABILITIES_PROPERTIES, _STEER_CAPABILITIES_PROPERTIES),
         "output.context": (_CONTEXT_PROPERTIES, _CONTEXT_PROPERTIES),
+        "output.usage": (_USAGE_PROPERTIES, _USAGE_PROPERTIES),
+        "output.usage.models": (frozenset(), frozenset()),
+        "output.usage.models.*": (_USAGE_MODEL_PROPERTIES, _USAGE_MODEL_PROPERTIES),
+        "output.usage.compactions": (_COMPACTIONS_PROPERTIES, _COMPACTIONS_PROPERTIES),
         "output.paths": (_PATHS_PROPERTIES, frozenset(_PATHS_PROPERTIES)),
         "output.denied[]": (_DENIAL_PROPERTIES, frozenset(_DENIAL_PROPERTIES - {"target"})),
         "output.permissions_clamp": (
@@ -795,6 +821,7 @@ EXPECTED_OUTPUT_ORACLES: dict[str, dict[str, tuple[frozenset[str], frozenset[str
                     "runtime_seconds",
                     "idle_seconds",
                     "context",
+                    "usage",
                     "exit_code",
                     "stop_reason",
                     "failure",
@@ -812,6 +839,10 @@ EXPECTED_OUTPUT_ORACLES: dict[str, dict[str, tuple[frozenset[str], frozenset[str
         ),
         "output.capabilities": (_STEER_CAPABILITIES_PROPERTIES, _STEER_CAPABILITIES_PROPERTIES),
         "output.context": (_CONTEXT_PROPERTIES, _CONTEXT_PROPERTIES),
+        "output.usage": (_USAGE_PROPERTIES, _USAGE_PROPERTIES),
+        "output.usage.models": (frozenset(), frozenset()),
+        "output.usage.models.*": (_USAGE_MODEL_PROPERTIES, _USAGE_MODEL_PROPERTIES),
+        "output.usage.compactions": (_COMPACTIONS_PROPERTIES, _COMPACTIONS_PROPERTIES),
         "output.limit": (_LIMIT_PROPERTIES, frozenset(_LIMIT_PROPERTIES)),
         "output.permissions": (_STATUS_PERMISSIONS_PROPERTIES, _STATUS_PERMISSIONS_PROPERTIES),
         "output.permissions.clamp": (_PERMISSIONS_CLAMP_PROPERTIES, _RESOLUTION_CLAMP_REQUIRED),
@@ -1522,11 +1553,17 @@ def _check_schema_shape(schema: dict[str, Any], path: str) -> None:
     types = schema["type"] if isinstance(schema["type"], list) else [schema["type"]]
     assert set(types) <= {"string", "integer", "number", "boolean", "array", "object", "null"}
     if "object" in types:
-        assert "properties" in schema and "required" in schema, path
-        assert len(schema["required"]) == len(set(schema["required"])), path
-        assert set(schema["required"]) <= set(schema["properties"]), path
-        for key, child in schema["properties"].items():
+        properties = schema.get("properties", {})
+        required = schema.get("required", [])
+        assert "additionalProperties" in schema or "properties" in schema, path
+        if "properties" in schema:
+            assert "required" in schema, path
+        assert len(required) == len(set(required)), path
+        assert set(required) <= set(properties), path
+        for key, child in properties.items():
             _check_schema_shape(child, f"{path}.{key}")
+        if "additionalProperties" in schema:
+            _check_schema_shape(schema["additionalProperties"], f"{path}.*")
     if "array" in types:
         assert "items" in schema, path
         _check_schema_shape(schema["items"], f"{path}[]")
@@ -1544,6 +1581,10 @@ def _schema_nodes(schema: dict[str, Any], path: str = "output") -> dict[str, dic
         nodes[path] = schema
         for name, child in schema["properties"].items():
             nodes.update(_schema_nodes(child, f"{path}.{name}"))
+    elif "object" in types and "additionalProperties" in schema:
+        nodes[path] = schema
+    if "object" in types and "additionalProperties" in schema:
+        nodes.update(_schema_nodes(schema["additionalProperties"], f"{path}.*"))
     if "array" in types and "items" in schema:
         nodes.update(_schema_nodes(schema["items"], f"{path}[]"))
     return nodes
@@ -1559,6 +1600,8 @@ def _empty_schema_paths(schema: dict[str, Any], path: str = "output") -> set[str
     if "object" in types:
         for name, child in schema.get("properties", {}).items():
             paths.update(_empty_schema_paths(child, f"{path}.{name}"))
+        if "additionalProperties" in schema:
+            paths.update(_empty_schema_paths(schema["additionalProperties"], f"{path}.*"))
     if "array" in types and "items" in schema:
         paths.update(_empty_schema_paths(schema["items"], f"{path}[]"))
     return paths
@@ -1570,8 +1613,8 @@ def _assert_output_oracle(name: str, detail: dict[str, Any]) -> None:
     expected_nodes = EXPECTED_OUTPUT_ORACLES[name]
     assert set(actual_nodes) == set(expected_nodes), name
     for path, (properties, required) in expected_nodes.items():
-        assert set(actual_nodes[path]["properties"]) == set(properties), (name, path)
-        assert set(actual_nodes[path]["required"]) == set(required), (name, path)
+        assert set(actual_nodes[path].get("properties", {})) == set(properties), (name, path)
+        assert set(actual_nodes[path].get("required", [])) == set(required), (name, path)
     empty_paths = {f"{name}.{path}" for path in _empty_schema_paths(output)}
     expected_empty = {path for path in EXPECTED_EMPTY_OUTPUT_OBJECTS if path.startswith(f"{name}.")}
     assert empty_paths == expected_empty, name
@@ -2720,6 +2763,11 @@ def _assert_reachable_output_enums(
         )
     assert declared == EXPECTED_OUTPUT_ENUMS
     for path, values in declared.items():
+        if ".output.usage." in path:
+            # Usage appears only for entries with a declared profile; profile
+            # specific CLI cases cover both quality values and all billing
+            # declarations in tests/test_usage.py.
+            continue
         assert observed.get(path, set()) == values, (path, values, observed.get(path))
 
 

@@ -36,7 +36,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from acpc import paths, proc, transcript, vocab
+from acpc import paths, proc, transcript, usage, vocab
 
 Clock = Callable[[], float]
 
@@ -195,6 +195,7 @@ class SessionMeta:
     failure: str | None = None
     # SPEC.md V6c: usage the tool never observed is `null`, never `0`.
     context: vocab.ContextOccupancy | None = None
+    usage: dict[str, Any] | None = None
     denied: dict[str, int] = field(default_factory=dict)
     denial_details: dict[str, dict[str, Any]] = field(default_factory=dict)
     prompt_snippet: str = ""
@@ -522,6 +523,64 @@ def _coerce_context(
     return {"used": legacy_tokens, "size": None, "peak": legacy_tokens}
 
 
+def _usage_count(value: Any, key: str, path: Path, *, nullable: bool = False) -> int | None:
+    number = _coerce_int(value, key, path)
+    if number is None and nullable:
+        return None
+    if number is None or number < 0:
+        raise CorruptSessionError(f"{path}: {key} is not a non-negative integer")
+    return number
+
+
+def _coerce_usage(value: Any, path: Path) -> dict[str, Any] | None:
+    """Read and validate the cumulative consumption object from metadata."""
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise CorruptSessionError(f"{path}: usage is not an object")
+    quality = value.get("quality")
+    source = value.get("source")
+    billing = value.get("billing")
+    if quality not in ("exact", "estimate") or not isinstance(source, str) or not source:
+        raise CorruptSessionError(f"{path}: usage has invalid quality or source")
+    if billing not in (None, "subscription", "api"):
+        raise CorruptSessionError(f"{path}: usage.billing is invalid")
+    models_raw = value.get("models")
+    compactions_raw = value.get("compactions")
+    if not isinstance(models_raw, Mapping) or not isinstance(compactions_raw, Mapping):
+        raise CorruptSessionError(f"{path}: usage models or compactions is not an object")
+    fields = (
+        "total_tokens",
+        "input_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "output_tokens",
+    )
+    models: dict[str, dict[str, int | None]] = {}
+    for model, counters in models_raw.items():
+        if not isinstance(model, str) or not model or not isinstance(counters, Mapping):
+            raise CorruptSessionError(f"{path}: usage.models has an invalid entry")
+        models[model] = {
+            field_name: _usage_count(
+                counters.get(field_name), f"usage.models.{model}.{field_name}", path, nullable=True
+            )
+            for field_name in fields
+        }
+    compactions = {
+        name: _usage_count(compactions_raw.get(name), f"usage.compactions.{name}", path)
+        for name in ("count", "unaccounted", "context_before", "context_after")
+    }
+    return {
+        "quality": quality,
+        "gaps": _usage_count(value.get("gaps"), "usage.gaps", path),
+        "calls": _usage_count(value.get("calls"), "usage.calls", path, nullable=True),
+        "models": models,
+        "compactions": compactions,
+        "source": source,
+        "billing": billing,
+    }
+
+
 def meta_from_dict(data: Mapping[str, Any], *, path: Path) -> SessionMeta:
     """Build a `SessionMeta` from parsed JSON, rejecting damaged state.
 
@@ -577,6 +636,7 @@ def meta_from_dict(data: Mapping[str, Any], *, path: Path) -> SessionMeta:
         stop_reason=stop_reason,
         failure=_coerce_str(known.get("failure"), "failure", path),
         context=_coerce_context(known, data, path),
+        usage=_coerce_usage(known.get("usage"), path),
         denied=_coerce_denied(known.get("denied"), "denied", path),
         denial_details=_coerce_denial_details(known.get("denial_details"), "denial_details", path),
         prompt_snippet=_coerce_str(known.get("prompt_snippet"), "prompt_snippet", path) or "",
@@ -678,11 +738,39 @@ def _persist_unknown(session_id: str, reason: str, *, clock: Clock) -> SessionMe
         current.state = "unknown"
         current.stop_reason = "unknown"
         current.exit_code = vocab.EXIT_AGENT_ERROR
+        current.usage = _unknown_usage(current)
         if current.finished_at is None:
             current.finished_at = clock()
         write_meta(current)
         _write_unknown_placeholder(current, reason)
     return current
+
+
+def _unknown_usage(meta: SessionMeta) -> dict[str, Any] | None:
+    adapter = meta.resolution.get("adapter")
+    if not isinstance(adapter, Mapping):
+        return meta.usage
+    profile = adapter.get("usage_profile", "none")
+    if profile not in (
+        "claude_model_usage",
+        "codex_usage_updates",
+        "grok_meta_usage",
+        "none",
+    ):
+        return meta.usage
+    identity = adapter.get("usage_identity")
+    identity = identity if isinstance(identity, Mapping) else {}
+    name = identity.get("name")
+    version = identity.get("version")
+    return usage.mark_unknown(
+        meta.usage,
+        profile=profile,
+        adapter_name=name if isinstance(name, str) else meta.base_adapter,
+        adapter_version=version if isinstance(version, str) else None,
+        billing=(
+            adapter.get("billing") if adapter.get("billing") in ("subscription", "api") else None
+        ),
+    )
 
 
 def _write_unknown_placeholder(meta: SessionMeta, reason: str) -> None:

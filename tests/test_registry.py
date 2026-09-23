@@ -23,6 +23,7 @@ def test_shipped_adapter_facts_and_presets_are_available(tmp_path: Path) -> None
 
     claude = registry.resolve("claude")
     codex = registry.resolve("codex")
+    grok = registry.resolve("grok")
 
     assert claude.command_args == ("claude-agent-acp",)
     assert claude.install_command == "npm install -g @agentclientprotocol/claude-agent-acp"
@@ -58,6 +59,43 @@ def test_shipped_adapter_facts_and_presets_are_available(tmp_path: Path) -> None
     # claude CLI >=2.1.224 offers no effort option for haiku; see claude.toml.
     assert claude.presets["fast"].model == "claude-haiku-4-5"
     assert claude.presets["fast"].effort is None
+    assert claude.usage_profile == "claude_model_usage"
+    assert codex.usage_profile == "codex_usage_updates"
+    assert grok.usage_profile == "grok_meta_usage"
+    assert claude.billing is codex.billing is grok.billing is None
+
+
+def test_usage_profile_and_billing_default_and_inherit_through_extends(tmp_path: Path) -> None:
+    agents = tmp_path / "agents"
+    write_entry(
+        agents,
+        "base",
+        'command = "python -m base"\nusage_profile = "grok_meta_usage"\nbilling = "api"\n',
+    )
+    write_entry(agents, "child", 'extends = "base"\n')
+    write_entry(agents, "override", 'extends = "child"\nusage_profile = "none"\n')
+    write_entry(agents, "defaulted", 'command = "python -m defaulted"\n')
+
+    registry = AgentRegistry(agents)
+
+    assert registry.resolve("child").usage_profile == "grok_meta_usage"
+    assert registry.resolve("child").billing == "api"
+    assert registry.resolve("override").usage_profile == "none"
+    assert registry.resolve("override").billing == "api"
+    assert registry.resolve("defaulted").usage_profile == "none"
+    assert registry.resolve("defaulted").billing is None
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [("usage_profile", "bogus"), ("billing", "free")],
+)
+def test_invalid_usage_registry_values_are_rejected(tmp_path: Path, key: str, value: str) -> None:
+    agents = tmp_path / "agents"
+    write_entry(agents, "bad", f'command = "python -m bad"\n{key} = "{value}"\n')
+
+    with pytest.raises(RegistryError, match=key):
+        AgentRegistry(agents)
 
 
 def test_variant_inherits_and_reports_nearest_field_provenance(tmp_path: Path) -> None:

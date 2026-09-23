@@ -993,6 +993,8 @@ def test_continue_migrates_legacy_mode_and_target_metadata(cli: CliRunner) -> No
         "model_via": "config_option",
         "effort_via": "config_option",
         "effort_cli_flag": None,
+        "usage_profile": "none",
+        "billing": None,
         "modes": {
             "default": {"grants": "read", "delegates": True},
             "plan": {"grants": "read", "delegates": True},

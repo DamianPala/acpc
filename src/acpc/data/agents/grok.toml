@@ -15,6 +15,7 @@ command = "grok agent --no-leader stdio"
 install_docs = "https://docs.x.ai/build/overview"
 home = "~/.grok"
 home_env = "GROK_HOME"
+usage_profile = "grok_meta_usage"
 env_passthrough = [
     "GROK_HOME",
     "XAI_API_KEY",

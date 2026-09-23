@@ -43,7 +43,7 @@ Exact-prefix triggers (donor design, for precise timing control in tests):
 - ``auth-data:``     fail with an auth error marked in ``data``, not in the text
 - ``meta:TOKENS:TICKS:TEXT`` -> prose plus per-turn PromptResponse ``_meta`` usage
 - ``both:TOKENS:TICKS:TEXT`` -> streamed usage plus deliberately stale ``_meta``
-- ``rawusage:claude|codex|grok`` -> vendor-shaped PromptResponse usage and ``_meta``
+- ``rawusage:claude|codex|grok[:USED,...]`` -> vendor-shaped PromptResponse usage, ``_meta`` and usage updates
 - ``cancelled-no-usage:`` -> return ``stop_reason=cancelled`` without usage
 
 Anything else runs the default scenario: three tool events, a progress msg, a
@@ -747,7 +747,13 @@ class MockAgent(Agent):
             )
 
         if prompt_text.startswith("rawusage:"):
-            profile = prompt_text.split(":", 1)[1]
+            raw_parts = prompt_text.split(":", 2)
+            profile = raw_parts[1]
+            supplied_usage = (
+                [int(value) for value in raw_parts[2].split(",")]
+                if len(raw_parts) > 2 and raw_parts[2]
+                else None
+            )
             await self._send_text(session_id, f"raw {profile} usage")
             if profile == "claude":
                 usage = {
@@ -771,7 +777,8 @@ class MockAgent(Agent):
                         "model_usage": [{"model": "claude-opus-5[1m]", "token_count": token_count}],
                     }
                 }
-                await self._send_usage(session_id, used=135037)
+                for used in supplied_usage or [135037]:
+                    await self._send_usage(session_id, used=used)
                 return PromptResponse.model_validate(
                     {"stopReason": "end_turn", "usage": usage, "_meta": meta}
                 )
@@ -796,7 +803,8 @@ class MockAgent(Agent):
                         "model_usage": [{"model": "gpt-6-sol", "token_count": token_count}],
                     }
                 }
-                await self._send_usage(session_id, used=21789)
+                for used in supplied_usage or [21789]:
+                    await self._send_usage(session_id, used=used)
                 return PromptResponse.model_validate(
                     {"stopReason": "end_turn", "usage": usage, "_meta": meta}
                 )
@@ -1078,6 +1086,31 @@ class MockAgent(Agent):
             f"{self._efforts.get(session_id, DEFAULT_EFFORT)} effort.\n"
         ) + self._history_reference(history)
         await self._send_text(session_id, answer)
+        if os.environ.get("ACPC_MOCK_LIMIT_CLAUDE_USAGE") == "1":
+            counts = {
+                "totalTokens": 1200,
+                "inputTokens": 1100,
+                "cachedInputTokens": 0,
+                "cachedWriteTokens": 0,
+                "outputTokens": 100,
+            }
+            return PromptResponse.model_validate(
+                {
+                    "stopReason": "end_turn",
+                    "usage": {
+                        "totalTokens": 1200,
+                        "inputTokens": 1100,
+                        "cachedReadTokens": 0,
+                        "cachedWriteTokens": 0,
+                        "outputTokens": 100,
+                    },
+                    "_meta": {
+                        "quota": {
+                            "model_usage": [{"model": "claude-sonnet-5", "token_count": counts}]
+                        }
+                    },
+                }
+            )
         return PromptResponse(stop_reason="end_turn")
 
     async def _run_fail(self, session_id: str, prompt_text: str) -> PromptResponse:

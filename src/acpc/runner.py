@@ -499,6 +499,8 @@ class TurnOutcome:
     stop_reason: str | None
     answer: str
     context: vocab.ContextOccupancy | None = None
+    usage: dict[str, Any] | None = None
+    usage_finalized: bool = False
     denied: dict[str, int] = field(default_factory=dict)
     denial_details: dict[str, dict[str, Any]] = field(default_factory=dict)
     adapter_session_id: str | None = None
@@ -695,85 +697,62 @@ async def _drive_turn(
         cancellation_dispatched=cancel.cancellation_dispatched,
         permission_prompt=request.permission_prompt,
         previous_context=stored.context,
+        previous_usage=stored.usage,
+        usage_profile=resolution.entry.usage_profile,
+        billing=resolution.entry.billing,
+        resolved_model=resolution.model,
+        prompt=request.prompt,
     )
     turn_error: BaseException | None = None
+    prompt_sent = False
+    usage_value: dict[str, Any] | None = None
+    usage_finalized = False
+    delivery: PromptDelivery | None = None
+    limit_record: dict[str, Any] | None = None
+    adapter_session_id = request.resume_adapter_session
+    stop_reason: str | None = "error"
+
+    def mark_prompt_sent() -> None:
+        nonlocal prompt_sent
+        prompt_sent = True
+
+    def finalize_usage() -> None:
+        nonlocal usage_value, usage_finalized
+        if not usage_finalized:
+            usage_value = client.finish_usage()
+            usage_finalized = True
 
     try:
-        async with spawn_adapter(
-            client,
-            command,
-            *args,
-            env=env,
-            cwd=request.cwd,
-            drain_stderr=True,
-        ) as (conn, _process):
-            initialize = await conn.initialize(protocol_version=PROTOCOL_VERSION)
-            client.capture_adapter(initialize)
-
-            if request.resume_adapter_session is not None:
-                adapter_session_id = request.resume_adapter_session
-                capabilities = getattr(initialize, "agent_capabilities", None)
-                try:
-                    resume_status = await verify_adapter_resume(
-                        conn,
-                        client,
-                        capabilities,
-                        adapter_session_id,
-                        request.cwd or os.getcwd(),
-                        session_id,
-                    )
-                except ResumePreparationError:
-                    raise
-                except Exception as error:
-                    if request.defer_rotation:
-                        raise ResumePreparationError(str(error)) from None
-                    raise
-                request = _prepare_resumed_turn(
-                    session_id,
-                    request,
-                    events,
-                    client=client,
-                    resume_status=resume_status,
-                    steer_mode=vocab.STEER_CANCEL_THEN_START,
+        try:
+            async with spawn_adapter(
+                client,
+                command,
+                *args,
+                env=env,
+                cwd=request.cwd,
+                drain_stderr=True,
+            ) as (conn, _process):
+                adapter_session_id, request = await _prepare_direct_adapter_session(
+                    conn, session_id, request, events, client
                 )
-                client.permission_level = PermissionLevel(request.resolution.permissions or "read")
-                client.modes = request.resolution.entry.modes
-            else:
-                session = await conn.new_session(cwd=request.cwd or os.getcwd(), mcp_servers=[])
-                adapter_session_id = session.session_id
-                client.capture_advertised(session)
-                # SPEC.md *State on disk*: recorded as soon as the adapter has
-                # accepted the session, before the prompt is sent, so a host
-                # process lost mid-turn still leaves a continuable session.
-                sessions.update_meta(session_id, adapter_session_id=adapter_session_id)
-
-            # After the restore, never before it: codex-acp#343 resets model and
-            # effort during session/load, so applying them first would be lost.
-            prompt_started = False
-            try:
-                await apply_call_options(conn, adapter_session_id, request)
-                prompt_started = True
-                stop_reason, turn_error, delivery, limit_record = await run_prompt_with_limits(
+                stop_reason, turn_error, delivery, limit_record = await _prompt_direct_turn(
                     conn,
-                    session_id,
-                    adapter_session_id,
                     request,
-                    cancel,
-                    client,
+                    session_id=session_id,
+                    adapter_session_id=adapter_session_id,
+                    cancel=cancel,
+                    client=client,
+                    on_delivered=mark_prompt_sent,
                 )
-            except BaseException as error:
-                if prompt_started or request.turn_token is None:
-                    raise
-                _finalize_claimed_setup_failure(
-                    session_id, request.turn_token, error, adapter_session_id
-                )
-                if isinstance(error, asyncio.CancelledError):
-                    raise
-                raise ResumeSetupError(
-                    describe_error(error), turn_token=request.turn_token
-                ) from None
-    finally:
-        client.flush()
+                finalize_usage()
+        finally:
+            client.flush()
+    except Exception as error:
+        if not prompt_sent:
+            raise
+        turn_error = error
+        stop_reason = "error"
+        finalize_usage()
 
     if cancel.stop_reason is not None:
         stop_reason = cancel.stop_reason
@@ -786,15 +765,98 @@ async def _drive_turn(
         stop_reason=stop_reason,
         answer=client.answer,
         context=client.context,
+        usage=usage_value,
+        usage_finalized=usage_finalized,
         denied=client.denied,
         denial_details=client.denial_details,
         adapter_session_id=adapter_session_id,
         advertised=client.advertised,
         error=turn_error,
-        delivery_record_incomplete=delivery.delivery_record_incomplete,
+        delivery_record_incomplete=bool(delivery and delivery.delivery_record_incomplete),
         turn_token=request.turn_token,
         limit=limit_record,
     )
+
+
+async def _prepare_direct_adapter_session(
+    conn: Any,
+    session_id: str,
+    request: TurnRequest,
+    events: transcript.Transcript,
+    client: AcpcClient,
+) -> tuple[str, TurnRequest]:
+    """Initialize or restore the adapter session before applying call options."""
+    initialize = await conn.initialize(protocol_version=PROTOCOL_VERSION)
+    client.capture_adapter(initialize)
+    record_usage_identity(session_id, client.adapter_identity)
+    if request.resume_adapter_session is None:
+        session = await conn.new_session(cwd=request.cwd or os.getcwd(), mcp_servers=[])
+        adapter_session_id = session.session_id
+        client.capture_advertised(session)
+        sessions.update_meta(session_id, adapter_session_id=adapter_session_id)
+        return adapter_session_id, request
+
+    adapter_session_id = request.resume_adapter_session
+    capabilities = getattr(initialize, "agent_capabilities", None)
+    try:
+        resume_status = await verify_adapter_resume(
+            conn,
+            client,
+            capabilities,
+            adapter_session_id,
+            request.cwd or os.getcwd(),
+            session_id,
+        )
+    except ResumePreparationError:
+        raise
+    except Exception as error:
+        if request.defer_rotation:
+            raise ResumePreparationError(str(error)) from None
+        raise
+    request = _prepare_resumed_turn(
+        session_id,
+        request,
+        events,
+        client=client,
+        resume_status=resume_status,
+        steer_mode=vocab.STEER_CANCEL_THEN_START,
+    )
+    client.permission_level = PermissionLevel(request.resolution.permissions or "read")
+    client.modes = request.resolution.entry.modes
+    return adapter_session_id, request
+
+
+async def _prompt_direct_turn(
+    conn: Any,
+    request: TurnRequest,
+    *,
+    session_id: str,
+    adapter_session_id: str,
+    cancel: _CancelSignal,
+    client: AcpcClient,
+    on_delivered: Callable[[], None],
+) -> tuple[str | None, BaseException | None, PromptDelivery, dict[str, Any] | None]:
+    """Apply options and send a prompt, preserving setup-failure handling."""
+    prompt_started = False
+    try:
+        await apply_call_options(conn, adapter_session_id, request)
+        prompt_started = True
+        return await run_prompt_with_limits(
+            conn,
+            session_id,
+            adapter_session_id,
+            request,
+            cancel,
+            client,
+            on_delivered=on_delivered,
+        )
+    except BaseException as error:
+        if prompt_started or request.turn_token is None:
+            raise
+        _finalize_claimed_setup_failure(session_id, request.turn_token, error, adapter_session_id)
+        if isinstance(error, asyncio.CancelledError):
+            raise
+        raise ResumeSetupError(describe_error(error), turn_token=request.turn_token) from None
 
 
 def _prepare_resumed_turn(
@@ -1168,6 +1230,7 @@ async def run_prompt_with_limits(
         # A rejection's rate-limit metadata describes that one send; carrying
         # it into the next send's classification would misread a genuine
         # success as a repeat of the limit that already resolved.
+        activity_before = client.begin_prompt_send()
         client.clear_rate_limit_info()
         delivery = register_prompt_delivery(
             conn, session_id, adapter_session_id, prompt_text, on_delivered=delivered_on_first_send
@@ -1200,6 +1263,8 @@ async def run_prompt_with_limits(
         observation = limits.classify_limit(turn_error, client.rate_limit_info, datetime.now(UTC))
         if observation is None:
             return stop_reason, turn_error, delivery, limit_record
+
+        client.record_limit_rejection(activity_before)
 
         action = _limit_action(
             observation,
@@ -1880,6 +1945,11 @@ def _finalize(
             exit_code=outcome.exit_code,
             stop_reason=outcome.stop_reason,
             context=outcome.context,
+            usage=(
+                outcome.usage
+                if outcome.usage_finalized
+                else (current.usage if current is not None else None)
+            ),
             denied=outcome.denied,
             denial_details=outcome.denial_details,
             error_event=error_event,
@@ -2185,6 +2255,8 @@ def session_resolution(
         "model_via": resolution.entry.model_via,
         "effort_via": resolution.entry.effort_via,
         "effort_cli_flag": resolution.entry.effort_cli_flag,
+        "usage_profile": resolution.entry.usage_profile,
+        "billing": resolution.entry.billing,
         "modes": mode_catalog_payload(resolution.entry.modes),
     }
     if resolution.mode is not None and resolution.mode_spec is not None:
@@ -2195,6 +2267,28 @@ def session_resolution(
         )
     payload["adapter"] = adapter
     return payload
+
+
+def record_usage_identity(session_id: str, identity: Mapping[str, Any]) -> None:
+    """Persist initialize's adapter identity for later liveness-detected gaps."""
+    name, version = identity.get("name"), identity.get("version")
+    if not isinstance(name, str) and not isinstance(version, str):
+        return
+    meta = sessions.read_meta(session_id)
+    resolution = dict(meta.resolution)
+    adapter = dict(resolution.get("adapter", {}))
+    if adapter.get("usage_profile", "none") == "none":
+        return
+    current = adapter.get("usage_identity")
+    value = {
+        "name": name if isinstance(name, str) else None,
+        "version": version if isinstance(version, str) else None,
+    }
+    if current == value:
+        return
+    adapter["usage_identity"] = value
+    resolution["adapter"] = adapter
+    sessions.update_meta(session_id, resolution=resolution)
 
 
 def _stored_value(payload: Mapping[str, Any], field: str) -> Any:
@@ -2248,6 +2342,17 @@ def resolution_from_session(meta: sessions.SessionMeta) -> CallResolution:
     effort_cli_flag = adapter.get("effort_cli_flag")
     if effort_cli_flag is not None and not isinstance(effort_cli_flag, str):
         raise RunnerError(f"session {meta.session_id} has invalid stored effort_cli_flag")
+    usage_profile = adapter.get("usage_profile", "none")
+    if usage_profile not in {
+        "claude_model_usage",
+        "codex_usage_updates",
+        "grok_meta_usage",
+        "none",
+    }:
+        raise RunnerError(f"session {meta.session_id} has invalid stored usage_profile")
+    billing = adapter.get("billing")
+    if billing not in {None, "subscription", "api"}:
+        raise RunnerError(f"session {meta.session_id} has invalid stored billing")
     env_passthrough = stored_strings("env_passthrough", payload)
 
     stored_mode = adapter.get("mode", _stored_value(payload, "mode"))
@@ -2286,6 +2391,8 @@ def resolution_from_session(meta: sessions.SessionMeta) -> CallResolution:
         model_via=model_via,
         effort_via=effort_via,
         effort_cli_flag=effort_cli_flag,
+        usage_profile=usage_profile,
+        billing=billing,
         env_passthrough=env_passthrough,
         description=None,
         model=None,

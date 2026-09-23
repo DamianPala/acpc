@@ -169,6 +169,7 @@ def result_envelope(
         "finished_at": _timestamp_or_none(meta.finished_at),
         "stop_reason": meta.stop_reason,
         "context": meta.context,
+        "usage": meta.usage,
         "paths": paths_for_turn,
         "answer": answer,
         "truncated": truncated,

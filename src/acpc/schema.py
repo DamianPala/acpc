@@ -162,6 +162,44 @@ _CONTEXT = {
     },
     "required": ["used", "size", "peak"],
 }
+_TOKEN_COUNT = {"type": ["integer", "null"], "minimum": 0}
+_USAGE_MODEL = _object(
+    {
+        name: _TOKEN_COUNT
+        for name in (
+            "total_tokens",
+            "input_tokens",
+            "cache_read_tokens",
+            "cache_write_tokens",
+            "output_tokens",
+        )
+    },
+    ("total_tokens", "input_tokens", "cache_read_tokens", "cache_write_tokens", "output_tokens"),
+)
+_USAGE = {
+    **_object(
+        {
+            "quality": {"type": "string", "enum": ["exact", "estimate"]},
+            "gaps": {"type": "integer", "minimum": 0},
+            "calls": _NULLABLE_INTEGER,
+            "models": {"type": "object", "additionalProperties": _USAGE_MODEL},
+            "compactions": _object(
+                {
+                    name: {"type": "integer", "minimum": 0}
+                    for name in ("count", "unaccounted", "context_before", "context_after")
+                },
+                ("count", "unaccounted", "context_before", "context_after"),
+            ),
+            "source": _STRING,
+            "billing": {
+                "type": ["string", "null"],
+                "enum": ["subscription", "api", None],
+            },
+        },
+        ("quality", "gaps", "calls", "models", "compactions", "source", "billing"),
+    ),
+    "type": ["object", "null"],
+}
 
 _SESSION_RESULT_PROPERTIES = {
     "session_id": _STRING,
@@ -169,6 +207,7 @@ _SESSION_RESULT_PROPERTIES = {
     "status": _SESSION_STATUS,
     "stop_reason": _NULLABLE_STRING,
     "context": _CONTEXT,
+    "usage": _USAGE,
     "paths": _PATHS,
     "answer": _STRING,
     "truncated": _BOOLEAN,
@@ -248,7 +287,7 @@ def _session_result_schema(
         properties.pop("changed")
     required = ["status", "session_id", "turn", "created_at", "started_at", "finished_at"]
     if foreground_only:
-        required += ["stop_reason", "context", "answer"]
+        required += ["stop_reason", "context", "usage", "answer"]
     required += ["paths", "truncated"]
     if include_partial:
         required.append("partial")
@@ -446,6 +485,7 @@ _STATUS_DETAIL = _object(
         "runtime_seconds": _NUMBER,
         "idle_seconds": _NULLABLE_NUMBER,
         "context": _CONTEXT,
+        "usage": _USAGE,
         "exit_code": _NULLABLE_INTEGER,
         "stop_reason": _NULLABLE_STRING,
         "failure": _NULLABLE_STRING,
@@ -473,6 +513,7 @@ _STATUS_DETAIL = _object(
         "runtime_seconds",
         "idle_seconds",
         "context",
+        "usage",
         "exit_code",
         "stop_reason",
         "failure",

@@ -722,6 +722,8 @@ def render_status_detail(
         f"steer: {_steer_mode_text(meta)}",
         _permissions_text(meta),
     ]
+    if usage_text := format_usage(meta.usage):
+        lines.insert(1, usage_text)
     if meta.failure is not None:
         lines.append(
             f"failure  {safe_text(meta.failure)} · continue: acpc continue {meta.session_id}"
@@ -737,6 +739,39 @@ def render_status_detail(
 def _steer_mode_text(meta: sessions.SessionMeta) -> str:
     """Render the session's default correction mode."""
     return safe_text(meta.steer_mode or vocab.STEER_CANCEL_THEN_START)
+
+
+def format_usage(value: Mapping[str, Any] | None) -> str | None:
+    """Render the known cumulative totals in one `status` line."""
+    if value is None:
+        return None
+    parts: list[str] = []
+    calls = value["calls"]
+    if calls is not None:
+        parts.append(f"{format_k(calls)} calls")
+    totals = [model["total_tokens"] for model in value["models"].values()]
+    known_totals = [total for total in totals if isinstance(total, int)]
+    if known_totals:
+        parts.append(f"{_format_usage_tokens(sum(known_totals))} tokens")
+    if value["gaps"]:
+        count = value["gaps"]
+        parts.append(f"{count} {'gap' if count == 1 else 'gaps'}")
+    compactions = value["compactions"]["count"]
+    if compactions:
+        parts.append(f"{compactions} {'compaction' if compactions == 1 else 'compactions'}")
+    summary = f" {' · '.join(parts)}" if parts else ""
+    return f"usage{summary} ({value['quality']})"
+
+
+def _format_usage_tokens(value: int) -> str:
+    """Format cumulative token totals with compact k/M/B units."""
+    if value < 1_000_000:
+        return format_k(value)
+    scale, suffix = (1_000_000_000, "B") if value >= 1_000_000_000 else (1_000_000, "M")
+    tenths = (value * 10 + scale // 2) // scale
+    whole, decimal = divmod(tenths, 10)
+    fraction = f".{decimal}" if decimal else ""
+    return f"{whole}{fraction}{suffix}"
 
 
 def _permissions_text(meta: sessions.SessionMeta) -> str:
@@ -809,6 +844,7 @@ def status_detail_json(
         "runtime_seconds": runtime_seconds,
         "idle_seconds": _idle_seconds(meta, now=now),
         "context": meta.context,
+        "usage": meta.usage,
         "exit_code": meta.exit_code,
         "stop_reason": meta.stop_reason,
         "failure": meta.failure,

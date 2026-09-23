@@ -1402,6 +1402,14 @@ class Daemon:
                 )
                 if preparing_cancel:
                     error = None
+                client = turn.client
+                usage_finalized = turn.phase == "running" and client is not None
+                answer = client.answer if client is not None else ""
+                if preparing_cancel:
+                    answer = runner.preparation_cancelled_answer(session_id)
+                usage_value = (
+                    client.finish_usage() if usage_finalized and client is not None else None
+                )
                 outcome = runner.TurnOutcome(
                     state=("canceled" if preparing_cancel else turn.cancel.state or "failed"),
                     stop_reason=(
@@ -1409,9 +1417,10 @@ class Daemon:
                         if preparing_cancel
                         else turn.cancel.stop_reason or "error"
                     ),
-                    answer=(
-                        runner.preparation_cancelled_answer(session_id) if preparing_cancel else ""
-                    ),
+                    answer=answer,
+                    context=client.context if client is not None else None,
+                    usage=usage_value,
+                    usage_finalized=usage_finalized,
                     turn_token=request.turn_token,
                 )
                 runner._finalize(
@@ -1462,8 +1471,14 @@ class Daemon:
             end_turn=cancel.end_turn,
             cancellation_dispatched=cancel.cancellation_dispatched,
             previous_context=stored.context,
+            previous_usage=stored.usage,
+            usage_profile=request.resolution.entry.usage_profile,
+            billing=request.resolution.entry.billing,
+            resolved_model=request.resolution.model,
+            prompt=request.prompt,
         )
         client.capture_adapter(self.host.initialize_response)
+        runner.record_usage_identity(session_id, client.adapter_identity)
         turn.client = client
 
         turn_error: BaseException | None = None
@@ -1538,6 +1553,7 @@ class Daemon:
                         session_id, adapter_session_id, turn
                     ),
                 )
+                usage_value = client.finish_usage()
             except BaseException as error:
                 if prompt_started or request.turn_token is None:
                     raise
@@ -1563,6 +1579,8 @@ class Daemon:
             stop_reason=stop_reason,
             answer=client.answer,
             context=client.context,
+            usage=usage_value,
+            usage_finalized=True,
             denied=client.denied,
             denial_details=client.denial_details,
             adapter_session_id=adapter_session_id,

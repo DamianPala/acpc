@@ -93,6 +93,7 @@ def test_json_envelope_has_pinned_fields_and_truncates_answer_only() -> None:
         "finished_at",
         "stop_reason",
         "context",
+        "usage",
         "paths",
         "answer",
         "truncated",

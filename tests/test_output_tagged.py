@@ -24,6 +24,20 @@ def envelope(**overrides: object) -> dict[str, object]:
         "finished_at": "2026-01-01T00:00:01Z",
         "stop_reason": "end_turn",
         "context": {"used": 42, "size": 200_000, "peak": 42},
+        "usage": {
+            "quality": "estimate",
+            "gaps": 0,
+            "calls": None,
+            "models": {},
+            "compactions": {
+                "count": 0,
+                "unaccounted": 0,
+                "context_before": 0,
+                "context_after": 0,
+            },
+            "source": "mock-acp 1.2.3 _meta.quota.model_usage",
+            "billing": None,
+        },
         "paths": {
             "dir": "/state/sessions/q7x2",
             "prompt": "/state/sessions/q7x2/prompt.md",
@@ -134,6 +148,7 @@ def test_no_selected_fields_omits_the_metadata_section() -> None:
         capabilities=None,
         stop_reason=None,
         context=None,
+        usage=None,
         next=None,
     )
     result = output.render_tagged(bare, max_output=0, answer_path=ANSWER_PATH)

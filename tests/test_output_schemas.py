@@ -28,7 +28,7 @@ home_env = "MOCK_HOME"
 default = {{ grants = "read", delegates = true }}
 '''
 
-O4_KEYWORDS = {"type", "enum", "properties", "required", "items"}
+O4_KEYWORDS = {"type", "enum", "properties", "required", "items", "additionalProperties", "minimum"}
 COMMANDS_WITH_OUTPUT = {
     "agents check",
     "agents create",
@@ -136,6 +136,7 @@ EXPECTED_REQUIRED: dict[str, tuple[str, ...]] = {
         "runtime_seconds",
         "idle_seconds",
         "context",
+        "usage",
         "exit_code",
         "stop_reason",
         "failure",
@@ -172,6 +173,7 @@ EXPECTED_REQUIRED: dict[str, tuple[str, ...]] = {
         "finished_at",
         "stop_reason",
         "context",
+        "usage",
         "answer",
         "paths",
         "truncated",
@@ -182,7 +184,7 @@ EXPECTED_REQUIRED: dict[str, tuple[str, ...]] = {
     ),
 }
 
-EXPECTED_ENUMS: dict[str, dict[str, tuple[str, ...]]] = {
+EXPECTED_ENUMS: dict[str, dict[str, tuple[Any, ...]]] = {
     "agents list": {"$.items[].kind": ("adapter", "variant")},
     "cancel": {
         "$.status": (
@@ -196,6 +198,8 @@ EXPECTED_ENUMS: dict[str, dict[str, tuple[str, ...]]] = {
     "continue": {
         "$.status": ("running", "succeeded", "failed", "canceled", "unknown"),
         "$.capabilities.steer_mode": ("in-place", "cancel-then-start"),
+        "$.usage.quality": ("exact", "estimate"),
+        "$.usage.billing": ("subscription", "api", None),
     },
     "log": {
         "$.type": tuple(
@@ -220,6 +224,8 @@ EXPECTED_ENUMS: dict[str, dict[str, tuple[str, ...]]] = {
     "run": {
         "$.status": ("running", "succeeded", "failed", "canceled", "unknown"),
         "$.capabilities.steer_mode": ("in-place", "cancel-then-start"),
+        "$.usage.quality": ("exact", "estimate"),
+        "$.usage.billing": ("subscription", "api", None),
     },
     "list": {
         "$.items[].status": (
@@ -245,14 +251,20 @@ EXPECTED_ENUMS: dict[str, dict[str, tuple[str, ...]]] = {
             "unknown",
         ),
         "$.capabilities.steer_mode": ("in-place", "cancel-then-start"),
+        "$.usage.quality": ("exact", "estimate"),
+        "$.usage.billing": ("subscription", "api", None),
     },
     "steer": {
         "$.status": ("running", "succeeded"),
         "$.capabilities.steer_mode": ("in-place", "cancel-then-start"),
+        "$.usage.quality": ("exact", "estimate"),
+        "$.usage.billing": ("subscription", "api", None),
     },
     "wait": {
         "$.status": ("succeeded", "failed", "canceled", "unknown"),
         "$.capabilities.steer_mode": ("in-place", "cancel-then-start"),
+        "$.usage.quality": ("exact", "estimate"),
+        "$.usage.billing": ("subscription", "api", None),
     },
 }
 
@@ -301,13 +313,21 @@ def validate_json(value: Any, contract: Mapping[str, Any], path: str = "$") -> N
     if "enum" in contract:
         assert value in contract["enum"], (path, value)
     if isinstance(value, dict):
-        properties = contract["properties"]
-        assert set(value) <= set(properties), (path, set(value) - set(properties))
-        for name in contract["required"]:
+        properties = contract.get("properties", {})
+        additional = contract.get("additionalProperties")
+        assert set(value) <= set(properties) or isinstance(additional, Mapping), (
+            path,
+            set(value) - set(properties),
+        )
+        for name in contract.get("required", []):
             assert name in value, (path, name)
         for name, child in properties.items():
             if name in value:
                 validate_json(value[name], child, f"{path}.{name}")
+        if isinstance(additional, Mapping):
+            for name, child in value.items():
+                if name not in properties:
+                    validate_json(child, additional, f"{path}.{name}")
     elif isinstance(value, list):
         for index, item in enumerate(value):
             validate_json(item, contract["items"], f"{path}[{index}]")
@@ -339,11 +359,15 @@ def _assert_o4_schema(contract: Mapping[str, Any], path: str = "$") -> None:
         [item for item in expected if item != "null"] if isinstance(expected, list) else [expected]
     )
     if "object" in types:
-        assert "properties" in contract, path
-        assert "required" in contract, path
-        assert set(contract["required"]) <= set(contract["properties"]), path
-        for name, child in contract["properties"].items():
+        properties = contract.get("properties", {})
+        assert "properties" in contract or "additionalProperties" in contract, path
+        if "properties" in contract:
+            assert "required" in contract, path
+        assert set(contract.get("required", [])) <= set(properties), path
+        for name, child in properties.items():
             _assert_o4_schema(child, f"{path}.{name}")
+        if "additionalProperties" in contract:
+            _assert_o4_schema(contract["additionalProperties"], f"{path}.*")
     if "array" in types:
         assert "items" in contract, path
         _assert_o4_schema(contract["items"], f"{path}[]")
@@ -427,6 +451,9 @@ def _schema_nodes(
     items = contract.get("items")
     if isinstance(items, Mapping):
         nodes.extend(_schema_nodes(items, f"{path}[]"))
+    additional = contract.get("additionalProperties")
+    if isinstance(additional, Mapping):
+        nodes.extend(_schema_nodes(additional, f"{path}.*"))
     return nodes
 
 
