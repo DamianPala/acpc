@@ -43,6 +43,8 @@ Exact-prefix triggers (donor design, for precise timing control in tests):
 - ``auth-data:``     fail with an auth error marked in ``data``, not in the text
 - ``meta:TOKENS:TICKS:TEXT`` -> prose plus per-turn PromptResponse ``_meta`` usage
 - ``both:TOKENS:TICKS:TEXT`` -> streamed usage plus deliberately stale ``_meta``
+- ``rawusage:claude|codex|grok`` -> vendor-shaped PromptResponse usage and ``_meta``
+- ``cancelled-no-usage:`` -> return ``stop_reason=cancelled`` without usage
 
 Anything else runs the default scenario: three tool events, a progress msg, a
 usage update, and a markdown answer quoting the prompt — history-aware, so a
@@ -743,6 +745,102 @@ class MockAgent(Agent):
                     },
                 },
             )
+
+        if prompt_text.startswith("rawusage:"):
+            profile = prompt_text.split(":", 1)[1]
+            await self._send_text(session_id, f"raw {profile} usage")
+            if profile == "claude":
+                usage = {
+                    "totalTokens": 135037,
+                    "inputTokens": 8,
+                    "outputTokens": 440,
+                    "cachedReadTokens": 133240,
+                    "cachedWriteTokens": 1349,
+                }
+                token_count = {
+                    "totalTokens": 135037,
+                    "inputTokens": 8,
+                    "cachedInputTokens": 133240,
+                    "cachedWriteTokens": 1349,
+                    "outputTokens": 440,
+                    "reasoningOutputTokens": 0,
+                }
+                meta = {
+                    "quota": {
+                        "token_count": token_count,
+                        "model_usage": [{"model": "claude-opus-5[1m]", "token_count": token_count}],
+                    }
+                }
+                await self._send_usage(session_id, used=135037)
+                return PromptResponse.model_validate(
+                    {"stopReason": "end_turn", "usage": usage, "_meta": meta}
+                )
+            if profile == "codex":
+                usage = {
+                    "totalTokens": 21789,
+                    "inputTokens": 279,
+                    "cachedReadTokens": 21504,
+                    "outputTokens": 6,
+                    "thoughtTokens": 0,
+                }
+                token_count = {
+                    "totalTokens": 21789,
+                    "inputTokens": 279,
+                    "cachedInputTokens": 21504,
+                    "outputTokens": 6,
+                    "reasoningOutputTokens": 0,
+                }
+                meta = {
+                    "quota": {
+                        "token_count": token_count,
+                        "model_usage": [{"model": "gpt-6-sol", "token_count": token_count}],
+                    }
+                }
+                await self._send_usage(session_id, used=21789)
+                return PromptResponse.model_validate(
+                    {"stopReason": "end_turn", "usage": usage, "_meta": meta}
+                )
+            if profile == "grok":
+                grok_usage = {
+                    "inputTokens": 99736,
+                    "outputTokens": 414,
+                    "totalTokens": 100150,
+                    "cachedReadTokens": 76032,
+                    "cacheCreationTokens": 0,
+                    "reasoningTokens": 197,
+                    "modelCalls": 4,
+                    "apiDurationMs": 9064,
+                    "costUsdTicks": 298887200,
+                    "modelUsage": {
+                        "grok-4.7-build": {
+                            "inputTokens": 99736,
+                            "outputTokens": 414,
+                            "totalTokens": 100150,
+                            "cachedReadTokens": 76032,
+                            "cacheCreationTokens": 0,
+                            "reasoningTokens": 197,
+                            "modelCalls": 4,
+                            "apiDurationMs": 9064,
+                            "costUsdTicks": 298887200,
+                        }
+                    },
+                    "numTurns": 4,
+                }
+                return PromptResponse.model_validate(
+                    {
+                        "stopReason": "end_turn",
+                        "_meta": {
+                            "totalTokens": 25234,
+                            "modelId": "grok-4.7",
+                            "usage": grok_usage,
+                        },
+                    }
+                )
+            raise RequestError(400, f"unknown raw usage profile: {profile}")
+
+        if prompt_text.startswith("cancelled-no-usage:"):
+            await self._send_text(session_id, "cancelled without usage")
+            return PromptResponse(stop_reason="cancelled")
 
         if prompt_text.startswith("echo:"):
             await self._send_text(session_id, prompt_text.split(":", 1)[1])

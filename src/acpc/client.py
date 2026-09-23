@@ -546,6 +546,7 @@ class AcpcClient:
         self._context: ContextOccupancy | None = previous_context
         self._usage_update_seen = False
         self._meta_usage_recorded = False
+        self._adapter_info: dict[str, str | None] = {"name": None, "version": None}
         self._rate_limit_info: dict[str, Any] | None = None
         self._recorded_progress = False
         self._denied: dict[str, int] = {}
@@ -623,40 +624,59 @@ class AcpcClient:
             models = self._models_from_session_meta(session)
         self._advertised["models"] = models
 
+    def capture_adapter(self, initialize_response: Any) -> None:
+        """Capture the adapter identity announced by ACP ``initialize``."""
+        agent_info = self._wire_field(initialize_response, "agent_info", "agentInfo")
+        name = self._wire_field(agent_info, "name")
+        version = self._wire_field(agent_info, "version")
+        self._adapter_info = {
+            "name": name if isinstance(name, str) else None,
+            "version": version if isinstance(version, str) else None,
+        }
+
     def record_prompt_usage(self, prompt_result: Any) -> None:
-        """Record context occupancy from a prompt response when usage_update is absent.
+        """Record raw response usage and the context occupancy at turn end.
 
         Some agents (Grok Build) put totals on PromptResponse ``_meta`` instead
         of streaming ACP ``usage_update`` notifications. This path never learns
         a context window size, so `size` stays `None`; acpc reports no cost
-        anywhere, so this path never parses one either.
+        anywhere, so this path never parses one either. The raw response fields
+        are retained under `meta` on the same `usage` event.
         """
-        if self._usage_update_seen or self._meta_usage_recorded:
-            return
-        meta = self._prompt_meta(prompt_result)
-        if not meta:
-            return
-        previous_context = self._context
-        # Measured 2026-08-25 with Grok CLI 1.0.4: numTurns=1 on both turns;
-        # totalTokens was 35570 then 35854 — the latest replayed-context total.
-        tokens = meta.get("totalTokens")
-        if tokens is None:
-            usage = meta.get("usage")
-            if isinstance(usage, Mapping):
-                tokens = usage.get("totalTokens") or usage.get("total_tokens")
-        if isinstance(tokens, (int, float)) and tokens > 0:
-            used = int(tokens)
-            previous_peak = previous_context["peak"] if previous_context is not None else 0
-            self._context = ContextOccupancy(used=used, size=None, peak=max(previous_peak, used))
-        self._meta_usage_recorded = True
-        if self._context != previous_context:
-            self.flush()
-            context = self._context
-            self.transcript.append(
-                "usage",
-                used=context["used"] if context is not None else None,
-                size=context["size"] if context is not None else None,
-            )
+        if not self._usage_update_seen and not self._meta_usage_recorded:
+            response_meta = self._prompt_meta(prompt_result)
+            # Measured 2026-08-25 with Grok CLI 1.0.4: numTurns=1 on both
+            # turns; totalTokens was 35570 then 35854, the latest replayed total.
+            tokens = response_meta.get("totalTokens")
+            if tokens is None:
+                usage = response_meta.get("usage")
+                if isinstance(usage, Mapping):
+                    tokens = usage.get("totalTokens") or usage.get("total_tokens")
+            if isinstance(tokens, (int, float)) and tokens > 0:
+                used = int(tokens)
+                previous_peak = self._context["peak"] if self._context is not None else 0
+                self._context = ContextOccupancy(
+                    used=used,
+                    size=None,
+                    peak=max(previous_peak, used),
+                )
+            self._meta_usage_recorded = True
+
+        context = self._context
+        self.flush()
+        self.transcript.append(
+            "usage",
+            used=context["used"] if context is not None else None,
+            size=context["size"] if context is not None else None,
+            meta={
+                "prompt_usage": {
+                    "usage": self._raw_prompt_usage(prompt_result),
+                    "meta": self._raw_response_meta(prompt_result),
+                },
+                "adapter": dict(self._adapter_info),
+                "scope": "turn",
+            },
+        )
 
     @asynccontextmanager
     async def replaying(
@@ -1232,6 +1252,43 @@ class AcpcClient:
             if isinstance(model_id, str) and model_id:
                 models.append(model_id)
         return models
+
+    @staticmethod
+    def _wire_field(value: Any, *names: str) -> Any:
+        """Read one ACP field from a parsed model or an as-sent mapping."""
+        if isinstance(value, Mapping):
+            for name in names:
+                if name in value:
+                    return value[name]
+            return None
+        for name in names:
+            field_value = getattr(value, name, None)
+            if field_value is not None:
+                return field_value
+        return None
+
+    @staticmethod
+    def _raw_prompt_usage(value: Any) -> Any:
+        """Return a prompt's usage object with ACP aliases and sent fields."""
+        usage = AcpcClient._wire_field(value, "usage")
+        if usage is None:
+            return None
+        if isinstance(usage, Mapping):
+            return dict(usage)
+        model_dump = getattr(usage, "model_dump", None)
+        if callable(model_dump):
+            return model_dump(mode="json", by_alias=True, exclude_unset=True)
+        return usage
+
+    @staticmethod
+    def _raw_response_meta(value: Any) -> Any:
+        """Return response `_meta` as received, distinguishing absent from empty."""
+        if isinstance(value, Mapping):
+            if "_meta" in value:
+                return value["_meta"]
+            return value.get("field_meta")
+        field_meta = getattr(value, "field_meta", None)
+        return field_meta if field_meta is not None else getattr(value, "_meta", None)
 
     @staticmethod
     def _prompt_meta(value: Any) -> dict[str, Any]:

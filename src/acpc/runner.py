@@ -708,6 +708,7 @@ async def _drive_turn(
             drain_stderr=True,
         ) as (conn, _process):
             initialize = await conn.initialize(protocol_version=PROTOCOL_VERSION)
+            client.capture_adapter(initialize)
 
             if request.resume_adapter_session is not None:
                 adapter_session_id = request.resume_adapter_session

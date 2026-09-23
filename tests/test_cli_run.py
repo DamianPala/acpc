@@ -1241,6 +1241,193 @@ def test_observed_usage_still_reports_the_real_count(cli: CliRunner) -> None:
     assert payload["context"] == {"used": 1200, "size": None, "peak": 1200}
 
 
+@pytest.mark.parametrize(
+    "profile,usage,meta,context",
+    [
+        (
+            "claude",
+            {
+                "totalTokens": 135037,
+                "inputTokens": 8,
+                "outputTokens": 440,
+                "cachedReadTokens": 133240,
+                "cachedWriteTokens": 1349,
+            },
+            {
+                "quota": {
+                    "token_count": {
+                        "totalTokens": 135037,
+                        "inputTokens": 8,
+                        "cachedInputTokens": 133240,
+                        "cachedWriteTokens": 1349,
+                        "outputTokens": 440,
+                        "reasoningOutputTokens": 0,
+                    },
+                    "model_usage": [
+                        {
+                            "model": "claude-opus-5[1m]",
+                            "token_count": {
+                                "totalTokens": 135037,
+                                "inputTokens": 8,
+                                "cachedInputTokens": 133240,
+                                "cachedWriteTokens": 1349,
+                                "outputTokens": 440,
+                                "reasoningOutputTokens": 0,
+                            },
+                        }
+                    ],
+                }
+            },
+            {"used": 135037, "size": 200000, "peak": 135037},
+        ),
+        (
+            "codex",
+            {
+                "totalTokens": 21789,
+                "inputTokens": 279,
+                "cachedReadTokens": 21504,
+                "outputTokens": 6,
+                "thoughtTokens": 0,
+            },
+            {
+                "quota": {
+                    "token_count": {
+                        "totalTokens": 21789,
+                        "inputTokens": 279,
+                        "cachedInputTokens": 21504,
+                        "outputTokens": 6,
+                        "reasoningOutputTokens": 0,
+                    },
+                    "model_usage": [
+                        {
+                            "model": "gpt-6-sol",
+                            "token_count": {
+                                "totalTokens": 21789,
+                                "inputTokens": 279,
+                                "cachedInputTokens": 21504,
+                                "outputTokens": 6,
+                                "reasoningOutputTokens": 0,
+                            },
+                        }
+                    ],
+                }
+            },
+            {"used": 21789, "size": 200000, "peak": 21789},
+        ),
+        (
+            "grok",
+            None,
+            {
+                "totalTokens": 25234,
+                "modelId": "grok-4.7",
+                "usage": {
+                    "inputTokens": 99736,
+                    "outputTokens": 414,
+                    "totalTokens": 100150,
+                    "cachedReadTokens": 76032,
+                    "cacheCreationTokens": 0,
+                    "reasoningTokens": 197,
+                    "modelCalls": 4,
+                    "apiDurationMs": 9064,
+                    "costUsdTicks": 298887200,
+                    "modelUsage": {
+                        "grok-4.7-build": {
+                            "inputTokens": 99736,
+                            "outputTokens": 414,
+                            "totalTokens": 100150,
+                            "cachedReadTokens": 76032,
+                            "cacheCreationTokens": 0,
+                            "reasoningTokens": 197,
+                            "modelCalls": 4,
+                            "apiDurationMs": 9064,
+                            "costUsdTicks": 298887200,
+                        }
+                    },
+                    "numTurns": 4,
+                },
+            },
+            {"used": 25234, "size": None, "peak": 25234},
+        ),
+    ],
+)
+def test_prompt_response_usage_is_recorded_verbatim(
+    cli: CliRunner,
+    state_root: Path,
+    profile: str,
+    usage: dict[str, object] | None,
+    meta: dict[str, object],
+    context: dict[str, int | None],
+) -> None:
+    result = invoke(cli, "run", "mock", f"rawusage:{profile}", "--json", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_OK
+    payload = json.loads(result.stdout)
+    events = [
+        json.loads(line)
+        for line in (state_root / "sessions" / payload["session_id"] / "transcript.ndjson")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    turn_usage = [event for event in events if event.get("meta", {}).get("scope") == "turn"]
+
+    assert payload["context"] == context
+    assert len(turn_usage) == 1
+    message = next(event for event in events if event.get("type") == "msg")
+    assert message["i"] < turn_usage[0]["i"]
+    assert turn_usage[0]["used"] == context["used"]
+    assert turn_usage[0]["size"] == context["size"]
+    assert turn_usage[0]["meta"] == {
+        "prompt_usage": {"usage": usage, "meta": meta},
+        "adapter": {"name": "mock-agent", "version": "0.1.0"},
+        "scope": "turn",
+    }
+    if profile == "grok":
+        assert len([event for event in events if event.get("type") == "usage"]) == 1
+
+
+def test_cancelled_prompt_response_without_usage_records_null_report(
+    cli: CliRunner, state_root: Path
+) -> None:
+    result = invoke(cli, "run", "mock", "cancelled-no-usage:", "--json", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_CANCELLED
+    session_id = sessions.list_sessions()[0].session_id
+    events = [
+        json.loads(line)
+        for line in (state_root / "sessions" / session_id / "transcript.ndjson")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    turn_usage = [event for event in events if event.get("meta", {}).get("scope") == "turn"]
+
+    assert len(turn_usage) == 1
+    assert turn_usage[0]["used"] is None
+    assert turn_usage[0]["size"] is None
+    assert turn_usage[0]["meta"] == {
+        "prompt_usage": {"usage": None, "meta": None},
+        "adapter": {"name": "mock-agent", "version": "0.1.0"},
+        "scope": "turn",
+    }
+
+
+def test_json_rpc_error_does_not_record_a_prompt_response(cli: CliRunner, state_root: Path) -> None:
+    first = invoke(cli, "run", "mock", "echo:first", "--json", "--quiet")
+    session_id = json.loads(first.stdout)["session_id"]
+    failed = invoke(cli, "continue", session_id, "crash-late:partial", "--json", "--quiet")
+    assert failed.exit_code == vocab.EXIT_AGENT_ERROR
+
+    events = [
+        json.loads(line)
+        for line in (state_root / "sessions" / session_id / "transcript.ndjson")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    turn_usage = [event for event in events if event.get("meta", {}).get("scope") == "turn"]
+
+    assert len(turn_usage) == 1
+    assert turn_usage[0]["meta"]["prompt_usage"] == {"usage": None, "meta": None}
+
+
 def test_max_output_caps_stdout(cli: CliRunner) -> None:
     result = invoke(
         cli, "run", "mock", "trigger the huge scenario", "--quiet", "--max-output", "4096"

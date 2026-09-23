@@ -300,6 +300,7 @@ class AdapterHost:
         self._process: Any = None
         self._command: tuple[str, tuple[str, ...]] | None = None
         self.agent_capabilities: Any = None
+        self.initialize_response: Any | None = None
         # SPEC.md `steer`: whether this adapter takes `_session/steering`.
         # Retained per warm process, exactly like the capabilities above.
         self.steering_supported = False
@@ -395,6 +396,7 @@ class AdapterHost:
         self._conn = conn
         self._process = process
         self._command = (command, args)
+        self.initialize_response = initialize
         self.agent_capabilities = getattr(initialize, "agent_capabilities", None)
         self.steering_supported = steering_supported(initialize)
         return conn
@@ -414,6 +416,7 @@ class AdapterHost:
         self._conn = None
         self._process = None
         self._command = None
+        self.initialize_response = None
         self.agent_capabilities = None
         self.steering_supported = False
         self.adapter_sessions.clear()
@@ -1460,6 +1463,7 @@ class Daemon:
             cancellation_dispatched=cancel.cancellation_dispatched,
             previous_context=stored.context,
         )
+        client.capture_adapter(self.host.initialize_response)
         turn.client = client
 
         turn_error: BaseException | None = None

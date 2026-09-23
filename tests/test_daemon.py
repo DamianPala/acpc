@@ -1253,6 +1253,23 @@ def test_a_warm_second_turn_still_knows_the_first(state_root: Path, live_daemon:
     assert "turn one of the conversation" in answer
 
 
+def test_daemon_turn_usage_names_the_adapter_on_cold_and_warm_turns(
+    state_root: Path, live_daemon: None
+) -> None:
+    """SPEC.md transcript: the turn-end `usage` event carries `initialize`'s adapter."""
+    session_id = new_session("rawusage:codex")
+    run_turn(session_id, "rawusage:codex")
+    next_turn(session_id, "rawusage:claude")
+
+    events = Transcript(sessions.transcript_path(session_id)).read().events
+    adapters = [
+        event["meta"]["adapter"]
+        for event in events
+        if event["type"] == "usage" and event.get("meta", {}).get("scope") == "turn"
+    ]
+    assert adapters == [{"name": "mock-agent", "version": "0.1.0"}] * 2
+
+
 def test_a_cold_resume_restores_the_adapter_persisted_history(state_root: Path) -> None:
     """Without a daemon, `session/load` restores the adapter's durable history."""
     session_id = new_session("turn one of the conversation")

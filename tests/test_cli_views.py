@@ -555,9 +555,7 @@ def test_log_json_emits_indexed_ndjson(cli: CliRunner) -> None:
 def test_log_json_and_ndjson_drop_the_usage_event_cost_and_meta(
     cli: CliRunner, state_root: Path
 ) -> None:
-    """SPEC.md `log`: `--format ndjson`'s one exception is a `usage` record,
-    published with `used` and `size` only — the adapter's `cost` and `meta`
-    stay on disk, and every other stored key keeps its on-disk order.
+    """SPEC.md `log`: each `usage` record drops `cost` and `meta` on publish.
 
     SPEC.md *State on disk* also keeps unknown fields, so a key acpc does not
     know about survives the same publication that drops `cost` and `meta`."""
@@ -572,13 +570,40 @@ def test_log_json_and_ndjson_drop_the_usage_event_cost_and_meta(
     lines[usage_index] = json.dumps(on_disk)
     transcript_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     expected = {key: value for key, value in on_disk.items() if key not in ("cost", "meta")}
+    turn_on_disk = next(
+        json.loads(line)
+        for line in lines
+        if json.loads(line).get("meta", {}).get("scope") == "turn"
+    )
+    expected_turn = {
+        key: value for key, value in turn_on_disk.items() if key not in ("cost", "meta")
+    }
 
     for args in (("--json",), ("--format", "ndjson")):
         result = invoke(cli, "log", session_id, *args)
         events = [json.loads(line) for line in result.stdout.splitlines()]
         usage_events = [event for event in events if event.get("type") == "usage"]
-        assert usage_events == [expected]
+        assert usage_events == [expected, expected_turn]
         assert list(usage_events[0].keys()) == list(expected.keys())
+
+
+def test_log_hides_raw_prompt_meta_in_all_usage_views(cli: CliRunner, state_root: Path) -> None:
+    session_id = run_mock(cli, "rawusage:grok")
+    transcript_path = state_root / "sessions" / session_id / "transcript.ndjson"
+    stored_events = [
+        json.loads(line) for line in transcript_path.read_text(encoding="utf-8").splitlines()
+    ]
+    turn_usage = next(
+        event for event in stored_events if event.get("meta", {}).get("scope") == "turn"
+    )
+    assert turn_usage["meta"]["prompt_usage"]["meta"]["usage"]["costUsdTicks"] == 298887200
+
+    for args in ((), ("--json",), ("--format", "ndjson")):
+        result = invoke(cli, "log", session_id, "--since", "0", *args, "--quiet")
+
+        assert result.exit_code == vocab.EXIT_OK
+        assert "costUsdTicks" not in result.stdout
+        assert "grok-4.7-build" not in result.stdout
 
 
 def test_log_json_and_ndjson_read_a_legacy_usage_events_tokens_as_used(

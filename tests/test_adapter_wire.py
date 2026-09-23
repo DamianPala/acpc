@@ -326,23 +326,21 @@ def test_record_prompt_usage_reads_prompt_response_meta(tmp_path: Path) -> None:
             "type": "usage",
             "used": 120,
             "size": None,
+            "meta": {
+                "prompt_usage": {
+                    "usage": None,
+                    "meta": {
+                        "totalTokens": 120,
+                        "usage": {"costUsdTicks": 1_000_000_000},
+                    },
+                },
+                "adapter": {"name": None, "version": None},
+                "scope": "turn",
+            },
             "ts": "1970-01-01T00:00:01.000000Z",
             "i": 1,
         }
     ]
-
-
-def test_record_prompt_usage_does_not_duplicate_when_unchanged(tmp_path: Path) -> None:
-    client, transcript = _client(tmp_path)
-    prompt = SimpleNamespace(
-        stop_reason="end_turn",
-        field_meta={"totalTokens": 50},
-    )
-    client.record_prompt_usage(prompt)
-    client.record_prompt_usage(prompt)
-    usage_events = [e for e in transcript.read().events if e.get("type") == "usage"]
-    assert len(usage_events) == 1
-    assert usage_events[0]["used"] == 50
 
 
 def test_models_from_session_meta_xai_session_config(tmp_path: Path) -> None:
