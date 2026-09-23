@@ -588,7 +588,10 @@ if begin_section S06-run "run sync + session dir layout + output contract + exit
     assert_eq "separator smoke run exits 0" "0" "$SEPARATOR_RC"
     SEPARATOR_JSON="$(cat "$SEPARATOR_OUT")"
     SEPARATOR_ANSWER="$(json_field "$SEPARATOR_JSON" '.answer')"
-    assert_contains "detectable message boundary keeps markdown separated" "$SEPARATOR_ANSWER" $'\n\n## Answer'
+    assert_contains "usage update leaves one message joined" \
+        "$SEPARATOR_ANSWER" '"separator smoke probe"## Answer'
+    assert_not_contains "usage update does not add a paragraph break" \
+        "$SEPARATOR_ANSWER" $'\n\n## Answer'
     SEPARATOR_ID="$(json_field "$SEPARATOR_JSON" '.session_id')"
     SEPARATOR_DIR="${ACPC_HOME}/sessions/${SEPARATOR_ID}"
     if [[ "$SEPARATOR_ANSWER" == "$(cat "${SEPARATOR_DIR}/answer.md")" ]]; then

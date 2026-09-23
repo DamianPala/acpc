@@ -198,7 +198,7 @@ def test_continuation_marker_marks_adjacent_same_type_events() -> None:
     assert "thought ↪" in lines[3]
 
 
-@pytest.mark.parametrize("separator", ["tool", "thought", "state", "usage"])
+@pytest.mark.parametrize("separator", ["tool", "thought", "state"])
 def test_continuation_marker_stops_at_an_intervening_event(separator: str) -> None:
     events = [
         event(1, "msg", text="first"),
@@ -285,6 +285,116 @@ def test_prose_keeps_messages_full_and_errors_but_filters_tools() -> None:
     assert result.next_cursor == 3
 
 
+def test_prose_separates_messages_errors_and_turns_but_joins_usage_fragments() -> None:
+    events = [
+        event(1, "state", **{"from": "starting", "to": "running"}),
+        event(2, "msg", text="turn one, message one"),
+        event(3, "usage", used=10, size=100),
+        event(4, "msg", text=" continued"),
+        event(5, "tool", name="Read", args_summary="notes.md", status="completed", duration_ms=1),
+        event(6, "msg", text="turn one, message two"),
+        event(7, "state", **{"from": "running", "to": "succeeded"}),
+        event(8, "state", **{"from": "starting", "to": "running"}),
+        event(9, "msg", text="turn two, message one"),
+        event(10, "permission", kind="read", decision="allow"),
+        event(11, "msg", text="turn two, message two"),
+        event(12, "error", message="agent error one"),
+        event(13, "error", message="agent error two"),
+        event(14, "state", **{"from": "running", "to": "failed"}),
+    ]
+
+    result = render.render_events(events, prose=True)
+    error_line_one = render.format_event(events[11])
+    error_line_two = render.format_event(events[12])
+
+    assert result.text == (
+        "turn one, message one continued\n\n"
+        "turn one, message two\n\n"
+        "turn two, message one\n\n"
+        "turn two, message two\n\n"
+        f"{error_line_one}\n\n{error_line_two}"
+    )
+    assert result.text.count("\n\n") == 5
+
+
+@pytest.mark.parametrize("event_type", ["plan", "future_update"])
+def test_renderer_separates_messages_across_future_transcript_records(event_type: str) -> None:
+    """Renderer-only fixture for records current clients do not write."""
+    events = [
+        event(1, "msg", text="before"),
+        event(2, event_type, detail="fork"),
+        event(3, "msg", text="after"),
+    ]
+
+    result = render.render_events(events, prose=True)
+
+    assert result.text == "before\n\nafter"
+
+
+@pytest.mark.parametrize(
+    ("ending", "separator"),
+    [("", "\n\n"), ("\n", "\n"), ("\n\n", "")],
+)
+def test_prose_adds_only_the_missing_part_of_a_blank_line(ending: str, separator: str) -> None:
+    events = [
+        event(1, "msg", text=f"first{ending}"),
+        event(2, "tool", name="Read", args_summary="notes.md", status="completed", duration_ms=1),
+        event(3, "msg", text="second"),
+    ]
+
+    result = render.render_events(events, prose=True)
+
+    assert result.text == f"first{ending}{separator}second"
+
+
+def test_legacy_message_records_join_across_usage_in_prose() -> None:
+    events = [
+        event(1, "msg", text="first"),
+        event(2, "usage", used=10, size=100),
+        event(3, "msg", text="second"),
+    ]
+
+    result = render.render_events(events, prose=True)
+
+    assert result.text == "firstsecond"
+
+
+def test_newline_only_continuation_keeps_two_existing_newlines_before_fork() -> None:
+    events = [
+        event(1, "msg", text="a\n"),
+        event(2, "usage", used=10, size=100),
+        event(3, "msg", text="\n"),
+        event(4, "tool", name="Read", args_summary="notes.md", status="completed", duration_ms=1),
+        event(5, "msg", text="b"),
+    ]
+
+    result = render.render_events(events, prose=True)
+
+    assert result.text == "a\n\nb"
+
+
+def test_prose_separates_an_error_at_the_start_of_a_page_from_message() -> None:
+    events = [event(1, "error", message="agent failed"), event(2, "msg", text="recovered")]
+    error_line = render.format_event(events[0])
+
+    result = render.render_events(events, prose=True)
+
+    assert result.text == f"{error_line}\n\nrecovered"
+
+
+@pytest.mark.parametrize("event_type", ["msg", "thought"])
+def test_condensed_view_marks_a_continuation_after_usage(event_type: str) -> None:
+    events = [
+        event(1, event_type, text="first"),
+        event(2, "usage", used=10, size=100),
+        event(3, event_type, text="second"),
+    ]
+
+    result = render.render_events(events)
+
+    assert f"{event_type} ↪ " in result.text
+
+
 def test_failed_view_can_expand_the_last_agent_message() -> None:
     last_message = ("The failure details are important. " * 20).strip()
     events = [event(1, "msg", text="first"), event(2, "msg", text=last_message)]
@@ -293,6 +403,20 @@ def test_failed_view_can_expand_the_last_agent_message() -> None:
 
     assert last_message in result.text
     assert result.next_cursor == 2
+
+
+def test_condensed_message_keeps_an_embedded_blank_line_visible() -> None:
+    result = render.render_events([event(1, "msg", text="before\n\nafter")])
+
+    assert '"before\\n\\nafter"' in result.text
+
+
+def test_condensed_message_snippet_keeps_an_early_blank_line_visible() -> None:
+    text = "before\n\nafter " + "word " * 60
+
+    result = render.render_events([event(1, "msg", text=text)])
+
+    assert '"before\\n\\nafter' in result.text
 
 
 def test_log_budget_stops_before_next_event_and_keeps_cursor_on_printed_event() -> None:

@@ -74,6 +74,15 @@ _CHUNK_MAX_CHARS = 4096
 _CANCELLATION_DISPATCH_TIMEOUT = 1.0
 
 
+def _message_separator(text: str) -> str:
+    """Return only the newline characters needed for one blank line."""
+    if text.endswith("\n\n"):
+        return ""
+    if text.endswith("\n"):
+        return "\n"
+    return "\n\n"
+
+
 @dataclass(slots=True)
 class _ToolCall:
     title: str | None
@@ -155,6 +164,15 @@ class ReplaySink:
 REPLAY_GENERATION_KEY = "acpc_replay_generation"
 VALIDATED_SESSION_ID_KEY = "acpc_validated_session_id"
 _REPLAY_SUPPRESSION_LOG = logging.getLogger(__name__)
+_STATE_REPORT_UPDATES = frozenset(
+    {
+        "usage_update",
+        "available_commands_update",
+        "config_option_update",
+        "current_mode_update",
+        "session_info_update",
+    }
+)
 
 # This is a memory-versus-leak-window tradeoff. Healthy generations release by
 # accounting, so this is only a backstop; eviction is safe because an evicted
@@ -523,6 +541,7 @@ class AcpcClient:
         self._pending: _PendingChunks | None = None
         self._answer_parts: list[str] = []
         self._answer_boundary_pending = False
+        self._transcript_boundary_pending = False
         self._tool_calls: dict[str, _ToolCall] = {}
         self._context: ContextOccupancy | None = previous_context
         self._usage_update_seen = False
@@ -673,7 +692,7 @@ class AcpcClient:
     def flush(self) -> None:
         """Write buffered agent prose to the transcript as one event.
 
-        Called before any non-chunk event lands and at the end of a turn, so
+        Called before transcript-bearing updates and at the end of a turn, so
         message text always precedes the event that interrupted it.
         """
         pending = self._pending
@@ -681,6 +700,12 @@ class AcpcClient:
             return
         self._pending = None
         self.transcript.append(pending.event_type, text="".join(pending.parts))
+
+    def record_external_event(self, event_type: str, **fields: Any) -> dict[str, Any]:
+        """Append a turn event produced outside an ACP client callback."""
+        self.flush()
+        self._mark_answer_boundary(recorded=True)
+        return self.transcript.append(event_type, **fields)
 
     def _buffer_chunk(self, event_type: str, text: str) -> None:
         now = self._clock()
@@ -700,6 +725,13 @@ class AcpcClient:
         pending.last_at = now
         if now - pending.started_at >= _CHUNK_MAX_AGE_SECONDS or pending.chars >= _CHUNK_MAX_CHARS:
             self.flush()
+
+    def _mark_answer_boundary(self, *, recorded: bool) -> None:
+        """Track a narrative fork and whether a transcript event records it."""
+        already_pending = self._answer_boundary_pending
+        self._answer_boundary_pending = True
+        if recorded or not already_pending:
+            self._transcript_boundary_pending = not recorded
 
     async def session_update(self, session_id: str, update: Any, **kwargs: Any) -> None:
         """Record one ACP session update in the public transcript format."""
@@ -725,32 +757,32 @@ class AcpcClient:
         if update_type == "agent_message_chunk" and isinstance(update, AgentMessageChunk):
             text = getattr(update.content, "text", None)
             if isinstance(text, str):
-                if (
-                    self._answer_boundary_pending
-                    and self.answer
-                    and not self.answer.endswith("\n\n")
-                ):
-                    self._answer_parts.append("\n\n")
+                separator = ""
+                if self._answer_boundary_pending and self.answer:
+                    separator = _message_separator(self.answer)
+                    self._answer_parts.append(separator)
                 self._answer_parts.append(text)
+                buffered_text = separator + text if self._transcript_boundary_pending else text
                 self._answer_boundary_pending = False
+                self._transcript_boundary_pending = False
                 self._recorded_progress = True
-                self._buffer_chunk("msg", text)
+                self._buffer_chunk("msg", buffered_text)
             return
-
-        self._answer_boundary_pending = True
 
         if update_type == "agent_thought_chunk" and isinstance(update, AgentThoughtChunk):
             text = getattr(update.content, "text", None)
             if isinstance(text, str):
+                self._mark_answer_boundary(recorded=True)
                 self._buffer_chunk("thought", text)
+            else:
+                self._mark_answer_boundary(recorded=False)
             return
 
-        # Every non-chunk update cuts the buffered prose, even one that writes
-        # nothing itself (a tool start): the boundary is where the narrative
-        # forked, not where the interrupting event was finally recorded.
-        self.flush()
+        if update_type not in _STATE_REPORT_UPDATES:
+            self._mark_answer_boundary(recorded=False)
 
         if update_type == "tool_call" and isinstance(update, ToolCallStart):
+            self.flush()
             self._start_tool(update)
             return
 
@@ -759,6 +791,7 @@ class AcpcClient:
             return
 
         if update_type == "usage_update" and isinstance(update, UsageUpdate):
+            self.flush()
             self._record_usage(update)
             return
 
@@ -780,6 +813,9 @@ class AcpcClient:
         if update_type == "current_mode_update" and isinstance(update, CurrentModeUpdate):
             return
 
+        if update_type in _STATE_REPORT_UPDATES:
+            return
+
     async def request_permission(
         self,
         session_id: str,
@@ -789,6 +825,7 @@ class AcpcClient:
     ) -> RequestPermissionResponse:
         """Answer an ACP permission request and record the policy decision."""
         del session_id, kwargs
+        self._mark_answer_boundary(recorded=True)
         self.flush()
         kind = getattr(tool_call, "kind", None) or "unknown"
         title = getattr(tool_call, "title", None) or ""
@@ -888,6 +925,7 @@ class AcpcClient:
 
     async def _authorize_client_method(self, kind: str, title: str) -> None:
         """Apply the policy to an ACP callback outside ``request_permission``."""
+        self._mark_answer_boundary(recorded=True)
         self.flush()
         category = CLIENT_METHOD_CATEGORIES[kind]
         decision = should_allow(self.permission_level, category)
@@ -1090,6 +1128,8 @@ class AcpcClient:
         current = self._tool_calls[tool_call_id]
         if current.finished:
             return
+        self._mark_answer_boundary(recorded=True)
+        self.flush()
         elapsed_ms = max(0.0, self._clock() - current.started_at) * 1000
         name, args_summary = self._tool_description(current)
         self.transcript.append(

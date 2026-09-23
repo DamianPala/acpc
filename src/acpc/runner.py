@@ -731,6 +731,7 @@ async def _drive_turn(
                     session_id,
                     request,
                     events,
+                    client=client,
                     resume_status=resume_status,
                     steer_mode=vocab.STEER_CANCEL_THEN_START,
                 )
@@ -758,7 +759,6 @@ async def _drive_turn(
                     request,
                     cancel,
                     client,
-                    events,
                 )
             except BaseException as error:
                 if prompt_started or request.turn_token is None:
@@ -801,6 +801,7 @@ def _prepare_resumed_turn(
     request: TurnRequest,
     events: transcript.Transcript,
     *,
+    client: AcpcClient | None = None,
     resume_status: str | None = None,
     pid: int | None = None,
     steer_mode: str | None = None,
@@ -844,7 +845,10 @@ def _prepare_resumed_turn(
         _finalize_claimed_setup_failure(session_id, rotated.turns, error)
         raise ResumeRotationError(str(error), turn_token=rotated.turns) from None
     try:
-        events.append("state", **{"from": "starting", "to": "running"})
+        if client is None:
+            events.append("state", **{"from": "starting", "to": "running"})
+        else:
+            client.record_external_event("state", **{"from": "starting", "to": "running"})
         return replace(
             request,
             resolution=resolution,
@@ -1136,7 +1140,6 @@ async def run_prompt_with_limits(
     request: TurnRequest,
     cancel: "_CancelSignal",
     client: "AcpcClient",
-    events: transcript.Transcript,
     *,
     on_delivered: Callable[[], None] | None = None,
 ) -> tuple[str | None, BaseException | None, PromptDelivery, dict[str, Any] | None]:
@@ -1202,7 +1205,7 @@ async def run_prompt_with_limits(
         )
         if action == "fail":
             limit_record = _limit_record(observation, auto_continue=False)
-            events.append(
+            client.record_external_event(
                 "limit",
                 reason=observation.reason,
                 resume_at=limit_record["resume_at"],
@@ -1213,7 +1216,7 @@ async def run_prompt_with_limits(
             return "rate_limit", turn_error, delivery, limit_record
 
         limit_record = _limit_record(observation, auto_continue=True)
-        events.append(
+        client.record_external_event(
             "limit",
             reason=observation.reason,
             resume_at=limit_record["resume_at"],
@@ -1221,7 +1224,7 @@ async def run_prompt_with_limits(
             source=observation.source,
             detail=observation.detail,
         )
-        events.append("state", **{"from": "running", "to": "waiting"})
+        client.record_external_event("state", **{"from": "running", "to": "waiting"})
         sessions.transition(session_id, "waiting", limit=limit_record)
         now = datetime.now(UTC)
         assert observation.resume_at is not None  # action == "wait" guarantees this
@@ -1239,7 +1242,7 @@ async def run_prompt_with_limits(
             sessions.update_meta(session_id, limit=limit_record)
             return "canceled", turn_error, delivery, limit_record
 
-        events.append("state", **{"from": "waiting", "to": "running"})
+        client.record_external_event("state", **{"from": "waiting", "to": "running"})
         sessions.transition(session_id, "running", limit=limit_record)
         prompt_text = (
             request.prompt

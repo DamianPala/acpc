@@ -25,6 +25,15 @@ DEFAULT_STATUS_LIMIT = 20
 
 
 @dataclass(frozen=True, slots=True)
+class ProseContext:
+    """State needed to continue prose rendering on the next follow page."""
+
+    last_prose_type: str | None = None
+    message_continuation_open: bool = False
+    trailing_newlines: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class RenderedEvents:
     """A rendered log page and the cursor it safely covers."""
 
@@ -35,6 +44,7 @@ class RenderedEvents:
     first_event: int | None = None
     last_event: int | None = None
     truncation_note: str | None = None
+    prose_context: ProseContext | None = None
 
 
 def format_table(
@@ -127,7 +137,10 @@ def snippet(text: str, *, limit: int = 200) -> str:
     A single token longer than the limit is cut hard — snapping to a
     boundary that does not exist would return nothing.
     """
-    normalized = _single_line(text)
+    return _truncate_snippet(_single_line(text), limit)
+
+
+def _truncate_snippet(normalized: str, limit: int) -> str:
     if len(normalized) <= limit:
         return normalized
     content_limit = limit - len("...")
@@ -139,7 +152,9 @@ def snippet(text: str, *, limit: int = 200) -> str:
 
 
 def _message_snippet(text: str, *, full: bool) -> str:
-    return _single_line(text) if full else snippet(text)
+    """Keep message paragraph breaks visible as JSON escapes in the view."""
+    normalized = "\n\n".join(_single_line(part) for part in text.split("\n\n"))
+    return normalized if full else _truncate_snippet(normalized, 200)
 
 
 def _event_index(event: Mapping[str, Any], fallback: int) -> int:
@@ -276,6 +291,24 @@ def _prose_event(event: Mapping[str, Any]) -> str:
     return ""
 
 
+def _prose_separator(content: str) -> str:
+    """Return the missing newline characters for one blank line."""
+    if content.endswith("\n\n"):
+        return ""
+    if content.endswith("\n"):
+        return "\n"
+    return "\n\n"
+
+
+def _trailing_newlines(previous: int, text: str) -> int:
+    if not text:
+        return previous
+    suffix = len(text) - len(text.rstrip("\n"))
+    if suffix == len(text):
+        return min(2, previous + suffix)
+    return min(2, suffix)
+
+
 def _utf8_head(text: str, byte_limit: int) -> str:
     if byte_limit <= 0:
         return ""
@@ -316,9 +349,16 @@ def _continues_message(events: Sequence[Mapping[str, Any]], index: int) -> bool:
     if index == 0:
         return False
     current = events[index]
-    previous = events[index - 1]
     current_type = current.get("type")
-    if current_type not in {"msg", "thought"} or previous.get("type") != current_type:
+    if current_type not in {"msg", "thought"}:
+        return False
+    previous_position = index - 1
+    while previous_position >= 0 and events[previous_position].get("type") == "usage":
+        previous_position -= 1
+    if previous_position < 0:
+        return False
+    previous = events[previous_position]
+    if previous.get("type") != current_type:
         return False
     current_index = current.get("i")
     previous_index = previous.get("i")
@@ -327,7 +367,7 @@ def _continues_message(events: Sequence[Mapping[str, Any]], index: int) -> bool:
         and not isinstance(current_index, bool)
         and isinstance(previous_index, int)
         and not isinstance(previous_index, bool)
-        and current_index == previous_index + 1
+        and current_index == previous_index + index - previous_position
     )
 
 
@@ -340,6 +380,7 @@ def render_events(
     transcript_path: Path | str = "transcript.ndjson",
     cursor: int = 0,
     full_last_message: bool = False,
+    prose_context: ProseContext | None = None,
 ) -> RenderedEvents:
     """Render selected events while preserving the cursor contract.
 
@@ -370,9 +411,14 @@ def render_events(
 
     entries: list[tuple[int, str]] = []
     entry_cursor = cursor
-    prose_content = ""
+    current_prose = prose_context or ProseContext()
+    last_prose_type = current_prose.last_prose_type
+    message_continuation_open = current_prose.message_continuation_open
+    trailing_newlines = current_prose.trailing_newlines
+    previous_prose_index: int | None = None
     for index, event in enumerate(events):
         event_cursor = _event_index(event, entry_cursor)
+        event_type = event.get("type")
         rendered = (
             _prose_event(event)
             if prose
@@ -382,19 +428,38 @@ def render_events(
                 continued=_continues_message(events, index),
             )
         )
-        if (
-            prose
-            and event.get("type") == "error"
-            and prose_content
-            and not prose_content.endswith("\n")
-        ):
-            rendered = "\n" + rendered
+        if prose and rendered:
+            continues = False
+            if event_type == "msg" and last_prose_type == "msg":
+                continues = (
+                    _continues_message(events, index)
+                    if previous_prose_index is not None
+                    else message_continuation_open
+                )
+            if last_prose_type is not None and not continues:
+                rendered = _prose_separator("\n" * trailing_newlines) + rendered
         unit = rendered if prose else rendered + "\n" if rendered else ""
         entries.append((event_cursor, unit))
         entry_cursor = event_cursor
 
         if prose:
-            prose_content += unit
+            trailing_newlines = _trailing_newlines(trailing_newlines, unit)
+            if event_type == "msg" and rendered:
+                last_prose_type = "msg"
+                message_continuation_open = True
+                previous_prose_index = index
+            elif event_type == "error" and rendered:
+                last_prose_type = "error"
+                message_continuation_open = False
+                previous_prose_index = index
+            elif event_type != "usage":
+                message_continuation_open = False
+
+    rendered_prose_context = (
+        ProseContext(last_prose_type, message_continuation_open, trailing_newlines)
+        if prose
+        else None
+    )
 
     output = ""
     next_cursor = cursor
@@ -430,9 +495,18 @@ def render_events(
             first_event,
             last_event,
             note,
+            rendered_prose_context,
         )
 
-    return RenderedEvents(output, next_cursor, False, printed_events, first_event, last_event)
+    return RenderedEvents(
+        output,
+        next_cursor,
+        False,
+        printed_events,
+        first_event,
+        last_event,
+        prose_context=rendered_prose_context,
+    )
 
 
 def _render_json_events(

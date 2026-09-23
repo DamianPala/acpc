@@ -164,6 +164,7 @@ class _Turn:
     preparation_cancelable: bool = False
     preparation_done: "asyncio.Future[dict[str, Any]] | None" = None
     turn_token: int | None = None
+    client: AcpcClient | None = None
     waiters: list["asyncio.Future[dict[str, Any]]"] = field(default_factory=list)
     result: dict[str, Any] | None = None
 
@@ -834,9 +835,15 @@ class Daemon:
         instruction did not land when it did.
         """
         with contextlib.suppress(OSError, sessions.SessionError, transcript.TranscriptError):
-            transcript.Transcript(sessions.transcript_path(session_id)).append(
-                "steer", mode=vocab.STEER_IN_PLACE, text=text, outcome=outcome
-            )
+            turn = self.turns.get(session_id)
+            if turn is not None and turn.client is not None:
+                turn.client.record_external_event(
+                    "steer", mode=vocab.STEER_IN_PLACE, text=text, outcome=outcome
+                )
+            else:
+                transcript.Transcript(sessions.transcript_path(session_id)).append(
+                    "steer", mode=vocab.STEER_IN_PLACE, text=text, outcome=outcome
+                )
 
     async def _start(self, frame: dict[str, Any]) -> dict[str, Any]:
         session_id = frame.get("session_id", "")
@@ -1438,6 +1445,7 @@ class Daemon:
             cancellation_dispatched=cancel.cancellation_dispatched,
             previous_context=stored.context,
         )
+        turn.client = client
 
         turn_error: BaseException | None = None
         warm = self.host.adapter_sessions.get(session_id)
@@ -1467,7 +1475,9 @@ class Daemon:
                     if request.defer_rotation:
                         raise runner.ResumePreparationError(str(error)) from None
                     raise
-                request = runner._prepare_resumed_turn(session_id, request, events, pid=os.getpid())
+                request = runner._prepare_resumed_turn(
+                    session_id, request, events, client=client, pid=os.getpid()
+                )
             finally:
                 self.host.mux.release(adapter_session_id)
         else:
@@ -1505,7 +1515,6 @@ class Daemon:
                     request,
                     cancel,
                     client,
-                    events,
                     on_delivered=lambda: self._prompt_delivered(
                         session_id, adapter_session_id, turn
                     ),

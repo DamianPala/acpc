@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
+from acpc import cli as cli_module
 from acpc import proc, sessions, transcript, vocab
 from acpc.cli import main
 
@@ -620,6 +621,49 @@ def test_log_prose_renders_markdown_without_tool_lines(cli: CliRunner) -> None:
     assert "## Answer" in result.stdout and "tool" not in result.stdout
 
 
+def test_log_prose_separates_messages_errors_and_turns(cli: CliRunner) -> None:
+    meta = finished_session()
+    transcript_file = transcript.Transcript(sessions.transcript_path(meta.session_id))
+    events = [
+        ("state", {"from": "starting", "to": "running"}),
+        ("msg", {"text": "turn one, message one"}),
+        ("usage", {"used": 10, "size": 100}),
+        ("msg", {"text": " continued"}),
+        (
+            "tool",
+            {
+                "name": "Read",
+                "args_summary": "notes.md",
+                "status": "completed",
+                "duration_ms": 1,
+            },
+        ),
+        ("msg", {"text": "turn one, message two"}),
+        ("state", {"from": "running", "to": "succeeded"}),
+        ("state", {"from": "starting", "to": "running"}),
+        ("msg", {"text": "turn two, message one"}),
+        ("permission", {"kind": "read", "decision": "allow"}),
+        ("msg", {"text": "turn two, message two"}),
+        ("error", {"message": "agent error one"}),
+        ("error", {"message": "agent error two"}),
+        ("state", {"from": "running", "to": "failed"}),
+    ]
+    for event_type, fields in events:
+        transcript_file.append(event_type, **fields)
+
+    result = invoke(cli, "log", meta.session_id, "--since", "0", "--prose", "--quiet")
+
+    assert result.stdout.count("\n\n") == 5
+    assert "turn one, message one continued" in result.stdout
+    assert "turn one, message one\n\n continued" not in result.stdout
+    assert "turn one, message two" in result.stdout
+    assert "error agent error one\n\n" in result.stdout
+    assert "error agent error two" in result.stdout
+    assert "turn two, message one" in result.stdout
+    assert "turn two, message two" in result.stdout
+    assert result.stderr == ""
+
+
 def test_log_prose_escapes_control_bytes_and_keeps_line_breaks(cli: CliRunner) -> None:
     """SPEC.md `log`: `--prose` escapes terminal control bytes and keeps line
     breaks — O3d applied to the full-message view, not just the answer."""
@@ -1202,6 +1246,126 @@ def test_follow_prose_renders_full_messages(cli: CliRunner) -> None:
 
     assert result.exit_code == vocab.EXIT_OK
     assert long_text in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("middle_event", "first_text", "expected"),
+    [
+        pytest.param(
+            (
+                "tool",
+                {
+                    "name": "Read",
+                    "args_summary": "notes.md",
+                    "status": "completed",
+                    "duration_ms": 0,
+                },
+            ),
+            "first",
+            "first\n\nsecond",
+            id="message-after-tool",
+        ),
+        pytest.param(
+            (
+                "tool",
+                {
+                    "name": "Read",
+                    "args_summary": "notes.md",
+                    "status": "completed",
+                    "duration_ms": 0,
+                },
+            ),
+            "first\n",
+            "first\n\nsecond",
+            id="message-after-tool-single-newline",
+        ),
+        pytest.param(
+            (
+                "tool",
+                {
+                    "name": "Read",
+                    "args_summary": "notes.md",
+                    "status": "completed",
+                    "duration_ms": 0,
+                },
+            ),
+            "first\n\n",
+            "first\n\nsecond",
+            id="message-after-tool-blank-line",
+        ),
+        pytest.param(
+            ("usage", {"used": 10, "size": 100}),
+            "first",
+            "firstsecond",
+            id="usage-inside-message",
+        ),
+    ],
+)
+def test_follow_prose_carries_message_context_between_polls(
+    cli: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    middle_event: tuple[str, dict[str, object]],
+    first_text: str,
+    expected: str,
+) -> None:
+    """Follow keeps message separators across polls but joins usage fragments."""
+    meta = running_session("prose state crosses polls")
+    transcript_file = transcript.Transcript(sessions.transcript_path(meta.session_id))
+    transcript_file.append("msg", text=first_text)
+    entered = [threading.Event(), threading.Event()]
+    released = [threading.Event(), threading.Event()]
+    counter = 0
+    counter_lock = threading.Lock()
+
+    def gate_poll(_deadline: float | None) -> None:
+        nonlocal counter
+        with counter_lock:
+            current = counter
+            counter += 1
+        assert current < len(entered)
+        entered[current].set()
+        assert released[current].wait(timeout=5)
+
+    monkeypatch.setattr(cli_module, "_sleep_until", gate_poll)
+    results = []
+
+    def follow() -> None:
+        results.append(
+            invoke(
+                cli,
+                "log",
+                meta.session_id,
+                "--since",
+                "0",
+                "--follow",
+                "--prose",
+                "--quiet",
+                "--timeout",
+                "5",
+            )
+        )
+
+    reader = threading.Thread(target=follow)
+    reader.start()
+    try:
+        assert entered[0].wait(timeout=2)
+        event_type, fields = middle_event
+        transcript_file.append(event_type, **fields)
+        released[0].set()
+
+        assert entered[1].wait(timeout=2)
+        transcript_file.append("msg", text="second")
+        sessions.transition(meta.session_id, "succeeded", exit_code=0, stop_reason="end_turn")
+        released[1].set()
+    finally:
+        for gate in released:
+            gate.set()
+        reader.join(timeout=5)
+
+    assert not reader.is_alive()
+    assert len(results) == 1
+    assert results[0].exit_code == vocab.EXIT_OK
+    assert results[0].stdout == expected
 
 
 def test_follow_and_wait_new_are_mutually_exclusive(cli: CliRunner) -> None:

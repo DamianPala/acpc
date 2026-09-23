@@ -3542,7 +3542,10 @@ def list_command(
 @click.option(
     "--prose",
     is_flag=True,
-    help="Render full agent messages; mutually exclusive with --json and --format ndjson.",
+    help=(
+        "Render full agent messages with one blank line between messages, error records and "
+        "turns; mutually exclusive with --json and --format ndjson."
+    ),
 )
 @_json_option("Emit raw transcript events as NDJSON; mutually exclusive with --prose.")
 @click.option(
@@ -3860,7 +3863,8 @@ def _emit_follow_page(
     used: int,
     transcript_path: Path,
     cursor: int,
-) -> tuple[int, int, bool, int | None, int | None, str | None]:
+    prose_context: render.ProseContext | None,
+) -> tuple[int, int, bool, int | None, int | None, str | None, render.ProseContext | None]:
     """Render one page inside the follow budget.
 
     SPEC `log --follow`: `--max-output` budgets the whole stream, so each page
@@ -3875,6 +3879,7 @@ def _emit_follow_page(
         max_output=budget,
         transcript_path=transcript_path,
         cursor=cursor,
+        prose_context=prose_context,
     )
     _write_stdout(rendered.text)
     return (
@@ -3884,6 +3889,7 @@ def _emit_follow_page(
         rendered.first_event,
         rendered.last_event,
         rendered.truncation_note,
+        rendered.prose_context,
     )
 
 
@@ -3939,6 +3945,7 @@ def _follow_log(
     page_start: int | None = None
     page_end: int | None = None
     truncation_note: str | None = None
+    prose_context: render.ProseContext | None = None
 
     while True:
         page = _read_transcript_page(transcript_file, since=cursor)
@@ -3955,6 +3962,7 @@ def _follow_log(
                 rendered_start,
                 rendered_end,
                 page_note,
+                prose_context,
             ) = _emit_follow_page(
                 page.events,
                 prose=prose,
@@ -3963,6 +3971,7 @@ def _follow_log(
                 used=used,
                 transcript_path=transcript_path,
                 cursor=cursor,
+                prose_context=prose_context,
             )
             if rendered_start is not None:
                 read_count += len(page.events)

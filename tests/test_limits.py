@@ -337,6 +337,39 @@ def test_resend_after_progress_uses_the_continuation_instruction(
     # Pinned literally, not just against the function under test (slice 23 review debt).
     assert "interrupted by a usage limit" in document["answer"]
     assert runner.continuation_instruction("rate_limit") in document["answer"]
+    prose = invoke(cli, "log", document["session_id"], "--since", "0", "--prose", "--quiet")
+    assert prose.exit_code == vocab.EXIT_OK, prose.stderr
+    assert prose.stdout == document["answer"]
+    assert "working on it\n\nWorking through:" in prose.stdout
+    assert "working on it\n\n\nWorking through:" not in prose.stdout
+
+
+def test_limit_wait_boundary_matches_answer_and_prose(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ACPC_MOCK_LIMIT_PROMPTS", "1")
+    monkeypatch.setenv("ACPC_MOCK_LIMIT_AFTER_TEXT", "1")
+    monkeypatch.setenv("ACPC_MOCK_LIMIT_META", "1")
+    monkeypatch.setenv("ACPC_MOCK_LIMIT_RESET_S", "1")
+    monkeypatch.setenv("ACPC_MOCK_LIMIT_SIMPLE_RESUME", "1")
+
+    result = invoke(cli, "run", "mock", "echo:tail", "--json", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    answer = json.loads(result.stdout)["answer"]
+    assert answer == "working on it\n\nresumed"
+    prose = invoke(
+        cli,
+        "log",
+        json.loads(result.stdout)["session_id"],
+        "--since",
+        "0",
+        "--prose",
+        "--quiet",
+    )
+    assert prose.exit_code == vocab.EXIT_OK, prose.stderr
+    assert prose.stdout == answer
+    assert prose.stdout.count("\n\n") == 1
 
 
 # --- behavior: 4/5/6. limit_wait_max = "0s", unknown time, and the wait cap

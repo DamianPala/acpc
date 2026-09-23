@@ -891,13 +891,15 @@ def test_early_line_segments_match_the_summary_and_stdout_matches_answer_file(
     assert result.stdout == sessions.answer_path(session_id).read_text(encoding="utf-8")
 
 
-def test_stdout_bytes_match_answer_file_after_a_detectable_message_boundary(
+def test_stdout_bytes_match_answer_file_without_a_usage_boundary(
     cli: CliRunner, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     force_human_presentation(monkeypatch)
     result = invoke(cli, "run", "mock", "separator contract probe")
 
-    assert "\n\n## Answer" in result.stdout
+    assert "Working through:" in result.stdout
+    assert "## Answer" in result.stdout
+    assert "\n\n## Answer" not in result.stdout
     metadata_lines = [line for line in result.stderr.splitlines() if line.startswith("-- ")]
     early_line = next(line for line in metadata_lines if line.startswith("-- session "))
     session_id = early_line.split()[2]

@@ -715,9 +715,14 @@ def test_steer_in_place_blocking_prints_the_observed_turns_answer(
     document = json.loads(result.stdout)
     assert document["status"] == "succeeded"
     assert "steered: X" in document["answer"]
+    assert document["answer"].startswith("started\n\nsteered: X")
+    assert document["answer"].count("\n\n") == 1
     assert document["turn"] == 1
     assert document["correction_result"]["target_status"] == "succeeded"
     assert document["correction_result"]["message_state"] == "accepted"
+    prose = invoke(cli, "log", session_id, "--since", "0", "--prose", "--quiet")
+    assert prose.exit_code == vocab.EXIT_OK, prose.stderr
+    assert prose.stdout == document["answer"]
 
 
 def test_two_in_place_corrections_arrive_in_the_order_they_were_sent(

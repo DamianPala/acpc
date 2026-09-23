@@ -28,6 +28,7 @@ Exact-prefix triggers (donor design, for precise timing control in tests):
 - ``large:N``        answer with N kilobytes of ASCII
 - ``multi:TEXT``     history-aware echo, supports session/load
 - ``burst:a|b|c``    several message chunks back to back
+- ``burst-commands:a|b`` send ``available_commands_update`` between message chunks
 - ``tool:TITLE``     one completed read-kind tool call
 - ``tool-edit:TITLE``one completed edit-kind tool call
 - ``write-file:NAME``request edit permission, then write NAME in the cwd
@@ -521,9 +522,10 @@ class MockAgent(Agent):
             config_options=self._config_options(session_id),
         )
 
-    async def _send_commands_update(self, session_id: str) -> None:
+    async def _send_commands_update(self, session_id: str, *, delayed: bool = True) -> None:
         """Advertise commands just after session/new returns to the client."""
-        await asyncio.sleep(COMMAND_UPDATE_DELAY_SECONDS)
+        if delayed:
+            await asyncio.sleep(COMMAND_UPDATE_DELAY_SECONDS)
         commands = [
             AvailableCommand(name="init", description="Create an AGENTS.md file for this repo"),
             AvailableCommand(name="review", description="Review current changes and find issues"),
@@ -685,6 +687,11 @@ class MockAgent(Agent):
         cancel_event: asyncio.Event,
     ) -> PromptResponse:
         await self._maybe_hit_limit(session_id)
+        if os.environ.get("ACPC_MOCK_LIMIT_SIMPLE_RESUME") == "1" and prompt_text.startswith(
+            "acpc: the previous request in this turn was interrupted by a usage limit"
+        ):
+            await self._send_text(session_id, "resumed")
+            return PromptResponse(stop_reason="end_turn")
         prefix_response = await self._prefix_trigger(session_id, prompt_text, cancel_event)
         if prefix_response is not None:
             return prefix_response
@@ -784,6 +791,15 @@ class MockAgent(Agent):
             text = prompt_text.split(":", 1)[1]
             turn_count = len(self._sessions.get(session_id, []))
             await self._send_text(session_id, f"turn {turn_count}: {text}")
+            return PromptResponse(stop_reason="end_turn")
+
+        if prompt_text.startswith("burst-commands:"):
+            chunks = prompt_text.split(":", 1)[1].split("|")
+            for index, chunk in enumerate(chunks):
+                await self._send_text(session_id, chunk)
+                if index == 0:
+                    await self._send_commands_update(session_id, delayed=False)
+                await asyncio.sleep(0)
             return PromptResponse(stop_reason="end_turn")
 
         if prompt_text.startswith("burst:"):
