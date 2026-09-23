@@ -692,6 +692,12 @@ class MockAgent(Agent):
         ):
             await self._send_text(session_id, "resumed")
             return PromptResponse(stop_reason="end_turn")
+        if prompt_text == "cwd-info":
+            await self._send_text(
+                session_id,
+                f"process_cwd={os.getcwd()}\nsession_cwd={self._session_cwds[session_id]}",
+            )
+            return PromptResponse(stop_reason="end_turn")
         prefix_response = await self._prefix_trigger(session_id, prompt_text, cancel_event)
         if prefix_response is not None:
             return prefix_response

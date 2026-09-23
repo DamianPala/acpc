@@ -402,6 +402,43 @@ def test_steer_interrupts_a_real_running_turn(cli: CliRunner, live_daemon: None)
     assert sessions.prompt_path(session_id).read_text(encoding="utf-8").startswith(STEER_PREAMBLE)
 
 
+def test_cancel_then_start_steer_refuses_a_removed_session_cwd(
+    cli: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_id = mid_turn_session(cli)
+    session_cwd = tmp_path / "removed-steer-cwd"
+    session_cwd.mkdir()
+    meta = sessions.read_meta(session_id)
+    meta.resolution["cwd"] = str(session_cwd)
+    sessions.write_meta(meta)
+    session_cwd.rmdir()
+
+    def unexpected_cancel(_meta: sessions.SessionMeta) -> Any:
+        pytest.fail("cancel-then-start must check the stored cwd before canceling")
+
+    monkeypatch.setattr(cli_module, "_cancel_session", unexpected_cancel)
+
+    result = invoke(
+        cli,
+        "steer",
+        session_id,
+        "diagnose only",
+        "--steer-mode",
+        "cancel-then-start",
+        "--json",
+    )
+
+    error = steer_error(result)
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    assert error["kind"] == "conflict"
+    assert error["context"] == {"session_id": session_id, "cwd": str(session_cwd)}
+    assert error["hint"] == (
+        "The session's working directory was removed; recreate it, or start a new session "
+        "with run --cwd."
+    )
+    assert sessions.read_meta(session_id).state == "running"
+
+
 def test_steer_cancel_then_start_times_out_while_the_turn_still_runs(
     cli: CliRunner, live_daemon: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -1972,6 +1972,59 @@ def test_a_cwd_mismatch_fails_before_rotation_or_prompt_dispatch(
     assert "must not run" not in (state_root / "mock-sessions.json").read_text(encoding="utf-8")
 
 
+def test_continue_refuses_a_removed_session_cwd_before_rotation_or_dispatch(
+    cli: CliRunner, state_root: Path, tmp_path: Path
+) -> None:
+    session_cwd = tmp_path / "removed-session-cwd"
+    session_cwd.mkdir()
+    session_id = start_session(cli, "the recorded context", "--cwd", str(session_cwd))
+    before = {
+        path: path.read_bytes()
+        for path in (
+            sessions.meta_path(session_id),
+            sessions.prompt_path(session_id),
+            sessions.answer_path(session_id),
+            sessions.transcript_path(session_id),
+        )
+    }
+    mock_store = state_root / "mock-sessions.json"
+    before_store = mock_store.read_bytes()
+    session_cwd.rmdir()
+
+    result = invoke(cli, "continue", session_id, "must not run", "--json")
+
+    error = json.loads(result.stderr)["error"]
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    assert error["kind"] == "conflict"
+    assert str(session_cwd) in error["message"]
+    assert error["context"] == {"session_id": session_id, "cwd": str(session_cwd)}
+    assert error["hint"] == (
+        "The session's working directory was removed; recreate it, or start a new session "
+        "with run --cwd."
+    )
+    for path, content in before.items():
+        assert path.read_bytes() == content
+    assert mock_store.read_bytes() == before_store
+    assert not (state_root / "daemon").exists()
+
+
+def test_continue_naming_the_removed_session_cwd_gets_the_conflict_not_a_usage_error(
+    cli: CliRunner, tmp_path: Path
+) -> None:
+    session_cwd = tmp_path / "removed-named-cwd"
+    session_cwd.mkdir()
+    session_id = start_session(cli, "the recorded context", "--cwd", str(session_cwd))
+    session_cwd.rmdir()
+
+    result = invoke(
+        cli, "continue", session_id, "must not run", "--cwd", str(session_cwd), "--json"
+    )
+
+    error = json.loads(result.stderr)["error"]
+    assert error["kind"] == "conflict"
+    assert error["context"] == {"session_id": session_id, "cwd": str(session_cwd)}
+
+
 def test_a_replay_prompt_mismatch_fails_before_the_new_prompt(
     cli: CliRunner, state_root: Path
 ) -> None:

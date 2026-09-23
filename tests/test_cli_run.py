@@ -1070,6 +1070,117 @@ def test_the_stored_resolution_carries_the_default_cwd(
     assert meta["resolution"]["cwd"] == str(caller_dir.resolve())
 
 
+@pytest.mark.parametrize("command", ["run", "resolve", "continue"])
+@pytest.mark.parametrize("path_kind", ["missing", "file"])
+def test_a_non_directory_cwd_is_invalid_before_session_or_daemon_creation(
+    cli: CliRunner,
+    state_root: Path,
+    tmp_path: Path,
+    command: str,
+    path_kind: str,
+) -> None:
+    cwd = tmp_path / f"cwd-{path_kind}"
+    if path_kind == "file":
+        cwd.write_text("not a directory", encoding="utf-8")
+    session_id = None
+    if command == "continue":
+        started = invoke(cli, "run", "mock", "existing session", "--quiet", "--json")
+        assert started.exit_code == vocab.EXIT_OK, started.stderr
+        session_id = json.loads(started.stdout)["session_id"]
+    sessions_dir = state_root / "sessions"
+    before_sessions = (
+        {path.name for path in sessions_dir.iterdir()} if sessions_dir.exists() else set()
+    )
+    if command == "run":
+        args = ["run", "mock", "new session"]
+    elif command == "resolve":
+        args = ["resolve", "mock"]
+    else:
+        assert session_id is not None
+        args = ["continue", session_id, "follow up"]
+
+    result = invoke(cli, *args, "--cwd", str(cwd), "--json")
+
+    error = error_envelope(result)
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert error["kind"] == "invalid_input"
+    assert str(cwd.resolve()) in error["message"]
+    assert error["hint"] == "Run acpc from an existing directory or pass --cwd."
+    after_sessions = (
+        {path.name for path in sessions_dir.iterdir()} if sessions_dir.exists() else set()
+    )
+    assert after_sessions == before_sessions
+    assert not (state_root / "daemon").exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permits removing the current directory")
+def test_run_from_a_removed_caller_directory_is_invalid_input(
+    cli: CliRunner, state_root: Path, tmp_path: Path
+) -> None:
+    original_cwd = Path.cwd()
+    removed_cwd = tmp_path / "removed-caller"
+    removed_cwd.mkdir()
+    os.chdir(removed_cwd)
+    removed_cwd.rmdir()
+    try:
+        result = invoke(cli, "run", "mock", "no cwd", "--json")
+    finally:
+        os.chdir(original_cwd)
+
+    error = error_envelope(result)
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert error["kind"] == "invalid_input"
+    assert error["hint"] == "Run acpc from an existing directory or pass --cwd."
+    assert "Traceback" not in result.stderr
+    assert not (state_root / "sessions").exists()
+    assert not (state_root / "daemon").exists()
+
+
+def test_a_warm_daemon_survives_removal_of_its_start_directory(
+    cli: CliRunner, state_root: Path, tmp_path: Path, live_daemon: None
+) -> None:
+    original_cwd = Path.cwd()
+    start_cwd = tmp_path / "daemon-start-cwd"
+    session_cwd = tmp_path / "second-session-cwd"
+    start_cwd.mkdir()
+    session_cwd.mkdir()
+
+    def daemon_pid() -> int:
+        result = invoke(cli, "daemon", "status", "mock", "--json")
+        assert result.exit_code == vocab.EXIT_OK, result.stderr
+        return json.loads(result.stdout)["items"][0]["pid"]
+
+    try:
+        os.chdir(start_cwd)
+        first = invoke(cli, "run", "mock", "start daemon", "--quiet", "--json")
+        assert first.exit_code == vocab.EXIT_OK, first.stderr
+        pid_before = daemon_pid()
+        proc_cwd = Path(f"/proc/{pid_before}/cwd")
+        if proc_cwd.is_symlink():
+            assert Path(os.readlink(proc_cwd)) == state_root / "daemon"
+
+        os.chdir(tmp_path)
+        start_cwd.rmdir()
+        second = invoke(
+            cli,
+            "run",
+            "mock",
+            "cwd-info",
+            "--cwd",
+            str(session_cwd),
+            "--quiet",
+            "--json",
+        )
+    finally:
+        os.chdir(original_cwd)
+
+    assert second.exit_code == vocab.EXIT_OK, second.stderr
+    result = json.loads(second.stdout)
+    assert f"process_cwd={state_root / 'daemon'}" in result["answer"]
+    assert f"session_cwd={session_cwd.resolve()}" in result["answer"]
+    assert daemon_pid() == pid_before
+
+
 def test_output_file_receives_the_answer(cli: CliRunner, tmp_path: Path) -> None:
     target = tmp_path / "answer.md"
 

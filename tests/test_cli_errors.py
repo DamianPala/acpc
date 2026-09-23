@@ -439,7 +439,9 @@ def test_ctrl_c_on_log_follow_exits_130_and_leaves_the_session_alone() -> None:
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal semantics")
-def test_ctrl_c_on_a_turn_cancels_it_and_names_the_session(cli: CliRunner) -> None:
+def test_ctrl_c_on_a_turn_cancels_it_and_names_the_session(
+    cli: CliRunner, live_daemon: None
+) -> None:
     """The turn's own process owns the turn, so it still cancels — and says so."""
     turn = run_cli("run", "mock", "slow:10 hold the turn open", "--quiet")
     try:

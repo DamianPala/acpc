@@ -841,6 +841,8 @@ def _prepare_resumed_turn(
         cwd = rotated.resolution.get("cwd")
         if cwd is not None and not isinstance(cwd, str):
             raise RunnerError(f"session {session_id} has an invalid stored working directory")
+        if cwd is None:
+            cwd = request.cwd
     except RunnerError as error:
         _finalize_claimed_setup_failure(session_id, rotated.turns, error)
         raise ResumeRotationError(str(error), turn_token=rotated.turns) from None
@@ -1276,6 +1278,12 @@ def daemon_payload(request: TurnRequest) -> dict[str, Any]:
     crossed a socket.
     """
     resolution = request.resolution
+    try:
+        cwd = str(Path(request.cwd).expanduser().resolve()) if request.cwd else os.getcwd()
+    except OSError as error:
+        raise RunnerError(
+            f"cannot resolve the daemon dispatch working directory: {error}"
+        ) from None
     return {
         "entry": resolution.entry.entry,
         "model": resolution.model,
@@ -1286,7 +1294,7 @@ def daemon_payload(request: TurnRequest) -> dict[str, Any]:
         "modes": mode_catalog_payload(resolution.entry.modes),
         "permissions": resolution.permissions,
         "home": resolution.home,
-        "cwd": request.cwd,
+        "cwd": cwd,
         "cancel_after": request.cancel_after,
         "prompt": request.prompt,
         "resume_adapter_session": request.resume_adapter_session,

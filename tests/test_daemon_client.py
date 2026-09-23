@@ -57,6 +57,21 @@ def test_a_cold_target_gets_a_daemon_started_for_it(live_daemon: None) -> None:
     assert status["pid"] > 0
 
 
+def test_a_relative_state_root_reaches_the_daemon_resolved(
+    state_root: Path, monkeypatch: pytest.MonkeyPatch, live_daemon: None
+) -> None:
+    monkeypatch.chdir(state_root.parent)
+    monkeypatch.setenv("ACPC_HOME", state_root.name)
+
+    async def scenario() -> bool:
+        routed = await daemon_client.ensure_daemon(target_name())
+        if not isinstance(routed, daemon_client.DaemonUnavailable):
+            await routed.close()
+        return not isinstance(routed, daemon_client.DaemonUnavailable)
+
+    assert asyncio.run(scenario())
+
+
 def test_a_second_caller_reuses_the_running_daemon(live_daemon: None) -> None:
     async def scenario() -> tuple[int, int]:
         pids = []

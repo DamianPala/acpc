@@ -4124,6 +4124,28 @@ def _resolve_caller_path(value: str) -> str:
     return str(Path(value).expanduser().resolve())
 
 
+_CWD_HINT = "Run acpc from an existing directory or pass --cwd."
+
+
+def _resolve_existing_cwd(value: str | None) -> str:
+    """Resolve a requested working directory and reject paths that cannot host a turn."""
+    try:
+        resolved = _resolve_caller_path(value) if value is not None else os.getcwd()
+    except OSError:
+        subject = value if value is not None else "the caller's working directory"
+        raise UsageProblem(
+            f"working directory {subject} cannot be resolved because the caller's directory "
+            "does not exist",
+            hint=_CWD_HINT,
+        ) from None
+    if not Path(resolved).is_dir():
+        raise UsageProblem(
+            f"working directory {resolved} does not exist or is not a directory",
+            hint=_CWD_HINT,
+        )
+    return resolved
+
+
 def _run_preview(
     resolution: CallResolution,
     *,
@@ -4182,6 +4204,7 @@ def resolve_command(
     """
     selected_format = _select_format(format_name, json_mode, native_text=True)
     permissions = _normalize_permission(permissions)
+    resolved_cwd = _resolve_existing_cwd(cwd)
     resolution = _resolve_run_call(
         agent,
         model=model,
@@ -4190,7 +4213,6 @@ def resolve_command(
         permissions=permissions,
         home=home,
     )
-    resolved_cwd = _resolve_caller_path(cwd) if cwd else os.getcwd()
     _run_preview(
         resolution,
         permissions=permissions,
@@ -4394,6 +4416,7 @@ def run_command(
     if background and timeout is not None:
         raise UsageProblem("--timeout only bounds waiting; use --cancel-after with --background")
     permissions = _normalize_permission(permissions)
+    resolved_cwd = _resolve_existing_cwd(cwd)
     resolution = _resolve_run_call(
         agent,
         model=model,
@@ -4403,7 +4426,6 @@ def run_command(
         home=home,
     )
     defaulted_permissions = permissions is None and resolution.permissions is None
-    resolved_cwd = _resolve_caller_path(cwd) if cwd else os.getcwd()
     prompt = _read_prompt(
         prompt_text,
         prompt_file,
@@ -4630,6 +4652,23 @@ def _continue_conflict_hint(meta: sessions.SessionMeta) -> str:
     )
 
 
+def _reject_removed_session_cwd(meta: sessions.SessionMeta) -> None:
+    """Refuse a new turn when the session's recorded directory is unavailable."""
+    cwd = meta.resolution.get("cwd")
+    if not isinstance(cwd, str) or Path(cwd).expanduser().is_dir():
+        return
+    raise AcpcError(
+        f"session {meta.session_id} working directory {cwd} no longer exists or is not a directory",
+        kind=errors.CONFLICT,
+        retryable=False,
+        hint=(
+            "The session's working directory was removed; recreate it, or start a new session "
+            "with run --cwd."
+        ),
+        context={"session_id": meta.session_id, "cwd": cwd},
+    )
+
+
 def _continuation_prompt(meta: sessions.SessionMeta) -> str:
     """SPEC `continue`: what a call with no message at all resumes.
 
@@ -4797,15 +4836,16 @@ def continue_command(
     if background and timeout is not None:
         raise UsageProblem("--timeout only bounds waiting; use --cancel-after with --background")
     permissions = _normalize_permission(permissions)
-
     has_message = prompt_text is not None or prompt_file is not None
     meta = _load_view_session(selector)
+    _reject_removed_session_cwd(meta)
+    resolved_cwd = _resolve_existing_cwd(cwd) if cwd is not None else None
     _validate_continue_flags(
         meta,
         model=model,
         effort=effort,
         mode=mode,
-        cwd=cwd,
+        cwd=resolved_cwd,
         home=home,
         name=name,
     )
@@ -4996,6 +5036,8 @@ def _follow_up_request(
         OSError,
     ) as error:
         raise _follow_up_problem(error, session_id) from None
+    if request.cwd is None:
+        request = replace(request, cwd=_resolve_existing_cwd(None))
     return current, request
 
 
@@ -5381,6 +5423,7 @@ def _steer_cancel_then_start(
     cancellation step is reported the same way as a failure after it: with
     `session_id`, `capabilities` and `correction_result` in `context`.
     """
+    _reject_removed_session_cwd(meta)
     target_turn = meta.turns
     capabilities = output.session_capabilities(meta)
     session_id = meta.session_id

@@ -364,12 +364,14 @@ class AdapterHost:
         command, args = runner.adapter_command(resolution)
         stack = contextlib.AsyncExitStack()
         try:
+            paths.ensure_private_dir(paths.daemon_dir())
             conn, process = await stack.enter_async_context(
                 spawn_adapter(
                     self.mux,
                     command,
                     *args,
                     env=resolution.adapter_environment,
+                    cwd=str(paths.daemon_dir()),
                     drain_stderr=True,
                 )
             )
@@ -1174,6 +1176,12 @@ class Daemon:
         Provenance is deliberately left as the lookup produced it: nothing on
         this path reads it, `session_resolution` runs client-side at dispatch.
         """
+        cwd = payload.get("cwd")
+        if not isinstance(cwd, str) or not cwd:
+            raise DaemonError("daemon dispatch is missing a working directory")
+        if not Path(cwd).is_absolute():
+            raise DaemonError("daemon dispatch working directory must be absolute")
+
         mode = payload.get("mode")
         grants = payload.get("grants")
         delegates = payload.get("delegates")
@@ -1239,7 +1247,7 @@ class Daemon:
         return runner.TurnRequest(
             resolution=resolution,
             prompt=payload.get("prompt", ""),
-            cwd=payload.get("cwd"),
+            cwd=cwd,
             cancel_after=payload.get("cancel_after"),
             resume_adapter_session=payload.get("resume_adapter_session"),
             defer_rotation=bool(payload.get("defer_rotation", False)),
@@ -1247,6 +1255,13 @@ class Daemon:
             resume_prepared=bool(payload.get("resume_prepared", False)),
             turn_token=payload.get("turn_token"),
         )
+
+    @staticmethod
+    def _request_cwd(request: runner.TurnRequest) -> str:
+        """Return the client-resolved directory, refusing malformed requests."""
+        if not isinstance(request.cwd, str) or not request.cwd:
+            raise DaemonError("daemon dispatch is missing a working directory")
+        return request.cwd
 
     async def _prepare_turn(
         self, session_id: str, request: runner.TurnRequest, turn: _Turn | None = None
@@ -1280,7 +1295,7 @@ class Daemon:
                         client,
                         self.host.agent_capabilities,
                         adapter_session_id,
-                        request.cwd or os.getcwd(),
+                        self._request_cwd(request),
                         session_id,
                         abandon_event=abandon_event,
                     ),
@@ -1466,7 +1481,7 @@ class Daemon:
                         client,
                         self.host.agent_capabilities,
                         adapter_session_id,
-                        request.cwd or os.getcwd(),
+                        self._request_cwd(request),
                         session_id,
                     )
                 except runner.ResumePreparationError:
@@ -1481,7 +1496,7 @@ class Daemon:
             finally:
                 self.host.mux.release(adapter_session_id)
         else:
-            session = await conn.new_session(cwd=request.cwd or os.getcwd(), mcp_servers=[])
+            session = await conn.new_session(cwd=self._request_cwd(request), mcp_servers=[])
             adapter_session_id = session.session_id
             client.capture_advertised(session)
             # SPEC.md *State on disk*: recorded as soon as the adapter has

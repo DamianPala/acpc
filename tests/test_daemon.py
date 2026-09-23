@@ -1004,7 +1004,11 @@ def test_daemon_carries_incomplete_delivery_into_a_cold_resume(
         try:
             first = await instance._run_turn(
                 session_id,
-                runner.TurnRequest(resolution=resolution, prompt="daemon marker outage"),
+                runner.TurnRequest(
+                    resolution=resolution,
+                    prompt="daemon marker outage",
+                    cwd=str(Path.cwd()),
+                ),
                 daemon._Turn(session_id=session_id, task=None, cancel=runner._CancelSignal()),
             )
             first_meta = sessions.read_meta(session_id)
@@ -1019,7 +1023,8 @@ def test_daemon_carries_incomplete_delivery_into_a_cold_resume(
                 {"session_id": session_id, "payload": runner.daemon_payload(request)}
             )
             assert accepted["ok"] is True
-            await instance._await_preparation({"session_id": session_id})
+            preparation = await instance._await_preparation({"session_id": session_id})
+            assert preparation["ok"] is True, preparation
             resume_status = sessions.read_meta(session_id).extra["resume"]
             second = await instance._await({"session_id": session_id})
             return first, resume_status, second["outcome"]
@@ -1061,7 +1066,9 @@ def test_daemon_keeps_a_pre_send_failure_record_complete_on_cold_resume(
         try:
             return await instance._run_turn(
                 session_id,
-                runner.TurnRequest(resolution=resolution, prompt="daemon before-wire"),
+                runner.TurnRequest(
+                    resolution=resolution, prompt="daemon before-wire", cwd=str(Path.cwd())
+                ),
                 daemon._Turn(session_id=session_id, task=None, cancel=runner._CancelSignal()),
             )
         finally:
@@ -1085,7 +1092,8 @@ def test_daemon_keeps_a_pre_send_failure_record_complete_on_cold_resume(
                 {"session_id": session_id, "payload": runner.daemon_payload(request)}
             )
             assert accepted["ok"] is True
-            await instance._await_preparation({"session_id": session_id})
+            preparation = await instance._await_preparation({"session_id": session_id})
+            assert preparation["ok"] is True, preparation
             resume_status = sessions.read_meta(session_id).extra["resume"]
             outcome = await instance._await({"session_id": session_id})
             assert outcome["outcome"]["state"] == "succeeded"
@@ -1201,6 +1209,14 @@ def test_await_with_no_turn_argument_behaves_as_before(state_root: Path) -> None
     assert reply["ok"] is True
     assert "stale" not in reply
     assert reply["outcome"]["state"] == "succeeded"
+
+
+def test_a_dispatch_without_a_working_directory_is_rejected(state_root: Path) -> None:
+    payload = dispatch_payload()
+    payload.pop("cwd")
+
+    with pytest.raises(daemon.DaemonError, match="working directory"):
+        daemon.Daemon(target())._rebuild_request(payload)
 
 
 def test_one_daemon_serves_several_sessions(state_root: Path, live_daemon: None) -> None:

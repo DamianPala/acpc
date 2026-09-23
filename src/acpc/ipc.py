@@ -99,7 +99,9 @@ def short_target_hash(value: str) -> str:
 def socket_path_for_target(target: str) -> Path:
     """Return the daemon socket path for a target within the daemon dir."""
     _validate_target(target)
-    directory = daemon_dir()
+    # Absolute, so a caller with a relative ACPC_HOME and the daemon it started
+    # (which runs in the daemon dir) derive the same, possibly hashed, name.
+    directory = daemon_dir().absolute()
     regular_path = directory / f"{target}.sock"
     if _socket_path_length(regular_path) < _SOCKET_PATH_LIMIT:
         return regular_path

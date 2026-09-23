@@ -267,12 +267,16 @@ def _spawn_daemon(target: str) -> str | None:
         extra: dict[str, Any] = {}
         if sys.platform != "win32":
             extra["start_new_session"] = True
+        # The daemon runs in its own state directory, so a relative ACPC_HOME
+        # must reach it resolved against the caller, not against that directory.
+        home = paths.acpc_home().absolute()
         subprocess.Popen(
             [sys.executable, "-m", "acpc.daemon", target],
             stdin=subprocess.DEVNULL,
             stdout=handle,
             stderr=handle,
-            env=dict(os.environ),
+            env={**os.environ, "ACPC_HOME": str(home)},
+            cwd=str(paths.daemon_dir().absolute()),
             **extra,
         )
     except OSError as error:
