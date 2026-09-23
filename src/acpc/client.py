@@ -41,6 +41,7 @@ from acp.schema import (
     WriteTextFileResponse,
 )
 
+from acpc import sessions
 from acpc.permissions import (
     CLIENT_METHOD_CATEGORIES,
     ModeSelectionError,
@@ -71,6 +72,7 @@ CLIENT_PERMISSION_ERROR_CODE = 400
 _CHUNK_GAP_SECONDS = 1.0
 _CHUNK_MAX_AGE_SECONDS = 2.0
 _CHUNK_MAX_CHARS = 4096
+_CONTEXT_REFRESH_INTERVAL_SECONDS = 2.0
 # A broken cancellation watcher must not hold an ACP permission response forever.
 _CANCELLATION_DISPATCH_TIMEOUT = 1.0
 
@@ -546,6 +548,7 @@ class AcpcClient:
         resolved_model: str | None = None,
         prompt: str = "",
         turn_number: int = 1,
+        session_id: str | None = None,
     ) -> None:
         self.transcript = transcript
         self.permission_level = permission_level
@@ -566,6 +569,9 @@ class AcpcClient:
         self._billing = billing
         self._resolved_model = resolved_model
         self._prompt = prompt
+        self._session_id = session_id
+        self._last_context_refresh_at: float | None = None
+        self._context_refresh_pending = False
         # Public: a deferred rotation opens the turn after this client exists.
         self.turn_number = turn_number
         self._turn_used: list[int] = []
@@ -1250,10 +1256,12 @@ class AcpcClient:
         self._usage_update_seen = True
         self._turn_used.append(update.used)
         self._turn_sizes.append(update.size)
-        previous_peak = self._context["peak"] if self._context is not None else 0
-        self._context = ContextOccupancy(
+        previous_context = self._context
+        previous_peak = previous_context["peak"] if previous_context is not None else 0
+        context = ContextOccupancy(
             used=update.used, size=update.size, peak=max(previous_peak, update.used)
         )
+        self._context = context
         event_fields: dict[str, Any] = {"used": update.used, "size": update.size}
         if update.cost is not None:
             event_fields["cost"] = update.cost.amount
@@ -1268,6 +1276,29 @@ class AcpcClient:
         rate_limit_info = meta.get("_claude/rateLimit")
         if isinstance(rate_limit_info, Mapping):
             self._rate_limit_info = dict(rate_limit_info)
+        # Last: a failed best-effort meta refresh must not skip the capture above.
+        self._refresh_context_if_due(previous_context, context)
+
+    def _refresh_context_if_due(
+        self,
+        previous: ContextOccupancy | None,
+        current: ContextOccupancy,
+    ) -> None:
+        if self._session_id is None:
+            return
+        if current != previous:
+            self._context_refresh_pending = True
+        if not self._context_refresh_pending:
+            return
+        now = self._clock()
+        if (
+            self._last_context_refresh_at is not None
+            and now - self._last_context_refresh_at < _CONTEXT_REFRESH_INTERVAL_SECONDS
+        ):
+            return
+        if sessions.refresh_context_if_active(self._session_id, self.turn_number, current):
+            self._last_context_refresh_at = now
+            self._context_refresh_pending = False
 
     async def _ask_permission(self, kind: str, title: str) -> bool:
         if self.permission_prompt is None:

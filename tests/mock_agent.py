@@ -24,7 +24,7 @@ Exact-prefix triggers (donor design, for precise timing control in tests):
 - ``error``          stop_reason=refusal immediately
 - ``slow:N``         wait N seconds (cancellable), then answer
 - ``chunkslow:N``    emit "started", wait N seconds (cancellable), "finished"
-- ``chunkhold:PATH`` emit "holding", hold the turn until PATH exists
+- ``chunkhold:PATH`` emit two spaced usage updates, hold until PATH exists
 - ``large:N``        answer with N kilobytes of ASCII
 - ``multi:TEXT``     history-aware echo, supports session/load
 - ``burst:a|b|c``    several message chunks back to back
@@ -908,13 +908,19 @@ class MockAgent(Agent):
         if prompt_text.startswith("chunkhold:"):
             release_path = Path(prompt_text.split(":", 1)[1])
             await self._send_text(session_id, "holding")
-            await self._send_usage(session_id, used=0)
+            await self._send_usage(session_id, used=123)
             deadline = time.monotonic() + HOLD_LIMIT_SECONDS
+            # Well past acpc's 2 s refresh window, so delivery jitter cannot throttle it.
+            second_usage_at = time.monotonic() + 2.5
+            sent_second_usage = False
             while not release_path.exists():
                 if cancel_event.is_set():
                     return PromptResponse(stop_reason="cancelled")
                 if time.monotonic() >= deadline:
                     break
+                if not sent_second_usage and time.monotonic() >= second_usage_at:
+                    await self._send_usage(session_id, used=456)
+                    sent_second_usage = True
                 await asyncio.sleep(HOLD_POLL_SECONDS)
             await self._send_text(session_id, "finished")
             return PromptResponse(stop_reason="end_turn")

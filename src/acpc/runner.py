@@ -703,6 +703,7 @@ async def _drive_turn(
         resolved_model=resolution.model,
         prompt=request.prompt,
         turn_number=stored.turns,
+        session_id=session_id,
     )
     turn_error: BaseException | None = None
     prompt_sent = False

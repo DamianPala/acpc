@@ -3,9 +3,13 @@
 import asyncio
 import gc
 import json
+import os
 import sys
+import threading
 import weakref
 from collections.abc import AsyncIterator, Mapping
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -36,7 +40,7 @@ from acp.schema import (
     UserMessageChunk,
 )
 
-from acpc import render
+from acpc import render, sessions
 from acpc.client import (
     MAX_RETAINED_CLOSED_REPLAY_GENERATIONS,
     REPLAY_GENERATION_KEY,
@@ -180,6 +184,180 @@ def test_tokens_carry_the_previous_turns_last_observed_value(tmp_path: Path) -> 
     )
 
     assert client.context == {"used": 1200, "size": None, "peak": 1200}
+
+
+def _make_context_refresh_client(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    clock: Any,
+) -> tuple[sessions.SessionMeta, AcpcClient]:
+    monkeypatch.setenv("ACPC_HOME", str(tmp_path / "acpc-state"))
+    meta = sessions.create_session(
+        entry="mock",
+        base_adapter="mock",
+        prompt="refresh context",
+        clock=lambda: 1.0,
+    )
+    meta = sessions.mark_running(
+        meta.session_id,
+        pid=os.getpid(),
+        process_start_time="test-process",
+        clock=lambda: 2.0,
+    )
+    meta.context = {"used": 4, "size": 100, "peak": 4}
+    meta.usage = {
+        "quality": "estimate",
+        "gaps": 0,
+        "calls": 1,
+        "models": {
+            "mock-model": {
+                "total_tokens": 7,
+                "input_tokens": None,
+                "cache_read_tokens": None,
+                "cache_write_tokens": None,
+                "output_tokens": None,
+            }
+        },
+        "compactions": {
+            "count": 0,
+            "unaccounted": 0,
+            "context_before": 0,
+            "context_after": 0,
+        },
+        "source": "mock usage_update.used",
+        "drift": None,
+        "billing": None,
+    }
+    meta.limit = {
+        "reason": "rate_limit",
+        "resume_at": None,
+        "auto_continue": True,
+        "source": "text",
+    }
+    with sessions.session_lock(meta.session_id):
+        sessions.write_meta(meta)
+    transcript = Transcript(sessions.transcript_path(meta.session_id), clock=lambda: 100.0)
+    client = AcpcClient(
+        transcript,
+        PermissionLevel.READ,
+        clock=clock,
+        previous_context=meta.context,
+        session_id=meta.session_id,
+        turn_number=meta.turns,
+    )
+    return meta, client
+
+
+def _send_usage_update(client: AcpcClient, used: int, size: int = 100) -> None:
+    asyncio.run(
+        client.session_update(
+            "adapter-session",
+            UsageUpdate(session_update="usage_update", used=used, size=size),
+        )
+    )
+
+
+def test_context_refresh_throttles_changed_usage_and_preserves_other_meta(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = [10.0]
+    meta, client = _make_context_refresh_client(tmp_path, monkeypatch, lambda: now[0])
+    before = sessions.read_meta(meta.session_id).to_dict()
+
+    _send_usage_update(client, 10)
+    first = sessions.read_meta(meta.session_id).to_dict()
+    assert first["context"] == {"used": 10, "size": 100, "peak": 10}
+
+    now[0] = 11.9
+    _send_usage_update(client, 20)
+    throttled = sessions.read_meta(meta.session_id).to_dict()
+    assert throttled["context"] == first["context"]
+
+    now[0] = 12.1
+    _send_usage_update(client, 20)
+    final = sessions.read_meta(meta.session_id).to_dict()
+    assert final["context"] == {"used": 20, "size": 100, "peak": 20}
+    assert {key: value for key, value in final.items() if key != "context"} == {
+        key: value for key, value in before.items() if key != "context"
+    }
+
+
+def test_context_refresh_ignores_an_unchanged_context_and_tracks_size_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    meta, client = _make_context_refresh_client(tmp_path, monkeypatch, lambda: 10.0)
+    path = sessions.meta_path(meta.session_id)
+    before = path.read_text(encoding="utf-8")
+
+    _send_usage_update(client, 4)
+
+    assert path.read_text(encoding="utf-8") == before
+    _send_usage_update(client, 4, size=200)
+    assert sessions.read_meta(meta.session_id).context == {"used": 4, "size": 200, "peak": 4}
+
+
+@pytest.mark.parametrize("stale_state", ["canceled", "unknown", "different-turn"])
+def test_context_refresh_skips_terminal_or_replaced_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stale_state: str
+) -> None:
+    meta, client = _make_context_refresh_client(tmp_path, monkeypatch, lambda: 10.0)
+    before = sessions.meta_path(meta.session_id).read_text(encoding="utf-8")
+    current = sessions.read_meta(meta.session_id)
+    if stale_state == "different-turn":
+        current.turns += 1
+    else:
+        current.state = stale_state
+    with sessions.session_lock(meta.session_id):
+        sessions.write_meta(current)
+    stale_before = sessions.meta_path(meta.session_id).read_text(encoding="utf-8")
+
+    _send_usage_update(client, 10)
+
+    after = sessions.meta_path(meta.session_id).read_text(encoding="utf-8")
+    assert after == stale_before
+    assert before != stale_before
+
+
+def test_context_refresh_skips_a_busy_session_lock_without_waiting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    meta, client = _make_context_refresh_client(tmp_path, monkeypatch, lambda: 10.0)
+    lock_held = threading.Event()
+    release_lock = threading.Event()
+
+    def hold_lock() -> None:
+        with sessions.session_lock(meta.session_id):
+            lock_held.set()
+            release_lock.wait(timeout=10)
+
+    holder = threading.Thread(target=hold_lock)
+    holder.start()
+    assert lock_held.wait(timeout=2)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        update = executor.submit(_send_usage_update, client, 10)
+        try:
+            update.result(timeout=2)
+            finished_while_locked = True
+        except FutureTimeout:
+            finished_while_locked = False
+        finally:
+            release_lock.set()
+            holder.join(timeout=2)
+        update.result(timeout=2)
+
+    assert finished_while_locked
+    assert not holder.is_alive()
+    assert sessions.read_meta(meta.session_id).context == {"used": 4, "size": 100, "peak": 4}
+
+
+def test_context_refresh_is_reentrant_when_the_turn_holds_the_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    meta, client = _make_context_refresh_client(tmp_path, monkeypatch, lambda: 10.0)
+
+    with sessions.session_lock(meta.session_id):
+        _send_usage_update(client, 10)
+        assert sessions.read_meta(meta.session_id).context == {"used": 10, "size": 100, "peak": 10}
 
 
 def test_answer_is_only_agent_messages_and_transcript_keeps_stream_order(

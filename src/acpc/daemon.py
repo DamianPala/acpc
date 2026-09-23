@@ -1477,6 +1477,7 @@ class Daemon:
             resolved_model=request.resolution.model,
             prompt=request.prompt,
             turn_number=stored.turns,
+            session_id=session_id,
         )
         client.capture_adapter(self.host.initialize_response)
         runner.record_usage_identity(session_id, client.adapter_identity)

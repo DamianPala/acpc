@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
+import pty
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -209,6 +212,127 @@ def _wait_for_state(session_id: str, expected: str, timeout: float = 10.0) -> se
             return meta
         time.sleep(0.02)
     pytest.fail(f"session {session_id} did not reach {expected!r}")
+
+
+def _wait_for_status_context(
+    cli: CliRunner,
+    session_id: str,
+    used: int,
+    *,
+    process: subprocess.Popen[str] | None = None,
+    timeout: float = 10.0,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if process is not None and process.poll() is not None:
+            stdout, stderr = process.communicate()
+            pytest.fail(f"direct run exited before context refresh: {stdout}\n{stderr}")
+        result = invoke(cli, "status", session_id, "--json")
+        if result.exit_code == 0:
+            payload = json.loads(result.stdout)
+            context = payload.get("context")
+            if payload.get("status") == "running" and context and context.get("used") == used:
+                assert payload["usage"] is None
+                return payload
+        time.sleep(0.05)
+    pytest.fail(f"session {session_id} did not report context used={used} while running")
+
+
+@pytest.mark.parametrize("route", ["daemon", "direct"])
+def test_context_updates_are_visible_while_a_turn_is_held(
+    cli: CliRunner,
+    live_daemon: None,
+    route: str,
+    tmp_path: Path,
+    state_root: Path,
+) -> None:
+    _set_usage_profile(state_root, "codex_usage_updates")
+    release = tmp_path / "release"
+    prompt = f"chunkhold:{release}"
+    direct_process: subprocess.Popen[str] | None = None
+    terminal_master: int | None = None
+    session_id: str | None = None
+    try:
+        if route == "daemon":
+            dispatched = invoke(cli, "run", "mock", prompt, "--bg", "--json", "--quiet")
+            assert dispatched.exit_code == 0, dispatched.stderr
+            session_id = json.loads(dispatched.stdout)["session_id"]
+        else:
+            source_root = Path(__file__).parents[1] / "src"
+            env = os.environ.copy()
+            env["PYTHONPATH"] = os.pathsep.join(
+                part for part in (str(source_root), env.get("PYTHONPATH", "")) if part
+            )
+            terminal_master, terminal_slave = pty.openpty()
+            direct_process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "acpc",
+                    "run",
+                    "mock",
+                    prompt,
+                    "--permissions",
+                    "ask",
+                    "--format",
+                    "text",
+                    "--quiet",
+                ],
+                cwd=source_root.parent,
+                env=env,
+                stdin=terminal_slave,
+                stdout=terminal_slave,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            os.close(terminal_slave)
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline and session_id is None:
+                candidates = [
+                    meta for meta in sessions.list_sessions() if "chunkhold:" in meta.prompt_snippet
+                ]
+                if candidates:
+                    session_id = candidates[0].session_id
+                    break
+                if direct_process.poll() is not None:
+                    stdout, stderr = direct_process.communicate()
+                    pytest.fail(f"direct run ended before session start: {stdout}\n{stderr}")
+                time.sleep(0.05)
+            assert session_id is not None, "direct run did not create a session"
+
+        assert session_id is not None
+        active = _wait_for_status_context(
+            cli,
+            session_id,
+            123,
+            process=direct_process,
+        )
+        assert active["context"] == {"used": 123, "size": 200_000, "peak": 123}
+        latest = _wait_for_status_context(
+            cli,
+            session_id,
+            456,
+            process=direct_process,
+        )
+        assert latest["context"] == {"used": 456, "size": 200_000, "peak": 456}
+
+        release.touch()
+        if direct_process is not None:
+            _stdout, stderr = direct_process.communicate(timeout=10)
+            assert direct_process.returncode == 0, stderr
+        else:
+            _wait_for_state(session_id, "succeeded")
+
+        final = json.loads(invoke(cli, "status", session_id, "--json").stdout)
+        assert final["context"] == {"used": 456, "size": 200_000, "peak": 456}
+        assert final["usage"] is not None
+        assert final["usage"] == sessions.read_meta(session_id).usage
+    finally:
+        release.touch()
+        if direct_process is not None and direct_process.poll() is None:
+            direct_process.communicate(timeout=10)
+        if terminal_master is not None:
+            os.close(terminal_master)
 
 
 def test_usage_is_cumulative_across_run_continue_status_and_meta(

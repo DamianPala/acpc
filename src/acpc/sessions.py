@@ -389,6 +389,28 @@ def session_lock(session_id: str) -> Iterator[None]:
         os.close(fd)
 
 
+@contextlib.contextmanager
+def try_session_lock(session_id: str) -> Iterator[bool]:
+    """Acquire a session lock without waiting, preserving same-thread re-entry."""
+    if session_id in _lock_depth.held:
+        yield True
+        return
+    directory = paths.ensure_private_dir(session_dir(session_id))
+    fd = os.open(directory / LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        if not _try_acquire_file_lock(fd):
+            yield False
+            return
+        _lock_depth.held.add(session_id)
+        try:
+            yield True
+        finally:
+            _lock_depth.held.discard(session_id)
+            _release_file_lock(fd)
+    finally:
+        os.close(fd)
+
+
 @contextlib.asynccontextmanager
 async def session_reservation(session_id: str) -> AsyncIterator[None]:
     """Reserve a finished session across asynchronous resume preparation.
@@ -745,6 +767,25 @@ def write_meta(meta: SessionMeta) -> None:
     """Publish `meta.json` atomically. Callers hold the session lock."""
     paths.ensure_private_dir(session_dir(meta.session_id))
     paths.atomic_write(meta_path(meta.session_id), meta.to_dict())
+
+
+def refresh_context_if_active(
+    session_id: str,
+    turn_number: int,
+    context: vocab.ContextOccupancy,
+) -> bool:
+    """Refresh only the matching active turn's context without waiting for its lock."""
+    with try_session_lock(session_id) as acquired:
+        if not acquired:
+            return False
+        meta = read_meta(session_id)
+        if not meta.is_active or meta.turns != turn_number:
+            return False
+        if meta.context == context:
+            return True
+        meta.context = {"used": context["used"], "size": context["size"], "peak": context["peak"]}
+        write_meta(meta)
+        return True
 
 
 def load(session_id: str, *, clock: Clock | None = None) -> SessionMeta:
