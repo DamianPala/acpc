@@ -576,12 +576,27 @@ def _drain_pty_master_with_deadline(fd: int, pid: int, *, deadline_seconds: floa
     return data
 
 
+def _wait_for_terminal_child(pid: int, ready_fd: int) -> None:
+    """Wait until the forkpty child confirms its slave is attached."""
+    ready, _, _ = select.select([ready_fd], [], [], _PTY_DRAIN_DEADLINE_SECONDS)
+    if ready and os.read(ready_fd, 1) == b"R":
+        return
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(pid, signal.SIGKILL)
+    os.waitpid(pid, 0)
+    raise AssertionError(
+        f"pty child did not attach its slave within {_PTY_DRAIN_DEADLINE_SECONDS}s"
+    )
+
+
 def _command_under_a_pty(args: tuple[str, ...], answer: str | None) -> tuple[int, str, str]:
     """Run a command in a child that owns a real controlling terminal.
 
     `pty.fork` is the only way to exercise the `/dev/tty` branch: the prompt
     deliberately ignores stdin.  `answer=None` writes nothing and closes the
-    terminal, which is how a caller that never answers looks from inside.
+    terminal, which is how a caller that never answers looks from inside.  In
+    that case a side pipe waits for the child to return from `pty.fork` first;
+    forkpty has attached the slave before the parent closes the master.
 
     The child's stderr is a pipe rather than the terminal, so a failure comes
     back as the envelope a caller matches on while stdin stays a real
@@ -590,14 +605,30 @@ def _command_under_a_pty(args: tuple[str, ...], answer: str | None) -> tuple[int
     """
     child = f"from acpc.cli import main; main({list(args)!r})"
     reading, writing = os.pipe()
+    terminal_ready: tuple[int, int] | None = os.pipe() if answer is None else None
     pid, fd = pty.fork()
     if pid == 0:  # pragma: no cover - replaced by execv in the child
+        if terminal_ready is not None:
+            os.close(terminal_ready[0])
         os.dup2(writing, 2)
+        if terminal_ready is not None:
+            os.write(terminal_ready[1], b"R")
+            os.close(terminal_ready[1])
         os.execv(sys.executable, [sys.executable, "-c", child])
     os.close(writing)
     if answer is not None:
         os.write(fd, answer.encode())
     else:
+        assert terminal_ready is not None
+        os.close(terminal_ready[1])
+        try:
+            _wait_for_terminal_child(pid, terminal_ready[0])
+        except BaseException:
+            os.close(fd)
+            os.close(reading)
+            os.close(terminal_ready[0])
+            raise
+        os.close(terminal_ready[0])
         os.close(fd)
     asked = b""
     if answer is not None:
@@ -648,19 +679,6 @@ def test_nothing_but_agreement_lets_the_install_through(
 
 
 @pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
-@pytest.mark.skipif(
-    sys.platform == "darwin",
-    reason=(
-        "closing the pty master before the child opens its slave dies fast on Linux "
-        "(SIGHUP within ~1ms) but hangs indefinitely on macOS: gate run 35585248162 "
-        "timed out at 30s (`Failed: Timeout (>30.0s) from pytest-timeout`) inside this "
-        "test's `os.read(reading, 1024)`, meaning the child never closed its stderr "
-        "pipe. `_drain_with_deadline` now bounds that read but raises instead of "
-        "quietly returning on a timeout (see its docstring), so this would fail loudly "
-        "on macOS rather than silently pass; tracked for 1.1 to find the real fix "
-        "(e.g. wait for the child to open the slave before closing the master)."
-    ),
-)
 def test_a_closed_terminal_installs_nothing(installer: Path) -> None:
     """A terminal that is gone before the child starts leaves nothing to report to.
 

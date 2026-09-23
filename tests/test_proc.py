@@ -36,23 +36,13 @@ def _lstart_under(locale_name: str) -> str:
     return completed.stdout.strip()
 
 
-def _non_c_locale() -> str | None:
-    """Return an installed locale that renders `lstart` differently from C.
+_NON_C_LOCALE_CANDIDATES = ("de_DE.UTF-8", "fr_FR.UTF-8", "pl_PL.UTF-8")
 
-    A name that merely differs from "C" is not enough to prove anything: on a
-    glibc box `locale -a` lists `C.utf8` first, and it renders `strftime`'s
-    `%c` exactly as `C` does, so a test comparing the two would pass whether
-    or not `_ps_fields` pins the locale at all.
-    """
-    try:
-        completed = subprocess.run(["locale", "-a"], capture_output=True, text=True, check=False)
-    except OSError:
-        return None
+
+def _non_c_locale() -> str | None:
+    """Return a common installed locale that renders `lstart` differently from C."""
     under_c = _lstart_under("C")
-    for name in completed.stdout.splitlines():
-        name = name.strip()
-        if not name or name.upper() in ("C", "POSIX"):
-            continue
+    for name in _NON_C_LOCALE_CANDIDATES:
         if _lstart_under(name) != under_c:
             return name
     return None
@@ -318,16 +308,18 @@ class TestPsFields:
     """`_ps_fields` is the shared foundation of the darwin backend, exercised
     directly here since Linux's procps `ps` accepts the same column spelling."""
 
-    def test_live_process_returns_lstart_stat_and_command(self) -> None:
+    def test_live_process_returns_stat_and_lstart_and_separate_command(self) -> None:
         process = subprocess.Popen(["sleep", "30"])
         try:
-            fields = _ps_fields(process.pid, "lstart", "stat", "command")
+            fields = _ps_fields(process.pid, "stat", "lstart")
             assert fields is not None
-            assert len(fields) == 3
-            lstart, stat, command = fields
-            assert lstart
+            assert len(fields) == 2
+            stat, lstart = fields
             assert stat
-            assert "sleep" in command
+            assert lstart
+            command_fields = _ps_fields(process.pid, "command")
+            assert command_fields is not None
+            assert "sleep" in command_fields[0]
         finally:
             process.kill()
             process.wait()
@@ -389,7 +381,10 @@ class TestDarwinProcessIdentity:
         """
         other_locale = _non_c_locale()
         if other_locale is None:
-            pytest.skip("no installed locale besides C/POSIX to prove LC_ALL is pinned")
+            candidates = ", ".join(_NON_C_LOCALE_CANDIDATES)
+            pytest.skip(
+                f"none of the candidate locales rendered lstart differently from C: {candidates}"
+            )
         process = subprocess.Popen(["sleep", "30"])
         try:
             with patch.object(sys, "platform", "darwin"):
@@ -418,13 +413,20 @@ class TestDarwinProcessIdentity:
 class TestDarwinLiveness:
     """Same rationale as TestDarwinProcessIdentity: real processes, patched platform."""
 
-    def test_live_process_with_its_own_token_is_verified(self) -> None:
+    def test_live_process_with_token_uses_one_ps_call_and_matching_start_token(self) -> None:
         process = subprocess.Popen(["sleep", "30"])
         try:
             with patch.object(sys, "platform", "darwin"):
                 token = process_start_time(process.pid)
                 assert token is not None
-                assert process_liveness(process.pid, token) == "verified"
+                combined_fields = _ps_fields(process.pid, "stat", "lstart")
+                assert combined_fields is not None
+                assert combined_fields[1] == token
+                with patch("acpc.proc.subprocess.run", wraps=subprocess.run) as run_spy:
+                    assert process_liveness(process.pid, token) == "verified"
+            assert run_spy.call_count == 1
+            assert run_spy.call_args is not None
+            assert run_spy.call_args.args[0][:3] == ["ps", "-o", "stat=,lstart="]
         finally:
             process.kill()
             process.wait()
@@ -441,8 +443,14 @@ class TestDarwinLiveness:
     def test_live_process_without_a_token_is_unverifiable(self) -> None:
         process = subprocess.Popen(["sleep", "30"])
         try:
-            with patch.object(sys, "platform", "darwin"):
+            with (
+                patch.object(sys, "platform", "darwin"),
+                patch("acpc.proc.subprocess.run", wraps=subprocess.run) as run_spy,
+            ):
                 assert process_liveness(process.pid) == "unverifiable"
+            assert run_spy.call_count == 1
+            assert run_spy.call_args is not None
+            assert run_spy.call_args.args[0][:3] == ["ps", "-o", "stat="]
         finally:
             process.kill()
             process.wait()
@@ -498,6 +506,28 @@ class TestDarwinLiveness:
         process.wait()
         with patch.object(sys, "platform", "darwin"):
             assert process_liveness(process.pid) == "dead"
+            # The pid vanishing between `kill 0` and `ps`: the `ps` read itself says gone.
+            with patch("acpc.proc.os.kill"):
+                assert process_liveness(process.pid) == "dead"
+                assert process_liveness(process.pid, "some-token") == "dead"
+
+    def test_combined_token_matches_start_time_when_ps_pads_the_day(self, tmp_path: Path) -> None:
+        """BSD `ps` pads `stat` and renders `%c` with a space-padded day (`Sep  4`)."""
+        fake_ps = tmp_path / "ps"
+        fake_ps.write_text(
+            '#!/bin/sh\ncase "$2" in\n'
+            '  lstart=) echo "Thu Sep  4 09:45:08 2026    " ;;\n'
+            '  *) echo "Ss   Thu Sep  4 09:45:08 2026    " ;;\nesac\n',
+            encoding="utf-8",
+        )
+        fake_ps.chmod(0o755)
+        with (
+            patch.object(sys, "platform", "darwin"),
+            patch.dict(os.environ, {"PATH": str(tmp_path)}),
+        ):
+            token = process_start_time(os.getpid())
+            assert token == "Thu Sep 4 09:45:08 2026"
+            assert process_liveness(os.getpid(), token) == "verified"
 
 
 class TestDarwinKillProcessTree:

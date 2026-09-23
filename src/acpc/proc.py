@@ -46,48 +46,50 @@ def process_identity_supported() -> bool:
 
 
 def _ps_fields(pid: int, *columns: str) -> list[str] | None:
-    """Return one ``ps -o <col>= -p <pid>`` value per requested column.
+    """Return values for one supported `ps -o` read.
 
-    Each column is fetched with its own ``ps`` invocation (rather than a
-    single comma-joined ``-o`` list) for two reasons: ``lstart`` and
-    ``command`` both contain internal whitespace, which a shared,
-    whitespace-split parse of a combined line would corrupt; and on macOS,
-    BSD `ps`'s ``command`` column (``adv_cmds/ps/print.c``,
-    ``p_command_and_or_args``) only prints the full, unabbreviated command
-    when ``command`` is the *last* (and here, only) requested column --
-    combined with another column it is truncated to its 16-character
-    keyword width. BSD `ps` (macOS) and procps `ps` (Linux) both accept this
-    spelling for ``lstart``, ``stat``, and ``command``, which is what lets
-    the darwin backend be exercised on Linux by tests. ``LC_ALL=C`` pins the
-    locale ``ps`` renders ``lstart`` in, so the token doesn't vary with the
-    caller's environment (the reuse guard compares it byte for byte later,
-    possibly from a different process).
+    A single column keeps its complete value, including spaces in `lstart`
+    or `command`. The combined `stat,lstart` shape splits the one-token
+    `stat` from the remaining start-time value. `command` stays in a separate
+    invocation and is its final column: on macOS, BSD `ps`'s `command` column
+    (`adv_cmds/ps/print.c`, `p_command_and_or_args`) only prints the full,
+    unabbreviated command when it is last. Combined with another column, it is
+    truncated to its 16-character keyword width.
+    BSD `ps` (macOS) and procps `ps` (Linux) both accept these spellings,
+    which lets tests exercise the darwin path on Linux. `LC_ALL=C` pins the
+    locale used for `lstart`, whose token is compared byte for byte later.
 
     Returns ``None`` when the pid is gone (``ps`` exits non-zero, prints
     nothing, or a column comes back short). Raises `_PsUnavailableError`
     when ``ps`` itself could not be run at all; callers decide how to map
     that.
     """
-    fields: list[str] = []
-    for column in columns:
-        try:
-            completed = subprocess.run(
-                ["ps", "-o", f"{column}=", "-p", str(pid)],
-                capture_output=True,
-                check=False,
-                env={**os.environ, "LC_ALL": "C"},
-            )
-        except OSError as error:
-            raise _PsUnavailableError(str(error)) from error
-        if completed.returncode != 0:
-            return None
-        value = completed.stdout.decode("utf-8", errors="surrogateescape").strip()
-        if not value:
-            return None
-        fields.append(value)
-    if len(fields) != len(columns):
+    if columns == ("stat", "lstart"):
+        column_argument = "stat=,lstart="
+    elif len(columns) == 1:
+        column_argument = f"{columns[0]}="
+    else:
+        raise ValueError(f"unsupported ps columns: {columns!r}")
+    try:
+        completed = subprocess.run(
+            ["ps", "-o", column_argument, "-p", str(pid)],
+            capture_output=True,
+            check=False,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+    except OSError as error:
+        raise _PsUnavailableError(str(error)) from error
+    if completed.returncode != 0:
         return None
-    return fields
+    value = completed.stdout.decode("utf-8", errors="surrogateescape").strip()
+    if not value:
+        return None
+    if columns == ("stat", "lstart"):
+        fields = value.split(None, 1)
+        if len(fields) != 2:
+            return None
+        return [fields[0], " ".join(fields[1].split())]
+    return [value]
 
 
 def process_start_time(pid: int | None = None) -> str | None:
@@ -186,8 +188,9 @@ def process_liveness(pid: int, process_token: str | None = None) -> ProcessLiven
         current_token = fields[19] if len(fields) > 19 else None
         return _verified_or_dead(current_token, process_token)
     if sys.platform == "darwin":
+        columns = ("stat", "lstart") if process_token is not None else ("stat",)
         try:
-            stat_fields = _ps_fields(pid, "stat")
+            stat_fields = _ps_fields(pid, *columns)
         except _PsUnavailableError:
             # `ps` itself failed to run: an infrastructure failure, not proof
             # the pid is gone. Mirrors Linux's `except OSError: return
@@ -198,7 +201,9 @@ def process_liveness(pid: int, process_token: str | None = None) -> ProcessLiven
             return "dead"
         if stat_fields[0].startswith("Z"):
             return "dead"
-        return _verified_or_dead(process_start_time(pid), process_token)
+        if process_token is None:
+            return "unverifiable"
+        return _verified_or_dead(stat_fields[1], process_token)
     return _verified_or_dead(process_start_time(pid), process_token)
 
 

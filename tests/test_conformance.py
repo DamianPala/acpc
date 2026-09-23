@@ -1725,7 +1725,14 @@ def test_O2a_O2b_default_format_is_exercised_for_every_indexed_command(
             assert result.stdout or result.stderr, name
 
 
-def _drain_master(fd: int, sink: bytearray, child_exited: threading.Event) -> None:
+def _drain_master(
+    fd: int,
+    sink: bytearray,
+    child_exited: threading.Event,
+    *,
+    marker: bytes | None = None,
+    marker_seen: threading.Event | None = None,
+) -> None:
     """Read a pty master while the child runs, then once more after it exited.
 
     Reading concurrently keeps the child from blocking on a full pty queue;
@@ -1743,6 +1750,8 @@ def _drain_master(fd: int, sink: bytearray, child_exited: threading.Event) -> No
             if not chunk:
                 return
             sink.extend(chunk)
+            if marker is not None and marker_seen is not None and marker in sink:
+                marker_seen.set()
             continue
         if child_exited.is_set():
             while select.select([fd], [], [], 0)[0]:
@@ -1750,6 +1759,8 @@ def _drain_master(fd: int, sink: bytearray, child_exited: threading.Event) -> No
                 if not chunk:
                     return
                 sink.extend(chunk)
+                if marker is not None and marker_seen is not None and marker in sink:
+                    marker_seen.set()
             return
 
 
@@ -2944,69 +2955,22 @@ def _wait_for_ready(process: subprocess.Popen[bytes]) -> None:
     assert process.stderr.readline() == b"READY\n"
 
 
-def _read_pty(fd: int, marker: bytes) -> bytes:
-    data = bytearray()
-    deadline = time.monotonic() + 5
-    while marker not in data and time.monotonic() < deadline:
-        remaining = max(0.0, deadline - time.monotonic())
-        ready, _, _ = select.select([fd], [], [], remaining)
-        if not ready:
-            break
-        try:
-            data.extend(os.read(fd, 4096))
-        except OSError as error:
-            raise AssertionError((bytes(data), error)) from error
-    assert marker in data
-    return bytes(data)
-
-
-def _drain_pty(fd: int) -> bytes:
-    data = bytearray()
-    os.set_blocking(fd, False)
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        remaining = max(0.0, deadline - time.monotonic())
-        ready, _, _ = select.select([fd], [], [], remaining)
-        if not ready:
-            break
-        try:
-            chunk = os.read(fd, 4096)
-        except BlockingIOError:
-            continue
-        except OSError:
-            break
-        if not chunk:
-            break
-        data.extend(chunk)
-    return bytes(data)
-
-
-_F2B_F5_DARWIN_PTY_HALF_SKIP_REASON = (
-    "the pty half reads back an empty stderr on macOS (gate run 35585248162: "
-    "json.decoder.JSONDecodeError: Expecting value at char 0 from "
-    "`stderr.splitlines()[-1]`), even though `_read_pty`/`_drain_pty` already use "
-    "`select` with a deadline and the master is closed only in the `finally` block "
-    "well after `communicate()`, the two portable fixes this slice's brief suggests. "
-    "The likely cause is a BSD-pty-specific quirk (unread data queued on a pty's "
-    "slave side can be discarded once the slave's last reference closes, unlike "
-    "Linux ptys, which retain it until read), but that cannot be confirmed without "
-    "a real Mac, so tracked for 1.1 instead of guessed at here."
-)
-
-
 @pytest.mark.timeout(60)
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal semantics")
 def test_F2b_F5_wait_interrupts_in_pipe_and_pty_contexts(cli: CliRunner, live_daemon: None) -> None:
     session_id = _background_session(cli, "slow:5 wait interruption")
+    # READY fires inside the running loop: a SIGINT while asyncio is still
+    # building it is a separate race that this test does not target.
     ready_code = (
         "import sys\n"
         "import acpc.cli as cli\n"
-        "original = cli._select_format\n"
-        "def ready(format_name, json_mode, **kwargs):\n"
+        "import acpc.runner as runner\n"
+        "original = runner._await_session\n"
+        "async def ready(*args, **kwargs):\n"
         "    sys.stderr.write('READY\\n')\n"
         "    sys.stderr.flush()\n"
-        "    return original(format_name, json_mode, **kwargs)\n"
-        "cli._select_format = ready\n"
+        "    return await original(*args, **kwargs)\n"
+        "runner._await_session = ready\n"
         "raise SystemExit(cli.main())\n"
     )
     command = [
@@ -3037,9 +3001,6 @@ def test_F2b_F5_wait_interrupts_in_pipe_and_pty_contexts(cli: CliRunner, live_da
     assert json.loads(stderr.splitlines()[-1])["error"]["kind"] == errors.INTERRUPTED
     _wait_for_state(session_id, "succeeded", timeout=10)
 
-    if sys.platform == "darwin":
-        pytest.skip(_F2B_F5_DARWIN_PTY_HALF_SKIP_REASON)
-
     session_id = _background_session(cli, "slow:5 wait pty interruption")
     master, slave = pty.openpty()
     pty_process = subprocess.Popen(
@@ -3050,23 +3011,42 @@ def test_F2b_F5_wait_interrupts_in_pipe_and_pty_contexts(cli: CliRunner, live_da
         start_new_session=True,
         env=os.environ.copy(),
     )
+    child_exited = threading.Event()
+    ready_seen = threading.Event()
+    pty_output = bytearray()
+    pty_reader = threading.Thread(
+        target=_drain_master,
+        args=(master, pty_output, child_exited),
+        kwargs={"marker": b"READY", "marker_seen": ready_seen},
+        daemon=True,
+    )
     try:
-        os.close(slave)
-        ready = _read_pty(master, b"READY")
+        pty_reader.start()
+        assert ready_seen.wait(timeout=5), "pty child did not print READY within 5s"
         os.killpg(pty_process.pid, signal.SIGINT)
         stdout, _ = pty_process.communicate(timeout=10)
-        stderr = ready + _drain_pty(master)
+        child_exited.set()
+        pty_reader.join(timeout=10)
+        assert not pty_reader.is_alive(), "pty master reader did not finish after the child exited"
+        stderr = bytes(pty_output)
     finally:
         if pty_process.poll() is None:
             os.killpg(pty_process.pid, signal.SIGKILL)
             pty_process.wait(timeout=10)
+        child_exited.set()
+        if pty_reader.ident is not None:
+            pty_reader.join(timeout=10)
         with contextlib.suppress(OSError):
             os.close(slave)
         with contextlib.suppress(OSError):
             os.close(master)
     assert pty_process.returncode == vocab.EXIT_CANCELLED
     assert stdout == b""
-    assert json.loads(stderr.splitlines()[-1])["error"]["kind"] == errors.INTERRUPTED
+    try:
+        pty_error = json.loads(stderr.splitlines()[-1])
+    except (IndexError, json.JSONDecodeError) as error:
+        pytest.fail(f"pty stderr was not a JSON error: {stderr!r}; {error}")
+    assert pty_error["error"]["kind"] == errors.INTERRUPTED
     _wait_for_state(session_id, "succeeded", timeout=10)
 
 
