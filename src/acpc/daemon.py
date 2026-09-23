@@ -1476,6 +1476,7 @@ class Daemon:
             billing=request.resolution.entry.billing,
             resolved_model=request.resolution.model,
             prompt=request.prompt,
+            turn_number=stored.turns,
         )
         client.capture_adapter(self.host.initialize_response)
         runner.record_usage_identity(session_id, client.adapter_identity)
@@ -1489,6 +1490,7 @@ class Daemon:
             # adapter treat the turn as a resume and lose that continuity.
             adapter_session_id = warm
         elif request.resume_prepared and request.resume_adapter_session is not None:
+            client.mark_cold_resume()
             adapter_session_id = request.resume_adapter_session
         elif request.resume_adapter_session is not None:
             adapter_session_id = request.resume_adapter_session
@@ -1503,6 +1505,7 @@ class Daemon:
                         self._request_cwd(request),
                         session_id,
                     )
+                    client.mark_cold_resume()
                 except runner.ResumePreparationError:
                     raise
                 except Exception as error:

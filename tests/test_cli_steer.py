@@ -762,6 +762,57 @@ def test_steer_in_place_blocking_prints_the_observed_turns_answer(
     assert prose.stdout == document["answer"]
 
 
+def test_steer_emits_usage_drift_note_for_observed_turn(
+    cli: CliRunner,
+    live_daemon: None,
+    monkeypatch: pytest.MonkeyPatch,
+    state_root: Path,
+) -> None:
+    agent_path = state_root / "agents" / "mock.toml"
+    configured = agent_path.read_text(encoding="utf-8").replace(
+        'home_env = "MOCK_HOME"\n',
+        'home_env = "MOCK_HOME"\nusage_profile = "codex_usage_updates"\n',
+    )
+    agent_path.write_text(configured, encoding="utf-8")
+    monkeypatch.setenv("ACPC_MOCK_STEERING", "1")
+    steering_log = state_root / "steering.log"
+    monkeypatch.setenv("ACPC_MOCK_STEERING_LOG", str(steering_log))
+    release_path = state_root / "release-drift-turn"
+    session_id = running_daemon_turn(cli, f"drift:codex:hold:{release_path}")
+    steer_process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "from acpc.cli import main; raise SystemExit(main())",
+            "steer",
+            session_id,
+            "keep the current direction",
+            "--json",
+        ],
+        env=os.environ.copy(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        wait_for_log_line(steering_log, "steer:")
+        release_path.touch()
+        stdout, stderr = steer_process.communicate(timeout=15)
+    finally:
+        if steer_process.poll() is None:
+            steer_process.kill()
+            steer_process.communicate()
+
+    assert steer_process.returncode == vocab.EXIT_OK, stderr
+    assert json.loads(stdout)["session_id"] == session_id
+    expected_note = (
+        f"acpc: mock-agent 0.1.0 reports usage as turn, the codex_usage_updates profile "
+        f"expects last; usage for session {session_id} is marked estimate"
+    )
+    assert stderr.splitlines().count(expected_note) == 1
+    assert json.loads(stdout)["usage"]["drift"]["check"] == "codex_usage_updates"
+
+
 def test_two_in_place_corrections_arrive_in_the_order_they_were_sent(
     cli: CliRunner, live_daemon: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -250,6 +250,7 @@ class SessionMeta:
 
 _META_FIELDS: tuple[str, ...] = tuple(f.name for f in fields(SessionMeta) if f.name != "extra")
 DELIVERY_RECORD_INCOMPLETE = "delivery_record_incomplete"
+USAGE_DRIFT_NOTE_EMITTED = "usage_drift_note_emitted"
 
 
 # --------------------------------------------------------------------------
@@ -532,6 +533,39 @@ def _usage_count(value: Any, key: str, path: Path, *, nullable: bool = False) ->
     return number
 
 
+def _coerce_usage_drift(value: Any, path: Path) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise CorruptSessionError(f"{path}: usage.drift is not an object")
+    check = value.get("check")
+    declared = value.get("declared")
+    observed = value.get("observed")
+    adapter = value.get("adapter")
+    version = value.get("version")
+    turn = _usage_count(value.get("turn"), "usage.drift.turn", path)
+    if (
+        not isinstance(check, str)
+        or not check
+        or not isinstance(declared, str)
+        or not isinstance(observed, str)
+        or not isinstance(adapter, str)
+        or not adapter
+        or (version is not None and not isinstance(version, str))
+        or turn is None
+        or turn < 1
+    ):
+        raise CorruptSessionError(f"{path}: usage.drift has invalid fields")
+    return {
+        "check": check,
+        "declared": declared,
+        "observed": observed,
+        "adapter": adapter,
+        "version": version,
+        "turn": turn,
+    }
+
+
 def _coerce_usage(value: Any, path: Path) -> dict[str, Any] | None:
     """Read and validate the cumulative consumption object from metadata."""
     if value is None:
@@ -577,6 +611,7 @@ def _coerce_usage(value: Any, path: Path) -> dict[str, Any] | None:
         "models": models,
         "compactions": compactions,
         "source": source,
+        "drift": _coerce_usage_drift(value.get("drift"), path),
         "billing": billing,
     }
 
@@ -679,6 +714,18 @@ def read_meta(session_id: str) -> SessionMeta:
         meta_path(session_id),
         not_found=lambda: SessionNotFound(f"unknown session {session_id!r}"),
     )
+
+
+def claim_usage_drift_note(session_id: str) -> dict[str, Any] | None:
+    """Claim the session's one stderr note for its first recorded usage drift."""
+    with session_lock(session_id):
+        meta = read_meta(session_id)
+        drift = meta.usage.get("drift") if meta.usage is not None else None
+        if not isinstance(drift, Mapping) or meta.extra.get(USAGE_DRIFT_NOTE_EMITTED):
+            return None
+        meta.extra[USAGE_DRIFT_NOTE_EMITTED] = True
+        write_meta(meta)
+        return dict(drift)
 
 
 def read_turn_meta(session_id: str, turn: int) -> SessionMeta:

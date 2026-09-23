@@ -176,6 +176,17 @@ _USAGE_MODEL = _object(
     },
     ("total_tokens", "input_tokens", "cache_read_tokens", "cache_write_tokens", "output_tokens"),
 )
+_USAGE_DRIFT = _object(
+    {
+        "check": _STRING,
+        "declared": _STRING,
+        "observed": _STRING,
+        "adapter": _STRING,
+        "version": _NULLABLE_STRING,
+        "turn": {"type": "integer", "minimum": 1},
+    },
+    ("check", "declared", "observed", "adapter", "version", "turn"),
+)
 _USAGE = {
     **_object(
         {
@@ -191,12 +202,17 @@ _USAGE = {
                 ("count", "unaccounted", "context_before", "context_after"),
             ),
             "source": _STRING,
+            "drift": {
+                "type": ["object", "null"],
+                "properties": _USAGE_DRIFT["properties"],
+                "required": _USAGE_DRIFT["required"],
+            },
             "billing": {
                 "type": ["string", "null"],
                 "enum": ["subscription", "api", None],
             },
         },
-        ("quality", "gaps", "calls", "models", "compactions", "source", "billing"),
+        ("quality", "gaps", "calls", "models", "compactions", "source", "drift", "billing"),
     ),
     "type": ["object", "null"],
 }

@@ -435,8 +435,9 @@ _LIMIT_PROPERTIES = frozenset({"reason", "resume_at", "auto_continue", "source"}
 # result that carries it (`run`, `continue`, `wait`, `steer`, `status`).
 _CONTEXT_PROPERTIES = frozenset({"used", "size", "peak"})
 _USAGE_PROPERTIES = frozenset(
-    {"quality", "gaps", "calls", "models", "compactions", "source", "billing"}
+    {"quality", "gaps", "calls", "models", "compactions", "source", "drift", "billing"}
 )
+_USAGE_DRIFT_PROPERTIES = frozenset({"check", "declared", "observed", "adapter", "version", "turn"})
 _USAGE_MODEL_PROPERTIES = frozenset(
     {"total_tokens", "input_tokens", "cache_read_tokens", "cache_write_tokens", "output_tokens"}
 )
@@ -472,6 +473,7 @@ def _session_output_oracle(
         "output.capabilities": (_STEER_CAPABILITIES_PROPERTIES, _STEER_CAPABILITIES_PROPERTIES),
         "output.context": (_CONTEXT_PROPERTIES, _CONTEXT_PROPERTIES),
         "output.usage": (_USAGE_PROPERTIES, _USAGE_PROPERTIES),
+        "output.usage.drift": (_USAGE_DRIFT_PROPERTIES, _USAGE_DRIFT_PROPERTIES),
         "output.usage.models": (frozenset(), frozenset()),
         "output.usage.models.*": (_USAGE_MODEL_PROPERTIES, _USAGE_MODEL_PROPERTIES),
         "output.usage.compactions": (_COMPACTIONS_PROPERTIES, _COMPACTIONS_PROPERTIES),
@@ -840,6 +842,7 @@ EXPECTED_OUTPUT_ORACLES: dict[str, dict[str, tuple[frozenset[str], frozenset[str
         "output.capabilities": (_STEER_CAPABILITIES_PROPERTIES, _STEER_CAPABILITIES_PROPERTIES),
         "output.context": (_CONTEXT_PROPERTIES, _CONTEXT_PROPERTIES),
         "output.usage": (_USAGE_PROPERTIES, _USAGE_PROPERTIES),
+        "output.usage.drift": (_USAGE_DRIFT_PROPERTIES, _USAGE_DRIFT_PROPERTIES),
         "output.usage.models": (frozenset(), frozenset()),
         "output.usage.models.*": (_USAGE_MODEL_PROPERTIES, _USAGE_MODEL_PROPERTIES),
         "output.usage.compactions": (_COMPACTIONS_PROPERTIES, _COMPACTIONS_PROPERTIES),

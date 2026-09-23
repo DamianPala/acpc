@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TextIO
 
-from acpc import paths, permissions, sessions, vocab
+from acpc import paths, permissions, sessions, usage, vocab
 
 DEFAULT_MAX_OUTPUT = 128 * 1024
 
@@ -644,6 +644,52 @@ def format_context(context: vocab.ContextOccupancy | None) -> str:
     return f"ctx {used}, peak {peak}"
 
 
+def format_usage(value: Mapping[str, Any] | None) -> str | None:
+    """Render the known cumulative totals in one `usage` segment."""
+    if value is None:
+        return None
+    parts: list[str] = []
+    calls = value["calls"]
+    if calls is not None:
+        parts.append(f"{format_k(calls)} calls")
+    totals = [model["total_tokens"] for model in value["models"].values()]
+    known_totals = [total for total in totals if isinstance(total, int)]
+    if known_totals:
+        parts.append(f"{_format_usage_tokens(sum(known_totals))} tokens")
+    if value["gaps"]:
+        count = value["gaps"]
+        parts.append(f"{count} {'gap' if count == 1 else 'gaps'}")
+    compactions = value["compactions"]["count"]
+    if compactions:
+        parts.append(f"{compactions} {'compaction' if compactions == 1 else 'compactions'}")
+    summary = f" {' · '.join(parts)}" if parts else ""
+    return f"usage{summary} ({value['quality']})"
+
+
+def _format_usage_tokens(value: int) -> str:
+    """Format cumulative token totals with compact k/M/B units."""
+    if value < 1_000_000:
+        return format_k(value)
+    scale, suffix = (1_000_000_000, "B") if value >= 1_000_000_000 else (1_000_000, "M")
+    tenths = (value * 10 + scale // 2) // scale
+    whole, decimal = divmod(tenths, 10)
+    fraction = f".{decimal}" if decimal else ""
+    return f"{whole}{fraction}{suffix}"
+
+
+def format_usage_drift_note(meta: sessions.SessionMeta, drift: Mapping[str, Any]) -> str:
+    """Name the adapter's observed usage semantics in one stderr note."""
+    source = meta.usage["source"] if meta.usage is not None else ""
+    profile = usage.profile_for_source(source)
+    adapter = drift["adapter"]
+    version = drift["version"]
+    identity = f"{adapter} {version}" if version else adapter
+    return (
+        f"acpc: {identity} reports usage as {drift['observed']}, the {profile} profile expects "
+        f"{drift['declared']}; usage for session {meta.session_id} is marked estimate"
+    )
+
+
 def _resolved_permissions(meta: sessions.SessionMeta) -> dict[str, Any]:
     resolved = meta.resolution.get("resolved", {})
     permission = resolved.get("permissions", {}) if isinstance(resolved, dict) else {}
@@ -801,6 +847,8 @@ def format_summary(
     """
     duration = sessions.runtime_seconds(meta) if runtime is None else runtime
     parts = [meta.state, format_duration(duration), format_context(meta.context)]
+    if usage_text := format_usage(meta.usage):
+        parts.append(usage_text)
     if meta.exit_code is not None:
         parts.append(f"exit {meta.exit_code}")
     parts.append(f"steer_mode {meta.steer_mode or vocab.STEER_CANCEL_THEN_START}")

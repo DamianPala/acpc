@@ -702,6 +702,7 @@ async def _drive_turn(
         billing=resolution.entry.billing,
         resolved_model=resolution.model,
         prompt=request.prompt,
+        turn_number=stored.turns,
     )
     turn_error: BaseException | None = None
     prompt_sent = False
@@ -813,6 +814,7 @@ async def _prepare_direct_adapter_session(
         if request.defer_rotation:
             raise ResumePreparationError(str(error)) from None
         raise
+    client.mark_cold_resume()
     request = _prepare_resumed_turn(
         session_id,
         request,
@@ -913,6 +915,7 @@ def _prepare_resumed_turn(
         if client is None:
             events.append("state", **{"from": "starting", "to": "running"})
         else:
+            client.turn_number = rotated.turns
             client.record_external_event("state", **{"from": "starting", "to": "running"})
         return replace(
             request,

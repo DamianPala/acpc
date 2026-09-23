@@ -1651,6 +1651,12 @@ def _echo_metadata(line: str) -> None:
     click.echo(line, err=True)
 
 
+def _emit_usage_drift_note(meta: sessions.SessionMeta, *, quiet: bool) -> None:
+    drift = sessions.claim_usage_drift_note(meta.session_id)
+    if drift is not None and not quiet:
+        _echo_metadata(output.format_usage_drift_note(meta, drift))
+
+
 def _display_home(value: str | None) -> str:
     """Render a vendor home in the copy-pastable form used by ``agents``."""
     if value is None:
@@ -4309,6 +4315,7 @@ def _run_foreground(
             f" — answer: acpc wait {meta.session_id} · cancel: acpc cancel {meta.session_id}"
         )
         _end_turn_for(meta.session_id, outcome)
+    _emit_usage_drift_note(final, quiet=quiet)
     if not quiet:
         _echo_metadata(
             output.format_summary(
@@ -5143,6 +5150,7 @@ def _dispatch_follow_up(
             f" — answer: acpc wait {meta.session_id} · cancel: acpc cancel {meta.session_id}"
         )
         _end_turn_for(meta.session_id, outcome)
+    _emit_usage_drift_note(final, quiet=quiet)
     if not quiet:
         _echo_metadata(
             output.format_summary(
@@ -5816,6 +5824,7 @@ def _observe_steered_turn(
             extra=_steer_extra(final, observed_correction),
         )
         _emit_turn_result(result, output_file=output_file, json_mode=presentation == "json")
+        _emit_usage_drift_note(final, quiet=quiet)
         if not quiet:
             _echo_metadata(
                 output.format_summary(
@@ -5933,6 +5942,7 @@ def wait_command(
             output_file=output_file,
             json_mode=presentation == "json",
         )
+        _emit_usage_drift_note(final, quiet=quiet)
         if not quiet:
             summary = output.format_summary(
                 final, truncated_output_file=result.output_file if result.truncated else None

@@ -44,6 +44,9 @@ Exact-prefix triggers (donor design, for precise timing control in tests):
 - ``meta:TOKENS:TICKS:TEXT`` -> prose plus per-turn PromptResponse ``_meta`` usage
 - ``both:TOKENS:TICKS:TEXT`` -> streamed usage plus deliberately stale ``_meta``
 - ``rawusage:claude|codex|grok[:USED,...]`` -> vendor-shaped PromptResponse usage, ``_meta`` and usage updates
+- ``drift:used-size`` -> a context usage update above its size
+- ``drift:claude-restore`` -> model usage shaped like a restore delta
+- ``drift:codex:hold:PATH`` -> drifting codex usage held until PATH exists
 - ``cancelled-no-usage:`` -> return ``stop_reason=cancelled`` without usage
 
 Anything else runs the default scenario: three tool events, a progress msg, a
@@ -746,6 +749,28 @@ class MockAgent(Agent):
                 },
             )
 
+        if prompt_text.startswith("drift:codex:hold:"):
+            return await self._drift_codex_hold(session_id, prompt_text, cancel_event)
+        if prompt_text.startswith("drift:used-size"):
+            return await self._drift_used_size(session_id)
+        if prompt_text.startswith("drift:claude-restore"):
+            return await self._drift_claude_restore(session_id)
+        if prompt_text.startswith("drift:codex"):
+            await self._send_text(session_id, "drifting codex usage")
+            for used in (100, 200, 300, 400):
+                await self._send_usage(session_id, used=used)
+            return PromptResponse.model_validate(
+                {
+                    "stopReason": "end_turn",
+                    "usage": {
+                        "totalTokens": 1000,
+                        "inputTokens": 900,
+                        "cachedReadTokens": 0,
+                        "outputTokens": 100,
+                    },
+                }
+            )
+
         if prompt_text.startswith("rawusage:"):
             raw_parts = prompt_text.split(":", 2)
             profile = raw_parts[1]
@@ -1004,6 +1029,73 @@ class MockAgent(Agent):
 
         return None
 
+    async def _drift_codex_hold(
+        self, session_id: str, prompt_text: str, cancel_event: asyncio.Event
+    ) -> PromptResponse:
+        release_path = Path(prompt_text.split(":", 3)[3])
+        await self._send_text(session_id, "drifting codex usage")
+        for used in (100, 200, 300, 400):
+            await self._send_usage(session_id, used=used)
+        deadline = time.monotonic() + HOLD_LIMIT_SECONDS
+        while not release_path.exists():
+            if cancel_event.is_set() or time.monotonic() >= deadline:
+                return PromptResponse(stop_reason="cancelled")
+            await asyncio.sleep(HOLD_POLL_SECONDS)
+        await self._send_steered(session_id)
+        return PromptResponse.model_validate(
+            {
+                "stopReason": "end_turn",
+                "usage": {
+                    "totalTokens": 1000,
+                    "inputTokens": 900,
+                    "cachedReadTokens": 0,
+                    "outputTokens": 100,
+                },
+            }
+        )
+
+    async def _drift_used_size(self, session_id: str) -> PromptResponse:
+        await self._send_text(session_id, "usage exceeds the context size")
+        await self._send_usage(session_id, used=200_001, size=200_000)
+        return PromptResponse.model_validate(
+            {
+                "stopReason": "end_turn",
+                "usage": {
+                    "totalTokens": 200_001,
+                    "inputTokens": 200_000,
+                    "outputTokens": 1,
+                },
+            }
+        )
+
+    async def _drift_claude_restore(self, session_id: str) -> PromptResponse:
+        await self._send_text(session_id, "claude restore shaped usage")
+        await self._send_usage(session_id, used=10)
+        token_count = {
+            "totalTokens": 1000,
+            "inputTokens": 800,
+            "cachedInputTokens": 100,
+            "cachedWriteTokens": 0,
+            "outputTokens": 100,
+        }
+        return PromptResponse.model_validate(
+            {
+                "stopReason": "end_turn",
+                "usage": {
+                    "totalTokens": 100,
+                    "inputTokens": 80,
+                    "cachedReadTokens": 10,
+                    "cachedWriteTokens": 0,
+                    "outputTokens": 10,
+                },
+                "_meta": {
+                    "quota": {
+                        "model_usage": [{"model": "claude-opus-5[1m]", "token_count": token_count}]
+                    }
+                },
+            }
+        )
+
     async def _maybe_hit_limit(self, session_id: str) -> None:
         """Fail this call with a usage limit, per ``ACPC_MOCK_LIMIT_*`` (slice 17).
 
@@ -1243,11 +1335,17 @@ class MockAgent(Agent):
         for text in self._steered.pop(session_id, []):
             await self._send_text(session_id, f"steered: {text}")
 
-    async def _send_usage(self, session_id: str, used: int, cost: float | None = None) -> None:
+    async def _send_usage(
+        self,
+        session_id: str,
+        used: int,
+        cost: float | None = None,
+        size: int = 200_000,
+    ) -> None:
         update = UsageUpdate(
             session_update="usage_update",
             used=used,
-            size=200_000,
+            size=size,
             cost=Cost(amount=cost, currency="USD") if cost is not None else None,
         )
         try:

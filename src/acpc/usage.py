@@ -21,6 +21,11 @@ _SPLIT_FIELDS: Final = (
     "cache_write_tokens",
     "output_tokens",
 )
+_DECLARED: Final = {
+    "claude_model_usage": "turn",
+    "codex_usage_updates": "last",
+    "grok_meta_usage": "turn",
+}
 
 
 def accumulate_turn(
@@ -37,6 +42,9 @@ def accumulate_turn(
     billing: str | None,
     limit_gaps: int = 0,
     missing_response_is_gap: bool = True,
+    sizes: Sequence[int | None] = (),
+    cold_resume: bool = False,
+    turn_number: int = 1,
 ) -> dict[str, Any] | None:
     """Return cumulative usage after one ended turn, or `None` for profile none."""
     if profile == "none":
@@ -44,16 +52,33 @@ def accumulate_turn(
     result = _copy_previous(previous, billing)
     drops = _context_drops(used, prompt, previous_context)
     observed = _apply_profile(result, profile, used, prompt_response, drops, resolved_model)
+    drift = check_turn_invariants(
+        previous=previous,
+        used=used,
+        sizes=sizes,
+        prompt_response=prompt_response,
+        profile=profile,
+        cold_resume=cold_resume,
+        prompt=prompt,
+        previous_context=previous_context,
+    )
+    if result["drift"] is None and drift is not None:
+        result["drift"] = {
+            **drift,
+            "adapter": adapter_name or "unknown",
+            "version": adapter_version,
+            "turn": turn_number,
+        }
     turn_gap = _turn_has_gap(profile, used, observed)
     if prompt_response is None and not missing_response_is_gap:
         turn_gap = False
     result["gaps"] += limit_gaps + int(turn_gap)
     _add_compactions(result, drops, profile, gap=turn_gap or limit_gaps > 0)
-    if previous is None and not observed and not drops and result["gaps"] == 0:
+    if previous is None and not observed and not drops and result["gaps"] == 0 and drift is None:
         return None
     result["source"] = _source(adapter_name, adapter_version, profile)
     result["billing"] = billing
-    result["quality"] = quality(result)
+    result["quality"] = quality(result, drift_detected=result["drift"] is not None)
     return result
 
 
@@ -72,12 +97,14 @@ def mark_unknown(
     result["gaps"] += 1
     result["source"] = _source(adapter_name, adapter_version, profile)
     result["billing"] = billing
-    result["quality"] = quality(result)
+    result["quality"] = quality(result, drift_detected=result["drift"] is not None)
     return result
 
 
-def quality(value: Mapping[str, Any], *, drift_detected: bool = False) -> str:
-    """Calculate quality in one place; later checks can add a drift condition."""
+def quality(value: Mapping[str, Any], *, drift_detected: bool | None = None) -> str:
+    """Calculate quality in one place, keeping a session with drift estimated."""
+    if drift_detected is None:
+        drift_detected = value.get("drift") is not None
     compactions = value["compactions"]
     models = value["models"]
     complete_models = bool(models) and all(
@@ -91,6 +118,130 @@ def quality(value: Mapping[str, Any], *, drift_detected: bool = False) -> str:
     ):
         return "exact"
     return "estimate"
+
+
+def check_turn_invariants(
+    *,
+    previous: Mapping[str, Any] | None,
+    used: Sequence[int],
+    sizes: Sequence[int | None],
+    prompt_response: Mapping[str, Any] | None,
+    profile: str,
+    cold_resume: bool = False,
+    prompt: str = "",
+    previous_context: Mapping[str, Any] | None = None,
+) -> dict[str, str] | None:
+    """Return the first passive usage-profile invariant violation for a turn."""
+    if profile == "codex_usage_updates" and (
+        observation := _codex_drift(previous, used, prompt_response, prompt, previous_context)
+    ):
+        return observation
+    if profile == "claude_model_usage":
+        if observation := _claude_response_drift(prompt_response):
+            return observation
+        context_drops = _context_drops(used, prompt, previous_context)
+        if (
+            cold_resume
+            and not context_drops
+            and (observation := _claude_restore_drift(used, prompt_response))
+        ):
+            return observation
+    if _usage_exceeds_size(used, sizes):
+        return _observation("used_le_size", profile, "cumulative")
+    return None
+
+
+def _codex_drift(
+    previous: Mapping[str, Any] | None,
+    used: Sequence[int],
+    response: Mapping[str, Any] | None,
+    prompt: str,
+    previous_context: Mapping[str, Any] | None,
+) -> dict[str, str] | None:
+    if _codex_zero_category_total(response) is not None:
+        return None
+    total = _response_total(response)
+    counted = _codex_counted_values(used, response, _context_drops(used, prompt, previous_context))
+    if total is None or len(counted) < 2:
+        return None
+    counted_sum = sum(counted)
+    if total == counted[-1]:
+        return None
+    if total == counted_sum:
+        return _observation("codex_usage_updates", "codex_usage_updates", "turn")
+    previous_total = _previous_total(previous)
+    if previous_total is not None and total == previous_total + counted_sum:
+        return _observation("codex_usage_updates", "codex_usage_updates", "cumulative")
+    return _observation("codex_usage_updates", "codex_usage_updates", "unknown")
+
+
+def _claude_response_drift(response: Mapping[str, Any] | None) -> dict[str, str] | None:
+    response_total = _response_total(response)
+    model_total = _claude_model_total(response)
+    if response_total is not None and model_total is not None and response_total > model_total:
+        return _observation("response_le_model_usage", "claude_model_usage", "cumulative")
+    return None
+
+
+def _claude_restore_drift(
+    used: Sequence[int], response: Mapping[str, Any] | None
+) -> dict[str, str] | None:
+    response_total = _response_total(response)
+    model_total = _claude_model_total(response)
+    peak = max(used, default=0)
+    if (
+        model_total is not None
+        and response_total is not None
+        and model_total > response_total + peak
+    ):
+        return _observation("restore_delta", "claude_model_usage", "cumulative")
+    return None
+
+
+def _observation(check: str, profile: str, observed: str) -> dict[str, str]:
+    return {"check": check, "declared": _DECLARED.get(profile, "unknown"), "observed": observed}
+
+
+def _response_total(response: Mapping[str, Any] | None) -> int | None:
+    return _first_int(_nested_mapping(response, "usage"), "totalTokens", "total_tokens")
+
+
+def _claude_model_total(response: Mapping[str, Any] | None) -> int | None:
+    entries = _nested_mapping(response, "_meta", "quota").get("model_usage")
+    if not isinstance(entries, list):
+        return None
+    totals: list[int] = []
+    for entry in entries:
+        if (
+            not isinstance(entry, Mapping)
+            or not isinstance(entry.get("model"), str)
+            or not entry["model"]
+            or not isinstance(entry.get("token_count"), Mapping)
+        ):
+            return None
+        total = _first_int(entry["token_count"], "totalTokens", "total_tokens")
+        if total is None:
+            return None
+        totals.append(total)
+    return sum(totals)
+
+
+def _previous_total(previous: Mapping[str, Any] | None) -> int | None:
+    models = previous.get("models") if previous is not None else None
+    if not isinstance(models, Mapping) or not models:
+        return None
+    totals = [model.get("total_tokens") for model in models.values() if isinstance(model, Mapping)]
+    known = [total for total in totals if isinstance(total, int) and not isinstance(total, bool)]
+    if len(known) != len(models):
+        return None
+    return sum(known)
+
+
+def _usage_exceeds_size(used: Sequence[int], sizes: Sequence[int | None]) -> bool:
+    return any(
+        size is not None and used_value > size
+        for used_value, size in zip(used, sizes, strict=False)
+    )
 
 
 def _copy_previous(previous: Mapping[str, Any] | None, billing: str | None) -> dict[str, Any]:
@@ -108,6 +259,7 @@ def _copy_previous(previous: Mapping[str, Any] | None, billing: str | None) -> d
             },
             "source": "",
             "billing": billing,
+            "drift": None,
         }
     return {
         "quality": previous["quality"],
@@ -117,6 +269,7 @@ def _copy_previous(previous: Mapping[str, Any] | None, billing: str | None) -> d
         "compactions": dict(previous["compactions"]),
         "source": previous["source"],
         "billing": billing,
+        "drift": dict(previous["drift"]) if isinstance(previous.get("drift"), Mapping) else None,
     }
 
 
@@ -203,6 +356,19 @@ def _apply_codex(
 ) -> bool:
     if not used:
         return False
+    counted = _codex_counted_values(used, response, drops)
+    result["calls"] = (result["calls"] or 0) + len(counted)
+    if counted:
+        model = _codex_model(response) or resolved_model or "unknown"
+        _add_model(result, model, _empty_fields(total_tokens=sum(counted)))
+    return True
+
+
+def _codex_counted_values(
+    used: Sequence[int],
+    response: Mapping[str, Any] | None,
+    drops: Sequence[tuple[int, int, int]],
+) -> list[int]:
     dropped = {index for index, _, _ in drops}
     estimate_total = _codex_zero_category_total(response)
     if estimate_total is not None:
@@ -212,12 +378,7 @@ def _apply_codex(
         )
         if matching is not None:
             dropped.add(matching)
-    counted = [value for index, value in enumerate(used) if index not in dropped]
-    result["calls"] = (result["calls"] or 0) + len(counted)
-    if counted:
-        model = _codex_model(response) or resolved_model or "unknown"
-        _add_model(result, model, _empty_fields(total_tokens=sum(counted)))
-    return True
+    return [value for index, value in enumerate(used) if index not in dropped]
 
 
 def _codex_zero_category_total(response: Mapping[str, Any] | None) -> int | None:
@@ -360,3 +521,9 @@ def _source(adapter_name: str | None, version: str | None, profile: str) -> str:
         parts.append(version)
     parts.append(field)
     return " ".join(parts)
+
+
+def profile_for_source(source: str) -> str:
+    """Return the usage profile named by a stored source field."""
+    field = source.rsplit(" ", maxsplit=1)[-1]
+    return next((profile for profile, path in _PROFILES.items() if path == field), "unknown")

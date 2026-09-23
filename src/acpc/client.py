@@ -545,6 +545,7 @@ class AcpcClient:
         billing: str | None = None,
         resolved_model: str | None = None,
         prompt: str = "",
+        turn_number: int = 1,
     ) -> None:
         self.transcript = transcript
         self.permission_level = permission_level
@@ -565,7 +566,11 @@ class AcpcClient:
         self._billing = billing
         self._resolved_model = resolved_model
         self._prompt = prompt
+        # Public: a deferred rotation opens the turn after this client exists.
+        self.turn_number = turn_number
         self._turn_used: list[int] = []
+        self._turn_sizes: list[int | None] = []
+        self._cold_resume = False
         self._usage_activity_count = 0
         self._limit_usage_gaps = 0
         self._known_limit_rejection = False
@@ -634,6 +639,10 @@ class AcpcClient:
         """Mark a new prompt attempt and return its starting activity count."""
         self._known_limit_rejection = False
         return self._usage_activity_count
+
+    def mark_cold_resume(self) -> None:
+        """Include a restored session in this turn's passive usage checks."""
+        self._cold_resume = True
 
     def record_limit_rejection(self, activity_before: int) -> None:
         """Record one active, unanswered limit send for Claude or Grok."""
@@ -745,6 +754,9 @@ class AcpcClient:
             billing=self._billing,
             limit_gaps=self._limit_usage_gaps,
             missing_response_is_gap=not self._known_limit_rejection,
+            sizes=self._turn_sizes,
+            cold_resume=self._cold_resume,
+            turn_number=self.turn_number,
         )
 
     @asynccontextmanager
@@ -1237,6 +1249,7 @@ class AcpcClient:
     def _record_usage(self, update: UsageUpdate) -> None:
         self._usage_update_seen = True
         self._turn_used.append(update.used)
+        self._turn_sizes.append(update.size)
         previous_peak = self._context["peak"] if self._context is not None else 0
         self._context = ContextOccupancy(
             used=update.used, size=update.size, peak=max(previous_peak, update.used)

@@ -251,6 +251,147 @@ def test_usage_is_cumulative_across_run_continue_status_and_meta(
     assert sessions.read_meta(session_id).usage is None
 
 
+def test_legacy_usage_without_drift_reads_as_null(cli: CliRunner, state_root: Path) -> None:
+    _set_usage_profile(state_root, "claude_model_usage")
+    result = invoke(cli, "run", "mock", "rawusage:claude", "--json", "--quiet")
+    session_id = json.loads(result.stdout)["session_id"]
+    meta_path = state_root / "sessions" / session_id / "meta.json"
+    saved = json.loads(meta_path.read_text(encoding="utf-8"))
+    saved["usage"].pop("drift")
+    meta_path.write_text(json.dumps(saved), encoding="utf-8")
+
+    usage_value = sessions.read_meta(session_id).usage
+    assert usage_value is not None
+    assert usage_value["drift"] is None
+
+
+def test_usage_drift_is_persisted_and_noted_once_across_run_and_continue(
+    cli: CliRunner, state_root: Path
+) -> None:
+    _set_usage_profile(state_root, "codex_usage_updates")
+
+    first = invoke(cli, "run", "mock", "drift:codex", "--json")
+    assert first.exit_code == 0, first.stderr
+    session_id = json.loads(first.stdout)["session_id"]
+    expected_drift = {
+        "check": "codex_usage_updates",
+        "declared": "last",
+        "observed": "turn",
+        "adapter": "mock-agent",
+        "version": "0.1.0",
+        "turn": 1,
+    }
+    expected_note = (
+        f"acpc: mock-agent 0.1.0 reports usage as turn, the codex_usage_updates profile "
+        f"expects last; usage for session {session_id} is marked estimate"
+    )
+    assert first.stderr.splitlines().count(expected_note) == 1
+    assert expected_note not in first.stdout
+    assert json.loads(first.stdout)["usage"]["drift"] == expected_drift
+
+    second = invoke(cli, "continue", session_id, "drift:codex", "--json")
+    assert second.exit_code == 0, second.stderr
+    assert expected_note not in second.stderr
+    assert json.loads(second.stdout)["usage"]["drift"] == expected_drift
+    assert json.loads(invoke(cli, "status", session_id, "--json").stdout)["usage"]["drift"] == (
+        expected_drift
+    )
+    saved = json.loads((state_root / "sessions" / session_id / "meta.json").read_text())
+    assert saved["usage"]["drift"] == expected_drift
+
+
+def test_clean_codex_turn_has_no_usage_drift_note(cli: CliRunner, state_root: Path) -> None:
+    _set_usage_profile(state_root, "codex_usage_updates")
+
+    result = invoke(cli, "run", "mock", "rawusage:codex", "--json")
+
+    assert result.exit_code == 0, result.stderr
+    assert "reports usage as" not in result.stderr
+    assert json.loads(result.stdout)["usage"]["drift"] is None
+
+
+def test_usage_update_above_context_size_drifts_through_the_cli(
+    cli: CliRunner, state_root: Path
+) -> None:
+    _set_usage_profile(state_root, "codex_usage_updates")
+
+    result = invoke(cli, "run", "mock", "drift:used-size", "--json")
+
+    assert result.exit_code == 0, result.stderr
+    payload = json.loads(result.stdout)
+    drift = payload["usage"]["drift"]
+    assert drift["check"] == "used_le_size"
+    assert drift["declared"] == "last"
+    assert drift["observed"] == "cumulative"
+    assert drift["turn"] == 1
+    assert "reports usage as cumulative" in result.stderr
+
+
+def test_restore_delta_is_only_checked_on_cold_continue_without_context_drop(
+    cli: CliRunner, state_root: Path
+) -> None:
+    _set_usage_profile(state_root, "claude_model_usage")
+
+    first = invoke(cli, "run", "mock", "drift:claude-restore", "--json")
+    assert first.exit_code == 0, first.stderr
+    session_id = json.loads(first.stdout)["session_id"]
+    assert json.loads(first.stdout)["usage"]["drift"] is None
+    assert "reports usage as" not in first.stderr
+
+    continued = invoke(cli, "continue", session_id, "drift:claude-restore", "--json")
+
+    assert continued.exit_code == 0, continued.stderr
+    drift = json.loads(continued.stdout)["usage"]["drift"]
+    assert drift["check"] == "restore_delta"
+    assert drift["declared"] == "turn"
+    assert drift["observed"] == "cumulative"
+    assert drift["turn"] == 2
+    assert continued.stderr.count("reports usage as cumulative") == 1
+
+
+def test_background_wait_emits_usage_drift_note_once(
+    cli: CliRunner, live_daemon: None, state_root: Path
+) -> None:
+    _set_usage_profile(state_root, "codex_usage_updates")
+    dispatched = invoke(cli, "run", "mock", "drift:codex", "--bg", "--json")
+    assert dispatched.exit_code == 0, dispatched.stderr
+    session_id = json.loads(dispatched.stdout)["session_id"]
+
+    first_wait = invoke(cli, "wait", session_id, "--json")
+    second_wait = invoke(cli, "wait", session_id, "--json")
+
+    assert first_wait.exit_code == 0, first_wait.stderr
+    assert first_wait.stderr.count("reports usage as turn") == 1
+    assert second_wait.exit_code == 0, second_wait.stderr
+    assert "reports usage as" not in second_wait.stderr
+
+
+def test_usage_drift_names_the_continued_turn_it_was_found_in(
+    cli: CliRunner, state_root: Path
+) -> None:
+    _set_usage_profile(state_root, "codex_usage_updates")
+    first = invoke(cli, "run", "mock", "rawusage:codex", "--json")
+    session_id = json.loads(first.stdout)["session_id"]
+
+    second = invoke(cli, "continue", session_id, "drift:codex", "--json")
+
+    assert second.exit_code == 0, second.stderr
+    assert json.loads(second.stdout)["usage"]["drift"]["turn"] == 2
+
+
+def test_quiet_turn_suppresses_and_consumes_the_usage_drift_note(
+    cli: CliRunner, state_root: Path
+) -> None:
+    _set_usage_profile(state_root, "codex_usage_updates")
+    first = invoke(cli, "run", "mock", "drift:codex", "--json", "--quiet")
+    session_id = json.loads(first.stdout)["session_id"]
+
+    second = invoke(cli, "continue", session_id, "drift:codex", "--json")
+
+    assert "reports usage as" not in first.stderr
+    assert "reports usage as" not in second.stderr
+
+
 def test_unknown_status_adds_one_usage_gap(
     cli: CliRunner, monkeypatch: pytest.MonkeyPatch, state_root: Path
 ) -> None:

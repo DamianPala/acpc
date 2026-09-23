@@ -293,6 +293,46 @@ def test_summary_shows_a_dot_for_unobserved_tokens() -> None:
 
     assert "ctx ·" in line
     assert "0 tok" not in line
+    assert "usage" not in line
+
+
+def test_summary_places_the_shared_usage_segment_after_context() -> None:
+    meta = make_session(Path("."))
+    meta.usage = {
+        "quality": "estimate",
+        "gaps": 0,
+        "calls": 9,
+        "models": {"model": {"total_tokens": 234_600}},
+        "compactions": {"count": 0},
+        "source": "mock _meta.usage",
+        "drift": None,
+        "billing": None,
+    }
+
+    segments = output.format_summary(meta, runtime=12.0).split(" | ")
+
+    assert segments[2] == "ctx ·"
+    assert segments[3] == "usage 9 calls · 234.6k tokens (estimate)"
+
+
+def test_usage_drift_note_omits_an_unknown_adapter_version() -> None:
+    meta = make_session(Path("."))
+    meta.usage = {"source": "mock-agent usage_update.used"}
+
+    note = output.format_usage_drift_note(
+        meta,
+        {
+            "adapter": "mock-agent",
+            "version": None,
+            "observed": "cumulative",
+            "declared": "last",
+        },
+    )
+
+    assert note == (
+        f"acpc: mock-agent reports usage as cumulative, the codex_usage_updates profile expects "
+        f"last; usage for session {meta.session_id} is marked estimate"
+    )
 
 
 def test_summary_names_partial_limit_correction_and_truncation() -> None:

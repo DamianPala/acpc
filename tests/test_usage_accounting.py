@@ -369,3 +369,265 @@ def test_quality_is_exact_only_for_complete_models_without_gaps_or_unaccounted_c
 
     partial = update("grok_meta_usage", response={"_meta": {"usage": {"totalTokens": 10}}})
     assert partial is not None and partial["quality"] == "estimate"
+
+
+def _codex_response(total: int) -> dict[str, Any]:
+    return {"usage": {"totalTokens": total, "inputTokens": total - 1, "outputTokens": 1}}
+
+
+def _claude_response(response_total: int, model_total: int) -> dict[str, Any]:
+    return {
+        "usage": {"totalTokens": response_total},
+        "_meta": {
+            "quota": {
+                "model_usage": [{"model": "claude-opus", "token_count": claude_counts(model_total)}]
+            }
+        },
+    }
+
+
+def test_codex_turn_total_distinguishes_last_turn_and_cumulative_reports() -> None:
+    previous = update("codex_usage_updates", used=(500,))
+    used = (10, 20, 30, 40)
+    sizes = (200_000,) * len(used)
+
+    assert (
+        usage.check_turn_invariants(
+            previous=previous,
+            used=used,
+            sizes=sizes,
+            prompt_response=_codex_response(40),
+            profile="codex_usage_updates",
+        )
+        is None
+    )
+    assert usage.check_turn_invariants(
+        previous=previous,
+        used=used,
+        sizes=sizes,
+        prompt_response=_codex_response(100),
+        profile="codex_usage_updates",
+    ) == {"check": "codex_usage_updates", "declared": "last", "observed": "turn"}
+    assert usage.check_turn_invariants(
+        previous=previous,
+        used=used,
+        sizes=sizes,
+        prompt_response=_codex_response(600),
+        profile="codex_usage_updates",
+    ) == {"check": "codex_usage_updates", "declared": "last", "observed": "cumulative"}
+    assert usage.check_turn_invariants(
+        previous=previous,
+        used=used,
+        sizes=sizes,
+        prompt_response=_codex_response(777),
+        profile="codex_usage_updates",
+    ) == {"check": "codex_usage_updates", "declared": "last", "observed": "unknown"}
+
+
+def test_codex_single_call_has_no_verdict_and_zero_category_is_ignored() -> None:
+    single = usage.check_turn_invariants(
+        previous=None,
+        used=(40,),
+        sizes=(200_000,),
+        prompt_response=_codex_response(100),
+        profile="codex_usage_updates",
+    )
+    zero_category = usage.check_turn_invariants(
+        previous=None,
+        used=(10, 20, 30, 40),
+        sizes=(200_000,) * 4,
+        prompt_response={
+            "usage": {
+                "totalTokens": 4998,
+                "inputTokens": 0,
+                "cachedReadTokens": 0,
+                "outputTokens": 0,
+            }
+        },
+        profile="codex_usage_updates",
+    )
+
+    assert single is None
+    assert zero_category is None
+
+
+def test_codex_check_uses_the_accumulator_count_after_compactions() -> None:
+    observation = usage.check_turn_invariants(
+        previous=None,
+        used=(100, 200, 50, 70),
+        sizes=(200_000,) * 4,
+        prompt_response=_codex_response(270),
+        profile="codex_usage_updates",
+        previous_context={"used": 200},
+    )
+
+    assert observation == {"check": "codex_usage_updates", "declared": "last", "observed": "turn"}
+
+
+def test_claude_response_total_cannot_exceed_this_turn_model_usage() -> None:
+    observation = usage.check_turn_invariants(
+        previous=None,
+        used=(),
+        sizes=(),
+        prompt_response=_claude_response(response_total=120, model_total=100),
+        profile="claude_model_usage",
+    )
+
+    assert observation == {
+        "check": "response_le_model_usage",
+        "declared": "turn",
+        "observed": "cumulative",
+    }
+
+
+def test_claude_cold_restore_detects_history_delta() -> None:
+    observation = usage.check_turn_invariants(
+        previous=None,
+        used=(200, 200),
+        sizes=(200_000, 200_000),
+        prompt_response=_claude_response(response_total=100, model_total=1000),
+        profile="claude_model_usage",
+        cold_resume=True,
+    )
+
+    assert observation == {
+        "check": "restore_delta",
+        "declared": "turn",
+        "observed": "cumulative",
+    }
+
+
+@pytest.mark.parametrize(
+    ("prompt", "previous_context", "used", "response_total", "model_total"),
+    [
+        ("/compact", {"used": 33_931}, (4_018,), 0, 39_430),
+        ("work", {"used": 42_201}, (26_967, 4_710), 26_967, 90_056),
+    ],
+    ids=["compact-1-turn-2", "auto-claude-turn-2"],
+)
+def test_claude_cold_restore_with_context_drop_has_no_restore_verdict(
+    prompt: str,
+    previous_context: dict[str, int],
+    used: tuple[int, ...],
+    response_total: int,
+    model_total: int,
+) -> None:
+    observation = usage.check_turn_invariants(
+        previous=None,
+        used=used,
+        sizes=(200_000,) * len(used),
+        prompt_response=_claude_response(response_total, model_total),
+        profile="claude_model_usage",
+        cold_resume=True,
+        prompt=prompt,
+        previous_context=previous_context,
+    )
+
+    assert observation is None
+
+
+def test_restore_and_size_checks_do_not_drift_at_their_boundaries() -> None:
+    restore_boundary = usage.check_turn_invariants(
+        previous=None,
+        used=(200,),
+        sizes=(200_000,),
+        prompt_response=_claude_response(response_total=100, model_total=300),
+        profile="claude_model_usage",
+        cold_resume=True,
+    )
+    size_boundary = usage.check_turn_invariants(
+        previous=None,
+        used=(200,),
+        sizes=(200,),
+        prompt_response=None,
+        profile="claude_model_usage",
+    )
+
+    assert restore_boundary is None
+    assert size_boundary is None
+
+
+@pytest.mark.parametrize(
+    "profile", ["claude_model_usage", "codex_usage_updates", "grok_meta_usage"]
+)
+def test_usage_update_cannot_report_more_than_its_context_size(profile: str) -> None:
+    observation = usage.check_turn_invariants(
+        previous=None,
+        used=(201,),
+        sizes=(200,),
+        prompt_response=None,
+        profile=profile,
+    )
+
+    assert observation == {
+        "check": "used_le_size",
+        "declared": {
+            "claude_model_usage": "turn",
+            "codex_usage_updates": "last",
+            "grok_meta_usage": "turn",
+        }[profile],
+        "observed": "cumulative",
+    }
+    unknown_size = usage.check_turn_invariants(
+        previous=None,
+        used=(201,),
+        sizes=(None,),
+        prompt_response=None,
+        profile=profile,
+    )
+    assert unknown_size is None
+
+
+def test_first_drift_survives_later_drift_and_clean_turns() -> None:
+    drifted = usage.accumulate_turn(
+        None,
+        used=(),
+        prompt_response=_claude_response(response_total=120, model_total=100),
+        prompt="work",
+        previous_context=None,
+        profile="claude_model_usage",
+        adapter_name="mock-agent",
+        adapter_version="0.1.0",
+        resolved_model="claude-opus",
+        billing=None,
+        turn_number=1,
+    )
+    second_drift = usage.accumulate_turn(
+        drifted,
+        used=(),
+        prompt_response=_claude_response(response_total=100, model_total=1000),
+        prompt="work",
+        previous_context=None,
+        profile="claude_model_usage",
+        adapter_name="mock-agent",
+        adapter_version="0.1.0",
+        resolved_model="claude-opus",
+        billing=None,
+        turn_number=2,
+        cold_resume=True,
+    )
+    clean = usage.accumulate_turn(
+        second_drift,
+        used=(),
+        prompt_response=_claude_response(response_total=100, model_total=100),
+        prompt="work",
+        previous_context=None,
+        profile="claude_model_usage",
+        adapter_name="mock-agent",
+        adapter_version="0.1.0",
+        resolved_model="claude-opus",
+        billing=None,
+        turn_number=3,
+    )
+
+    assert drifted is not None and second_drift is not None and clean is not None
+    assert drifted["drift"] == {
+        "check": "response_le_model_usage",
+        "declared": "turn",
+        "observed": "cumulative",
+        "adapter": "mock-agent",
+        "version": "0.1.0",
+        "turn": 1,
+    }
+    assert second_drift["drift"] == drifted["drift"] == clean["drift"]
+    assert clean["quality"] == "estimate"
