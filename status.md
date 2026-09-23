@@ -2,6 +2,36 @@
 
 ## Now
 
+**1.1 in progress on `feat/1.1` (worktree `acpc.feat-1.1`, from `main` `c86d53b`), 2026-09-23.**
+Scope accepted by Damian: usage measurement (compaction counted, nothing priced), macOS
+leftovers and the message-boundary decision, the small UX pack, warm-daemon health. Steps 1–5 are
+green-lit; step 6 (macOS `ps` leftovers) waits for his go. Builder and explorer run as acpc
+entries (Luna max), the reviewer is Opus through the Agent tool; one commit per slice.
+
+- `6113bc5` slice 27: result caps bounded (`--max-output` 1–4095 is now an error), special
+  output files accepted.
+- `7ba98ed` slice 28: `continue` verifies stored settings; the clamp remedy names the ceiling.
+- `608064f` slice 29: the answer, `log` and `log --prose` delimit messages alike. State-only
+  updates (usage, commands, config, mode, session info) are not boundaries; narrative forks are.
+- `2ef6a64` slice 30: the daemon runs in its state dir with an absolute `ACPC_HOME`, rejects a
+  dispatch without an absolute cwd, and a session whose cwd was removed gets `conflict`.
+- `fb8d9d6` slice 31: each prompt response's raw usage report is kept on a turn-end `usage` event.
+- `978a4a7` slice 32: cumulative `usage` per model with gaps, compactions (a drop of at least
+  5 % in `used`) and `quality`; registry facts `usage_profile` and `billing`.
+- `fc24b2a` slice 33: per-turn drift checks against the declared usage profile; the first
+  violation lands in `usage.drift`, quality stays `estimate`, one stderr note per session.
+- `e87dfc6` slice 34: `status`/`list` show the running turn's context, refreshed at most every
+  2 s under a non-blocking session lock.
+
+Open in 1.1: codex usage-limit wording not recognized as `limit` (explorer running); subscription
+windows moved to 1.2. Live checks after installing 1.1: a real claude limit (its rate-limit
+`usage_update` probably adds a usage gap), claude `/compact` and steered turns, codex
+auto-compaction figures, claude's first turn after `session/load`, the condensed `log` ctx line,
+`status --json` during a direct codex `continue`; run `acpc daemon stop` once after the install,
+because the version string stays 1.0.1. Release notes must name the `--max-output` change, the
+`usage`/`drift` fields and the `--cwd` validation. Branch `feat/1.1-daemon` (slice 30 before its
+cherry-pick) can be deleted.
+
 **1.0.1 released (2026-09-22): tag `v1.0.1` (`5a6186e`) and main are on origin with the gate
 green on `ubuntu-latest` and `macos-latest`, and the release page
 <https://github.com/DamianPala/acpc/releases/tag/v1.0.1> covers 0.7.1 → 1.0.1 (`v1.0.0` has no
