@@ -3,8 +3,8 @@
 SPEC.md `run`: a limit that blocks `session/prompt` is recognized from the
 adapter's JSON-RPC error (`data.errorKind`), from a preceding `usage_update`'s
 `_meta["_claude/rateLimit"]`, or from the vendor's own text. Only
-claude-agent-acp publishes anything structural; codex-acp's limits report
-none of these signals and stay plain failures.
+claude-agent-acp publishes a shared structural signal. codex-acp sends its
+usage-limit text in JSON-RPC error data, which this module also examines.
 
 This module is pure: it takes what the runner already observed (the raised
 error, the last-seen rate-limit metadata, and the current time) and returns a
@@ -14,7 +14,7 @@ classification, with no I/O and no knowledge of sessions, turns or the clock.
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, tzinfo
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -25,7 +25,12 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 # wait for, so they are deliberately not matched here: an error with none of
 # the three recognition signals below falls through to a plain failure, same
 # as before this module existed.
-_TEMPORARY_LIMIT_PREFIXES = ("You've hit your", "You've reached your")
+_TEMPORARY_LIMIT_PREFIXES = (
+    "You've hit your",
+    "You’ve hit your",
+    "You've reached your",
+    "You’ve reached your",
+)
 
 _INTERNAL_ERROR_PREFIX = "Internal error: "
 
@@ -37,6 +42,16 @@ _RESETS_RE = re.compile(
     r"(?:(?P<month>[A-Za-z]{3})\s+(?P<day>\d{1,2})(?:\s+at|,)\s+)?"
     r"(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>am|pm)"
     r"\s*\((?P<zone>[^)]+)\)",
+    re.IGNORECASE,
+)
+
+# codex-acp includes local wall time without a zone in its usage-limit text:
+# "try again at 10:47 PM" or "try again at Sep 24th, 2026 10:47 PM".
+_CODEX_RETRY_RE = re.compile(
+    r"try again at\s+"
+    r"(?:(?P<month>[A-Za-z]{3})\s+(?P<day>\d{1,2})(?:st|nd|rd|th)?"
+    r"(?:,\s*(?P<year>\d{4}))?[,\s]+)?"
+    r"(?P<hour>\d{1,2}):(?P<minute>\d{2})\s*(?P<ampm>am|pm)\b",
     re.IGNORECASE,
 )
 
@@ -128,6 +143,57 @@ def _parse_resets_clause(text: str, *, now: datetime) -> datetime | None:
     return candidate.astimezone(UTC)
 
 
+def _local_zone(now: datetime) -> tzinfo | None:
+    """Return an injected IANA timezone, if `now` carries one."""
+    return now.tzinfo if isinstance(now.tzinfo, ZoneInfo) else None
+
+
+def _parse_codex_retry_at(text: str, *, now: datetime) -> datetime | None:
+    """Parse Codex's unzoned retry time in local time, keeping past times past."""
+    match = _CODEX_RETRY_RE.search(text)
+    if match is None:
+        return None
+
+    hour = int(match.group("hour"))
+    minute = int(match.group("minute"))
+    if not 1 <= hour <= 12 or minute > 59:
+        return None
+    hour = hour % 12
+    if match.group("ampm").lower() == "pm":
+        hour += 12
+
+    zone = _local_zone(now)
+    now_local = now.astimezone(zone) if zone is not None else now.astimezone()
+    month_name = match.group("month")
+    if month_name is None:
+        year, month, day = now_local.year, now_local.month, now_local.day
+    else:
+        month = _MONTHS.get(month_name.lower())
+        if month is None:
+            return None
+        day = int(match.group("day"))
+        year = int(match.group("year") or now_local.year)
+    try:
+        candidate = datetime(year, month, day, hour, minute, tzinfo=zone)
+        if zone is None:
+            candidate = candidate.astimezone()
+    except ValueError:
+        return None
+    return candidate.astimezone(UTC)
+
+
+def _error_texts(error: Exception | None, data: Mapping[str, Any] | None) -> tuple[str, ...]:
+    texts: list[str] = []
+    if error is not None:
+        texts.append(_strip_internal_prefix(str(error)))
+    if data is not None:
+        for key in ("message", "additionalDetails"):
+            value = data.get(key)
+            if isinstance(value, str) and value:
+                texts.append(value)
+    return tuple(text for text in texts if text)
+
+
 def classify_limit(
     error: Exception | None,
     rate_limit_info: Mapping[str, Any] | None,
@@ -139,17 +205,19 @@ def classify_limit(
     ``usage_update``'s ``rate_limit_info.status == "rejected"``, or the
     error's own text starting with a temporary-limit prefix. The return time
     prefers `rate_limit_info`'s `resetsAt` when it observed the rejection,
-    then the text's own `resets` clause; a structural signal with neither is
+    then the text's `try again at` or `resets` clause; a signal with neither is
     still recognized, just with an unknown return time.
     """
     data = getattr(error, "data", None) if error is not None else None
     error_kind = data.get("errorKind") if isinstance(data, Mapping) else None
-    message = str(error) if error is not None else ""
-    text = _strip_internal_prefix(message)
+    texts = _error_texts(error, data if isinstance(data, Mapping) else None)
+    text = next((value for value in texts if _is_temporary_limit_text(value)), "")
+    detail = text or (texts[0] if texts else "")
+    combined_text = " ".join(texts)
 
     info = rate_limit_info if isinstance(rate_limit_info, Mapping) else None
     info_rejected = info is not None and info.get("status") == "rejected"
-    temporary_text = _is_temporary_limit_text(text)
+    temporary_text = bool(text)
 
     if not (error_kind == "rate_limit" or info_rejected or temporary_text):
         return None
@@ -160,23 +228,25 @@ def classify_limit(
             reason="rate_limit",
             resume_at=datetime.fromtimestamp(reset_at, tz=UTC),
             source="rate_limit_info",
-            detail=text or message,
+            detail=detail,
         )
 
-    text_resume = _parse_resets_clause(text, now=now) if temporary_text else None
+    text_resume = None
+    if temporary_text:
+        text_resume = _parse_codex_retry_at(combined_text, now=now)
+        if text_resume is None:
+            text_resume = _parse_resets_clause(combined_text, now=now)
     if text_resume is not None:
         return LimitObservation(
-            reason="rate_limit", resume_at=text_resume, source="text", detail=text or message
+            reason="rate_limit", resume_at=text_resume, source="text", detail=detail
         )
 
     if error_kind == "rate_limit":
         return LimitObservation(
-            reason="rate_limit", resume_at=None, source="error_kind", detail=text or message
+            reason="rate_limit", resume_at=None, source="error_kind", detail=detail
         )
     if info_rejected:
         return LimitObservation(
-            reason="rate_limit", resume_at=None, source="rate_limit_info", detail=text or message
+            reason="rate_limit", resume_at=None, source="rate_limit_info", detail=detail
         )
-    return LimitObservation(
-        reason="rate_limit", resume_at=None, source="text", detail=text or message
-    )
+    return LimitObservation(reason="rate_limit", resume_at=None, source="text", detail=detail)

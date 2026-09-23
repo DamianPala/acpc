@@ -11,8 +11,9 @@ import json
 import sys
 import threading
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 from acp import RequestError
@@ -92,6 +93,26 @@ def _run_in_background_thread(cli: CliRunner, *args: str) -> tuple[threading.Thr
     return thread, holder
 
 
+def _freeze_runner_clock(monkeypatch: pytest.MonkeyPatch, now: datetime) -> None:
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            instant = now.astimezone(UTC)
+            return instant if tz is None else instant.astimezone(tz)
+
+    monkeypatch.setattr(runner, "datetime", FrozenDateTime)
+
+
+def _codex_retry_text(at: datetime) -> str:
+    months = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+    suffix = (
+        "th" if 11 <= at.day % 100 <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(at.day % 10, "th")
+    )
+    hour = at.hour % 12 or 12
+    ampm = "AM" if at.hour < 12 else "PM"
+    return f"{months[at.month - 1]} {at.day}{suffix}, {at.year} {hour}:{at.minute:02d} {ampm}"
+
+
 # --- classify_limit: parser table --------------------------------------------
 
 _NOW = datetime(2026, 9, 20, 10, 0, 0, tzinfo=UTC)
@@ -100,6 +121,15 @@ _NOW = datetime(2026, 9, 20, 10, 0, 0, tzinfo=UTC)
 def _limit_error(text: str, *, with_data: bool = True) -> RequestError:
     data = {"errorKind": "rate_limit"} if with_data else None
     return RequestError(-32603, f"Internal error: You've hit your session limit · {text}", data)
+
+
+def _codex_limit_error(
+    text: str, *, field: str = "message", codex_error_info: str | None = "usageLimitExceeded"
+) -> RequestError:
+    data = {field: text}
+    if codex_error_info is not None:
+        data["codexErrorInfo"] = codex_error_info
+    return RequestError(-32603, "Internal error", data)
 
 
 @pytest.mark.parametrize(
@@ -136,6 +166,162 @@ def test_classify_limit_returns_no_time_for_an_unknown_zone() -> None:
     assert observation is not None
     assert observation.resume_at is None
     assert observation.source == "text"
+
+
+@pytest.mark.parametrize("apostrophe", ["'", "’"])
+def test_classify_codex_limit_parses_a_local_time_without_a_date(apostrophe: str) -> None:
+    now = datetime(2026, 9, 24, 18, 0, tzinfo=ZoneInfo("America/Los_Angeles"))
+    error = _codex_limit_error(
+        f"You{apostrophe}ve hit your usage limit. Upgrade to Pro or try again at 10:47 PM."
+    )
+
+    observation = limits.classify_limit(error, None, now)
+
+    assert observation is not None
+    assert observation.reason == "rate_limit"
+    assert observation.source == "text"
+    assert observation.resume_at == datetime(2026, 9, 25, 5, 47, tzinfo=UTC)
+
+
+@pytest.mark.parametrize(
+    ("date_text", "expected"),
+    [
+        (
+            "Sep 24th, 2026 10:47 PM",
+            datetime(2026, 9, 25, 5, 47, tzinfo=UTC),
+        ),
+        (
+            "Sep 24th 10:47 PM",
+            datetime(2026, 9, 25, 5, 47, tzinfo=UTC),
+        ),
+        # After the end of DST: the offset is the zone's rule for that date.
+        ("Nov 2nd, 2026 10:47 AM", datetime(2026, 11, 2, 18, 47, tzinfo=UTC)),
+        ("Jan 1st, 2027 1:00 AM", datetime(2027, 1, 1, 9, 0, tzinfo=UTC)),
+    ],
+)
+def test_classify_codex_limit_parses_a_dated_local_time(date_text: str, expected: datetime) -> None:
+    now = datetime(2026, 9, 20, 3, 0, tzinfo=ZoneInfo("America/Los_Angeles"))
+    error = _codex_limit_error(f"You've hit your usage limit. Try again at {date_text}.")
+
+    observation = limits.classify_limit(error, None, now)
+
+    assert observation is not None
+    assert observation.source == "text"
+    assert observation.resume_at == expected
+
+
+def test_classify_codex_limit_reads_the_machine_zone_across_dst(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The runner passes a UTC `now`, so the process zone applies to the text.
+    text = "You've hit your usage limit. Try again at Oct 26th, 2026 10:47 AM."
+    try:
+        with monkeypatch.context() as patch:
+            patch.setenv("TZ", "Europe/Warsaw")
+            time.tzset()
+            observation = limits.classify_limit(
+                _codex_limit_error(text), None, datetime(2026, 10, 24, 10, 0, tzinfo=UTC)
+            )
+    finally:
+        time.tzset()
+
+    assert observation is not None
+    assert observation.resume_at == datetime(2026, 10, 26, 9, 47, tzinfo=UTC)
+
+
+def test_classify_codex_limit_keeps_a_same_day_time_that_is_already_past() -> None:
+    now = datetime(2026, 9, 24, 23, 0, tzinfo=ZoneInfo("America/Los_Angeles"))
+    error = _codex_limit_error("You've hit your usage limit. Try again at 10:47 PM.")
+
+    observation = limits.classify_limit(error, None, now)
+
+    assert observation is not None
+    resume_at = observation.resume_at
+    assert resume_at is not None
+    assert resume_at == datetime(2026, 9, 25, 5, 47, tzinfo=UTC)
+    assert resume_at < now.astimezone(UTC)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "You've hit your usage limit. Try again later.",
+        "You've hit your usage limit.",
+    ],
+)
+def test_classify_codex_limit_without_a_time_stays_a_limit(text: str) -> None:
+    observation = limits.classify_limit(_codex_limit_error(text), None, _NOW)
+
+    assert observation is not None
+    assert observation.reason == "rate_limit"
+    assert observation.source == "text"
+    assert observation.resume_at is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "To use Codex with your ChatGPT plan, upgrade to Plus: access details.",
+        "Quota exceeded. Check your plan and billing details.",
+    ],
+)
+def test_classify_codex_ignores_permanent_access_failures(text: str) -> None:
+    assert limits.classify_limit(_codex_limit_error(text), None, _NOW) is None
+
+
+def test_classify_codex_ignores_usage_limit_code_with_unknown_text() -> None:
+    error = _codex_limit_error("Internal error", field="message")
+
+    assert limits.classify_limit(error, None, _NOW) is None
+
+
+def test_classify_codex_reads_limit_text_from_additional_details() -> None:
+    error = RequestError(
+        -32603,
+        "Internal error",
+        {
+            "message": "Internal error",
+            "additionalDetails": "You've hit your usage limit. Try again later.",
+            "codexErrorInfo": "usageLimitExceeded",
+        },
+    )
+
+    observation = limits.classify_limit(error, None, _NOW)
+
+    assert observation is not None
+    assert observation.source == "text"
+    assert observation.resume_at is None
+
+
+def test_classify_text_in_data_message_without_codex_code_like_claude() -> None:
+    error = _codex_limit_error(
+        "You've hit your usage limit. Try again later.", codex_error_info=None
+    )
+
+    observation = limits.classify_limit(error, None, _NOW)
+
+    assert observation is not None
+    assert observation.source == "text"
+    assert observation.resume_at is None
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        "You've hit your",
+        "You’ve hit your",
+        "You've reached your",
+        "You’ve reached your",
+    ],
+)
+def test_classify_claude_prefixes_accept_both_apostrophes(prefix: str) -> None:
+    error = RequestError(-32603, f"Internal error: {prefix} session limit", None)
+
+    observation = limits.classify_limit(error, None, _NOW)
+
+    assert observation is not None
+    assert observation.source == "text"
+    assert observation.resume_at is None
 
 
 def test_classify_limit_prefers_rate_limit_info_over_text() -> None:
@@ -182,6 +368,81 @@ def test_classify_limit_ignores_an_unrelated_failure() -> None:
 
 
 # --- behavior: 1. wait through the limit and resume in the same turn --------
+
+
+def test_run_waits_through_a_codex_limit_and_resumes_in_the_same_turn(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch, state_root: Path
+) -> None:
+    (state_root / "config.toml").write_text('limit_wait_max = "30s"\n', encoding="utf-8")
+    target = datetime.now().astimezone().replace(second=0, microsecond=0) + timedelta(minutes=1)
+    _freeze_runner_clock(monkeypatch, target - timedelta(seconds=1))
+    monkeypatch.setenv("ACPC_MOCK_LIMIT_VENDOR", "codex")
+    monkeypatch.setenv("ACPC_MOCK_LIMIT_CODEX_CASE", "timed")
+    monkeypatch.setenv("ACPC_MOCK_LIMIT_CODEX_AT", _codex_retry_text(target))
+    monkeypatch.setenv("ACPC_MOCK_LIMIT_PROMPTS", "1")
+
+    thread, holder = _run_in_background_thread(
+        cli, "run", "mock", "echo:x", "--json", "--quiet", "--name", "codex-limit-wait"
+    )
+    session_id = _await_alias("codex-limit-wait")
+    meta = _wait_for_state(session_id, "waiting", timeout=3)
+
+    assert meta.limit is not None
+    assert meta.limit["source"] == "text"
+    assert meta.limit["resume_at"] is not None
+    assert datetime.fromisoformat(meta.limit["resume_at"]) == target.astimezone(UTC)
+    assert meta.turns == 1
+
+    thread.join(timeout=20)
+    assert not thread.is_alive()
+    assert "error" not in holder, holder
+    result = holder["result"]
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    document = json.loads(result.stdout)
+    assert document["status"] == "succeeded"
+    assert document["answer"] == "x"
+    assert document["turn"] == 1
+    assert document["limit"]["source"] == "text"
+    events = [
+        json.loads(line) for line in invoke(cli, "log", session_id, "--json").stdout.splitlines()
+    ]
+    transitions = [
+        (event.get("from"), event.get("to")) for event in events if event["type"] == "state"
+    ]
+    assert ("running", "waiting") in transitions
+    assert ("waiting", "running") in transitions
+
+
+def test_run_codex_try_again_later_fails_with_an_unknown_resume_time(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ACPC_MOCK_LIMIT_VENDOR", "codex")
+    monkeypatch.setenv("ACPC_MOCK_LIMIT_CODEX_CASE", "later")
+    monkeypatch.setenv("ACPC_MOCK_LIMIT_PROMPTS", "1")
+
+    result = invoke(cli, "run", "mock", "echo:x", "--json", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    document = json.loads(result.stdout)
+    assert document["status"] == "failed"
+    assert document["stop_reason"] == "rate_limit"
+    assert document["limit"]["source"] == "text"
+    assert document["limit"]["resume_at"] is None
+
+
+def test_run_codex_permanent_access_error_fails_without_a_limit(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ACPC_MOCK_LIMIT_VENDOR", "codex")
+    monkeypatch.setenv("ACPC_MOCK_LIMIT_CODEX_CASE", "not_included")
+    monkeypatch.setenv("ACPC_MOCK_LIMIT_PROMPTS", "1")
+
+    result = invoke(cli, "run", "mock", "echo:x", "--json", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    document = json.loads(result.stdout)
+    assert document["status"] == "failed"
+    assert document.get("limit") is None
 
 
 def test_run_waits_through_a_limit_and_resumes_the_original_prompt(

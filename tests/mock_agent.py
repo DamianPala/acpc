@@ -93,7 +93,11 @@ a reset time with sub-minute precision. ``ACPC_MOCK_LIMIT_NO_DATA=1`` omits
 ``data`` from the error. ``ACPC_MOCK_LIMIT_NO_TIME=1`` drops the ``resets``
 clause from the text. ``ACPC_MOCK_LIMIT_AFTER_TEXT=1`` streams one message
 chunk before the error, to exercise the continuation-instruction path. The
-zone is ``TZ`` if set, else ``Europe/Warsaw``.
+zone is ``TZ`` if set, else ``Europe/Warsaw``. ``ACPC_MOCK_LIMIT_VENDOR=codex``
+sends the codex-acp shape (``data.message`` and ``codexErrorInfo``);
+``ACPC_MOCK_LIMIT_CODEX_CASE`` can select ``timed``, ``later``,
+``not_included``, ``quota_exceeded`` or ``unknown``. ``ACPC_MOCK_LIMIT_CODEX_AT``
+overrides the retry date/time text for a timed case.
 
 Advertised dataset: modes ``default``/``acceptEdits``/``plan``/``yolo`` (the
 restricted mode), models ``mock-opus-5``/``mock-sonnet-5``/``mock-haiku-4-5``,
@@ -293,6 +297,49 @@ def _reset_clause(reset_epoch: float, zone_name: str) -> str:
     ampm = "am" if local.hour < 12 else "pm"
     time_text = f"{hour12}:{local.minute:02d}{ampm}" if local.minute else f"{hour12}{ampm}"
     return f"resets {time_text} ({zone_name})"
+
+
+def _ordinal(day: int) -> str:
+    if 11 <= day % 100 <= 13:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+    return f"{day}{suffix}"
+
+
+def _codex_retry_at(reset_epoch: float, zone_name: str) -> str:
+    rounded = math.ceil(reset_epoch / 60) * 60
+    local = datetime.fromtimestamp(rounded, tz=UTC).astimezone(ZoneInfo(zone_name))
+    hour12 = local.hour % 12 or 12
+    ampm = "AM" if local.hour < 12 else "PM"
+    time_text = f"{hour12}:{local.minute:02d} {ampm}"
+    today = datetime.now(tz=UTC).astimezone(ZoneInfo(zone_name)).date()
+    if local.date() == today:
+        return time_text
+    months = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+    return f"{months[local.month - 1]} {_ordinal(local.day)}, {local.year} {time_text}"
+
+
+def _codex_limit_error(reset_epoch: float, zone_name: str) -> RequestError:
+    case = os.environ.get("ACPC_MOCK_LIMIT_CODEX_CASE", "timed")
+    if case == "not_included":
+        message = "To use Codex with your ChatGPT plan, upgrade to Plus: access details."
+    elif case == "quota_exceeded":
+        message = "Quota exceeded. Check your plan and billing details."
+    elif case == "unknown":
+        message = "The Codex request failed for an unknown reason."
+    else:
+        prefix = "You've hit your usage limit."
+        if case == "later":
+            retry = "try again later"
+        else:
+            at = os.environ.get("ACPC_MOCK_LIMIT_CODEX_AT") or _codex_retry_at(
+                reset_epoch, zone_name
+            )
+            retry = f"try again at {at}"
+        message = f"{prefix} Upgrade your plan or {retry}."
+    data = {"message": message, "codexErrorInfo": "usageLimitExceeded"}
+    return RequestError(-32603, "Internal error", data)
 
 
 def select_scenario(prompt: str) -> str | None:
@@ -1120,6 +1167,9 @@ class MockAgent(Agent):
         reset_seconds = float(os.environ.get("ACPC_MOCK_LIMIT_RESET_S", "60"))
         reset_epoch = time.time() + reset_seconds
         zone_name = os.environ.get("TZ") or "Europe/Warsaw"
+
+        if os.environ.get("ACPC_MOCK_LIMIT_VENDOR") == "codex":
+            raise _codex_limit_error(reset_epoch, zone_name)
 
         if os.environ.get("ACPC_MOCK_LIMIT_AFTER_TEXT") == "1":
             await self._send_text(session_id, "working on it")

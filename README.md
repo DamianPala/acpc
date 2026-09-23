@@ -79,7 +79,7 @@ daemon status|stop [target] [--force]   # plumbing escape hatch — never needed
 `daemon status` orders entries by target name, ascending, with the default window being the first 20 entries in that order.
 `prune` fixes its target set before confirmation, then locks and rechecks every target before clearing any session; a target that changed meanwhile fails with `conflict` and leaves the set intact.
 
-A vendor usage limit that blocks a turn is waited out inside that turn: the session shows `waiting`, `status` names the reason and the reset time under `limit`, and acpc resends on the same adapter session after the reset (within `limit_wait_max`, 8h by default; `"0s"` in the config turns waiting off, so every limit ends the turn as `failed` with `stop_reason: rate_limit`). `cancel` during the wait drops the resumption. Only claude-agent-acp reports limits in a way acpc can read; codex limits remain plain failures.
+A vendor usage limit that blocks a turn is waited out inside that turn: the session shows `waiting`, `status` names the reason and the reset time under `limit`, and acpc resends on the same adapter session after the reset (within `limit_wait_max`, 8h by default; `"0s"` in the config turns waiting off, so every limit ends the turn as `failed` with `stop_reason: rate_limit`). `cancel` during the wait drops the resumption. acpc reads the limits of claude-agent-acp and codex-acp; a codex plan with no access at all stays a plain failure.
 
 For one-time changes from earlier releases, see [MIGRATION.md](MIGRATION.md).
 
