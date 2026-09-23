@@ -2105,9 +2105,6 @@ def resolution_payload(
     if resolution.permissions_clamp is not None:
         requested, ceiling = resolution.permissions_clamp
         permissions = resolved["permissions"]
-        permissions["source"] = (
-            f"{permissions['source']} (clamped from {requested} by inherited ceiling {ceiling})"
-        )
         permissions["clamp"] = {
             "requested": requested,
             "ceiling": ceiling,

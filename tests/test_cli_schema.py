@@ -401,6 +401,17 @@ def test_run_time_resolved_values_are_not_published_as_defaults(runner: CliRunne
     assert flags["max-output"]["default"] == 131072
 
 
+def test_continue_resolution_flags_are_published_as_stored_value_checks(
+    runner: CliRunner,
+) -> None:
+    flags = {flag["name"]: flag for flag in read_detail(runner, "continue")["flags"]}
+    for name in ("model", "effort", "mode", "cwd", "home", "name"):
+        assert flags[name]["description"] == (
+            f"Must equal the session's stored {name}; continue reuses the session's settings."
+        )
+        assert "default" not in flags[name]
+
+
 @pytest.mark.parametrize("command", ["run", "continue", "steer", "wait"])
 def test_answer_commands_publish_the_max_output_floor(runner: CliRunner, command: str) -> None:
     flags = {flag["name"]: flag for flag in read_detail(runner, command)["flags"]}

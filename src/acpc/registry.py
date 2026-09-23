@@ -22,7 +22,7 @@ from acpc.environment import adapter_environment
 from acpc.paths import agents_dir
 from acpc.vocab import EFFORT_VALUES, PERMISSION_ALIASES, PERMISSION_VALUES, normalize_permission
 
-_TIERS: Final = frozenset({"fast", "standard", "max"})
+MODEL_TIERS: Final = frozenset({"fast", "standard", "max"})
 _NON_INHERITABLE_FIELDS: Final = frozenset({"description"})
 _MODE_KEYS: Final = frozenset({"grants", "delegates", "escalates"})
 _MODE_GRANTS: Final = frozenset(PERMISSION_VALUES[:-1])
@@ -300,7 +300,7 @@ class ResolvedEntry:
         resolved_effort: str | None
         sources: dict[str, FieldSource] = {}
 
-        if model is not None and model in _TIERS:
+        if model is not None and model in MODEL_TIERS:
             preset = self.presets.get(model)
             if preset is None:
                 if not self.presets:

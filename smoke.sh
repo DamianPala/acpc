@@ -956,10 +956,16 @@ if begin_section S09-continue "continue + steer: context, turn rotation, cursor 
     assert_eq "transcript cursor space is contiguous across turns" \
         "$CONVO_EXPECTED" "$CONVO_IS"
 
-    # A run-only flag on continue names the rule, not a bare unrecognized-argument
+    # An equal resolution flag is accepted without changing the stored model.
     run_acpc continue "$CONVO_ID" "third turn" --model mock-sonnet-5
-    assert_eq "run-only flag on continue is a usage error" "2" "$LAST_RC"
-    assert_contains "the error names the rule" "$LAST_ERR" "--model"
+    assert_eq "matching model on continue starts the turn" "0" "$LAST_RC"
+    assert_contains "matching model keeps the turn on the stored model" "$LAST_OUT" \
+        "third turn"
+
+    run_acpc continue "$CONVO_ID" "fourth turn" --model mock-opus-5
+    assert_eq "different model on continue is a usage error" "2" "$LAST_RC"
+    assert_contains "model mismatch prints stored and given values" "$LAST_ERR" \
+        "stored model mock-sonnet-5; given mock-opus-5"
 
     run_acpc continue does-not-exist "hi"
     assert_eq "continue on an unknown id fails" "1" "$LAST_RC"

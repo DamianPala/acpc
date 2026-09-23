@@ -678,11 +678,17 @@ def status_permissions(meta: sessions.SessionMeta) -> dict[str, Any]:
     resolved = _resolved_permissions(meta)
     policy = resolved.get("value")
     source = meta.resolution.get("permissions_source") or resolved.get("source")
+    clamp = _permissions_clamp(meta)
+    if clamp is not None and isinstance(source, str):
+        legacy_suffix = (
+            f" (clamped from {clamp['requested']} by inherited ceiling {clamp['ceiling']})"
+        )
+        source = source.removesuffix(legacy_suffix)
     return {
         "policy": policy if isinstance(policy, str) else "read",
         "mode": _resolved_mode(meta),
         "source": source if isinstance(source, str) else "unset",
-        "clamp": _permissions_clamp(meta),
+        "clamp": clamp,
     }
 
 

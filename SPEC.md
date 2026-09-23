@@ -93,6 +93,7 @@ cancel SELECTOR [--format text|json]
 
 ```text
 continue SELECTOR [PROMPT | -] [--prompt-file FILE] [--permissions P]
+    [--model M] [--effort E] [--mode MODE] [--cwd DIR] [--home DIR] [--name ALIAS]
     [--output-file FILE] [--format text|json] [--background]
     [--timeout S] [--cancel-after S]
     [--max-output BYTES] [--quiet]
@@ -104,7 +105,7 @@ A `continue` without a message, neither `PROMPT`, `-` nor `--prompt-file`, conti
 
 The adapter session is verified before a cold resume sends the new prompt. A listing check and a replay check are independent; an unavailable check leaves the resume unverified rather than inventing certainty. If acpc cannot account for every prompt known to have crossed the adapter boundary, the result says `resume: unverified — delivery record incomplete`. A mismatch fails before the new prompt is sent.
 
-Replay from `session/load` or `session/resume` is silent. It does not add old messages to the answer, transcript, stderr or context occupancy. A session in `starting`, `running`, `preparing` or `waiting` cannot be continued; the `conflict` error's hint names `steer` and `wait`, and for a session that has nothing in flight to correct in place (`starting`, `preparing`, `waiting`) it names `--steer-mode cancel-then-start`, so the hinted command never fails with a second `conflict`. Resolution flags that belong to a new dispatch are rejected with a hint to use `run`. `--timeout` and `--cancel-after` behave as for `run`, counted from the call: a deadline that expires during the cold resume, before the new turn was observed, leaves stdout empty with `error.context.status` `starting` or `preparing`. A usage limit on the turn this call starts is handled as for `run`.
+Replay from `session/load` or `session/resume` is silent. It does not add old messages to the answer, transcript, stderr or context occupancy. A session in `starting`, `running`, `preparing` or `waiting` cannot be continued; the `conflict` error's hint names `steer` and `wait`, and for a session that has nothing in flight to correct in place (`starting`, `preparing`, `waiting`) it names `--steer-mode cancel-then-start`, so the hinted command never fails with a second `conflict`. Resolution flags that belong to a new dispatch (`--model`, `--effort`, `--mode`, `--cwd`, `--home`, `--name`) are accepted only when they name the session's stored value, compared after the normalization `run` applies (a path resolved against the caller's directory, a preset name resolved through the session's adapter table); such a flag changes nothing. A different value, including one given where the session stores none, is a usage error that prints the stored and the given value, with a hint to drop the flag or use `run`. `--timeout` and `--cancel-after` behave as for `run`, counted from the call: a deadline that expires during the cold resume, before the new turn was observed, leaves stdout empty with `error.context.status` `starting` or `preparing`. A usage limit on the turn this call starts is handled as for `run`.
 
 ### `daemon`
 
@@ -464,7 +465,7 @@ daemon_max_concurrent = 8
 limit_wait_max = "8h"
 ```
 
-`limit_wait_max` caps how long one turn may wait for usage limits in total; a duration with the `--timeout` syntax, and `"0s"` disables waiting so that every recognized limit ends the turn `failed` at once. Unknown config keys are hard errors. Relative paths in `--cwd`, `--prompt-file` and `--output-file` resolve against the caller's working directory; a leading `~` is expanded. Directories are mode 0700 and files are mode 0600 where the platform supports those permissions. Metadata and cache writes are atomic, and transcript appends are whole lines.
+`limit_wait_max` caps how long one turn may wait for usage limits in total; a duration with the `--timeout` syntax, and `"0s"` disables waiting so that every recognized limit ends the turn `failed` at once. Unknown config keys are hard errors. Relative paths in `--cwd`, `--prompt-file` and `--output-file`, and in `--home` on `run`, `resolve` and `continue`, resolve against the caller's working directory; a leading `~` is expanded. Directories are mode 0700 and files are mode 0600 where the platform supports those permissions. Metadata and cache writes are atomic, and transcript appends are whole lines.
 
 `meta.json` uses `status`, not a second state field, and stores the resolved invocation, timestamps, turn count, context occupancy (`context`, the object `status` reports), exit code, stop reason, failure observation, prompt snippet, adapter session id, target and the steer mode. Metadata written before 1.0 carried `tokens` and `cost` instead; on read, `tokens` becomes `context` with `used` and `peak` equal to it and `size` `null`, and `cost` is dropped. The adapter session id is recorded as soon as the adapter has accepted the session, before the prompt is sent, so a host process lost mid-turn leaves a session that can still be continued. Timestamps are RFC 3339 with a consistent microsecond precision. A per-session lock serializes turns, cleanup and metadata transitions.
 
@@ -513,7 +514,7 @@ MODEL_PROVIDER = "openrouter"
 
 The permission scale is `none`, `read`, `edit`, `execute`, `all`, with `ask` as a separate policy that prompts for categories above read. `write` and `prompt` are deprecated aliases for `execute` and `ask`. Categories come from ACP tool-call kinds: reads, searches, fetches and thoughts are read; edits are edit; execute, delete and move are execute; unknown kinds are unknown. A mode is eligible only when its measured `grants` does not exceed the requested policy. Among eligible modes acpc prefers delegation and then the highest grant. `delegates` and `escalates` are descriptive facts, not extra policy levels.
 
-`ACPC_CEILING` carries an inherited ceiling into nested dispatch. A child cannot request more authority than its parent. A denied category is recorded in the answer result and does not itself make the turn fail; the adapter can also suppress a request by handling an action internally.
+`ACPC_CEILING` carries an inherited ceiling into nested dispatch. A child cannot request more authority than its parent. When the ceiling is below the lowest policy an entry runs under, the refusal names the ceiling rather than suggesting `--permissions`, which the ceiling would clamp again. A denied category is recorded in the answer result and does not itself make the turn fail; the adapter can also suppress a request by handling an action internally.
 
 ## Bundled skills
 

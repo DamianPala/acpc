@@ -282,8 +282,8 @@ def run_cli_until_early_line(*args: str) -> tuple[int, str, str, str, bool]:
     return process.returncode, early_line, stdout, stderr, still_running
 
 
-def start_session(cli: CliRunner, prompt: str = "turn one") -> str:
-    result = invoke(cli, "run", "mock", prompt, "--quiet", "--json")
+def start_session(cli: CliRunner, prompt: str = "turn one", *options: str) -> str:
+    result = invoke(cli, "run", "mock", prompt, *options, "--quiet", "--json")
     assert result.exit_code == vocab.EXIT_OK
     return json.loads(result.stdout)["session_id"]
 
@@ -311,12 +311,123 @@ def test_continue_accepts_a_suffixed_timeout(cli: CliRunner) -> None:
     assert "waited 2s" in result.stdout
 
 
-def test_continue_rejects_run_only_flags_with_a_run_hint(cli: CliRunner) -> None:
-    result = invoke(cli, "continue", "abcd", "try again", "--model", "mock-opus-5")
+def test_continue_keeps_hints_for_resolve_only_flags(cli: CliRunner) -> None:
+    result = invoke(cli, "continue", "abcd", "try again", "--dry-run")
 
     assert result.exit_code == vocab.EXIT_USAGE
-    assert "--model" in result.stderr
-    assert "acpc run" in result.stderr
+    assert "--dry-run was removed from continue" in result.stderr
+    assert "acpc resolve" in result.stderr
+
+    result = invoke(cli, "continue", "abcd", "try again", "--resolve")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert "--resolve moved to: acpc resolve" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("flag", "value", "run_options"),
+    [
+        ("--model", "mock-sonnet-5", ()),
+        ("--effort", "high", ()),
+        ("--mode", "default", ()),
+        ("--cwd", ".", ("--cwd", ".")),
+        ("--home", ".", ("--home", ".")),
+        ("--name", "saved-name", ("--name", "saved-name")),
+    ],
+)
+def test_continue_accepts_each_matching_resolution_flag_and_starts_a_turn(
+    cli: CliRunner, flag: str, value: str, run_options: tuple[str, ...]
+) -> None:
+    session_id = start_session(cli, "turn one", *run_options)
+    if flag == "--home":
+        assert sessions.read_meta(session_id).resolution["resolved"]["home"]["value"] == str(
+            Path.cwd()
+        )
+
+    result = invoke(cli, "continue", session_id, "turn two", flag, value, "--quiet")
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    assert sessions.read_meta(session_id).turns == 2
+
+
+@pytest.mark.parametrize(
+    ("flag", "value", "stored", "given", "run_options"),
+    [
+        ("--model", "mock-opus-5", "mock-sonnet-5", "mock-opus-5", ()),
+        ("--effort", "low", "high", "low", ()),
+        ("--mode", "yolo", "default", "yolo", ()),
+        ("--cwd", "/tmp", str(Path.cwd()), str(Path("/tmp").resolve()), ()),
+        (
+            "--home",
+            "/tmp",
+            str(Path("~/.mock").expanduser().resolve()),
+            str(Path("/tmp").resolve()),
+            (),
+        ),
+        ("--name", "given-name", "stored-name", "given-name", ("--name", "stored-name")),
+    ],
+)
+def test_continue_rejects_each_different_resolution_flag_before_starting_a_turn(
+    cli: CliRunner,
+    flag: str,
+    value: str,
+    stored: str,
+    given: str,
+    run_options: tuple[str, ...],
+) -> None:
+    session_id = start_session(cli, "turn one", *run_options)
+
+    result = invoke(cli, "continue", session_id, "turn two", flag, value)
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    error = json.loads(result.stderr)["error"]
+    assert error["kind"] == "invalid_input"
+    assert f"--{flag[2:]}: continue reuses the session's stored" in error["message"]
+    assert f"{stored}; given {given}" in error["message"]
+    assert error["hint"] == (f"Drop {flag}, or start a new session: acpc run mock ...")
+    assert sessions.read_meta(session_id).turns == 1
+
+
+@pytest.mark.parametrize(
+    ("flag", "value", "field"),
+    [
+        ("--model", "mock-sonnet-5", "model"),
+        ("--effort", "high", "effort"),
+        ("--mode", "default", "mode"),
+        ("--cwd", ".", "cwd"),
+        ("--home", "~/.mock", "home"),
+        ("--name", "given-name", "name"),
+    ],
+)
+def test_continue_rejects_a_flag_when_its_stored_value_is_null(
+    cli: CliRunner, flag: str, value: str, field: str
+) -> None:
+    session_id = start_session(cli)
+    meta = sessions.read_meta(session_id)
+    if field == "name":
+        meta.name = None
+    elif field == "cwd":
+        meta.resolution["cwd"] = None
+    else:
+        meta.resolution["resolved"][field]["value"] = None
+    sessions.write_meta(meta)
+
+    result = invoke(cli, "continue", session_id, "turn two", flag, value)
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    error = json.loads(result.stderr)["error"]
+    assert error["kind"] == "invalid_input"
+    assert f"stored {field} null; given" in error["message"]
+    assert sessions.read_meta(session_id).turns == 1
+
+
+def test_continue_resolves_a_model_preset_before_comparing(cli: CliRunner) -> None:
+    session_id = start_session(cli)
+
+    result = invoke(cli, "continue", session_id, "turn two", "--model", "standard", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    assert sessions.read_meta(session_id).turns == 2
 
 
 def test_status_exposes_daemon_resume_preparation(cli: CliRunner, live_daemon: None) -> None:

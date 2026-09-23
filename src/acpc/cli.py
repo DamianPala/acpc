@@ -44,12 +44,14 @@ from acpc import probe as probe_engine
 from acpc.errors import AcpcError, AgentProblem, UsageProblem
 from acpc.permissions import ModeSelectionError, PermissionLevel, select_mode
 from acpc.registry import (
+    MODEL_TIERS,
     AgentNotFound,
     AgentRegistry,
     CallResolution,
     CorruptEntry,
     FieldSource,
     InstallNotSupported,
+    ModeSpec,
     RegistryError,
     ResolvedEntry,
 )
@@ -874,18 +876,9 @@ def _status_option_hint(message: str) -> str | None:
 
 def _continue_option_hint(message: str) -> str | None:
     hints = {
-        flag: f"{flag} is a run-only flag — use acpc run; continue reuses stored settings"
-        for flag in (
-            "--model",
-            "--effort",
-            "--mode",
-            "--cwd",
-            "--home",
-            "--name",
-        )
+        "--resolve": "--resolve moved to: acpc resolve <agent>",
+        "--dry-run": "--dry-run was removed from continue — use acpc resolve <agent>",
     }
-    hints["--resolve"] = "--resolve moved to: acpc resolve <agent>"
-    hints["--dry-run"] = "--dry-run was removed from continue — use acpc resolve <agent>"
     return _matching_option_hint(message, hints)
 
 
@@ -1332,9 +1325,6 @@ def _updated_session_resolution(
     permission_payload: dict[str, Any] = {"value": policy, "source": permission_source}
     if resolution.permissions_clamp is not None:
         requested, ceiling = resolution.permissions_clamp
-        permission_payload["source"] = (
-            f"{permission_source} (clamped from {requested} by inherited ceiling {ceiling})"
-        )
         permission_payload["clamp"] = {
             "requested": requested,
             "ceiling": ceiling,
@@ -1478,11 +1468,11 @@ def _clamp_inherited_ceiling(policy: str) -> tuple[str, tuple[str, str] | None]:
     return effective, (policy, ceiling)
 
 
-def _mode_list(entry: ResolvedEntry) -> str:
+def _mode_list(modes: Mapping[str, ModeSpec]) -> str:
     """Render declared modes in their TOML order for a selection error."""
-    if not entry.modes:
+    if not modes:
         return "none"
-    return ", ".join(f"{name} (grants {spec.grants})" for name, spec in entry.modes.items())
+    return ", ".join(f"{name} (grants {spec.grants})" for name, spec in modes.items())
 
 
 def _mode_selection_error(
@@ -1491,10 +1481,10 @@ def _mode_selection_error(
 ) -> AcpcError:
     """Turn a policy/mode mismatch into an actionable CLI usage error."""
     entry = resolution.entry
-    modes = _mode_list(entry)
+    modes = _mode_list(error.modes)
     if error.explicit_mode is not None:
         mode = error.explicit_mode
-        spec = entry.modes.get(mode)
+        spec = error.modes.get(mode)
         if spec is None:
             reason = (
                 f"mode {mode} is not declared in {entry.base_adapter}'s [modes] table; "
@@ -1531,6 +1521,24 @@ def _mode_selection_error(
         key=lambda level: level.rank,
     ).value
     reason = f"{reason} — the lowest policy {entry.entry} runs under is {floor}"
+    inherited_ceiling = os.environ.get("ACPC_CEILING")
+    if (
+        inherited_ceiling in vocab.PERMISSION_VALUES[:-1]
+        and PermissionLevel(inherited_ceiling).rank < PermissionLevel(floor).rank
+    ):
+        reason = (
+            f"no mode on {entry.entry} grants at most permissions {error.policy}; "
+            f"the lowest policy {entry.entry} runs under is {floor}, above the inherited "
+            f"ceiling {inherited_ceiling} (ACPC_CEILING); dispatch it from a caller whose "
+            f"ceiling allows {floor}"
+        )
+        return UsageProblem(
+            f"{reason}; declared modes: {modes}",
+            kind=errors.PERMISSION_DENIED,
+            hint=(
+                "The ceiling comes from the calling acpc session; --permissions cannot raise it."
+            ),
+        )
     return UsageProblem(
         f"{reason}; pass --permissions {floor}; declared modes: {modes}",
         kind=errors.PERMISSION_DENIED,
@@ -4092,7 +4100,7 @@ def _resolve_run_call(
             effort=effort,
             mode=mode,
             permissions=permissions,
-            home=home,
+            home=_resolve_caller_path(home) if home is not None else None,
         )
         if permissions is None:
             _warn_permission_alias(registry.permission_alias(agent))
@@ -4100,6 +4108,11 @@ def _resolve_run_call(
         return resolution
     except RegistryError as error:
         raise _registry_problem(error) from None
+
+
+def _resolve_caller_path(value: str) -> str:
+    """Resolve a CLI path against the caller's directory, expanding ``~``."""
+    return str(Path(value).expanduser().resolve())
 
 
 def _run_preview(
@@ -4168,7 +4181,7 @@ def resolve_command(
         permissions=permissions,
         home=home,
     )
-    resolved_cwd = str(Path(cwd).expanduser().resolve()) if cwd else os.getcwd()
+    resolved_cwd = _resolve_caller_path(cwd) if cwd else os.getcwd()
     _run_preview(
         resolution,
         permissions=permissions,
@@ -4381,7 +4394,7 @@ def run_command(
         home=home,
     )
     defaulted_permissions = permissions is None and resolution.permissions is None
-    resolved_cwd = str(Path(cwd).expanduser().resolve()) if cwd else os.getcwd()
+    resolved_cwd = _resolve_caller_path(cwd) if cwd else os.getcwd()
     prompt = _read_prompt(
         prompt_text,
         prompt_file,
@@ -4656,6 +4669,37 @@ def _continuation_prompt(meta: sessions.SessionMeta) -> str:
     help=_FORMAT_NATIVE_HELP,
 )
 @click.option(
+    "--model",
+    metavar="M",
+    help="Must equal the session's stored model; continue reuses the session's settings.",
+)
+@click.option(
+    "--effort",
+    metavar="E",
+    help="Must equal the session's stored effort; continue reuses the session's settings.",
+)
+@click.option(
+    "--mode",
+    metavar="M",
+    help="Must equal the session's stored mode; continue reuses the session's settings.",
+)
+@click.option(
+    "--cwd",
+    metavar="DIR",
+    help="Must equal the session's stored cwd; continue reuses the session's settings.",
+)
+@click.option(
+    "--home",
+    metavar="DIR",
+    help="Must equal the session's stored home; continue reuses the session's settings.",
+)
+@click.option(
+    "--name",
+    "name",
+    metavar="ALIAS",
+    help="Must equal the session's stored name; continue reuses the session's settings.",
+)
+@click.option(
     "--permissions",
     type=click.Choice(_PERMISSION_CHOICES),
     metavar="P",
@@ -4717,19 +4761,26 @@ def continue_command(
     max_output: int,
     quiet: bool,
     json_mode: bool,
+    model: str | None,
+    effort: str | None,
+    mode: str | None,
+    cwd: str | None,
+    home: str | None,
+    name: str | None,
     permissions: str | None,
 ) -> None:
     """Continue a finished session and print an observed result, even on failure.
 
-    Model, effort, mode, permissions and home come from the session, not from
-    re-resolving the agent entry — editing an entry never changes a session
-    mid-conversation. A canceled session keeps its adapter context when the
-    adapter supports continuation. A call that observed no turn prints no
-    result. ``--permissions`` is the one ``run`` resolution flag ``continue``
-    accepts: it applies to this turn and every turn after it. ``PROMPT`` is
-    optional after an interrupted turn — canceled, failed or unknown — where
-    it defaults to acpc's own continuation instruction; a succeeded turn
-    still requires a message.
+    Model, effort, mode, cwd, home and name come from the session, not from
+    re-resolving the agent entry; editing an entry never changes a session
+    mid-conversation. Matching resolution flags verify those stored values
+    without changing them. ``--permissions`` is the one resolution flag that
+    changes stored settings; it applies to this turn and every turn after it.
+    A canceled session keeps its adapter context when the adapter supports
+    continuation. A call that observed no turn prints no result. ``PROMPT``
+    is optional after an interrupted turn — canceled, failed or unknown —
+    where it defaults to acpc's own continuation instruction; a succeeded
+    turn still requires a message.
 
     Example: ``acpc continue <session-id> "Run the tests again"``
     """
@@ -4740,6 +4791,15 @@ def continue_command(
 
     has_message = prompt_text is not None or prompt_file is not None
     meta = _load_view_session(selector)
+    _validate_continue_flags(
+        meta,
+        model=model,
+        effort=effort,
+        mode=mode,
+        cwd=cwd,
+        home=home,
+        name=name,
+    )
     if meta.is_active:
         raise AcpcError(
             f"session {meta.session_id} is {meta.state} — it cannot be continued",
@@ -4770,6 +4830,79 @@ def continue_command(
         quiet=quiet,
         presentation=_select_presentation(selected_format),
     )
+
+
+def _continue_stored_value(meta: sessions.SessionMeta, field: str) -> Any:
+    """Read one setting from the session snapshot for a continue flag check."""
+    if field == "name":
+        return meta.name
+    if field == "cwd":
+        return meta.resolution.get("cwd")
+    resolved = meta.resolution.get("resolved")
+    if not isinstance(resolved, Mapping):
+        return None
+    stored = resolved.get(field)
+    if not isinstance(stored, Mapping):
+        return None
+    return stored.get("value")
+
+
+def _continue_model_value(meta: sessions.SessionMeta, value: str) -> str:
+    """Resolve a model preset through the entry recorded for this session."""
+    if value not in MODEL_TIERS:
+        return value
+    try:
+        entry = AgentRegistry().resolve(meta.entry)
+        model = entry.resolve_call(model=value).model
+    except RegistryError as error:
+        raise _registry_problem(error) from None
+    return model if model is not None else value
+
+
+def _continue_flag_value(meta: sessions.SessionMeta, field: str, value: str) -> str:
+    if field == "model":
+        return _continue_model_value(meta, value)
+    if field in {"cwd", "home"}:
+        return _resolve_caller_path(value)
+    return value
+
+
+def _continue_value_text(value: Any) -> str:
+    return "null" if value is None else render.safe_text(str(value))
+
+
+def _validate_continue_flags(
+    meta: sessions.SessionMeta,
+    *,
+    model: str | None,
+    effort: str | None,
+    mode: str | None,
+    cwd: str | None,
+    home: str | None,
+    name: str | None,
+) -> None:
+    """Reject a continue flag unless it names the stored setting unchanged."""
+    for field, given in (
+        ("model", model),
+        ("effort", effort),
+        ("mode", mode),
+        ("cwd", cwd),
+        ("home", home),
+        ("name", name),
+    ):
+        if given is None:
+            continue
+        normalized_given = _continue_flag_value(meta, field, given)
+        stored = _continue_stored_value(meta, field)
+        if field in {"cwd", "home"} and isinstance(stored, str):
+            stored = _resolve_caller_path(stored)
+        if stored == normalized_given:
+            continue
+        raise UsageProblem(
+            f"--{field}: continue reuses the session's stored {field} "
+            f"{_continue_value_text(stored)}; given {_continue_value_text(normalized_given)}",
+            hint=f"Drop --{field}, or start a new session: acpc run {meta.entry} ...",
+        )
 
 
 def _follow_up_request(

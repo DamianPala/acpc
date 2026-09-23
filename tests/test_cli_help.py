@@ -237,7 +237,7 @@ def test_help_explains_session_lifecycle_and_retention(runner: CliRunner) -> Non
     assert "the free way to reprint an answer." in wait_help
     assert "editing an entry never changes a session mid-conversation." in continue_help
     assert (
-        "``--permissions`` is the one ``run`` resolution flag ``continue`` accepts" in continue_help
+        "``--permissions`` is the one resolution flag that changes stored settings" in continue_help
     )
     assert (
         "A finished session is a ``conflict``; the follow-up verb is ``acpc continue``."

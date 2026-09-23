@@ -19,6 +19,8 @@ from click.testing import CliRunner
 from acpc import cli as cli_module
 from acpc import interaction, sessions, vocab
 from acpc.cli import main
+from acpc.permissions import ModeSelectionError
+from acpc.registry import ModeSpec
 
 MOCK_AGENT_SCRIPT = str(Path(__file__).with_name("mock_agent.py"))
 
@@ -378,7 +380,8 @@ def test_inherited_ceiling_clamps_a_nested_all_policy_and_reports_it(
         "ceiling": "edit",
         "effective": "edit",
     }
-    assert "clamped from all by inherited ceiling edit" in permission["source"]
+    assert permission["source"] == "call flag"
+    assert "clamped from" not in permission["source"]
 
 
 def test_inherited_ceiling_keeps_a_lower_nested_policy(
@@ -407,6 +410,10 @@ def test_inherited_ceiling_is_reported_by_a_real_run(
         "ceiling": "edit",
         "effective": "edit",
     }
+    session_id = json.loads(result.stdout)["session_id"]
+    stored = sessions.read_meta(session_id).resolution["resolved"]["permissions"]
+    assert stored["source"] == "call flag"
+    assert stored["clamp"] == json.loads(result.stdout)["permissions_clamp"]
 
 
 @pytest.mark.parametrize("ceiling", ["edit", "read"])
@@ -1517,6 +1524,67 @@ def test_an_execute_floor_refuses_policies_below_execute(
     assert "the lowest policy grok-floor runs under is execute" in envelope["message"]
     assert "declared modes: bypass (grants all), default (grants execute)" in envelope["message"]
     assert envelope["hint"] == "Run: acpc run grok-floor --permissions execute"
+
+
+def test_inherited_ceiling_below_an_entry_floor_names_the_ceiling(
+    cli: CliRunner, grok_floor_entry: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ACPC_CEILING", "read")
+
+    result = invoke(cli, "run", "grok-floor", "probe")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    envelope = error_envelope(result)
+    assert envelope["kind"] == "permission_denied"
+    assert (
+        "no mode on grok-floor grants at most permissions read; the lowest policy "
+        "grok-floor runs under is execute, above the inherited ceiling read "
+        "(ACPC_CEILING); dispatch it from a caller whose ceiling allows execute"
+    ) in envelope["message"]
+    assert "pass --permissions" not in envelope["message"]
+    assert envelope["hint"] == (
+        "The ceiling comes from the calling acpc session; --permissions cannot raise it."
+    )
+
+
+@pytest.mark.parametrize("ceiling", ["execute", "all"])
+def test_a_ceiling_at_or_above_the_floor_keeps_the_permissions_remedy(
+    cli: CliRunner, grok_floor_entry: None, monkeypatch: pytest.MonkeyPatch, ceiling: str
+) -> None:
+    monkeypatch.setenv("ACPC_CEILING", ceiling)
+
+    envelope = error_envelope(invoke(cli, "run", "grok-floor", "probe"))
+
+    assert "pass --permissions execute" in envelope["message"]
+    assert "ACPC_CEILING" not in envelope["message"]
+    assert envelope["hint"] == "Run: acpc run grok-floor --permissions execute"
+
+
+def test_mode_refusal_uses_the_selection_error_mode_table_for_floor_and_list(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    selected_modes = {
+        "snapshot-execute": ModeSpec(grants="execute", delegates=False),
+        "snapshot-all": ModeSpec(grants="all", delegates=False),
+    }
+
+    def reject_from_selection_table(modes, policy, explicit_mode=None):
+        raise ModeSelectionError(
+            "test table mismatch",
+            policy=policy,
+            modes=selected_modes,
+            explicit_mode=explicit_mode,
+        )
+
+    monkeypatch.setattr(cli_module, "select_mode", reject_from_selection_table)
+
+    result = invoke(cli, "run", "mock", "probe")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    message = error_envelope(result)["message"]
+    assert "lowest policy mock runs under is execute" in message
+    assert "declared modes: snapshot-execute (grants execute), snapshot-all (grants all)" in message
+    assert "declared modes: default (grants read)" not in message
 
 
 def test_an_execute_floor_resolve_refusal_names_the_permission_floor(

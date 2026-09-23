@@ -239,11 +239,60 @@ def test_status_json_reports_a_clamped_permission(
     permissions = json.loads(invoke(cli, "status", session_id, "--json").stdout)["permissions"]
 
     assert permissions["policy"] == "edit"
+    assert permissions["source"] == "call flag"
     assert permissions["clamp"] == {
         "requested": "all",
         "ceiling": "edit",
         "effective": "edit",
     }
+    text = invoke(cli, "status", session_id, "--format", "text").stdout
+    assert text.count("clamped from all by inherited ceiling edit") == 1
+
+
+def test_status_removes_a_legacy_clamp_suffix_from_meta_source(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ACPC_CEILING", "edit")
+    result = invoke(cli, "run", "mock", "echo:legacy clamp", "--permissions", "all", "--json")
+    session_id = json.loads(result.stdout)["session_id"]
+    meta = sessions.read_meta(session_id)
+    permissions = meta.resolution["resolved"]["permissions"]
+    permissions["source"] = "call flag (clamped from all by inherited ceiling edit)"
+    sessions.write_meta(meta)
+
+    status = json.loads(invoke(cli, "status", session_id, "--json").stdout)
+    text = invoke(cli, "status", session_id, "--format", "text").stdout
+
+    assert status["permissions"]["source"] == "call flag"
+    assert status["permissions"]["clamp"] == {
+        "requested": "all",
+        "ceiling": "edit",
+        "effective": "edit",
+    }
+    assert text.count("clamped from all by inherited ceiling edit") == 1
+
+
+@pytest.mark.parametrize(
+    ("ceiling", "stored_source"),
+    [
+        (None, "call flag (clamped from all by inherited ceiling edit)"),
+        ("edit", "call flag (clamped from all by inherited ceiling read)"),
+    ],
+)
+def test_status_keeps_a_source_that_is_not_the_exact_legacy_clamp_suffix(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch, ceiling: str | None, stored_source: str
+) -> None:
+    monkeypatch.delenv("ACPC_CEILING", raising=False)
+    if ceiling is not None:
+        monkeypatch.setenv("ACPC_CEILING", ceiling)
+    result = invoke(cli, "run", "mock", "echo:kept source", "--permissions", "all", "--json")
+    meta = sessions.read_meta(json.loads(result.stdout)["session_id"])
+    meta.resolution["resolved"]["permissions"]["source"] = stored_source
+    sessions.write_meta(meta)
+
+    status = json.loads(invoke(cli, "status", meta.session_id, "--json").stdout)
+
+    assert status["permissions"]["source"] == stored_source
 
 
 def test_status_reports_the_model_a_real_dispatch_resolved(cli: CliRunner) -> None:
