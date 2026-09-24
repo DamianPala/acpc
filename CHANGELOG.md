@@ -1,5 +1,34 @@
 # Changelog
 
+## [1.1.0] - 2026-09-24
+
+### Added
+
+- `usage` in `status`, result documents and `meta.json`: what the session consumed, cumulative over its turns, per model (`total_tokens`, `input_tokens`, `cache_read_tokens`, `cache_write_tokens`, `output_tokens`), with `calls`, `compactions`, `gaps`, `quality` (`exact` or `estimate`), `source` and `billing`. Entries declare it through `usage_profile` and `billing`; `usage` is `null` for an entry without a profile and for sessions written before 1.1. acpc still prices nothing
+- Codex usage limits are waited out like Claude's: the resume time comes from codex's "try again at …" text, read in the local time zone; a plan with no access still fails at once
+- `status` shows the current `context` while a turn runs, refreshed at most every 2 s, instead of the value from the end of the previous turn
+- `continue` accepts `--model`, `--effort`, `--mode`, `--cwd`, `--home` and `--name` as checks: a value equal to the stored one is a no-op, a different one is a usage error naming both
+- Each turn's transcript ends with a `usage` event holding the adapter's raw usage report and its name and version
+- `usage.drift`: when an adapter's usage reports break the invariants of the entry's usage profile, acpc records the first violation, keeps `quality` at `estimate` for the rest of the session and prints one note on stderr
+- `python -m acpc` runs the CLI
+
+### Changed
+
+- **BREAKING:** `--max-output` on `run`, `continue`, `steer` and `wait` accepts `0` (no cap) or at least 4096 bytes; 1–4095 is a usage error. Migration: use `0` or a value of 4096 or more
+- `run` and `resolve` refuse a working directory that does not exist (`invalid_input`), and `continue` and `steer` refuse a session whose recorded directory was removed (`conflict`), before any state is written or anything is sent
+- A relative `--home` on `run`, `resolve` and `continue` resolves against the caller's directory, like the other path flags
+- An inherited `ACPC_CEILING` below every mode of the entry fails naming the ceiling, instead of suggesting a `--permissions` value the ceiling would clamp again
+- The `--max-output` cap never cuts the result's envelope: when the envelope alone exceeds it, only the answer shrinks to the truncation marker
+- `permissions.source` no longer carries the clamp as text; the structured `clamp` field is the only place it appears
+
+### Fixed
+
+- Removing the directory a call was started from no longer breaks the daemon or the adapters it keeps warm: they now run from acpc's own state directory
+- The answer, the condensed `log` view and `log --prose` split messages at the same points, and updates that only report state (context usage, available commands, configuration, mode, session info) no longer cut one message in two
+- `--output-file` works with `/dev/null` and FIFOs, and a target acpc cannot write fails with `permission_denied` naming the path
+- The condensed `log` view no longer repeats an unchanged context reading within a turn
+- macOS: a liveness check forks one `ps` instead of two, and only one column when the session has no start time to compare; the pty tests now run on macOS in CI
+
 ## [1.0.1] - 2026-09-22
 
 ### Added
@@ -46,4 +75,5 @@
 - `log --max-output` truncation is reported on stderr instead of as a fake event inside the stream
 - Shipped `claude` and `codex` adapter facts refreshed to what the vendors currently support
 
+[1.1.0]: https://github.com/DamianPala/acpc/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/DamianPala/acpc/compare/v0.7.1...v1.0.1
