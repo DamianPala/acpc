@@ -2,7 +2,10 @@
 
 ## Now
 
-**1.1 in progress on `feat/1.1` (worktree `acpc.feat-1.1`, from `main` `c86d53b`), 2026-09-23.**
+**1.1.0 bumped on `feat/1.1` (worktree `acpc.feat-1.1`, from `main` `c86d53b`), 2026-09-24;
+steps 1–6 done, live-checked on real adapters, CI green on macOS and Ubuntu. Left for Damian:
+push `main` `c86d53b`, PR and merge of `feat/1.1`, then CHANGELOG, tag and release page
+through `release-create` on his go.**
 Scope accepted by Damian: usage measurement (compaction counted, nothing priced), macOS
 leftovers and the message-boundary decision, the small UX pack, warm-daemon health. Steps 1–5 are
 green-lit, and step 6 (macOS leftovers) since 2026-09-23. Builder and explorer run as acpc
@@ -24,26 +27,39 @@ grant, 2026-09-23; main, tags, PRs and merges stay his).
   violation lands in `usage.drift`, quality stays `estimate`, one stderr note per session.
 - `e87dfc6` slice 34: `status`/`list` show the running turn's context, refreshed at most every
   2 s under a non-blocking session lock.
-
 - `e0eb5f8` slice 35: codex usage limits wait like claude's. codex-acp sends a generic
   `Internal error` with the text in `data.message`; the text decides, because the same
   `usageLimitExceeded` also marks a plan with no access. `try again at …` parsed in local time.
 - `4c83517` slice 36 (step 6): darwin liveness reads `stat` and `lstart` in one `ps` call; the
   two pty tests and the locale test run on macOS (CI: 10 skips left, all Linux-only). Built on
   `feat/1.1-macos` (pushed, CI vehicle) and squashed in.
+- `e308ade` + `867db48` slice 37, from the live checks: the `used ≤ size` drift check compares
+  with the largest window seen in the turn or before it (claude-agent-acp reports a default
+  200k until its first result per adapter process, then 1M, and again 200k after a cold
+  resume); the condensed `log` shows a repeated context reading once per turn.
 
-Steps 1–6 are done. Open in 1.1: closing only (install, live checks, CHANGELOG, bump, release
-notes). Subscription windows moved to 1.2. Backlog, not scheduled: SIGINT during event-loop
-construction breaks the envelope-last contract (slice 36 review); a daemon-stop flake in
-`test_continue_rejects_an_adapter_without_load_session` seen once under xdist. Live checks after installing 1.1: a real claude limit (its rate-limit
-`usage_update` probably adds a usage gap), claude `/compact` and steered turns, codex
-auto-compaction figures, claude's first turn after `session/load`, the condensed `log` ctx line,
-`status --json` during a direct codex `continue`, a real codex limit (codex-acp also streams the
-limit text as a message, so the answer starts with it and the resend is the continuation
-instruction); run `acpc daemon stop` once after the install, because the version string stays
-1.0.1. Release notes must name the `--max-output` change, the `usage`/`drift` fields, the
-`--cwd` validation and codex limits. Branches `feat/1.1-daemon` (local) and `feat/1.1-macos`
-(local and on origin) can be deleted once Damian agrees.
+Live checks (2026-09-24, branch build from its own venv, isolated `ACPC_HOME`, system `acpc`
+untouched): claude Sonnet 5 multi-call turn `exact` with per-model split (Haiku side calls as
+their own model), `/compact` counted (93.3k → 3.7k, still `exact`), cold resume `verified` with no
+drift, in-place steer, `status` refreshing the running turn's context; codex Luna on the direct
+path (`ACPC_HOME` too long for a socket) with `model_auto_compact_token_limit=40000`: 3 and 4
+compactions counted as `unaccounted`, `estimate`, no drift, `status` refreshing during a direct
+`continue` including a mid-turn compaction. Not checkable on demand: a real usage limit on claude
+or codex (codex-acp also streams the limit text as a message, so the answer starts with it and
+the resend is the continuation instruction).
+
+Release notes must name: `--max-output` 1–4095 now an error, the `usage` object with `drift`,
+the `--cwd` validation, codex usage limits, `status` context during a turn, macOS pty coverage.
+After the install run `acpc daemon stop` once (daemons of 1.0.1 stay up otherwise). Backlog, not
+scheduled: SIGINT during event-loop construction breaks the envelope-last contract (slice 36
+review); a daemon-stop flake in `test_continue_rejects_an_adapter_without_load_session` seen once
+under xdist; `test_cancelled_restore_drops_late_frame_after_mux_release` failed once on
+`ubuntu-latest` (run 35939991317: the late `usage_update` of a released restore reached the
+cancelled session's transcript), 0 of 60 locally including 40 under parallel load, and the
+routing it covers is unchanged since 1.0; `previous_context` reaches only one turn back, so two cold turns in a row that both
+fail before a result could still give a false `used_le_size`. Subscription windows moved to 1.2.
+Branches `feat/1.1-daemon` (local) and `feat/1.1-macos` (local and on origin) can be deleted
+once Damian agrees.
 
 **1.0.1 released (2026-09-22): tag `v1.0.1` (`5a6186e`) and main are on origin with the gate
 green on `ubuntu-latest` and `macos-latest`, and the release page
