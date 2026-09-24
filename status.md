@@ -2,10 +2,11 @@
 
 ## Now
 
-**1.1.0 bumped on `feat/1.1` (worktree `acpc.feat-1.1`, from `main` `c86d53b`), 2026-09-24;
-steps 1–6 done, live-checked on real adapters, CI green on macOS and Ubuntu. Left for Damian:
-push `main` `c86d53b`, PR and merge of `feat/1.1`, then CHANGELOG, tag and release page
-through `release-create` on his go.**
+**1.1.0 released 2026-09-24: `feat/1.1` fast-forwarded into `main` (`1c74f95`, with the
+CHANGELOG), tag `v1.1.0`, release page https://github.com/DamianPala/acpc/releases/tag/v1.1.0,
+host reinstalled (`acpc -V` 1.1.0). The `feat/1.1*` branches and worktrees are deleted; plan
+files that existed only in the worktree are in `docs/plans/1.1/worktree-feat-1.1/`. Next: the
+backlog in `docs/plans/1.1/backlog.md`; the `ai-lab` container still runs 0.7.1.**
 Scope accepted by Damian: usage measurement (compaction counted, nothing priced), macOS
 leftovers and the message-boundary decision, the small UX pack, warm-daemon health. Steps 1–5 are
 green-lit, and step 6 (macOS leftovers) since 2026-09-23. Builder and explorer run as acpc
