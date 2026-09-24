@@ -109,6 +109,7 @@ level" to surface. A small command list is advertised after session/new.
 import asyncio
 import contextlib
 import json
+import logging
 import math
 import os
 import sys
@@ -1726,6 +1727,10 @@ async def main() -> None:
                     flush=True,
                 )
                 raise SystemExit(2)
+    # The SDK logs every errored request ("Background task failed" plus a
+    # traceback) to stderr, racing the JSON-RPC error into the daemon log; tests
+    # that assert on the log tail need stderr to hold only what a scenario prints.
+    logging.disable(logging.ERROR)
     await run_agent(
         MockAgent(), use_unstable_protocol=os.environ.get("ACPC_MOCK_ADVERTISE_RESUME") == "1"
     )
