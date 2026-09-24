@@ -1560,7 +1560,7 @@ def test_authentication_refusal_records_the_remedy_even_with_an_empty_log(
     assert "authentication was refused" in event["message"]
     assert event["next_step"] == "run 'mock login'"
     assert "adapter_log" in event
-    assert "adapter_log_tail" not in event
+    assert "adapter_log_tail" not in event, event.get("adapter_log_tail")
 
 
 def test_a_failure_quotes_its_own_turn_and_not_an_earlier_one(
