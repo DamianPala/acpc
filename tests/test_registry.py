@@ -54,7 +54,8 @@ def test_shipped_adapter_facts_and_presets_are_available(tmp_path: Path) -> None
         for name, spec in (*claude.modes.items(), *codex.modes.items())
         if name not in {"auto", "read-only"}
     )
-    assert claude.presets["max"].model == "claude-opus-5"
+    assert claude.presets["max"].model == "claude-opus-5-5"
+    assert claude.effective_efforts("claude-opus-5-5") == ("low", "medium", "high", "xhigh", "max")
     assert codex.presets["standard"].effort == "xhigh"
     # claude CLI >=2.1.224 offers no effort option for haiku; see claude.toml.
     assert claude.presets["fast"].model == "claude-haiku-4-5"
@@ -640,7 +641,9 @@ def test_shipped_grok_uses_set_model_and_cli_effort(tmp_path: Path) -> None:
     assert grok.effort_via == "cli"
     assert grok.effort_cli_flag == "--reasoning-effort"
     assert "default" in grok.modes
-    assert grok.presets["standard"].model == "grok-4.6"
+    assert grok.presets["standard"].model == "grok-4.7"
+    assert grok.presets["max"].model == "grok-4.7"
+    assert grok.effective_efforts("grok-4.7") == ("low", "medium", "high", "xhigh")
     call = grok.resolve_call(model="fast", permissions="execute")
     assert call.model == "grok-4.5"
     assert call.effort == "low"

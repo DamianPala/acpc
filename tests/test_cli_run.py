@@ -1965,7 +1965,7 @@ def test_unlisted_model_warns_on_resolve(cli: CliRunner) -> None:
         "resolve",
         "grok",
         "--model",
-        "grok-4.7",
+        "grok-4.7-build-fast",
         "--effort",
         "xhigh",
         "--permissions",
@@ -1973,7 +1973,7 @@ def test_unlisted_model_warns_on_resolve(cli: CliRunner) -> None:
     )
 
     assert result.exit_code == vocab.EXIT_OK
-    assert "grok-4.7 has no [effort_by_model] row" in result.stderr
+    assert "grok-4.7-build-fast has no [effort_by_model] row" in result.stderr
     assert "using adapter efforts low, medium, high, xhigh" in result.stderr
 
 

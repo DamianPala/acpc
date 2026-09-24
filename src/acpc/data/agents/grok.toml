@@ -30,10 +30,13 @@ model_via = "set_model"
 effort_via = "cli"
 effort_cli_flag = "--reasoning-effort"
 
-# xhigh is grok-4.6 only (measured; models_cache re-checked 2026-08-25, 1.0.5).
+# grok-4.5 has no xhigh (measured; models_cache re-checked 2026-08-25, 1.0.5).
+# grok-4.7: models_cache lists low..xhigh (2026-09-24, 1.0.41) and one turn per
+# level ran without a reject.
 [effort_by_model]
 "grok-4.5" = ["low", "medium", "high"]
 "grok-4.6" = ["low", "medium", "high", "xhigh"]
+"grok-4.7" = ["low", "medium", "high", "xhigh"]
 
 # Measured 2026-08-25, `grok agent stdio` (CLI 1.0.4/1.0.5): zero
 # request_permission ever reached the client, with and without
@@ -54,7 +57,8 @@ dontAsk = { grants = "execute", delegates = false, escalates = true }
 bypassPermissions = { grants = "all", delegates = false }
 
 [presets]
-# Live catalogue 2026-08-25: grok-4.6 (default), grok-4.5.
+# Live catalogue 2026-09-24 (subscription): grok-4.7 (default), grok-4.7-build-fast,
+# grok-4.6, grok-4.5. fast stays on grok-4.5 until grok-4.7-build-fast is measured.
 fast = { model = "grok-4.5", effort = "low" }
-standard = { model = "grok-4.6", effort = "high" }
-max = { model = "grok-4.6", effort = "xhigh" }
+standard = { model = "grok-4.7", effort = "high" }
+max = { model = "grok-4.7", effort = "xhigh" }

@@ -34,6 +34,9 @@ effort_config_id = "effort"
 claude-haiku-4-5 = []
 claude-sonnet-5 = ["default", "low", "medium", "high", "xhigh", "max"]
 claude-opus-5 = ["default", "low", "medium", "high", "xhigh", "max"]
+# Measured 2026-09-24 against claude-agent-acp 0.81.1 (0.75.1 rejected the model
+# id): one turn per level, each accepted by the effort config option.
+claude-opus-5-5 = ["low", "medium", "high", "xhigh", "max"]
 
 # Measured by probe spike 2026-08-10 against claude-agent-acp 0.64.0 /
 # Claude Code 2.1.226 (docs/plans/0.6/spike-probe/REPORT.md). Two corrections
@@ -57,4 +60,4 @@ bypassPermissions = { grants = "all", delegates = false }
 [presets]
 fast = { model = "claude-haiku-4-5" }
 standard = { model = "claude-sonnet-5", effort = "high" }
-max = { model = "claude-opus-5", effort = "max" }
+max = { model = "claude-opus-5-5", effort = "max" }
