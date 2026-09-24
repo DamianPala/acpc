@@ -3624,6 +3624,7 @@ def log_command(
     """Render selected transcript events and keep metadata on stderr.
 
     Without --since, --limit, or --tail this shows the last 20 events.
+    The condensed view skips repeated usage values within the same turn.
 
     Example: ``acpc log <session-id> --prose --since 0``
     """
@@ -3774,6 +3775,9 @@ def _emit_log_page(
 ) -> None:
     """Render one selected page and its footer; raise on a `--wait-new` timeout."""
     full_last_message = meta.state in {"failed", "unknown"}
+    usage_context = None
+    if not prose and not json_mode and page.events:
+        usage_context = _usage_context_at(transcript_file, int(page.events[0]["i"]) - 1)
     rendered = render.render_events(
         page.events,
         prose=prose,
@@ -3782,6 +3786,7 @@ def _emit_log_page(
         transcript_path=sessions.transcript_path(meta.session_id),
         cursor=cursor,
         full_last_message=full_last_message,
+        usage_context=usage_context,
     )
     _write_stdout(rendered.text)
     if not quiet:
@@ -3871,6 +3876,13 @@ def _sleep_until(deadline: float | None) -> None:
     time.sleep(min(_LOG_WAIT_POLL_INTERVAL, max(0.0, deadline - time.monotonic())))
 
 
+def _usage_context_at(transcript_file: transcript.Transcript, cursor: int) -> render.UsageContext:
+    """Seed condensed usage rendering from events before a selected page."""
+    history = _read_transcript_page(transcript_file).events
+    prefix = [event for event in history if int(event["i"]) <= cursor]
+    return render.usage_context_after(prefix)
+
+
 def _emit_follow_page(
     events: Sequence[Mapping[str, Any]],
     *,
@@ -3881,7 +3893,17 @@ def _emit_follow_page(
     transcript_path: Path,
     cursor: int,
     prose_context: render.ProseContext | None,
-) -> tuple[int, int, bool, int | None, int | None, str | None, render.ProseContext | None]:
+    usage_context: render.UsageContext | None,
+) -> tuple[
+    int,
+    int,
+    bool,
+    int | None,
+    int | None,
+    str | None,
+    render.ProseContext | None,
+    render.UsageContext | None,
+]:
     """Render one page inside the follow budget.
 
     SPEC `log --follow`: `--max-output` budgets the whole stream, so each page
@@ -3897,6 +3919,7 @@ def _emit_follow_page(
         transcript_path=transcript_path,
         cursor=cursor,
         prose_context=prose_context,
+        usage_context=usage_context,
     )
     _write_stdout(rendered.text)
     return (
@@ -3907,6 +3930,7 @@ def _emit_follow_page(
         rendered.last_event,
         rendered.truncation_note,
         rendered.prose_context,
+        rendered.usage_context,
     )
 
 
@@ -3963,6 +3987,7 @@ def _follow_log(
     page_end: int | None = None
     truncation_note: str | None = None
     prose_context: render.ProseContext | None = None
+    usage_context = _usage_context_at(transcript_file, cursor) if condense else None
 
     while True:
         page = _read_transcript_page(transcript_file, since=cursor)
@@ -3980,6 +4005,7 @@ def _follow_log(
                 rendered_end,
                 page_note,
                 prose_context,
+                usage_context,
             ) = _emit_follow_page(
                 page.events,
                 prose=prose,
@@ -3989,6 +4015,7 @@ def _follow_log(
                 transcript_path=transcript_path,
                 cursor=cursor,
                 prose_context=prose_context,
+                usage_context=usage_context,
             )
             if rendered_start is not None:
                 read_count += len(page.events)

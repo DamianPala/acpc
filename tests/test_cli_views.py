@@ -542,6 +542,83 @@ def test_log_limit_starts_at_the_selected_position(cli: CliRunner) -> None:
     assert "event-2" not in result.stdout
 
 
+def test_log_since_and_limit_cover_a_suppressed_usage_event(
+    cli: CliRunner,
+) -> None:
+    meta = finished_session()
+    transcript_file = transcript.Transcript(sessions.transcript_path(meta.session_id))
+    transcript_file.append("state", **{"from": "starting", "to": "running"})
+    first_usage = transcript_file.append("usage", used=100, size=1000)
+    transcript_file.append("msg", text="between reports")
+    repeated_usage = transcript_file.append("usage", used=100, size=1000)
+    transcript_file.append("msg", text="after reports")
+    transcript_file.append("state", **{"from": "running", "to": "succeeded"})
+
+    limited = invoke(
+        cli,
+        "log",
+        meta.session_id,
+        "--since",
+        str(first_usage["i"] - 1),
+        "--limit",
+        "3",
+    )
+    repeated_only = invoke(
+        cli,
+        "log",
+        meta.session_id,
+        "--since",
+        str(repeated_usage["i"] - 1),
+        "--limit",
+        "1",
+    )
+    resumed = invoke(cli, "log", meta.session_id, "--since", str(repeated_usage["i"]))
+    prose = invoke(cli, "log", meta.session_id, "--since", "0", "--prose", "--quiet")
+
+    assert limited.stdout.count("usage ctx") == 1
+    assert f"cursor: {repeated_usage['i']}" in limited.stderr
+    assert repeated_only.stdout == ""
+    assert f"events {repeated_usage['i']}–{repeated_usage['i']} of 6" in repeated_only.stderr
+    assert f"cursor: {repeated_usage['i']}" in repeated_only.stderr
+    assert "usage ctx" not in resumed.stdout
+    assert "after reports" in resumed.stdout
+    assert "between reports" in prose.stdout and "after reports" in prose.stdout
+    assert "usage ctx" not in prose.stdout
+    for args in (("--json",), ("--format", "ndjson")):
+        result = invoke(
+            cli,
+            "log",
+            meta.session_id,
+            "--since",
+            str(first_usage["i"] - 1),
+            *args,
+            "--quiet",
+        )
+        usage_records = [
+            json.loads(line)
+            for line in result.stdout.splitlines()
+            if json.loads(line).get("type") == "usage"
+        ]
+        assert len(usage_records) == 2
+
+
+def test_log_seeds_usage_repeats_from_history_per_turn(cli: CliRunner) -> None:
+    meta = finished_session()
+    transcript_file = transcript.Transcript(sessions.transcript_path(meta.session_id))
+    transcript_file.append("state", **{"from": "starting", "to": "running"})
+    transcript_file.append("usage", used=100, size=1000)
+    transcript_file.append("state", **{"from": "running", "to": "succeeded"})
+    new_turn = transcript_file.append("state", **{"from": "starting", "to": "running"})
+    transcript_file.append("usage", used=100, size=1000)
+    transcript_file.append("usage", used=100, size=1000)
+
+    for mode in ((), ("--follow",)):
+        from_turn = invoke(cli, "log", meta.session_id, "--since", str(new_turn["i"]), *mode)
+        mid_turn = invoke(cli, "log", meta.session_id, "--since", str(new_turn["i"] + 1), *mode)
+        assert from_turn.stdout.count("usage ctx") == 1
+        assert "usage ctx" not in mid_turn.stdout
+
+
 def test_log_json_emits_indexed_ndjson(cli: CliRunner) -> None:
     """Log --json emits valid event lines carrying integer indices."""
     session_id = run_mock(cli)
@@ -1068,6 +1145,71 @@ def test_follow_tail_replays_the_selected_window_then_follows(cli: CliRunner) ->
     assert result.exit_code == vocab.EXIT_OK
     records = [json.loads(line) for line in result.stdout.splitlines()]
     assert [record["text"] for record in records] == ["event-22", "event-23", "event-24"]
+
+
+def test_follow_skips_repeated_usage_across_poll_pages(
+    cli: CliRunner,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    meta = running_session("usage state crosses follow polls")
+    transcript_file = transcript.Transcript(sessions.transcript_path(meta.session_id))
+    transcript_file.append("usage", used=93_300, size=1_000_000)
+    entered = [threading.Event(), threading.Event()]
+    released = [threading.Event(), threading.Event()]
+    counter = 0
+    counter_lock = threading.Lock()
+
+    def gate_poll(_deadline: float | None) -> None:
+        nonlocal counter
+        with counter_lock:
+            current = counter
+            counter += 1
+        assert current < len(entered)
+        entered[current].set()
+        assert released[current].wait(timeout=5)
+
+    monkeypatch.setattr(cli_module, "_sleep_until", gate_poll)
+    results = []
+
+    def follow() -> None:
+        results.append(
+            invoke(
+                cli,
+                "log",
+                meta.session_id,
+                "--since",
+                "0",
+                "--follow",
+                "--timeout",
+                "5",
+            )
+        )
+
+    reader = threading.Thread(target=follow)
+    reader.start()
+    try:
+        assert entered[0].wait(timeout=2)
+        transcript_file.append("msg", text="metadata between usage reports")
+        transcript_file.append("usage", used=93_300, size=1_000_000)
+        released[0].set()
+
+        assert entered[1].wait(timeout=2)
+        transcript_file.append("msg", text="after repeated usage")
+        sessions.transition(meta.session_id, "succeeded", exit_code=0, stop_reason="end_turn")
+        released[1].set()
+    finally:
+        for gate in released:
+            gate.set()
+        reader.join(timeout=5)
+
+    assert not reader.is_alive()
+    assert len(results) == 1
+    result = results[0]
+    assert result.exit_code == vocab.EXIT_OK
+    assert result.stdout.count("usage ctx") == 1
+    assert "metadata between usage reports" in result.stdout
+    assert "after repeated usage" in result.stdout
+    assert f"cursor: {transcript_file.read().next_cursor}" in result.stderr
 
 
 def test_follow_limit_zero_replays_nothing(cli: CliRunner) -> None:

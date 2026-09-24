@@ -35,6 +35,14 @@ class ProseContext:
 
 
 @dataclass(frozen=True, slots=True)
+class UsageContext:
+    """The last usage record in the current turn, carried across log pages."""
+
+    last_usage: tuple[object, object] | None = None
+    has_usage: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class RenderedEvents:
     """A rendered log page and the cursor it safely covers."""
 
@@ -46,6 +54,7 @@ class RenderedEvents:
     last_event: int | None = None
     truncation_note: str | None = None
     prose_context: ProseContext | None = None
+    usage_context: UsageContext | None = None
 
 
 def format_table(
@@ -372,6 +381,31 @@ def _continues_message(events: Sequence[Mapping[str, Any]], index: int) -> bool:
     )
 
 
+def _starts_turn(event: Mapping[str, Any]) -> bool:
+    # A usage-limit wait resumes the same turn (`waiting → running`).
+    return (
+        event.get("type") == "state"
+        and event.get("to") == "running"
+        and event.get("from") != "waiting"
+    )
+
+
+def usage_context_after(
+    events: Sequence[Mapping[str, Any]], *, context: UsageContext | None = None
+) -> UsageContext:
+    """Return the usage-deduplication state after the supplied transcript prefix."""
+    last_usage = context.last_usage if context is not None else None
+    has_usage = context.has_usage if context is not None else False
+    for event in events:
+        if _starts_turn(event):
+            last_usage = None
+            has_usage = False
+        elif event.get("type") == "usage":
+            last_usage = (event.get("used", event.get("tokens")), event.get("size"))
+            has_usage = True
+    return UsageContext(last_usage, has_usage)
+
+
 def render_events(
     events: Sequence[Mapping[str, Any]],
     *,
@@ -382,6 +416,7 @@ def render_events(
     cursor: int = 0,
     full_last_message: bool = False,
     prose_context: ProseContext | None = None,
+    usage_context: UsageContext | None = None,
 ) -> RenderedEvents:
     """Render selected events while preserving the cursor contract.
 
@@ -410,23 +445,39 @@ def render_events(
 
     events = condense_events(events) if not prose else [dict(event) for event in events]
 
-    entries: list[tuple[int, str]] = []
+    entries: list[tuple[int, str, bool]] = []
     entry_cursor = cursor
     current_prose = prose_context or ProseContext()
     last_prose_type = current_prose.last_prose_type
     message_continuation_open = current_prose.message_continuation_open
     trailing_newlines = current_prose.trailing_newlines
     previous_prose_index: int | None = None
+    current_usage = usage_context or UsageContext()
+    last_usage = current_usage.last_usage
+    has_usage = current_usage.has_usage
     for index, event in enumerate(events):
         event_cursor = _event_index(event, entry_cursor)
         event_type = event.get("type")
+        repeated_usage = False
+        if not prose and _starts_turn(event):
+            last_usage = None
+            has_usage = False
+        elif not prose and event_type == "usage":
+            current_usage_value = (event.get("used", event.get("tokens")), event.get("size"))
+            repeated_usage = has_usage and current_usage_value == last_usage
+            last_usage = current_usage_value
+            has_usage = True
         rendered = (
-            _prose_event(event)
-            if prose
-            else format_event(
-                event,
-                full_message=index == last_message_index,
-                continued=_continues_message(events, index),
+            ""
+            if repeated_usage
+            else (
+                _prose_event(event)
+                if prose
+                else format_event(
+                    event,
+                    full_message=index == last_message_index,
+                    continued=_continues_message(events, index),
+                )
             )
         )
         if prose and rendered:
@@ -440,7 +491,7 @@ def render_events(
             if last_prose_type is not None and not continues:
                 rendered = _prose_separator("\n" * trailing_newlines) + rendered
         unit = rendered if prose else rendered + "\n" if rendered else ""
-        entries.append((event_cursor, unit))
+        entries.append((event_cursor, unit, repeated_usage))
         entry_cursor = event_cursor
 
         if prose:
@@ -461,6 +512,7 @@ def render_events(
         if prose
         else None
     )
+    rendered_usage_context = UsageContext(last_usage, has_usage) if not prose else None
 
     output = ""
     next_cursor = cursor
@@ -468,9 +520,13 @@ def render_events(
     first_event: int | None = None
     last_event: int | None = None
     note = _truncation_note(transcript_path)
-    for index, (event_cursor, unit) in enumerate(entries):
+    for index, (event_cursor, unit, repeated_usage) in enumerate(entries):
         if not unit:
             next_cursor = event_cursor
+            if repeated_usage:
+                if first_event is None:
+                    first_event = event_cursor
+                last_event = event_cursor
             continue
 
         fits = max_output == 0 or len((output + unit).encode("utf-8")) <= max_output
@@ -487,7 +543,9 @@ def render_events(
             output = _utf8_head(unit, max_output)
             next_cursor = event_cursor
             printed_events += 1
-            first_event = last_event = event_cursor
+            if first_event is None:
+                first_event = event_cursor
+            last_event = event_cursor
         return RenderedEvents(
             output,
             next_cursor,
@@ -497,6 +555,7 @@ def render_events(
             last_event,
             note,
             rendered_prose_context,
+            rendered_usage_context,
         )
 
     return RenderedEvents(
@@ -507,6 +566,7 @@ def render_events(
         first_event,
         last_event,
         prose_context=rendered_prose_context,
+        usage_context=rendered_usage_context,
     )
 
 

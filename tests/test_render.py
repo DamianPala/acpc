@@ -174,6 +174,49 @@ def test_usage_event_reads_legacy_tokens_as_used() -> None:
     assert line.endswith("usage ctx 1.2k")
 
 
+def test_condensed_usage_skips_repeats_in_a_turn_but_keeps_changes_and_new_turns() -> None:
+    events = [
+        event(1, "state", **{"from": "starting", "to": "running"}),
+        event(2, "usage", used=93_300, size=1_000_000),
+        event(3, "msg", text="between usage reports"),
+        event(4, "usage", used=93_300, size=1_000_000),
+        event(5, "usage", used=93_300, size=200_000),
+        event(6, "state", **{"from": "succeeded", "to": "running"}),
+        event(7, "usage", used=93_300, size=200_000),
+        event(8, "state", **{"from": "running", "to": "waiting"}),
+        event(9, "state", **{"from": "waiting", "to": "running"}),
+        event(10, "usage", used=93_300, size=200_000),
+    ]
+
+    result = render.render_events(events)
+
+    assert result.text.count("usage ctx") == 3
+    assert result.next_cursor == 10
+    assert result.first_event == 1
+    assert result.last_event == 10
+
+
+def test_condensed_usage_context_skips_a_repeat_on_the_next_page() -> None:
+    first = render.render_events(
+        [
+            event(1, "state", **{"from": "starting", "to": "running"}),
+            event(2, "usage", used=100, size=1000),
+        ]
+    )
+
+    second = render.render_events(
+        [event(3, "msg", text="intervening"), event(4, "usage", used=100, size=1000)],
+        cursor=2,
+        usage_context=first.usage_context,
+    )
+
+    assert first.usage_context is not None
+    assert "usage ctx" not in second.text
+    assert second.next_cursor == 4
+    assert second.first_event == 3
+    assert second.last_event == 4
+
+
 def test_message_length_is_only_reported_for_oversized_chunks() -> None:
     short = render.format_event(event(1, "msg", text="x" * 1023))
     large = render.format_event(event(2, "msg", text="x" * 1024))
