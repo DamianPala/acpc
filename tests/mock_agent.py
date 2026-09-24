@@ -799,7 +799,7 @@ class MockAgent(Agent):
         if prompt_text.startswith("drift:codex:hold:"):
             return await self._drift_codex_hold(session_id, prompt_text, cancel_event)
         if prompt_text.startswith("drift:used-size"):
-            return await self._drift_used_size(session_id)
+            return await self._drift_used_size(session_id, prompt_text)
         if prompt_text.startswith("drift:claude-restore"):
             return await self._drift_claude_restore(session_id)
         if prompt_text.startswith("drift:codex"):
@@ -1107,7 +1107,37 @@ class MockAgent(Agent):
             }
         )
 
-    async def _drift_used_size(self, session_id: str) -> PromptResponse:
+    async def _drift_used_size(self, session_id: str, prompt_text: str) -> PromptResponse:
+        if prompt_text == "drift:used-size:claude-default-window":
+            await self._send_text(session_id, "context window size changed during the turn")
+            await self._send_usage(session_id, used=250_000, size=200_000)
+            await self._send_usage(session_id, used=250_000, size=1_000_000)
+            return PromptResponse.model_validate(
+                {
+                    "stopReason": "end_turn",
+                    "usage": {
+                        "totalTokens": 100,
+                        "inputTokens": 90,
+                        "outputTokens": 10,
+                    },
+                    "_meta": {
+                        "quota": {
+                            "model_usage": [
+                                {
+                                    "model": "claude-sonnet-5[1m]",
+                                    "token_count": {
+                                        "totalTokens": 100,
+                                        "inputTokens": 80,
+                                        "cachedInputTokens": 10,
+                                        "cachedWriteTokens": 0,
+                                        "outputTokens": 10,
+                                    },
+                                }
+                            ]
+                        }
+                    },
+                }
+            )
         await self._send_text(session_id, "usage exceeds the context size")
         await self._send_usage(session_id, used=200_001, size=200_000)
         return PromptResponse.model_validate(

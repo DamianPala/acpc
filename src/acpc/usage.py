@@ -146,7 +146,8 @@ def check_turn_invariants(
             and (observation := _claude_restore_drift(used, prompt_response))
         ):
             return observation
-    if _usage_exceeds_size(used, sizes):
+    previous_size = previous_context.get("size") if previous_context is not None else None
+    if _usage_exceeds_size(used, sizes, previous_size):
         return _observation("used_le_size", profile, "cumulative")
     return None
 
@@ -237,11 +238,13 @@ def _previous_total(previous: Mapping[str, Any] | None) -> int | None:
     return sum(known)
 
 
-def _usage_exceeds_size(used: Sequence[int], sizes: Sequence[int | None]) -> bool:
-    return any(
-        size is not None and used_value > size
-        for used_value, size in zip(used, sizes, strict=False)
-    )
+def _usage_exceeds_size(
+    used: Sequence[int], sizes: Sequence[int | None], previous_size: object = None
+) -> bool:
+    known_sizes = [size for size in sizes if isinstance(size, int) and not isinstance(size, bool)]
+    if isinstance(previous_size, int) and not isinstance(previous_size, bool):
+        known_sizes.append(previous_size)
+    return bool(known_sizes) and any(used_value > max(known_sizes) for used_value in used)
 
 
 def _copy_previous(previous: Mapping[str, Any] | None, billing: str | None) -> dict[str, Any]:

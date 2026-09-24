@@ -578,6 +578,49 @@ def test_usage_update_cannot_report_more_than_its_context_size(profile: str) -> 
     assert unknown_size is None
 
 
+def test_usage_size_check_uses_the_largest_window_reported_during_the_turn() -> None:
+    observation = usage.check_turn_invariants(
+        previous=None,
+        used=(250_000, 250_000),
+        sizes=(200_000, 1_000_000),
+        prompt_response=None,
+        profile="claude_model_usage",
+    )
+
+    assert observation is None
+
+
+def test_usage_size_check_uses_the_previous_context_window_after_cold_resume() -> None:
+    observation = usage.check_turn_invariants(
+        previous=None,
+        used=(250_000,),
+        sizes=(200_000,),
+        prompt_response=None,
+        profile="claude_model_usage",
+        cold_resume=True,
+        previous_context={"used": 250_000, "size": 1_000_000},
+    )
+
+    assert observation is None
+
+
+def test_usage_above_every_known_window_still_drifts() -> None:
+    observation = usage.check_turn_invariants(
+        previous=None,
+        used=(1_000_001,),
+        sizes=(200_000,),
+        prompt_response=None,
+        profile="claude_model_usage",
+        previous_context={"used": 900_000, "size": 1_000_000},
+    )
+
+    assert observation == {
+        "check": "used_le_size",
+        "declared": "turn",
+        "observed": "cumulative",
+    }
+
+
 def test_first_drift_survives_later_drift_and_clean_turns() -> None:
     drifted = usage.accumulate_turn(
         None,

@@ -451,6 +451,19 @@ def test_usage_update_above_context_size_drifts_through_the_cli(
     assert "reports usage as cumulative" in result.stderr
 
 
+def test_claude_usage_uses_the_later_large_window_without_a_drift_note(
+    cli: CliRunner, state_root: Path
+) -> None:
+    _set_usage_profile(state_root, "claude_model_usage")
+
+    result = invoke(cli, "run", "mock", "drift:used-size:claude-default-window", "--json")
+
+    assert result.exit_code == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["usage"]["drift"] is None
+    assert "reports usage as" not in result.stderr
+
+
 def test_restore_delta_is_only_checked_on_cold_continue_without_context_drop(
     cli: CliRunner, state_root: Path
 ) -> None:
