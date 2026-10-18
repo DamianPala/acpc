@@ -17,16 +17,16 @@
 
 ## Build contract
 
-Roles and loop per `~/ai/lab/knowledge/build-contract.md` (main session briefs, builder implements, reviewer verifies on a fresh context, max 2 rounds). Local mapping, in force since the 1.1 cycle (2026-09-23):
+Roles and loop per `~/ai/lab/knowledge/build-contract.md` (main session briefs, builder implements, reviewer verifies on a fresh context, max 2 rounds). Local mapping, every role inside Claude Code since 2026-10-18 (acpc is the product under test, never the dispatch path):
 
-- builder = `acpc run builder` (Codex, gpt-6-luna, effort max); explorer = `acpc run explorer` (same model, read-only work); reviewer = Agent tool `reviewer` (Opus, high, adversarial with mutation testing on a `git archive` copy — never in the worktree). Hard design or diagnosis questions: Agent tool on Fable 5.1 or `acpc run expert-astra`, one question per dispatch.
-- acpc dispatches run `--bg` with `--prompt-file` and `--cwd` of the slice worktree; the orchestrator arms `acpc wait <id> --output-file <file>` in the background in the same turn.
+- builder-light = Agent tool `builder-light` (Haiku, high); builder = Agent tool `builder` (Sonnet, high); explorer = Agent tool `explorer` (Sonnet, high, read-only work); reviewer = Agent tool `reviewer` (Opus, high, adversarial with mutation testing on a `git archive` copy, never in the worktree). Hard design or diagnosis questions: Agent tool on Fable 5.1, one question per dispatch.
+- An agent gets the brief's path and the slice worktree's path in its prompt and works there; acpc itself runs only in the orchestrator's live checks of the feature being built.
 - Brief, builder report, reviewer verdicts and SPEC delta live as files under `docs/plans/<version>/` (`slice-N.md`, `slice-N-report.md`, `slice-N-review-<round>.md`, `slice-N-spec-delta.md`). Agents return a few lines; the file is the record.
 - SPEC/README/help wording is authored by the orchestrator before dispatch and pasted verbatim into the brief; builders never edit `SPEC.md`.
 - One commit per slice. After `approve` plus green gate (`pytest` with `ACPC_STANDARD_CHECKOUT` set, ruff, pyright, `smoke.sh`) and the orchestrator's own diff read, commit without asking; pushing stays Damian's act.
 - One writer per tree: no builder or reviewer edits while a live-run or gate runs on the same worktree, and vice versa.
 - Every test and dev run: short isolated `ACPC_HOME` (daemon socket path limit 108 B), `env -u ACPC_CEILING`, `uv run --frozen`. `pgrep`/`kill` only by the full repo path; never bare `git stash` (shared across worktrees).
-- Long prompts via `--prompt-file`, never argv (visible in `ps`; a 2026-08-04 dispatch matched a cleanup `pgrep -f` pattern and was killed). Never export `CODEX_HOME`/`CLAUDE_CONFIG_DIR` around an acpc dispatch; daemons key on the entry's declared environment.
+- Live checks through acpc: long prompts via `--prompt-file`, never argv (visible in `ps`; a 2026-08-04 dispatch matched a cleanup `pgrep -f` pattern and was killed). Never export `CODEX_HOME`/`CLAUDE_CONFIG_DIR` around a dispatch; daemons key on the entry's declared environment.
 
 ## Docs contract
 
