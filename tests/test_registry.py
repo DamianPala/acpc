@@ -57,9 +57,11 @@ def test_shipped_adapter_facts_and_presets_are_available(tmp_path: Path) -> None
     assert claude.presets["max"].model == "claude-opus-5-5"
     assert claude.effective_efforts("claude-opus-5-5") == ("low", "medium", "high", "xhigh", "max")
     assert codex.presets["standard"].effort == "xhigh"
-    # claude CLI >=2.1.224 offers no effort option for haiku; see claude.toml.
-    assert claude.presets["fast"].model == "claude-haiku-4-5"
-    assert claude.presets["fast"].effort is None
+    assert claude.presets["fast"].model == "claude-haiku-5-5"
+    assert claude.presets["fast"].effort == "low"
+    assert claude.effective_efforts("claude-haiku-5-5") == ("low", "medium", "high", "xhigh", "max")
+    # claude CLI >=2.1.224 offers no effort option for haiku 4.5; see claude.toml.
+    assert claude.effective_efforts("claude-haiku-4-5") == ()
     assert claude.usage_profile == "claude_model_usage"
     assert codex.usage_profile == "codex_usage_updates"
     assert grok.usage_profile == "grok_meta_usage"
