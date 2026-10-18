@@ -2,6 +2,27 @@
 
 ## Now
 
+**1.1.1 in progress on `fix/1.1.1` (2026-10-18, from `main` `02d3ac0`): slice 1 committed as
+`20feb4d` (every value-taking option without a value answers `invalid_input` instead of a
+traceback; `run_with_sigint_deferred` keeps SIGINT blocked only while the loop is built, with the
+after-first-step restore reserved for `execute_turn`; `delete` names `status <id>` as its
+preview; README says `edit` on claude selects plan mode today), `9f9690e` (`claude-haiku-5-5`
+effort row low..max measured on claude-agent-acp 0.88.0/0.89.1, `fast` preset on it at `low`),
+`d72f150` (AGENTS.md: every build-contract role inside Claude Code). Builder Luna via acpc for
+round 1 (the last acpc dispatch), builder-light Haiku for round 2, reviewer Opus twice; the
+round-1 review caught a regression (processes spawned in the first step inherited a blocked
+SIGINT). Gate: 1616 tests, ruff, pyright 0, smoke 609/609; live on claude: cold `--bg` daemon and
+adapter with `SigBlk 0`, `--model fast` on Haiku 5.5 at `low`, Ctrl-C from 0,6 s on ends with the
+`interrupted` envelope (a Ctrl-C inside the first ~0,5 s hits the pydantic import on 1.1.0 too,
+backlog). Not done: the version bump, CHANGELOG and tag (release-create on Damian's go), the push
+of `fix/1.1.1` (outside the `feat/1.1*` CI grant). Host adapters: claude-agent-acp 0.89.1 and
+codex-acp 2.2.2 (installed as the 7-day npm cooldown releases them, no more exceptions). Scope of
+1.2 decided with the expert review in `docs/plans/1.2/expert-scope-review.md` and Damian's rulings
+in `docs/plans/1.1/backlog.md` ("Scope decisions"): `selectable = false` on `plan`, effort from the
+adapter with the vendor default (BREAKING), acpc as the eval-judge transport (`one_shot`,
+`system_prompt_file`, `tools = []`, `served_model`, `failure` object, `data_residency`, window
+cache), measurement first.**
+
 **1.1.0 released 2026-09-24: `feat/1.1` fast-forwarded into `main` (`1c74f95`, with the
 CHANGELOG), tag `v1.1.0`, release page https://github.com/DamianPala/acpc/releases/tag/v1.1.0,
 host reinstalled (`acpc -V` 1.1.0). The `feat/1.1*` branches and worktrees are deleted; plan
