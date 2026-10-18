@@ -618,7 +618,7 @@ Long or uncertain task: acpc run <agent> "Run the tests" --background --json; ac
 Checking on a run: acpc log <id> --tail 10 --follow --timeout 60
 Steering a running session: acpc steer <id> "Stop editing; diagnose only"   in place when the adapter supports it; --steer-mode cancel-then-start to interrupt; blocks until the turn ends unless --background
 Context care: log is condensed by default; use --prose for the full answer.
-Maintenance and setup: delete, prune and bare daemon stop explain their gates; prune and daemon stop preview with --dry-run, resolve previews a dispatch.
+Maintenance and setup: delete, prune and bare daemon stop explain their gates; prune and daemon stop preview with --dry-run, status previews delete, resolve previews a dispatch.
   Truncated or huge answer? Read <dir>/answer.md selectively — always complete.
   SIGINT cancels the turn owned by this command. SIGTERM detaches work already taken over by the daemon.
   acpc continue <id> "Now fix what you found"
@@ -1027,10 +1027,12 @@ _MISSING_ARGUMENT_RECOVERY = {
 
 def _friendly_usage_problem(message: str, command_path: str | None, exit_code: int) -> UsageProblem:
     command_parts = (command_path or "").split()
-    command_name = " ".join(command_parts[-2:])
-    recovery = _MISSING_ARGUMENT_RECOVERY.get(command_name)
-    if recovery is None:
-        recovery = _MISSING_ARGUMENT_RECOVERY.get(command_parts[-1])
+    recovery = None
+    if command_parts:
+        command_name = " ".join(command_parts[-2:])
+        recovery = _MISSING_ARGUMENT_RECOVERY.get(command_name)
+        if recovery is None:
+            recovery = _MISSING_ARGUMENT_RECOVERY.get(command_parts[-1])
     if recovery is not None and (
         "Missing argument" in message
         or "Missing parameter" in message
@@ -1038,6 +1040,16 @@ def _friendly_usage_problem(message: str, command_path: str | None, exit_code: i
     ):
         friendly_message, hint = recovery
         return UsageProblem(friendly_message, hint=hint, exit_code=exit_code)
+    missing_option_message = message.removesuffix(".")
+    prefix = "Option '"
+    suffix = "' requires an argument"
+    if missing_option_message.startswith(prefix) and missing_option_message.endswith(suffix):
+        option = missing_option_message[len(prefix) : -len(suffix)]
+        return UsageProblem(
+            f"Option '{option}' requires an argument",
+            hint=f"Pass a value after {option}",
+            exit_code=exit_code,
+        )
     return UsageProblem(
         _friendly_usage_message(message, command_path=command_path),
         exit_code=exit_code,
@@ -1844,7 +1856,9 @@ def _ensure_cache(entry: ResolvedEntry) -> cache.CachedAdvertised:
         return record
     if not entry.installed:
         raise cache.ProbeError(entry.missing_binary_error())
-    advertised = asyncio.run(cache.probe_advertised(entry.resolve_call()))
+    advertised = runner.run_with_sigint_deferred(
+        lambda: cache.probe_advertised(entry.resolve_call())
+    )
     refreshed = cache.read_advertised(entry.base_adapter)
     return refreshed or cache.CachedAdvertised(advertised=advertised, cached_at=time.time())
 
@@ -2202,8 +2216,8 @@ def _check_one(registry: AgentRegistry, entry: ResolvedEntry, timeout: float) ->
     try:
         resolution = registry.resolve_call(entry.entry)
         _warn_unlisted_effort_model(resolution)
-        advertised = asyncio.run(
-            asyncio.wait_for(cache.probe_advertised(resolution), timeout=timeout)
+        advertised = runner.run_with_sigint_deferred(
+            lambda: asyncio.wait_for(cache.probe_advertised(resolution), timeout=timeout)
         )
         return {"agent": entry.entry, "ok": True, "models": len(advertised["models"])}
     except (cache.ProbeError, TimeoutError) as error:
@@ -2992,8 +3006,11 @@ def _cancel_session(meta: sessions.SessionMeta) -> _CancelResult:
     answers `stale` and neither turn is touched further here.
     """
     expected_turn = meta.turns
-    if meta.target is not None:
-        reply = asyncio.run(_cancel_with_daemon(meta.target, meta.session_id, expected_turn))
+    target = meta.target
+    if target is not None:
+        reply = runner.run_with_sigint_deferred(
+            lambda: _cancel_with_daemon(target, meta.session_id, expected_turn)
+        )
         if isinstance(reply, daemon_client.DaemonUnavailable):
             current = sessions.load(meta.session_id)
             if not current.is_active:
@@ -3116,6 +3133,7 @@ def delete_command(
     the prompt and the answer go with it and acpc cannot bring them back, so
     the call needs ``--yes``. The session directory remains as a permanent
     identifier tombstone; ``list`` and ``status`` do not treat it as a session.
+    There is no ``--dry-run``; ``acpc status <id>`` is the preview.
     Prints the removed session id; ``--json`` also lists the deleted paths.
 
     Example: ``acpc delete q7x2 --yes``
@@ -3301,9 +3319,10 @@ async def _collect_preparing_sessions(targets: Sequence[str]) -> set[str]:
 
 def _status_view_meta(meta: sessions.SessionMeta) -> sessions.SessionMeta:
     """Overlay the daemon-only ``preparing`` phase for status rendering."""
-    if meta.target is None:
+    target = meta.target
+    if target is None:
         return meta
-    preparing = asyncio.run(_collect_preparing_sessions([meta.target]))
+    preparing = runner.run_with_sigint_deferred(lambda: _collect_preparing_sessions([target]))
     return replace(meta, state="preparing") if meta.session_id in preparing else meta
 
 
@@ -3429,8 +3448,15 @@ def _status_collection(
     if selected_format == "plain" and not explicit_limit:
         raise UsageProblem("--plain requires an explicit --limit")
     metas = sessions.list_sessions()
-    targets = [meta.target for meta in metas if meta.target is not None]
-    preparing = asyncio.run(_collect_preparing_sessions(targets)) if targets else set()
+    targets: list[str] = []
+    for meta in metas:
+        if meta.target is not None:
+            targets.append(meta.target)
+    preparing = (
+        runner.run_with_sigint_deferred(lambda: _collect_preparing_sessions(targets))
+        if targets
+        else set()
+    )
     metas = [
         replace(meta, state="preparing") if meta.session_id in preparing else meta for meta in metas
     ]
@@ -4650,7 +4676,9 @@ def _dispatch_background(
     SPEC `run --bg`: on a terminal, stdout is exactly the session id and its
     directory; off one, `text` prints the tagged receipt (V6a) instead.
     """
-    problem = asyncio.run(runner.dispatch_background(session_id, request))
+    problem = runner.run_with_sigint_deferred(
+        lambda: runner.dispatch_background(session_id, request)
+    )
     if problem is not None:
         # The session exists by now: the caller has to be able to reach it
         # even though the dispatch that would have run it failed (R7a).  No
@@ -5724,7 +5752,9 @@ def _steer_in_place(
         )
     capabilities = output.session_capabilities(meta)
     delivery = _in_place_delivery(
-        asyncio.run(_steer_with_daemon(target, meta.session_id, instruction)),
+        runner.run_with_sigint_deferred(
+            lambda: _steer_with_daemon(target, meta.session_id, instruction)
+        ),
         meta.session_id,
     )
     correction: dict[str, Any] = {
@@ -6095,7 +6125,7 @@ def daemon_status_command(
         and ctx.get_parameter_source("limit") is not click.core.ParameterSource.COMMANDLINE
     ):
         raise UsageProblem("--plain requires an explicit --limit")
-    all_entries = asyncio.run(_collect_daemon_status(agent))
+    all_entries = runner.run_with_sigint_deferred(lambda: _collect_daemon_status(agent))
     entries = all_entries[:limit]
     if selected_format == "json":
         _emit_json(output.collection_envelope(entries, has_more=len(entries) < len(all_entries)))
@@ -6220,7 +6250,7 @@ def daemon_stop_command(
         # an effect: a daemon of another version stands down on contact.
         stopped = list(targets)
     else:
-        stopped = asyncio.run(_stop_daemons(targets))
+        stopped = runner.run_with_sigint_deferred(lambda: _stop_daemons(targets))
     payload = {
         "targets": stopped,
         "changed": bool(stopped) and not dry_run,

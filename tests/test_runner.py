@@ -5,6 +5,7 @@ import contextlib
 import json
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -117,6 +118,72 @@ def test_each_final_state_maps_to_its_fixed_exit_code(state: str, expected: int)
 def test_exit_code_ignores_the_stop_reason_for_a_finished_turn() -> None:
     assert runner.exit_code_for("done", "refusal") == vocab.EXIT_OK
     assert runner.exit_code_for("failed", "end_turn") == vocab.EXIT_AGENT_ERROR
+
+
+@pytest.mark.skipif(not hasattr(signal, "pthread_sigmask"), reason="POSIX signal semantics")
+def test_sigint_during_loop_startup_reaches_the_coroutine_handler() -> None:
+    previous_mask = signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT})
+    previous_handler = signal.signal(signal.SIGINT, signal.default_int_handler)
+    received = False
+
+    async def scenario() -> bool:
+        nonlocal received
+        loop = asyncio.get_running_loop()
+        event = asyncio.Event()
+        signal.pthread_kill(threading.get_ident(), signal.SIGINT)
+        loop.add_signal_handler(signal.SIGINT, event.set)
+        await event.wait()
+        received = True
+        return received
+
+    try:
+        try:
+            assert runner.run_with_sigint_deferred(scenario, installs_sigint_handler=True)
+        except KeyboardInterrupt:
+            pytest.fail("SIGINT escaped before the coroutine installed its handler")
+    finally:
+        signal.signal(signal.SIGINT, previous_handler)
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+
+@pytest.mark.skipif(not hasattr(signal, "pthread_sigmask"), reason="POSIX signal semantics")
+def test_sigint_is_unblocked_again_when_the_operation_cannot_start() -> None:
+    previous_mask = signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT})
+
+    def unbuildable() -> Any:
+        raise RuntimeError("cannot build the operation")
+
+    try:
+        with pytest.raises(RuntimeError, match="cannot build"):
+            runner.run_with_sigint_deferred(unbuildable)
+        assert signal.SIGINT not in signal.pthread_sigmask(signal.SIG_BLOCK, set())
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+
+@pytest.mark.skipif(not hasattr(signal, "pthread_sigmask"), reason="POSIX signal semantics")
+def test_a_child_spawned_in_the_first_step_does_not_inherit_a_blocked_sigint() -> None:
+    previous_mask = signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT})
+    child_report = (
+        "import signal\n"
+        "mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())\n"
+        "print('blocked' if signal.SIGINT in mask else 'unblocked')\n"
+    )
+
+    # The blocking spawn stays in the first step on purpose: that is the case under test.
+    async def spawn_child_first() -> str:
+        completed = subprocess.run(  # noqa: ASYNC221
+            [sys.executable, "-c", child_report],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return completed.stdout.strip()
+
+    try:
+        assert runner.run_with_sigint_deferred(spawn_child_first) == "unblocked"
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 
 # --- the happy path ---------------------------------------------------------

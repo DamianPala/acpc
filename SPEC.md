@@ -133,7 +133,7 @@ Named `daemon stop AGENT` stops the targeted daemon without a confirmation gate.
 delete SELECTOR [--yes] [--format text|json]
 ```
 
-`delete` clears the selected session directory only after the session is finished and the caller has supplied `--yes`, then leaves a permanent tombstone marker in that directory. It does not prompt at a terminal. The session's transcript, prompt, answer and metadata are removed together. The identifier remains reserved forever, so repeating the call reports `not_found` and no later session can reuse it. The structured result contains `session_id`, `removed`, `changed` and `paths`.
+`delete` clears the selected session directory only after the session is finished and the caller has supplied `--yes`, then leaves a permanent tombstone marker in that directory. It does not prompt at a terminal. The session's transcript, prompt, answer and metadata are removed together. The identifier remains reserved forever, so repeating the call reports `not_found` and no later session can reuse it. The structured result contains `session_id`, `removed`, `changed` and `paths`. `delete` offers no `--dry-run`; `status <id>` is its preview, naming the state, paths and timestamps the deletion acts on.
 
 ### `install`
 

@@ -29,7 +29,7 @@ import signal
 import subprocess
 import sys
 import time
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -83,6 +83,35 @@ _FAILURE_STOP_REASONS = frozenset({"refusal", "max_tokens", "max_turn_requests"}
 
 # ...of those, the ones where the adapter hit a ceiling rather than broke.
 _ADAPTER_LIMIT_STOP_REASONS = frozenset({"max_tokens", "max_turn_requests"})
+
+
+def run_with_sigint_deferred[T](
+    coro_factory: Callable[[], Coroutine[Any, Any, T]],
+    *,
+    installs_sigint_handler: bool = False,
+) -> T:
+    """Run an async operation with SIGINT blocked until its loop can take it.
+
+    The mask comes back before the operation's first step, so a process the
+    operation spawns in that step does not inherit a blocked SIGINT. An operation
+    that installs its own SIGINT handler in its first step keeps the mask until
+    that step ends, so a SIGINT cannot land before the handler exists.
+    """
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
+    try:
+
+        async def run() -> T:
+            loop = asyncio.get_running_loop()
+            if not installs_sigint_handler:
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+            task = loop.create_task(coro_factory())
+            if installs_sigint_handler:
+                loop.call_soon(signal.pthread_sigmask, signal.SIG_SETMASK, previous_mask)
+            return await task
+
+        return asyncio.run(run())
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 
 class RunnerError(Exception):
@@ -1799,7 +1828,10 @@ def _host_pid() -> int:
 def execute_turn(session_id: str, request: TurnRequest) -> TurnOutcome:
     """Run one turn synchronously and leave the session finalized on disk."""
     try:
-        outcome = asyncio.run(_execute(session_id, request))
+        outcome = run_with_sigint_deferred(
+            lambda: _execute(session_id, request),
+            installs_sigint_handler=True,
+        )
     except ResumePreparationError as error:
         # Verification happens before a deferred continuation rotates the
         # session, so preserve the finished session exactly as it was.
@@ -2553,7 +2585,9 @@ def wait_for_session(session_id: str, *, timeout: float | None = None) -> tuple[
     turn = meta.turns
     if meta.is_finished:
         return turn, meta.state
-    return turn, asyncio.run(_await_session(session_id, meta.target, timeout, turn))
+    return turn, run_with_sigint_deferred(
+        lambda: _await_session(session_id, meta.target, timeout, turn)
+    )
 
 
 def daemon_targets_for(agent: str) -> list[str]:

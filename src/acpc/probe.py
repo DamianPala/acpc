@@ -9,7 +9,6 @@ from the `[modes]` table the entry records.
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import json
 import sys
@@ -279,7 +278,7 @@ def run(entry_name: str) -> ProbeReport:
         raise ProbeError(_WINDOWS_UNSUPPORTED_REASON + "; probe is unavailable on Windows")
     try:
         entry = AgentRegistry().resolve(entry_name)
-        return asyncio.run(_run_async(entry))
+        return runner.run_with_sigint_deferred(lambda: _run_async(entry))
     except RegistryError:
         raise
     except (runner.RunnerError, OSError, RequestError) as error:

@@ -90,6 +90,39 @@ def test_root_help_is_a_compact_cheat_sheet(runner: CliRunner) -> None:
         "cancel <id>       cancel a running session; it stays resumable with continue"
         in result.stdout
     )
+    assert "status previews delete" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("args", "option"),
+    [
+        (("log", "abcd", "--tail"), "--tail"),
+        (("wait", "abcd", "--timeout"), "--timeout"),
+        (("list", "--limit"), "--limit"),
+        (("run", "x", "--model"), "--model"),
+        (("log", "abcd", "--json", "--tail"), "--tail"),
+    ],
+)
+def test_value_options_without_values_are_friendly_usage_errors(
+    runner: CliRunner, args: tuple[str, ...], option: str
+) -> None:
+    result = invoke(runner, *args)
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert result.stdout == ""
+    assert "Traceback" not in result.stderr
+    error = json.loads(result.stderr)["error"]
+    assert error["kind"] == "invalid_input"
+    assert error["message"] == f"Option '{option}' requires an argument"
+    assert option in error["hint"]
+
+
+def test_delete_help_names_status_as_its_preview(runner: CliRunner) -> None:
+    result = invoke(runner, "delete", "--help")
+
+    assert result.exit_code == vocab.EXIT_OK
+    help_text = " ".join(result.stdout.split())
+    assert "There is no ``--dry-run``; ``acpc status <id>`` is the preview." in help_text
 
 
 def test_root_help_describes_every_group_and_command(runner: CliRunner) -> None:
