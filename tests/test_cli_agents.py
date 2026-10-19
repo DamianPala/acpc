@@ -224,13 +224,14 @@ def test_agents_list_labels_variant_columns_and_adapts_to_long_values(
 ) -> None:
     long_entry = "variant-name-longer-than-the-old-column"
     long_model = "0123456789" * 5 + "ab"
+    long_home = "~/.local/state/some-tool/agent/cfg-dir"
     (state_root / "agents" / f"{long_entry}.toml").write_text(
         f'''
 extends = "mock"
 model = "{long_model}"
 effort = "xhigh"
 permissions = "write"
-home = "~/.home-longer-than-the-old-column"
+home = "{long_home}"
 ''',
         encoding="utf-8",
     )
@@ -246,11 +247,13 @@ home = "~/.home-longer-than-the-old-column"
     assert header.split() == list(headings)
     assert lines.count(header) == 1
     model_preview = f"{long_model[:17]}…{long_model[-17:]}"
-    assert [row.index(value) for value in (long_entry, model_preview, "xhigh", "execute")] == [
-        header.index(value) for value in headings[:4]
-    ]
+    home_preview = f"{long_home[:11]}…{long_home[-12:]}"
+    assert [
+        row.index(value) for value in (long_entry, model_preview, "xhigh", "execute", home_preview)
+    ] == [header.index(value) for value in headings[:5]]
     assert len(model_preview) == 35
-    assert "~/.home-longer-than-the-old-column" in row
+    assert len(home_preview) == 24
+    assert long_home not in row
     assert "(full:" not in result.stdout
     assert not any(line.startswith("ENTRY") for line in lines)
 

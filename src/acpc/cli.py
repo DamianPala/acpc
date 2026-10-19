@@ -1849,7 +1849,7 @@ def _variant_row(entry: ResolvedEntry) -> tuple[str, ...]:
         model,
         render.safe_text(values["effort"] or "·"),
         render.safe_text(values["permissions"] or "·"),
-        render.safe_text(values["home"] or "·"),
+        render.middle_cut(render.safe_text(values["home"] or "·"), limit=24),
         _roster_description(entry.description),
     )
 
