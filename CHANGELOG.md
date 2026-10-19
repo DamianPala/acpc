@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.1.1] - 2026-10-19
+
+### Changed
+
+- README: on `claude`, `edit` selects `plan` today, which refuses ordinary file writes and can answer on a different model than the entry names; a claude entry that must write uses `execute`
+- `claude` presets: `fast` runs Haiku 5.5 at `low` and `max` runs Opus 5.5 at `max`; Haiku 5.5 and Opus 5.5 gain their effort rows (`low` to `max`), so `--effort` works on them
+- `grok` presets: `standard` and `max` run grok-4.7 (`high` and `xhigh`); `fast` stays on grok-4.5 at `low`
+- `delete --help` and the spec name `status <id>` as the preview of a deletion; there is no `--dry-run`
+
+### Fixed
+
+- An option given without its value (`log --tail`, `wait --timeout`, `list --limit`, `run --model`, …) fails as a one-line `invalid_input` usage error with a hint and exit 2, instead of a traceback
+- Ctrl-C during a command's start-up no longer escapes as a bare `KeyboardInterrupt`: SIGINT is held while the event loop is built, and for a turn until the turn's own handler is installed, so the turn ends with the `interrupted` envelope; daemons and adapters spawned during start-up begin with SIGINT unblocked
+
 ## [1.1.0] - 2026-09-24
 
 ### Added
@@ -75,5 +89,6 @@
 - `log --max-output` truncation is reported on stderr instead of as a fake event inside the stream
 - Shipped `claude` and `codex` adapter facts refreshed to what the vendors currently support
 
+[1.1.1]: https://github.com/DamianPala/acpc/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/DamianPala/acpc/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/DamianPala/acpc/compare/v0.7.1...v1.0.1
