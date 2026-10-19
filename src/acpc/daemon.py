@@ -502,13 +502,20 @@ def _stored_call(payload: Mapping[str, Any]) -> CallResolution:
             else runner.system_prompt_from_payload(raw_prompt, context=context)
         )
         tools = runner.tools_from_payload(payload.get("tools"), context=context)
+        setting_sources = runner.setting_sources_from_payload(
+            payload.get("setting_sources"), context=context
+        )
         one_shot = runner.one_shot_from_payload(payload.get("one_shot"), context=context)
     except runner.RunnerError as error:
         raise DaemonError(str(error)) from None
     entry = AgentRegistry().resolve(payload["entry"])
     entry = entry.without_session_keys(system_prompt_via=prompt_via, tools_via=tools_via)
     return replace(
-        entry.resolve_call(), system_prompt=system_prompt, tools=tools, one_shot=one_shot
+        entry.resolve_call(),
+        system_prompt=system_prompt,
+        tools=tools,
+        one_shot=one_shot,
+        setting_sources=setting_sources,
     )
 
 
@@ -1503,7 +1510,7 @@ class Daemon:
             return outcome
 
     def _retire_if_reduced(self, session_id: str) -> str | None:
-        """Stop serving a session the finalization just reduced (a one-shot success).
+        """Stop serving a session the finalization just reduced (a one-shot terminal turn).
 
         Nothing can continue it, so the warm mapping goes. A late adapter
         update finds no client: `_drive` released the turn's routing before

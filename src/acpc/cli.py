@@ -400,6 +400,46 @@ def _emit_turn_result(
     _write_stdout(result.text)
 
 
+def _transcript_extra(meta: sessions.SessionMeta, destination: str | None) -> dict[str, Any]:
+    if (
+        destination is None
+        or not meta.is_finished
+        or not sessions.transcript_path(meta.session_id).exists()
+    ):
+        return {}
+    return {"transcript_file": str(Path(destination).expanduser().absolute())}
+
+
+def _deliver_turn_result(
+    meta: sessions.SessionMeta,
+    result: output.OutputResult,
+    *,
+    one_shot: bool,
+    output_file: str | None,
+    transcript_file: str | None,
+    json_mode: bool,
+) -> None:
+    """Consume only after every output write and flush has succeeded."""
+    claim = sessions.pending_delivery(meta.session_id) if one_shot else contextlib.nullcontext()
+    try:
+        with claim:
+            # The transcript goes first, so a failed copy prints no document naming it.
+            source = sessions.transcript_path(meta.session_id)
+            if meta.is_finished and transcript_file is not None and source.exists():
+                output.write_transcript_file(transcript_file, source.read_bytes())
+            _emit_turn_result(result, output_file=output_file, json_mode=json_mode)
+    except FileNotFoundError:
+        if not one_shot or sessions.answer_path(meta.session_id).exists():
+            raise
+        raise AcpcError(
+            f"session {meta.session_id} is one_shot and its answer was already delivered",
+            kind=errors.CONFLICT,
+            retryable=False,
+            hint=f"Run: acpc status {meta.session_id}",
+            context={"session_id": meta.session_id},
+        ) from None
+
+
 def _timeout_failure(
     session_id: str, *, turn: int, status: str | None, retryable: bool
 ) -> AcpcError:
@@ -1662,8 +1702,8 @@ def _emit_resolution(payload: dict[str, Any], *, json_mode: bool) -> None:
             lines.append(f"{name:<12} {value} ({reason}) · {delegation}{escalation}{selection}")
         elif name == "system_prompt":
             lines.append(f"{'prompt file':<12} {value} ({item['bytes']} bytes, {item['source']})")
-        elif name == "tools":
-            names = " · ".join(item["value"]) if item["value"] else "none"
+        elif name in ("tools", "setting_sources"):
+            names = value if item["value"] is None else (" · ".join(item["value"]) or "none")
             lines.append(f"{name:<12} {names} ({item['source']})")
         elif name == "one_shot":
             if item["value"]:
@@ -2038,6 +2078,12 @@ def _entry_session_rows(entry: ResolvedEntry) -> list[str]:
     if entry.tools is not None:
         tool_names = " · ".join(entry.tools) if entry.tools else "none"
         rows.append(f"{'tools':<12} {tool_names} ({_source_text(entry.provenance.get('tools'))})")
+    if entry.setting_sources is None:
+        rows.append("setting_sources ·")
+    else:
+        names = " · ".join(entry.setting_sources) or "none"
+        source = _source_text(entry.provenance.get("setting_sources"))
+        rows.append(f"setting_sources {names} ({source})")
     if entry.one_shot:
         rows.append(f"{'one-shot':<12} yes ({_source_text(entry.provenance.get('one_shot'))})")
     refused = entry.route_refusal()
@@ -2054,6 +2100,9 @@ def _entry_session_payload(entry: ResolvedEntry) -> dict[str, Any]:
         "system_prompt_via": entry.system_prompt_via,
         "tools_via": entry.tools_via,
         "one_shot": entry.one_shot,
+        "setting_sources": list(entry.setting_sources)
+        if entry.setting_sources is not None
+        else None,
         "refused": entry.route_refusal(),
     }
 
@@ -3094,7 +3143,10 @@ def _turn_terminal_state(session_id: str, turn: int) -> str:
     event in order is that turn's own ending — the newer turn a `stale` reply
     means is not read here.
     """
-    events = transcript.Transcript(sessions.transcript_path(session_id)).read().events
+    with sessions.session_lock(session_id):
+        if not sessions.transcript_path(session_id).exists():
+            return "unknown"
+        events = transcript.Transcript(sessions.transcript_path(session_id)).read().events
     seen = 0
     for event in events:
         if event.get("type") == "state" and event.get("to") in vocab.FINISHED_STATES:
@@ -3112,6 +3164,19 @@ def _stale_cancel_result(meta: sessions.SessionMeta, expected_turn: int) -> _Can
 
 def _cancel_local_session(meta: sessions.SessionMeta) -> _CancelResult:
     if meta.pid is None:
+        if runner.stored_one_shot(meta):
+            # No host recorded an answer yet, but `canceled` is a terminal state,
+            # so the one-shot rule still reduces the directory (SPEC: "in any
+            # terminal state"); the empty answer stays pending for one `wait`.
+            final = sessions.finalize_turn(
+                meta.session_id,
+                "canceled",
+                answer="",
+                exit_code=vocab.EXIT_CANCELLED,
+                stop_reason="stopped by user",
+                reduce=True,
+            )
+            return _CancelResult(final or sessions.load(meta.session_id), True)
         return _CancelResult(
             sessions.transition(
                 meta.session_id,
@@ -3567,7 +3632,10 @@ def _read_transcript_page(
 def _latest_failure_message(session_id: str) -> str | None:
     """Read the recorded cause for a failed wait summary, if one exists."""
     try:
-        events = transcript.Transcript(sessions.transcript_path(session_id)).read().events
+        with sessions.session_lock(session_id):
+            if not sessions.transcript_path(session_id).exists():
+                return None
+            events = transcript.Transcript(sessions.transcript_path(session_id)).read().events
     except (OSError, transcript.TranscriptError):
         return None
     for event in reversed(events):
@@ -3841,7 +3909,9 @@ def log_command(
     _reject_reduced_session(meta, verb="log")
     with _reduction_ends_the_read(meta.session_id):
         try:
-            transcript_file = transcript.Transcript(sessions.transcript_path(meta.session_id))
+            with sessions.session_lock(meta.session_id):
+                _reject_reduced_session(sessions.read_meta(meta.session_id), verb="log")
+                transcript_file = transcript.Transcript(sessions.transcript_path(meta.session_id))
         except transcript.TranscriptError as error:
             raise AcpcError(
                 str(error), kind=errors.CORRUPT_STATE, context={"session_id": meta.session_id}
@@ -4514,6 +4584,7 @@ def _run_foreground(
     request: runner.TurnRequest,
     *,
     output_file: str | None,
+    transcript_file: str | None,
     selected_format: str,
     max_output: int,
     quiet: bool,
@@ -4535,9 +4606,13 @@ def _run_foreground(
         tagged=presentation == "tagged",
         max_output=max_output,
         changed=True,
+        extra=_transcript_extra(final, transcript_file),
     )
-    _emit_turn_result(
+    _deliver_turn_result(
+        final,
         result,
+        one_shot=request.resolution.one_shot and final.is_finished,
+        transcript_file=transcript_file,
         output_file=output_file,
         json_mode=presentation == "json",
     )
@@ -4557,6 +4632,21 @@ def _run_foreground(
             )
         )
     _end_turn_for(meta.session_id, outcome)
+
+
+def _reject_background_flags(
+    background: bool, *, timeout: float | None, transcript_file: str | None
+) -> None:
+    """Refuse the `run` flags that only make sense for a command that waits for the turn."""
+    if not background:
+        return
+    if timeout is not None:
+        raise UsageProblem("--timeout only bounds waiting; use --cancel-after with --background")
+    if transcript_file is not None:
+        raise UsageProblem(
+            "--transcript-file cannot be used with --background",
+            hint="--transcript-file belongs to: acpc wait <id> --transcript-file FILE",
+        )
 
 
 @effects.non_idempotent
@@ -4589,6 +4679,7 @@ def _run_foreground(
     metavar="FILE",
     help="Replace the system prompt for this call; overrides the entry's system_prompt_file.",
 )
+@click.option("--transcript-file", metavar="FILE", help="Copy the finished transcript as NDJSON.")
 @click.option("--output-file", "output_file", metavar="FILE", help=_OUTPUT_FILE_HELP)
 @click.option(
     "--format",
@@ -4651,6 +4742,7 @@ def run_command(
     mode: str | None,
     home: str | None,
     output_file: str | None,
+    transcript_file: str | None,
     format_name: str | None,
     timeout: float | None,
     cancel_after: float | None,
@@ -4670,8 +4762,7 @@ def run_command(
     Example: ``acpc run codex "Fix the failing test" --permissions execute``
     """
     selected_format = _select_format(format_name, json_mode, native_text=True)
-    if background and timeout is not None:
-        raise UsageProblem("--timeout only bounds waiting; use --cancel-after with --background")
+    _reject_background_flags(background, timeout=timeout, transcript_file=transcript_file)
     permissions = _normalize_permission(permissions)
     resolved_cwd = _resolve_existing_cwd(cwd)
     resolution = _resolve_run_call(
@@ -4732,6 +4823,7 @@ def run_command(
         meta,
         request,
         output_file=output_file,
+        transcript_file=transcript_file,
         selected_format=selected_format,
         max_output=max_output,
         quiet=quiet,
@@ -4925,26 +5017,26 @@ def _reduction_ends_the_read(session_id: str) -> Iterator[None]:
     """
     try:
         yield
+        _reject_reduced_session(_load_view_session(session_id), verb="log")
     except FileNotFoundError:
         _reject_reduced_session(_load_view_session(session_id), verb="log")
         raise
 
 
 def _reject_reduced_session(meta: sessions.SessionMeta, *, verb: str) -> None:
-    """Refuse `continue` or `log` on a one-shot session that was reduced after success.
-
-    Its prompt, transcript and parked turns are gone, so there is nothing to
-    continue from or to read; `status` and `wait` still serve the result.
-    """
-    if meta.retained:
+    """Refuse all one-shot continuations and logs of terminal one-shot turns."""
+    if not runner.stored_one_shot(meta) or (verb == "log" and not meta.is_finished):
         return
     if verb == "continue":
         what, hint = "cannot be continued", f"Start a new session: acpc run {meta.entry} ..."
     else:
-        what, hint = "has no transcript to read", f"Run: acpc wait {meta.session_id}"
+        # `wait` still delivers the transcript while the answer is pending;
+        # once it was consumed, only the metadata is left to look at.
+        pending = sessions.answer_path(meta.session_id).exists()
+        command = "wait" if pending else "status"
+        what, hint = "has no transcript to read", f"Run: acpc {command} {meta.session_id}"
     raise AcpcError(
-        f"session {meta.session_id} is a one_shot session that succeeded and was reduced to "
-        f"meta.json and answer.md; it {what}",
+        f"session {meta.session_id} is a one_shot session; it {what}",
         kind=errors.CONFLICT,
         retryable=False,
         hint=hint,
@@ -5287,6 +5379,7 @@ def _follow_up_request(
     """
     try:
         current = sessions.read_meta(session_id)
+        _reject_reduced_session(current, verb="continue")
         stored_policy = _stored_permission_policy(current)
         transcript.Transcript(sessions.transcript_path(session_id)).read()
     except (sessions.SessionError, transcript.TranscriptError) as error:
@@ -6155,6 +6248,7 @@ def _observe_steered_turn(
     metavar="S",
     help=_WAIT_TIMEOUT_HELP,
 )
+@click.option("--transcript-file", metavar="FILE", help="Copy the finished transcript as NDJSON.")
 @click.option("--output-file", "output_file", metavar="FILE", help=_OUTPUT_FILE_HELP)
 @click.option(
     "--format",
@@ -6177,6 +6271,7 @@ def wait_command(
     selector: str,
     timeout: float | None,
     output_file: str | None,
+    transcript_file: str | None,
     format_name: str | None,
     max_output: int,
     quiet: bool,
@@ -6187,7 +6282,7 @@ def wait_command(
     The turn observed is the one active when this call starts (M1g): a later
     ``continue`` or ``steer`` that opens a newer turn does not change what this
     call reports. The exit code mirrors the turn's result. A turn already
-    finished is returned immediately — the free way to reprint an answer.
+    finished is returned immediately; one-shot answers can be delivered only once.
     ``--timeout`` stops the waiting only and exits 124: the session keeps
     running, and no result is printed, even when a partial answer was recorded
     (``log --tail`` reads that instead). A session that failed adds a
@@ -6235,10 +6330,14 @@ def wait_command(
             tagged=presentation == "tagged",
             max_output=max_output,
             turn=(None if is_current else turn),
+            extra=_transcript_extra(final, transcript_file),
         )
         exit_code = runner.exit_code_for(final.state, final.stop_reason)
-        _emit_turn_result(
+        _deliver_turn_result(
+            final,
             result,
+            one_shot=runner.stored_one_shot(final) and final.is_finished,
+            transcript_file=transcript_file,
             output_file=output_file,
             json_mode=presentation == "json",
         )

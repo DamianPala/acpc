@@ -73,7 +73,9 @@ def ensure_private_dir(path: Path) -> Path:
     return path
 
 
-def atomic_write(path: Path, data: dict[str, Any] | str, *, exclusive: bool = False) -> None:
+def atomic_write(
+    path: Path, data: dict[str, Any] | str | bytes, *, exclusive: bool = False
+) -> None:
     """Write JSON or text through a same-directory temporary file.
 
     `exclusive=True` publishes with `os.link`, which fails with `FileExistsError`
@@ -84,11 +86,13 @@ def atomic_write(path: Path, data: dict[str, Any] | str, *, exclusive: bool = Fa
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as file:
-            if isinstance(data, str):
+        with os.fdopen(fd, "wb") as file:
+            if isinstance(data, bytes):
                 file.write(data)
+            elif isinstance(data, str):
+                file.write(data.encode("utf-8"))
             else:
-                json.dump(data, file)
+                file.write(json.dumps(data).encode("utf-8"))
         if exclusive:
             os.link(tmp, path)
             with contextlib.suppress(OSError):

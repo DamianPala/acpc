@@ -330,9 +330,8 @@ def adapter_session_meta(session_id: str, resolution: CallResolution) -> dict[st
     byte-identical on the wire. The prompt text is read from the session's
     `system.md` here, at the call that sends it, so no payload or snapshot
     carries it. Only the `acp_meta` routes are served by this function; the
-    adapter facts decide. A one-shot session adds the three options that keep
-    the vendor from storing a transcript or loading settings of its own, in
-    the same `claudeCode.options` object as the tool list.
+    adapter facts decide. One-shot disables vendor transcript persistence;
+    setting_sources independently controls which vendor settings are loaded.
     """
     meta: dict[str, Any] = {}
     if resolution.system_prompt is not None and resolution.entry.system_prompt_via == "acp_meta":
@@ -349,7 +348,11 @@ def adapter_session_meta(session_id: str, resolution: CallResolution) -> dict[st
         if resolution.tools is not None:
             options["tools"] = list(resolution.tools)
         if resolution.one_shot:
-            options.update(persistSession=False, settingSources=[], strictMcpConfig=True)
+            options["persistSession"] = False
+        if resolution.setting_sources is not None:
+            options["settingSources"] = list(resolution.setting_sources)
+            if not resolution.setting_sources:
+                options["strictMcpConfig"] = True
         if options:
             meta["claudeCode"] = {"options": options}
     return meta
@@ -1476,6 +1479,9 @@ def daemon_payload(request: TurnRequest) -> dict[str, Any]:
         "system_prompt_via": resolution.entry.system_prompt_via,
         "tools_via": resolution.entry.tools_via,
         "one_shot": resolution.one_shot,
+        "setting_sources": (
+            list(resolution.setting_sources) if resolution.setting_sources is not None else None
+        ),
     }
 
 
@@ -2068,7 +2074,7 @@ def _finalize(
                 else None
             ),
             delivery_record_incomplete=outcome.delivery_record_incomplete,
-            reduce=_reduces_on_success(current),
+            reduce=_reduces_at_end(current),
             adapter_session_id=(
                 outcome.adapter_session_id
                 if outcome.adapter_session_id is not None
@@ -2097,11 +2103,10 @@ def _after_finalize(finalized: sessions.SessionMeta, outcome: TurnOutcome) -> No
             cache.refresh_advertised(_agent_of(finalized.session_id), outcome.advertised)
 
 
-def _reduces_on_success(current: sessions.SessionMeta | None) -> bool:
-    """Whether a succeeding turn of this session consumes it (a one-shot session).
+def _reduces_at_end(current: sessions.SessionMeta | None) -> bool:
+    """Whether ending a turn of this session consumes it (a one-shot session).
 
-    The session's own snapshot, not the live entry, decides, and a turn that
-    does not succeed keeps its full session for diagnosis whatever this says.
+    The session's own snapshot, not the live entry, decides.
     A snapshot that cannot be read leaves the session whole.
     """
     if current is None:
@@ -2334,6 +2339,11 @@ def resolution_payload(
             "value": list(resolution.tools),
             "source": _source_label(provenance.get("tools")),
         }
+    if resolution.setting_sources is not None:
+        resolved["setting_sources"] = {
+            "value": list(resolution.setting_sources),
+            "source": _source_label(provenance.get("setting_sources")),
+        }
     resolved["one_shot"] = {
         "value": resolution.one_shot,
         "source": _source_label(provenance.get("one_shot")),
@@ -2404,6 +2414,21 @@ def tools_from_payload(raw: object, *, context: str) -> tuple[str, ...] | None:
         return None
     if not isinstance(raw, list) or any(not isinstance(item, str) for item in raw):
         raise RunnerError(f"{context} has an invalid stored tool list")
+    return tuple(raw)
+
+
+def setting_sources_from_payload(raw: object, *, context: str) -> tuple[str, ...] | None:
+    """Read the optional setting source list, including pre-key snapshots."""
+    if raw is None:
+        return None
+    if (
+        not isinstance(raw, list)
+        or any(
+            not isinstance(item, str) or item not in {"user", "project", "local"} for item in raw
+        )
+        or len(set(raw)) != len(raw)
+    ):
+        raise RunnerError(f"{context} has invalid stored setting_sources: {raw!r}")
     return tuple(raw)
 
 
@@ -2552,6 +2577,7 @@ def resolution_from_session(meta: sessions.SessionMeta) -> CallResolution:
     system_prompt_via, tools_via = routes_from_payload(adapter, context=context)
     system_prompt, tools = _stored_prompt_and_tools(meta)
     one_shot = stored_one_shot(meta)
+    setting_sources = _stored_setting_sources(meta)
     env_passthrough = stored_strings("env_passthrough", payload)
     stored_mode, mode_spec, modes = _stored_modes(meta)
 
@@ -2588,6 +2614,7 @@ def resolution_from_session(meta: sessions.SessionMeta) -> CallResolution:
         system_prompt_via=system_prompt_via,
         tools_via=tools_via,
         one_shot=one_shot,
+        setting_sources=setting_sources,
     )
     return CallResolution(
         entry=entry,
@@ -2603,6 +2630,7 @@ def resolution_from_session(meta: sessions.SessionMeta) -> CallResolution:
         system_prompt=system_prompt,
         tools=tools,
         one_shot=one_shot,
+        setting_sources=setting_sources,
     )
 
 
@@ -2654,19 +2682,27 @@ def _stored_prompt_and_tools(
     return prompt, tools_from_payload(raw_tools["value"], context=context)
 
 
+def _stored_setting_sources(meta: sessions.SessionMeta) -> tuple[str, ...] | None:
+    resolved = meta.resolution.get("resolved")
+    if not isinstance(resolved, Mapping) or "setting_sources" not in resolved:
+        return None
+    raw = resolved["setting_sources"]
+    context = f"session {meta.session_id}"
+    if not isinstance(raw, Mapping) or "value" not in raw or raw["value"] is None:
+        raise RunnerError(f"{context} has invalid stored setting_sources: {raw!r}")
+    return setting_sources_from_payload(raw["value"], context=context)
+
+
 def stored_one_shot(meta: sessions.SessionMeta) -> bool:
     """Whether the session's own snapshot says it is consumed once.
 
     The snapshot, not the live entry, decides: an entry edited after the
     session started neither turns the reduction on nor off for it.
     """
-    resolved = meta.resolution.get("resolved")
-    raw = resolved.get("one_shot") if isinstance(resolved, Mapping) else None
-    if raw is None:
-        return False
-    if not isinstance(raw, Mapping):
-        raise RunnerError(f"session {meta.session_id} has an invalid stored one_shot")
-    return one_shot_from_payload(raw.get("value"), context=f"session {meta.session_id}")
+    try:
+        return sessions.stored_one_shot(meta)
+    except sessions.SessionError as error:
+        raise RunnerError(str(error)) from None
 
 
 def continue_request(

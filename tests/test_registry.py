@@ -1112,3 +1112,27 @@ def test_a_non_boolean_one_shot_is_rejected(tmp_path: Path, line: str) -> None:
 
     with pytest.raises(RegistryError, match="one_shot"):
         AgentRegistry(agents)
+
+
+@pytest.mark.parametrize("value", ['"user"', "1", '["user", "user"]', '["bad"]', "[1]", "[[]]"])
+def test_setting_sources_rejects_invalid_values(tmp_path: Path, value: str) -> None:
+    agents = tmp_path / "agents"
+    write_entry(agents, "settings", f'command = "true"\nsetting_sources = {value}\n')
+    with pytest.raises(RegistryError, match="setting_sources"):
+        AgentRegistry(agents).resolve("settings")
+
+
+def test_setting_sources_inherits_and_child_replaces(tmp_path: Path) -> None:
+    agents = tmp_path / "agents"
+    write_entry(
+        agents,
+        "base",
+        'command = "true"\ntools_via = "acp_meta"\nsetting_sources = ["user", "project"]\n',
+    )
+    write_entry(agents, "inherits", 'extends = "base"\n')
+    write_entry(agents, "empty", 'extends = "base"\nsetting_sources = []\n')
+    write_entry(agents, "local", 'extends = "base"\nsetting_sources = ["local"]\n')
+    registry = AgentRegistry(agents)
+    assert registry.resolve_call("inherits").setting_sources == ("user", "project")
+    assert registry.resolve_call("empty").setting_sources == ()
+    assert registry.resolve_call("local").setting_sources == ("local",)

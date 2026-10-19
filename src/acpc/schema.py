@@ -230,6 +230,7 @@ _SESSION_RESULT_PROPERTIES = {
     "truncated": _BOOLEAN,
     "partial": _BOOLEAN,
     "output_file": _STRING,
+    "transcript_file": _STRING,
     "denied": _array(_DENIAL),
     "capabilities": _CAPABILITIES,
     "permissions_clamp": {
@@ -286,6 +287,7 @@ _RESOLUTION = _object(
                 },
                 "system_prompt": _RESOLUTION_SYSTEM_PROMPT,
                 "tools": _RESOLUTION_TOOLS,
+                "setting_sources": _RESOLUTION_TOOLS,
                 "one_shot": _RESOLUTION_ONE_SHOT,
             },
             ("model", "effort", "mode", "permissions", "home"),
@@ -395,6 +397,7 @@ _AGENTS_GET = _object(
         "base_adapter": _STRING,
         "system_prompt_file": _NULLABLE_STRING,
         "tools": {"type": ["array", "null"], "items": _STRING},
+        "setting_sources": {"type": ["array", "null"], "items": _STRING},
         "system_prompt_via": _STRING,
         "tools_via": _STRING,
         "one_shot": _BOOLEAN,

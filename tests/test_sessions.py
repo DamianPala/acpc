@@ -6,6 +6,7 @@ windows and retention ages are exercised without sleeping.
 """
 
 import json
+import os
 import random
 import stat
 import subprocess
@@ -494,7 +495,7 @@ class TestRetained:
         with pytest.raises(sessions.CorruptSessionError, match="retained"):
             sessions.read_meta(meta.session_id)
 
-    def test_reducing_a_succeeded_session_keeps_only_lock_meta_and_answer(self) -> None:
+    def test_reducing_a_succeeded_session_keeps_only_metadata_and_pending_files(self) -> None:
         meta = sessions.create_session(
             entry="builder", base_adapter="builder", prompt="p", system_prompt="be a judge"
         )
@@ -515,12 +516,13 @@ class TestRetained:
             "answer.md",
             "lock",
             "meta.json",
+            "transcript.ndjson",
         ]
         reread = sessions.read_meta(session_id)
         assert reread.retained is False
         assert reread.state == "succeeded"
         assert sessions.answer_path(session_id).read_text() == "the answer"
-        assert reread.prompt_snippet == "p"
+        assert reread.prompt_snippet == ""
 
     def test_a_reduced_session_is_deleted_like_any_finished_one(self) -> None:
         meta = make_session()
@@ -550,36 +552,58 @@ class TestRetained:
             "answer.md",
             "lock",
             "meta.json",
+            "transcript.ndjson",
         ]
 
     @pytest.mark.parametrize("state", ["failed", "canceled"])
-    def test_finalizing_with_reduce_keeps_a_turn_that_did_not_succeed(self, state: str) -> None:
+    def test_finalizing_with_reduce_reduces_every_terminal_state(self, state: str) -> None:
         meta = make_session()
         sessions.mark_running(meta.session_id, pid=1, process_start_time="token", clock=at(1.0))
 
         sessions.finalize_turn(meta.session_id, state, answer="partial", exit_code=1, reduce=True)
 
-        assert sessions.read_meta(meta.session_id).retained is True
-        assert "transcript.ndjson" in {
-            item.name for item in sessions.session_dir(meta.session_id).iterdir()
-        }
+        assert sessions.read_meta(meta.session_id).retained is False
+        assert sessions.read_meta(meta.session_id).prompt_snippet == ""
+        assert sorted(item.name for item in sessions.session_dir(meta.session_id).iterdir()) == [
+            "answer.md",
+            "lock",
+            "meta.json",
+            "transcript.ndjson",
+        ]
 
-    def test_a_removal_that_fails_midway_still_reads_as_reduced(self) -> None:
-        meta = make_session()
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory permissions")
+    @pytest.mark.parametrize("ending", ["finalize", "liveness"])
+    def test_a_failed_removal_still_publishes_the_terminal_state(
+        self, ending: str, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        meta = sessions.create_session(
+            entry="judge",
+            base_adapter="judge",
+            prompt="private prompt",
+            resolution={"resolved": {"one_shot": {"value": True}}},
+        )
         session_id = meta.session_id
-        sessions.mark_running(session_id, pid=1, process_start_time="token", clock=at(1.0))
-        stuck = sessions.session_dir(session_id) / "stuck"
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        child.wait(timeout=15)
+        sessions.mark_running(session_id, pid=child.pid, clock=at(1.0))
+        # Sorts before prompt.md: the removal must go on past it.
+        stuck = sessions.session_dir(session_id) / "0-stuck"
         stuck.mkdir()
         (stuck / "file").write_text("x")
         stuck.chmod(0o500)
         try:
-            # The answer and the final state are published; the failed removal is not an error.
-            sessions.finalize_turn(session_id, "succeeded", answer="kept", exit_code=0, reduce=True)
-            reread = sessions.read_meta(session_id)
+            if ending == "finalize":
+                sessions.finalize_turn(
+                    session_id, "succeeded", answer="kept", exit_code=0, reduce=True
+                )
+            reread = sessions.load(session_id)
         finally:
             stuck.chmod(0o700)
-        assert (reread.state, reread.retained) == ("succeeded", False)
-        assert sessions.answer_path(session_id).read_text() == "kept"
+        state = "succeeded" if ending == "finalize" else "unknown"
+        assert (reread.state, reread.retained) == (state, False)
+        assert sessions.answer_path(session_id).exists()
+        assert not (sessions.session_dir(session_id) / "prompt.md").exists()
+        assert "0-stuck" in capsys.readouterr().err
 
 
 class TestTurnRotation:

@@ -3077,8 +3077,6 @@ def test_continue_refuses_a_system_prompt_file_the_session_never_had(
 
 # --- one_shot is a stored session fact ----------------------------------------
 
-STERILITY = {"persistSession": False, "settingSources": [], "strictMcpConfig": True}
-
 
 def fail_first_turn(cli: CliRunner, entry: str = "judge") -> str:
     failed = invoke(cli, "run", entry, "auth:vendor rejected the request", "--quiet", "--json")
@@ -3088,7 +3086,7 @@ def fail_first_turn(cli: CliRunner, entry: str = "judge") -> str:
 
 # `--permissions` sends the continuation through the live-entry selection path.
 @pytest.mark.parametrize("flags", [(), ("--permissions", "read")])
-def test_a_failed_one_shot_session_continues_under_its_stored_flag_and_is_then_reduced(
+def test_a_failed_one_shot_session_refuses_continue_under_its_stored_flag(
     cli: CliRunner,
     state_root: Path,
     tmp_path: Path,
@@ -3099,21 +3097,12 @@ def test_a_failed_one_shot_session_continues_under_its_stored_flag_and_is_then_r
     monkeypatch.setenv("ACPC_MOCK_WIRE_FILE", str(wire_file))
     write_judge_entry(state_root, "one_shot = true\n")
     session_id = fail_first_turn(cli)
-    assert (sessions.session_dir(session_id) / "prompt.md").exists()
-    # The entry no longer says one_shot; the session began as one and stays one.
     write_judge_entry(state_root)
-
     result = invoke(cli, "continue", session_id, "echo:second try", "--quiet", "--json", *flags)
-
-    assert result.exit_code == vocab.EXIT_OK, result.stderr
-    assert json.loads(result.stdout)["retained"] is False
-    assert wire_meta(wire_file, "session/load") == [{"claudeCode": {"options": STERILITY}}]
-    assert sorted(item.name for item in sessions.session_dir(session_id).iterdir()) == [
-        "answer.md",
-        "lock",
-        "meta.json",
-    ]
-    assert sessions.read_meta(session_id).state == "succeeded"
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    assert "one_shot" in json.loads(result.stderr)["error"]["message"]
+    assert wire_meta(wire_file, "session/load") == []
+    assert sessions.read_meta(session_id).state == "failed"
 
 
 @pytest.mark.parametrize("flags", [(), ("--permissions", "read")])
@@ -3141,3 +3130,48 @@ def test_an_entry_that_gains_one_shot_does_not_reduce_a_session_that_began_witho
     again = invoke(cli, "continue", session_id, "echo:third try", "--quiet", "--json", *flags)
     assert again.exit_code == vocab.EXIT_OK, again.stderr
     assert json.loads(again.stdout)["retained"] is True
+
+
+@pytest.mark.parametrize("sources", [[], ["user", "project"], None])
+def test_cold_load_preserves_setting_sources_and_reads_pre_key_snapshots(
+    cli: CliRunner,
+    state_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sources: list[str] | None,
+) -> None:
+    wire_file = tmp_path / "wire.jsonl"
+    monkeypatch.setenv("ACPC_MOCK_WIRE_FILE", str(wire_file))
+    extra = "" if sources is None else f"setting_sources = {json.dumps(sources)}\n"
+    write_judge_entry(state_root, extra)
+    started = invoke(cli, "run", "judge", "echo:first", "--quiet", "--json")
+    session_id = json.loads(started.stdout)["session_id"]
+    # A pre-key snapshot omits setting_sources. The current entry is irrelevant.
+    write_judge_entry(state_root, 'setting_sources = ["local"]\n')
+    continued = invoke(cli, "continue", session_id, "echo:second", "--quiet", "--json")
+    assert continued.exit_code == 0, continued.stderr
+    options: dict = {} if sources is None else {"settingSources": sources}
+    if sources == []:
+        options["strictMcpConfig"] = True
+    expected = {} if not options else {"claudeCode": {"options": options}}
+    assert wire_meta(wire_file, "session/load") == [expected]
+
+
+@pytest.mark.parametrize("bad", ["user", ["bad"], ["user", "user"], [1]])
+def test_malformed_stored_setting_sources_refuses_continue(
+    cli: CliRunner,
+    state_root: Path,
+    bad: object,
+) -> None:
+    write_judge_entry(state_root)
+    started = invoke(cli, "run", "judge", "echo:first", "--quiet", "--json")
+    session_id = json.loads(started.stdout)["session_id"]
+    meta_file = sessions.session_dir(session_id) / "meta.json"
+    data = json.loads(meta_file.read_text())
+    data["resolution"]["resolved"]["setting_sources"] = {"value": bad, "source": "entry"}
+    meta_file.write_text(json.dumps(data))
+    result = invoke(cli, "continue", session_id, "echo:second", "--quiet", "--json")
+    assert result.exit_code != 0
+    error = json.loads(result.stderr)["error"]
+    assert "setting_sources" in error["message"]
+    assert sessions.read_meta(session_id).turns == 1

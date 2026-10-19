@@ -582,3 +582,14 @@ def test_the_steer_result_publishes_the_correction_it_made(
 
     log_types = read_detail(runner, "log")["output"]["properties"]["type"]["enum"]
     assert "steer" in log_types
+
+
+@pytest.mark.parametrize("name", ["run", "wait"])
+def test_transcript_export_flag_and_result_field(runner: CliRunner, name: str) -> None:
+    detail = read_detail(runner, name)
+    assert any(flag["name"] == "transcript-file" for flag in detail["flags"])
+    assert detail["output"]["properties"]["transcript_file"] == {"type": "string"}
+    for other in ["continue", "steer"]:
+        assert not any(
+            flag["name"] == "transcript-file" for flag in read_detail(runner, other)["flags"]
+        )

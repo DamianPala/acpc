@@ -421,6 +421,7 @@ _SESSION_OUTPUT_PROPERTIES = frozenset(
         "truncated",
         "partial",
         "output_file",
+        "transcript_file",
         "denied",
         "permissions_clamp",
         "capabilities",
@@ -452,7 +453,12 @@ _COMPACTIONS_PROPERTIES = frozenset({"count", "unaccounted", "context_before", "
 # R2d's inspection object `status` reports: policy, mode, source and clamp, all required.
 _STATUS_PERMISSIONS_PROPERTIES = frozenset({"policy", "mode", "source", "clamp"})
 _RESOLUTION_REQUIRED = frozenset({"model", "effort", "mode", "permissions", "home"})
-_RESOLUTION_PROPERTIES = _RESOLUTION_REQUIRED | {"system_prompt", "tools", "one_shot"}
+_RESOLUTION_PROPERTIES = _RESOLUTION_REQUIRED | {
+    "system_prompt",
+    "tools",
+    "one_shot",
+    "setting_sources",
+}
 _RESOLUTION_FIELD_PROPERTIES = frozenset(
     {"value", "source", "grants", "delegates", "escalates", "selectable", "clamp"}
 )
@@ -523,6 +529,7 @@ EXPECTED_OUTPUT_ORACLES: dict[str, dict[str, tuple[frozenset[str], frozenset[str
                     "base_adapter",
                     "system_prompt_file",
                     "tools",
+                    "setting_sources",
                     "system_prompt_via",
                     "tools_via",
                     "one_shot",
@@ -825,6 +832,10 @@ EXPECTED_OUTPUT_ORACLES: dict[str, dict[str, tuple[frozenset[str], frozenset[str
             frozenset({"value", "source", "bytes"}),
         ),
         "output.resolved.tools": (
+            frozenset({"value", "source"}),
+            frozenset({"value", "source"}),
+        ),
+        "output.resolved.setting_sources": (
             frozenset({"value", "source"}),
             frozenset({"value", "source"}),
         ),

@@ -54,6 +54,7 @@ _ENTRY_KEYS: Final = frozenset(
     {
         "system_prompt_file",
         "tools",
+        "setting_sources",
         "system_prompt_via",
         "tools_via",
         "one_shot",
@@ -87,6 +88,7 @@ _PRESET_KEYS: Final = frozenset({"model", "effort"})
 _FIELD_NAMES: Final = (
     "system_prompt_file",
     "tools",
+    "setting_sources",
     "system_prompt_via",
     "tools_via",
     "one_shot",
@@ -228,6 +230,7 @@ class CallResolution:
     tools: tuple[str, ...] | None = None
     # A session of this call is consumed once (`sessions.finalize_turn(reduce=True)`).
     one_shot: bool = False
+    setting_sources: tuple[str, ...] | None = None
 
     @property
     def adapter_environment(self) -> dict[str, str]:
@@ -298,6 +301,7 @@ class ResolvedEntry:
     tools_via: str
     # Each session of the entry is consumed once; no adapter refuses it.
     one_shot: bool
+    setting_sources: tuple[str, ...] | None = None
 
     @property
     def is_variant(self) -> bool:
@@ -424,6 +428,7 @@ class ResolvedEntry:
         else:
             sources["system_prompt"] = self.source_for("system_prompt_file")
         sources["tools"] = self.source_for("tools")
+        sources["setting_sources"] = self.source_for("setting_sources")
         sources["one_shot"] = self.source_for("one_shot")
 
         return CallResolution(
@@ -440,6 +445,7 @@ class ResolvedEntry:
             system_prompt=system_prompt,
             tools=self.tools,
             one_shot=self.one_shot,
+            setting_sources=self.setting_sources,
         )
 
     def _resolve_model_and_effort(
@@ -541,12 +547,13 @@ class ResolvedEntry:
         )
 
     def _check_tools_route(self) -> None:
-        if self.tools is not None and self.tools_via == "none":
-            raise RouteNotSupported(
-                f"entry {self.entry} sets tools, but adapter {self.base_adapter} "
-                "has no tool list route (tools_via = none)",
-                hint=_DROP_KEY_HINT,
-            )
+        for key, value in (("tools", self.tools), ("setting_sources", self.setting_sources)):
+            if value is not None and self.tools_via == "none":
+                raise RouteNotSupported(
+                    f"entry {self.entry} sets {key}, but adapter {self.base_adapter} "
+                    "has no tool list route (tools_via = none)",
+                    hint=_DROP_KEY_HINT,
+                )
 
     def without_session_keys(
         self, *, system_prompt_via: str | None = None, tools_via: str | None = None
@@ -563,6 +570,7 @@ class ResolvedEntry:
             self,
             system_prompt_file=None,
             tools=None,
+            setting_sources=None,
             system_prompt_via=system_prompt_via or self.system_prompt_via,
             tools_via=tools_via or self.tools_via,
         )
@@ -662,6 +670,20 @@ def _expect_string_list(path: Path, key: str, value: Any) -> tuple[str, ...]:
     return tuple(value)
 
 
+def _validate_setting_sources(path: Path, raw: Mapping[str, Any]) -> None:
+    if "setting_sources" in raw:
+        value = raw["setting_sources"]
+        if (
+            not isinstance(value, list)
+            or any(
+                not isinstance(item, str) or item not in {"user", "project", "local"}
+                for item in value
+            )
+            or len(set(value)) != len(value)
+        ):
+            raise RegistryError(f"{path}: key 'setting_sources' has invalid value {value!r}")
+
+
 def _validate_judge_keys(path: Path, raw: dict[str, Any]) -> None:
     """Validate the system prompt and tool keys; make the prompt path absolute.
 
@@ -677,6 +699,7 @@ def _validate_judge_keys(path: Path, raw: dict[str, Any]) -> None:
         )
     if "tools" in raw:
         _expect_string_list(path, "tools", raw["tools"])
+    _validate_setting_sources(path, raw)
     if "one_shot" in raw and not isinstance(raw["one_shot"], bool):
         raise RegistryError(f"{path}: key 'one_shot' must be a boolean")
     for key, allowed in (
@@ -968,6 +991,9 @@ def _session_keys(data: Mapping[str, Any]) -> dict[str, Any]:
     prompt_file, tools = data.get("system_prompt_file"), data.get("tools")
     prompt_via, tools_via = data.get("system_prompt_via"), data.get("tools_via")
     return {
+        "setting_sources": (
+            tuple(data["setting_sources"]) if data.get("setting_sources") is not None else None
+        ),
         "one_shot": data.get("one_shot") is True,
         "system_prompt_file": prompt_file if isinstance(prompt_file, str) else None,
         "tools": tuple(tools) if isinstance(tools, (list, tuple)) else None,

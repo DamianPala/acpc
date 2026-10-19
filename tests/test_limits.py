@@ -8,6 +8,8 @@ same as the rest of this suite.
 """
 
 import json
+import os
+import subprocess
 import sys
 import threading
 import time
@@ -528,39 +530,51 @@ def test_run_recognizes_a_text_only_limit_and_cancel_drops_the_wait(
     steering_log = tmp_path / "steering.log"
     monkeypatch.setenv("ACPC_MOCK_STEERING_LOG", str(steering_log))
 
-    # `cancel` signals the process hosting the turn by pid; a plain foreground
-    # `run` executes in-process on this thread, so `--timeout` is what routes
-    # the turn through the real, separate `acpc.direct_worker` subprocess that
-    # a pid-based signal can actually reach (see `_kill_turn_worker` in
-    # test_conformance.py for the same requirement).
-    thread, holder = _run_in_background_thread(
-        cli,
-        "run",
-        "mock",
-        "echo:x",
-        "--json",
-        "--quiet",
-        "--name",
-        "limit-wait-2",
-        "--timeout",
-        "30",
+    # CliRunner replaces process-global stdout/stderr. A second invocation
+    # cannot safely overlap its isolation, so the observer gets its own process.
+    # Force the existing direct-worker route in the child; --timeout still
+    # starts the separate turn worker that pid-based cancel must signal.
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "acpc.cli",
+            "run",
+            "mock",
+            "echo:x",
+            "--json",
+            "--quiet",
+            "--name",
+            "limit-wait-2",
+            "--timeout",
+            "30",
+        ],
+        env={**os.environ, "ACPC_DIRECT_WORKER": "1"},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
     )
-    session_id = _await_alias("limit-wait-2")
-    meta = _wait_for_state(session_id, "waiting")
-    assert meta.limit is not None
-    assert meta.limit["source"] == "text"
-    assert meta.limit["resume_at"] is not None
+    try:
+        session_id = _await_alias("limit-wait-2")
+        meta = _wait_for_state(session_id, "waiting")
+        assert meta.limit is not None
+        assert meta.limit["source"] == "text"
+        assert meta.limit["resume_at"] is not None
 
-    cancel_result = invoke(cli, "cancel", session_id, "--json")
-    assert cancel_result.exit_code == vocab.EXIT_OK
-    document = json.loads(cancel_result.stdout)
-    assert document["status"] == "canceled"
-    assert document["changed"] is True
-    assert document["stop_reason"] == "canceled"
+        cancel_result = invoke(cli, "cancel", session_id, "--json")
+        assert cancel_result.exit_code == vocab.EXIT_OK
+        document = json.loads(cancel_result.stdout)
+        assert document["status"] == "canceled"
+        assert document["changed"] is True
+        assert document["stop_reason"] == "canceled"
 
-    thread.join(timeout=15)
-    assert "error" not in holder, holder
-    assert holder["result"].exit_code == vocab.EXIT_CANCELLED
+        stdout, stderr = process.communicate(timeout=15)
+        assert process.returncode == vocab.EXIT_CANCELLED, stderr
+        assert json.loads(stdout)["status"] == "canceled"
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.communicate(timeout=15)
 
     events = [
         json.loads(line) for line in invoke(cli, "log", session_id, "--json").stdout.splitlines()

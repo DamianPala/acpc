@@ -209,7 +209,7 @@ class SessionMeta:
     # turn or is waited out is a config-time question (`limit_wait_max`), not
     # session state.
     limit: dict[str, Any] | None = None
-    # `false` once a one-shot session was reduced to `meta.json` and `answer.md`;
+    # `false` once a one-shot session was reduced to metadata plus pending delivery files;
     # a `meta.json` written before the field existed reads as `true`.
     retained: bool = True
     extra: dict[str, Any] = field(default_factory=dict)
@@ -851,19 +851,39 @@ def _verify_liveness(meta: SessionMeta, *, clock: Clock) -> SessionMeta:
     return _persist_unknown(meta.session_id, reason, clock=clock)
 
 
+def stored_one_shot(meta: SessionMeta) -> bool:
+    """Read the session's consumption policy, independent of the live entry."""
+    resolved = meta.resolution.get("resolved")
+    raw = resolved.get("one_shot") if isinstance(resolved, Mapping) else None
+    if raw is None:
+        return False
+    if not isinstance(raw, Mapping) or not isinstance(raw.get("value"), bool):
+        raise SessionError(f"session {meta.session_id} has an invalid stored one_shot")
+    return raw["value"]
+
+
 def _persist_unknown(session_id: str, reason: str, *, clock: Clock) -> SessionMeta:
     with session_lock(session_id):
         current = read_meta(session_id)
         if not current.is_active:
             return current
+        previous_state = current.state
         current.state = "unknown"
         current.stop_reason = "unknown"
         current.exit_code = vocab.EXIT_AGENT_ERROR
         current.usage = _unknown_usage(current)
         if current.finished_at is None:
             current.finished_at = clock()
-        write_meta(current)
         _write_unknown_placeholder(current, reason)
+        reduced = stored_one_shot(current)
+        if reduced:
+            transcript.Transcript(transcript_path(session_id)).append(
+                "state", **{"from": previous_state, "to": "unknown"}
+            )
+            current.retained = False
+            current.prompt_snippet = ""
+            _drop_consumed_files(session_id)
+        write_meta(current)
     return current
 
 
@@ -948,10 +968,10 @@ def _is_tombstone(directory: Path) -> bool:
     return (directory / TOMBSTONE_NAME).is_file()
 
 
-def _clear_directory(directory: Path, *, keep: frozenset[str] = frozenset()) -> None:
-    """Remove every child except the lock and the names in `keep`."""
+def _clear_directory(directory: Path) -> None:
+    """Remove every child except the lock."""
     for child in sorted(directory.iterdir(), reverse=True):
-        if child.name == LOCK_NAME or child.name in keep:
+        if child.name == LOCK_NAME:
             continue
         if child.is_dir() and not child.is_symlink():
             _remove_tree(child)
@@ -1122,10 +1142,10 @@ def finalize_turn(
     owner from writing its answer into the replacement turn.
 
     ``reduce`` is a one-shot session's consume-once rule (SPEC.md *Agent
-    variants*): when the turn succeeds, the final `meta.json` is published
+    variants*): when the turn ends, the final `meta.json` is published
     already carrying `retained: false` and the files go before the lock is
-    released, so no reader sees a succeeded one-shot session that is still
-    whole. A turn that did not succeed keeps the whole session for diagnosis.
+    released, so no reader sees a finished one-shot session that is still whole.
+    Answer and transcript remain pending until a consumer delivers them.
     """
     resolved_clock = _resolve_clock(clock)
     to_state = vocab.normalize_session_state(to_state)
@@ -1164,21 +1184,57 @@ def finalize_turn(
             if meta.finished_at is None:
                 meta.finished_at = now
             _close_limit(meta)
-        reduced = reduce and to_state == "succeeded"
+        reduced = reduce and to_state in vocab.FINISHED_STATES
         if reduced:
             meta.retained = False
+            meta.prompt_snippet = ""
+            _drop_consumed_files(session_id)
         write_meta(meta)
-        if reduced:
-            # The reduction is already published; a failed removal must not
-            # fail the finalization that wrote the answer.
-            with contextlib.suppress(OSError):
-                _drop_consumed_files(session_id)
         return meta
 
 
 def _drop_consumed_files(session_id: str) -> None:
-    """Remove everything a reduced session no longer keeps; the lock is held."""
-    _clear_directory(session_dir(session_id), keep=frozenset({META_NAME, ANSWER_NAME}))
+    """Remove everything a reduced session no longer keeps; the lock is held.
+
+    A finished turn must still publish its answer and terminal state, so a
+    child that cannot be removed is skipped and named on stderr, not raised.
+    """
+    keep = frozenset({META_NAME, ANSWER_NAME, TRANSCRIPT_NAME, LOCK_NAME})
+    left: list[str] = []
+    for child in sorted(session_dir(session_id).iterdir()):
+        if child.name in keep:
+            continue
+        try:
+            if child.is_dir() and not child.is_symlink():
+                _remove_tree(child)
+            else:
+                child.unlink()
+        except OSError:
+            left.append(child.name)
+    if left:
+        names = ", ".join(left)
+        print(f"acpc: one_shot session {session_id} could not remove {names}", file=sys.stderr)
+
+
+@contextlib.contextmanager
+def pending_delivery(session_id: str) -> Iterator[None]:
+    """Serialize consumers on the pending answer inode; keep files on failed writes.
+
+    No additional file is needed. A waiter that opened the old inode before
+    another consumer removed it checks the path again after acquiring the lock.
+    The session lock is taken only after delivery, for the final removal.
+    """
+    with answer_path(session_id).open("rb") as pending:
+        _acquire_file_lock(pending.fileno())
+        try:
+            if not answer_path(session_id).exists():
+                raise FileNotFoundError(answer_path(session_id))
+            yield
+            with session_lock(session_id):
+                answer_path(session_id).unlink(missing_ok=True)
+                transcript_path(session_id).unlink(missing_ok=True)
+        finally:
+            _release_file_lock(pending.fileno())
 
 
 def mark_running(

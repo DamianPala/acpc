@@ -832,7 +832,7 @@ def render_status_detail(
     if usage_text := format_usage(meta.usage):
         lines.insert(1, usage_text)
     if not meta.retained:
-        lines.append("retained no · one_shot session reduced to meta.json and answer.md")
+        lines.append("retained no · one_shot session, data pending delivery or removed")
     if meta.failure is not None:
         lines.append(
             f"failure  {safe_text(meta.failure)} · continue: acpc continue {meta.session_id}"

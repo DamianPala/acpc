@@ -148,7 +148,7 @@ def result_envelope(
             "permissions_clamp": _permissions_clamp(meta),
             "capabilities": session_capabilities(meta),
         }
-        if meta.retained:
+        if not sessions.stored_one_shot(meta):
             envelope["next"] = ["acpc", "wait", meta.session_id]
         if not include_partial:
             envelope.pop("partial")
@@ -181,7 +181,7 @@ def result_envelope(
         "capabilities": session_capabilities(meta),
     }
     # A reduced one-shot session cannot be continued, so no `next` points there.
-    if meta.retained:
+    if not sessions.stored_one_shot(meta):
         envelope["next"] = ["acpc", "continue", meta.session_id]
     if include_partial:
         envelope["partial"] = partial
@@ -288,9 +288,22 @@ def write_output_file(path: Path | str, answer: str) -> int:
                 file.write(answer)
         else:
             paths.atomic_write(target, answer)
-    except PermissionError as error:
+    except (PermissionError, IsADirectoryError) as error:
         raise OutputFilePermissionError(target) from error
     return len(answer.encode("utf-8"))
+
+
+def write_transcript_file(path: Path | str, data: bytes) -> None:
+    """Copy NDJSON bytes with the same destination rules as answer output."""
+    target = Path(path).expanduser().absolute()
+    try:
+        if target.exists() and not target.is_file():
+            with target.open("wb") as file:
+                file.write(data)
+        else:
+            paths.atomic_write(target, data)
+    except (PermissionError, IsADirectoryError) as error:
+        raise OutputFilePermissionError(target) from error
 
 
 # V6b "Escaping": attribute values escape five characters plus tab, CR and LF;
@@ -323,7 +336,14 @@ _ANSWER_TAG_TRIGGERS = (
 _PRESERVED_ANSWER_WHITESPACE = frozenset({0x09, 0x0A, 0x0D})
 
 _METADATA_LEAD_FIELDS = ("turn", "capabilities", "context", "stop_reason")
-_METADATA_OPTIONAL_FIELDS = ("correction_result", "denied", "permissions_clamp", "resume", "limit")
+_METADATA_OPTIONAL_FIELDS = (
+    "correction_result",
+    "denied",
+    "permissions_clamp",
+    "resume",
+    "limit",
+    "transcript_file",
+)
 
 
 def _escape_attr(value: str) -> str:
@@ -872,7 +892,7 @@ def format_summary(
     if truncated_output_file is not None:
         parts.append(f"truncated → {truncated_output_file}")
     parts.extend(_session_segments(meta))
-    if meta.retained:
+    if not sessions.stored_one_shot(meta):
         parts.append(f"Next: acpc continue {meta.session_id}")
     if route_note:
         parts.append(route_note)

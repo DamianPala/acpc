@@ -51,14 +51,14 @@ The answer text is untouched apart from control-byte escaping. When it contains 
 ## Command surface
 
 ```
-run <agent> (prompt | - | --prompt-file) [options]   # default: block, stdout = final answer
+run <agent> (prompt | - | --prompt-file) [--transcript-file FILE] [options]   # default: block, stdout = final answer
 resolve <agent> [options]                             # preview one call, dispatch nothing
 continue <id> (prompt | - | --prompt-file)           # follow-up in the same session context
 steer <id> (instruction | - | --prompt-file)         # correct the running turn in place, or cancel and redirect it
 status <id>                # one session's liveness-verified vitals
 list                       # active + recent sessions, bounded by 20
 log <id> [--since CURSOR] [--limit N | --tail N] [--prose] [--wait-new | --follow]   # incremental transcript access
-wait <id> [--timeout S]    # block until the turn selected at call start ends, print its answer
+wait <id> [--timeout S] [--transcript-file FILE]    # block until the turn selected at call start ends, print its answer
 cancel <id>
 delete <id> --yes | prune [--older-than D] [--dry-run] [--yes]
 agents list|get|check|create|delete          # adapters + variants
@@ -177,9 +177,10 @@ extends = "bare"
 permissions = "read"
 tools = []
 one_shot = true
+setting_sources = []
 ```
 
-`acpc run judge --model claude-sonnet-5-5 --effort low --system-prompt-file judge-v2.md --prompt-file case.md --cancel-after 120 --json` answers with the judge prompt in place of Claude Code's own and no tool available; the prompt in force is kept as `system.md` in the session directory, and `system_prompt_file` on the entry pins one prompt for every call instead. Killing the client does not cancel the turn, `--cancel-after` does. The keys need an adapter with a route (`system_prompt_via`, `tools_via` in `agents get`); on one without, the call fails `not_supported` before any session exists, and acpc never falls back to the vendor's prompt. `one_shot = true` consumes each session once: after a successful answer acpc keeps only `meta.json` and `answer.md`, the vendor keeps no transcript and loads no settings of its own, and `continue` or `log` on that session refuse with `conflict`; a failed call keeps its full session for diagnosis.
+`acpc run judge --model claude-sonnet-5-5 --effort low --system-prompt-file judge-v2.md --prompt-file case.md --cancel-after 120 --json` answers with the judge prompt in place of Claude Code's own and no tool available; the prompt in force is kept as `system.md` in the session directory, and `system_prompt_file` on the entry pins one prompt for every call instead. Killing the client does not cancel the turn, `--cancel-after` does. The keys need an adapter with a route (`system_prompt_via`, `tools_via` in `agents get`); on one without, the call fails `not_supported` before any session exists, and acpc never falls back to the vendor's prompt. `one_shot = true` makes the session consume-once: the answer, and the transcript when you pass `--transcript-file`, are delivered exactly once (by the foreground `run`, or by the first `wait`) and then removed; nothing but `meta.json` stays, in every terminal state. `setting_sources = []` keeps the vendor from loading any user or project settings, so the judge sees only your prompt; a skill-testing entry sets `["user", "project"]` instead and still leaves no transcript behind.
 
 ## Teaching agents about acpc
 

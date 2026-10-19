@@ -2455,7 +2455,7 @@ def test_the_system_prompt_file_survives_delete_listing_and_status(
 
 # --- one_shot (judge entries consumed once) -----------------------------------
 
-STERILITY = {"persistSession": False, "settingSources": [], "strictMcpConfig": True}
+STERILITY = {"persistSession": False}
 
 
 def session_files(session_id: str) -> list[str]:
@@ -2520,26 +2520,28 @@ def test_a_one_shot_entry_on_an_adapter_without_a_tool_route_sends_nothing_extra
     # The reduction is acpc's own part and needs no adapter route.
     document = json.loads(result.stdout)
     assert document["retained"] is False
-    assert session_files(document["session_id"]) == ["answer.md", "lock", "meta.json"]
+    assert session_files(document["session_id"]) == ["lock", "meta.json"]
 
 
-def test_a_succeeded_one_shot_session_keeps_only_lock_meta_and_answer(
+def test_a_succeeded_one_shot_session_delivers_then_keeps_only_lock_and_meta(
     cli: CliRunner, state_root: Path
 ) -> None:
     document = run_one_shot(cli, state_root)
 
     session_id = document["session_id"]
-    assert session_files(session_id) == ["answer.md", "lock", "meta.json"]
+    assert session_files(session_id) == ["lock", "meta.json"]
     assert document["retained"] is False
     assert document["answer"] == "one shot answer"
-    assert paths.session_dir(session_id).joinpath("answer.md").read_text() == "one shot answer"
+    assert not paths.session_dir(session_id).joinpath("answer.md").exists()
     assert (
         json.loads(paths.session_dir(session_id).joinpath("meta.json").read_text())["retained"]
         is False
     )
 
 
-def test_status_list_and_wait_serve_a_reduced_session(cli: CliRunner, state_root: Path) -> None:
+def test_status_and_list_serve_a_delivered_session_but_wait_refuses(
+    cli: CliRunner, state_root: Path
+) -> None:
     document = run_one_shot(cli, state_root)
     session_id = document["session_id"]
 
@@ -2557,11 +2559,11 @@ def test_status_list_and_wait_serve_a_reduced_session(cli: CliRunner, state_root
     assert [item["retained"] for item in listed if item["session_id"] == session_id] == [False]
     assert "retained no" in text
     for result in (waited, waited_again):
-        assert result.exit_code == vocab.EXIT_OK, result.stderr
-        delivered = json.loads(result.stdout)
-        assert delivered["answer"] == "one shot answer"
-        assert delivered["status"] == "succeeded"
-        assert delivered["retained"] is False
+        assert result.exit_code == vocab.EXIT_AGENT_ERROR, result.stderr
+        error = error_envelope(result)
+        assert error["kind"] == "conflict"
+        assert "one_shot" in error["message"]
+        assert error["hint"] == f"Run: acpc status {session_id}"
 
 
 def test_a_plain_session_stays_retained_in_every_document(cli: CliRunner, state_root: Path) -> None:
@@ -2583,20 +2585,15 @@ def test_a_plain_session_stays_retained_in_every_document(cli: CliRunner, state_
     )
 
 
-def test_a_failed_one_shot_turn_keeps_the_whole_session(cli: CliRunner, state_root: Path) -> None:
+def test_a_failed_one_shot_turn_delivers_and_removes_data(cli: CliRunner, state_root: Path) -> None:
     write_judge_entry(state_root, "one_shot = true\n")
-
     result = invoke(cli, "run", "judge", "auth:vendor rejected the request", "--json", "--quiet")
-
     assert result.exit_code == vocab.EXIT_AGENT_ERROR
     document = json.loads(result.stdout)
-    session_id = document["session_id"]
     assert document["status"] == "failed"
-    assert document["retained"] is True
-    files = session_files(session_id)
-    for name in ("answer.md", "lock", "meta.json", "prompt.md", "transcript.ndjson"):
-        assert name in files
-    assert json.loads(invoke(cli, "status", session_id, "--json").stdout)["retained"] is True
+    assert document["retained"] is False
+    assert error_envelope(result)["kind"] == "operation_failed"
+    assert session_files(document["session_id"]) == ["lock", "meta.json"]
 
 
 def test_continue_and_log_refuse_a_reduced_session_and_change_nothing(
@@ -2732,7 +2729,7 @@ def test_a_timeout_worker_reduces_the_session_on_its_own(cli: CliRunner, state_r
         time.sleep(0.05)
     assert sessions.read_meta(session_id).retained is False
     assert sessions.read_meta(session_id).state == "succeeded"
-    assert session_files(session_id) == ["answer.md", "lock", "meta.json"]
+    assert session_files(session_id) == ["answer.md", "lock", "meta.json", "transcript.ndjson"]
     waited = json.loads(invoke(cli, "wait", session_id, "--json").stdout)
     assert waited["answer"] != ""
     assert waited["retained"] is False
@@ -2740,12 +2737,10 @@ def test_a_timeout_worker_reduces_the_session_on_its_own(cli: CliRunner, state_r
 
 def test_a_reduced_session_result_carries_no_next(cli: CliRunner, state_root: Path) -> None:
     document = run_one_shot(cli, state_root)
-    waited = json.loads(invoke(cli, "wait", document["session_id"], "--json").stdout)
     write_judge_entry(state_root, name="judge-plain")
     plain = json.loads(invoke(cli, "run", "judge-plain", "echo:x", "--quiet", "--json").stdout)
 
     assert "next" not in document
-    assert "next" not in waited
     assert plain["next"] == ["acpc", "continue", plain["session_id"]]
 
 
@@ -2797,10 +2792,36 @@ def test_log_follow_across_the_reduction_ends_with_conflict_not_a_crash(
 
     assert followed.exit_code == vocab.EXIT_AGENT_ERROR, followed.stderr
     assert "Traceback" not in followed.stderr
+    # The records of the running turn stream first; only the reduction ends the read.
+    assert followed.stdout.strip(), followed.stderr
     envelope = error_envelope(followed)
     assert envelope["kind"] == "conflict"
     assert "one_shot" in envelope["message"]
     assert envelope["context"]["session_id"] == session_id
+
+
+def test_cancel_before_a_host_is_recorded_still_reduces_a_one_shot_session(
+    cli: CliRunner, state_root: Path
+) -> None:
+    """`canceled` is a terminal state, so a cancel that found no host reduces too."""
+    write_judge_entry(state_root, "one_shot = true\n")
+    meta = sessions.create_session(
+        entry="judge",
+        base_adapter="mock",
+        prompt="never dispatched",
+        resolution={"resolved": {"one_shot": {"value": True, "source": "entry"}}},
+    )
+
+    canceled = invoke(cli, "cancel", meta.session_id, "--json")
+
+    assert canceled.exit_code == vocab.EXIT_OK, canceled.stderr
+    assert json.loads(canceled.stdout)["status"] == "canceled"
+    status = json.loads(invoke(cli, "status", meta.session_id, "--json").stdout)
+    assert status["retained"] is False
+    assert "prompt.md" not in session_files(meta.session_id)
+    waited = invoke(cli, "wait", meta.session_id, "--json")
+    assert waited.exit_code == vocab.EXIT_CANCELLED, waited.stderr
+    assert "answer.md" not in session_files(meta.session_id)
 
 
 def test_a_reduced_judge_run_still_names_its_system_prompt_path(
@@ -2824,11 +2845,10 @@ def test_a_reduced_judge_run_still_names_its_system_prompt_path(
     run_document = json.loads(result.stdout)
     session_id = run_document["session_id"]
     status = json.loads(invoke(cli, "status", session_id, "--json").stdout)
-    waited = json.loads(invoke(cli, "wait", session_id, "--json").stdout)
 
     assert "system.md" not in session_files(session_id)
     expected = str(paths.session_dir(session_id) / "system.md")
-    for document in (run_document, status, waited):
+    for document in (run_document, status):
         assert document["paths"]["system"] == expected
     # A reduced session that never had a system prompt names none.
     plain = run_one_shot(cli, state_root)
@@ -2839,7 +2859,7 @@ def test_no_reader_sees_a_succeeded_one_shot_session_that_is_still_whole(
     cli: CliRunner, state_root: Path
 ) -> None:
     write_judge_entry(state_root, "one_shot = true\n")
-    seen: list[tuple[str, bool]] = []
+    seen: list[tuple[str, bool, bool]] = []
     stop = threading.Event()
 
     def poll() -> None:
@@ -2850,7 +2870,13 @@ def test_no_reader_sees_a_succeeded_one_shot_session_that_is_still_whole(
                     data = json.loads(meta_file.read_text(encoding="utf-8"))
                 except (OSError, ValueError):
                     continue
-                seen.append((data["status"], data.get("retained", True)))
+                seen.append(
+                    (
+                        data["status"],
+                        data.get("retained", True),
+                        (meta_file.parent / "prompt.md").exists(),
+                    )
+                )
 
     reader = threading.Thread(target=poll)
     reader.start()
@@ -2862,6 +2888,302 @@ def test_no_reader_sees_a_succeeded_one_shot_session_that_is_still_whole(
         stop.set()
         reader.join()
 
-    succeeded = [retained for state, retained in seen if state == "succeeded"]
+    succeeded = [retained for state, retained, _ in seen if state == "succeeded"]
     assert succeeded, "the reader never saw a finished session"
     assert not any(succeeded)
+
+    assert not any(prompt for state, _, prompt in seen if state == "succeeded")
+
+
+@pytest.mark.parametrize("one_shot", [False, True])
+def test_transcript_export_preserves_bytes_and_reports_absolute_path(
+    cli: CliRunner,
+    state_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    one_shot: bool,
+) -> None:
+    write_judge_entry(state_root, "one_shot = true\n" if one_shot else "")
+    monkeypatch.chdir(tmp_path)
+    result = invoke(
+        cli,
+        "run",
+        "judge",
+        "echo:export",
+        "--json",
+        "--quiet",
+        "--transcript-file",
+        "nested/transcript.ndjson",
+    )
+    assert result.exit_code == 0, result.stderr
+    document = json.loads(result.stdout)
+    target = tmp_path / "nested/transcript.ndjson"
+    assert document["transcript_file"] == str(target)
+    records = [json.loads(line) for line in target.read_bytes().splitlines()]
+    assert any(record.get("type") == "state" for record in records)
+    source = sessions.transcript_path(document["session_id"])
+    if one_shot:
+        assert session_files(document["session_id"]) == ["lock", "meta.json"]
+    else:
+        assert target.read_bytes() == source.read_bytes()
+
+
+@pytest.mark.parametrize("destination", ["answer", "transcript"])
+def test_failed_output_write_keeps_both_pending_files(
+    cli: CliRunner,
+    state_root: Path,
+    tmp_path: Path,
+    destination: str,
+) -> None:
+    write_judge_entry(state_root, "one_shot = true\n")
+    flag = "--output-file" if destination == "answer" else "--transcript-file"
+    failed = invoke(cli, "run", "judge", "echo:pending", "--json", "--quiet", flag, str(tmp_path))
+    assert error_envelope(failed)["kind"] == "permission_denied"
+    assert failed.stdout == ""
+    meta = sessions.list_sessions()[0]
+    assert session_files(meta.session_id) == ["answer.md", "lock", "meta.json", "transcript.ndjson"]
+    assert meta.retained is False
+    assert meta.prompt_snippet == ""
+    assert error_envelope(invoke(cli, "log", meta.session_id))["kind"] == "conflict"
+    target = tmp_path / "collected.ndjson"
+    expected = sessions.transcript_path(meta.session_id).read_bytes()
+    result = invoke(
+        cli, "wait", meta.session_id, "--json", "--quiet", "--transcript-file", str(target)
+    )
+    assert result.exit_code == 0, result.stderr
+    assert json.loads(result.stdout)["answer"] == "pending"
+    assert json.loads(result.stdout)["transcript_file"] == str(target)
+    assert target.read_bytes() == expected
+    assert session_files(meta.session_id) == ["lock", "meta.json"]
+    assert error_envelope(invoke(cli, "wait", meta.session_id))["kind"] == "conflict"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory permissions")
+def test_unwritable_transcript_destination_keeps_pending_files(
+    cli: CliRunner,
+    state_root: Path,
+    tmp_path: Path,
+) -> None:
+    write_judge_entry(state_root, "one_shot = true\n")
+    directory = tmp_path / "readonly"
+    directory.mkdir(mode=0o500)
+    target = str(directory / "transcript.ndjson")
+    try:
+        failed = invoke(
+            cli, "run", "judge", "echo:pending", "--json", "--quiet", "--transcript-file", target
+        )
+    finally:
+        directory.chmod(0o700)
+    assert failed.exit_code != 0
+    error = error_envelope(failed)
+    assert error["kind"] == "permission_denied"
+    assert target in error["message"]
+    meta = sessions.list_sessions()[0]
+    assert sessions.answer_path(meta.session_id).exists()
+    assert sessions.transcript_path(meta.session_id).exists()
+
+
+def test_missing_pending_transcript_still_delivers_answer(
+    cli: CliRunner,
+    state_root: Path,
+    tmp_path: Path,
+) -> None:
+    write_judge_entry(state_root, "one_shot = true\n")
+    invoke(cli, "run", "judge", "echo:pending", "--json", "--quiet", "--output-file", str(tmp_path))
+    meta = sessions.list_sessions()[0]
+    sessions.transcript_path(meta.session_id).unlink()
+    target = tmp_path / "missing.ndjson"
+    result = invoke(
+        cli, "wait", meta.session_id, "--json", "--quiet", "--transcript-file", str(target)
+    )
+    assert result.exit_code == 0, result.stderr
+    assert json.loads(result.stdout)["answer"] == "pending"
+    assert "transcript_file" not in json.loads(result.stdout)
+    assert not target.exists()
+    assert session_files(meta.session_id) == ["lock", "meta.json"]
+
+
+@pytest.mark.parametrize(
+    "prompt,state", [("crash-late:partial answer", "failed"), ("cancelled-no-usage:", "canceled")]
+)
+def test_every_terminal_one_shot_reduces_before_delivery(
+    cli: CliRunner,
+    state_root: Path,
+    tmp_path: Path,
+    prompt: str,
+    state: str,
+) -> None:
+    write_judge_entry(state_root, "one_shot = true\n")
+    invoke(cli, "run", "judge", prompt, "--quiet", "--json", "--output-file", str(tmp_path))
+    meta = sessions.list_sessions()[0]
+    assert meta.state == state
+    assert meta.retained is False
+    assert meta.prompt_snippet == ""
+    assert session_files(meta.session_id) == ["answer.md", "lock", "meta.json", "transcript.ndjson"]
+    delivered = invoke(cli, "wait", meta.session_id, "--json", "--quiet")
+    assert error_envelope(delivered)["kind"] == "operation_failed"
+    if state == "failed":
+        assert json.loads(delivered.stdout)["answer"] == "partial answer"
+    assert session_files(meta.session_id) == ["lock", "meta.json"]
+    assert error_envelope(invoke(cli, "continue", meta.session_id, "again"))["kind"] == "conflict"
+
+
+@pytest.mark.parametrize("sources", [[], ["user", "project"], ["local"]])
+def test_setting_sources_wire_and_inspection(
+    cli: CliRunner,
+    state_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sources: list[str],
+) -> None:
+    wire_file = state_root / "wire.jsonl"
+    monkeypatch.setenv("ACPC_MOCK_WIRE_FILE", str(wire_file))
+    write_judge_entry(state_root, f"setting_sources = {json.dumps(sources)}\n")
+    result = invoke(cli, "run", "judge", "echo:settings", "--json", "--quiet")
+    assert result.exit_code == 0, result.stderr
+    options: dict = {"settingSources": sources}
+    if not sources:
+        options["strictMcpConfig"] = True
+    assert session_new_meta(wire_file) == [{"claudeCode": {"options": options}}]
+    resolved = json.loads(invoke(cli, "resolve", "judge", "--json").stdout)
+    assert resolved["resolved"]["setting_sources"]["value"] == sources
+    assert resolved["resolved"]["setting_sources"]["source"].startswith("entry")
+    got = json.loads(invoke(cli, "agents", "get", "judge", "--json").stdout)
+    assert got["setting_sources"] == sources
+    assert "setting_sources" in invoke(cli, "agents", "get", "judge", "--format", "text").stdout
+
+
+def test_unset_setting_sources_and_route_refusal(cli: CliRunner, state_root: Path) -> None:
+    got = json.loads(invoke(cli, "agents", "get", "mock", "--json").stdout)
+    assert got["setting_sources"] is None
+    assert re.search(
+        r"setting_sources +·", invoke(cli, "agents", "get", "mock", "--format", "text").stdout
+    )
+    (state_root / "agents/settings.toml").write_text('extends = "mock"\nsetting_sources = []\n')
+    got = json.loads(invoke(cli, "agents", "get", "settings", "--json").stdout)
+    assert "setting_sources" in got["refused"]
+    result = invoke(cli, "run", "settings", "echo:refused", "--json")
+    error = error_envelope(result)
+    assert error["kind"] == "not_supported"
+    assert "setting_sources" in error["message"]
+    (state_root / "agents/tools-refused.toml").write_text('extends = "mock"\ntools = []\n')
+    tools_error = error_envelope(invoke(cli, "run", "tools-refused", "echo:refused", "--json"))
+    assert error["hint"] == tools_error["hint"]
+    assert sessions.list_sessions() == []
+
+
+@pytest.mark.parametrize("interrupt", ["broken_pipe", "killed"])
+def test_interrupted_delivery_leaves_both_files(
+    cli: CliRunner,
+    state_root: Path,
+    tmp_path: Path,
+    interrupt: str,
+) -> None:
+    write_judge_entry(state_root, "one_shot = true\n")
+    invoke(cli, "run", "judge", "huge", "--quiet", "--json", "--output-file", str(tmp_path))
+    meta = sessions.list_sessions()[0]
+    before = dir_snapshot(meta.session_id)
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "acpc.cli",
+            "wait",
+            meta.session_id,
+            "--json",
+            "--quiet",
+            "--max-output",
+            "0",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert process.stdout is not None
+    try:
+        ready, _, _ = select.select([process.stdout], [], [], 15)
+        assert ready, "wait did not start delivering"
+        assert os.read(process.stdout.fileno(), 1)
+        if interrupt == "broken_pipe":
+            process.stdout.close()
+            assert process.wait(timeout=15) == vocab.EXIT_SIGPIPE
+        else:
+            process.kill()
+            process.wait(timeout=15)
+        assert dir_snapshot(meta.session_id) == before
+    finally:
+        if process.poll() is None:
+            process.kill()
+        process.communicate(timeout=15)
+
+
+def test_concurrent_waiters_deliver_exactly_once(
+    cli: CliRunner,
+    state_root: Path,
+    tmp_path: Path,
+) -> None:
+    write_judge_entry(state_root, "one_shot = true\n")
+    invoke(cli, "run", "judge", "huge", "--quiet", "--json", "--output-file", str(tmp_path))
+    meta = sessions.list_sessions()[0]
+    command = [
+        sys.executable,
+        "-m",
+        "acpc.cli",
+        "wait",
+        meta.session_id,
+        "--json",
+        "--quiet",
+        "--max-output",
+        "0",
+    ]
+    first = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    second = None
+    try:
+        assert first.stdout is not None
+        ready, _, _ = select.select([first.stdout], [], [], 15)
+        assert ready, "first wait did not start delivering"
+        prefix = os.read(first.stdout.fileno(), 1)
+        assert prefix
+        second = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # The first consumer is blocked on its full stdout pipe. The second
+        # cannot deliver until it releases the claim, even with a finished turn.
+        with pytest.raises(subprocess.TimeoutExpired):
+            second.wait(timeout=1)
+        first_out, first_err = first.communicate(timeout=15)
+        second_out, second_err = second.communicate(timeout=15)
+        assert first.returncode == 0, first_err
+        assert json.loads(prefix + first_out)["answer"]
+        assert second.returncode == vocab.EXIT_AGENT_ERROR
+        assert second_out == b""
+        assert json.loads(second_err)["error"]["kind"] == "conflict"
+        assert session_files(meta.session_id) == ["lock", "meta.json"]
+    finally:
+        for process in [first, second]:
+            if process is not None:
+                if process.poll() is None:
+                    process.kill()
+                process.communicate(timeout=15)
+
+
+def test_orphaned_one_shot_reduces_when_liveness_is_checked(
+    cli: CliRunner,
+    state_root: Path,
+) -> None:
+    write_judge_entry(state_root, "one_shot = true\n")
+    # Persist a real process identity, then let it exit before the view loads.
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    meta = sessions.create_session(
+        entry="judge",
+        base_adapter="judge",
+        prompt="private prompt",
+        resolution={"resolved": {"one_shot": {"value": True}}},
+    )
+    sessions.mark_running(meta.session_id, pid=child.pid)
+    child.wait(timeout=15)
+    status = invoke(cli, "status", meta.session_id, "--json")
+    assert status.exit_code == 0, status.stderr
+    assert json.loads(status.stdout)["status"] == "unknown"
+    assert sessions.read_meta(meta.session_id).prompt_snippet == ""
+    assert sessions.read_meta(meta.session_id).retained is False
+    assert session_files(meta.session_id) == ["answer.md", "lock", "meta.json", "transcript.ndjson"]
+    waited = invoke(cli, "wait", meta.session_id, "--json", "--quiet")
+    assert json.loads(waited.stdout)["status"] == "unknown"
+    assert session_files(meta.session_id) == ["lock", "meta.json"]

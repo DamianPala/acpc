@@ -282,7 +282,7 @@ def test_help_explains_session_lifecycle_and_retention(runner: CliRunner) -> Non
     assert "absent, text on a TTY and JSON on non-TTY" in status_help
     assert "exits 124: the session keeps running" in wait_help
     assert "The exit code mirrors the turn's result." in wait_help
-    assert "the free way to reprint an answer." in wait_help
+    assert "one-shot answers can be delivered only once." in wait_help
     assert "editing an entry never changes a session mid-conversation." in continue_help
     assert (
         "``--permissions`` is the one resolution flag that changes stored settings" in continue_help

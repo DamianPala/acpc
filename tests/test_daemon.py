@@ -2323,7 +2323,7 @@ def test_a_malformed_one_shot_payload_is_rejected(state_root: Path, value: objec
         daemon.Daemon("judge")._rebuild_request(payload)
 
 
-def test_a_daemon_reduces_a_one_shot_session_and_wait_returns_the_same_answer_twice(
+def test_a_daemon_reduces_a_one_shot_session_and_wait_delivers_once(
     state_root: Path, live_daemon: None
 ) -> None:
     write_judge_entry(state_root, "one_shot = true\n")
@@ -2342,16 +2342,13 @@ def test_a_daemon_reduces_a_one_shot_session_and_wait_returns_the_same_answer_tw
     assert meta.pid is not None and meta.pid != os.getpid()
     assert meta.retained is False
     assert sorted(item.name for item in sessions.session_dir(session_id).iterdir()) == [
-        "answer.md",
         "lock",
         "meta.json",
     ]
-    for result in (first, second):
-        assert result.exit_code == vocab.EXIT_OK, result.stderr
-        document = json.loads(result.stdout)
-        assert document["answer"] == "daemon one shot"
-        assert document["retained"] is False
-    assert json.loads(first.stdout) == json.loads(second.stdout)
+    assert first.exit_code == vocab.EXIT_OK, first.stderr
+    assert json.loads(first.stdout)["answer"] == "daemon one shot"
+    assert second.exit_code == vocab.EXIT_AGENT_ERROR
+    assert json.loads(second.stderr.splitlines()[-1])["error"]["kind"] == "conflict"
     status = json.loads(cli.invoke(main, ["status", session_id, "--json"]).stdout)
     assert status["retained"] is False and status["status"] == "succeeded"
 
@@ -2373,7 +2370,6 @@ def test_a_late_adapter_update_never_writes_into_a_reduced_session(
 
     assert waited.exit_code == vocab.EXIT_OK, waited.stderr
     assert sorted(item.name for item in sessions.session_dir(session_id).iterdir()) == [
-        "answer.md",
         "lock",
         "meta.json",
     ]
@@ -2429,7 +2425,7 @@ def test_a_daemon_continue_loads_the_adapter_session_with_the_stored_meta(
 ) -> None:
     wire_file = tmp_path / "wire.jsonl"
     monkeypatch.setenv("ACPC_MOCK_WIRE_FILE", str(wire_file))
-    write_judge_entry(state_root, "one_shot = true\ntools = []\n")
+    write_judge_entry(state_root, "setting_sources = []\ntools = []\n")
     cli = CliRunner()
     failed = cli.invoke(main, ["run", "judge", "auth:rejected", "--quiet", "--json"])
     session_id = json.loads(failed.stdout)["session_id"]
@@ -2441,7 +2437,7 @@ def test_a_daemon_continue_loads_the_adapter_session_with_the_stored_meta(
     assert result.exit_code == vocab.EXIT_OK, result.stderr
     assert sessions.read_meta(session_id).pid != os.getpid()
     events = [json.loads(line) for line in wire_file.read_text(encoding="utf-8").splitlines()]
-    options = {"tools": [], "persistSession": False, "settingSources": [], "strictMcpConfig": True}
+    options = {"tools": [], "settingSources": [], "strictMcpConfig": True}
     assert [e["params"]["meta"] for e in events if e["method"] == "session/load"] == [
         {"claudeCode": {"options": options}}
     ]
@@ -2467,3 +2463,89 @@ def test_log_follow_across_the_daemon_reduction_ends_with_conflict(
     error = json.loads(lines[-1])["error"]
     assert error["kind"] == "conflict"
     assert "one_shot" in error["message"]
+
+
+def test_background_transcript_flag_refused_and_timeout_keeps_pending_data(
+    state_root: Path,
+    live_daemon: None,
+    tmp_path: Path,
+) -> None:
+    write_judge_entry(state_root, "one_shot = true\n")
+    cli = CliRunner()
+    bad = cli.invoke(
+        main,
+        [
+            "run",
+            "judge",
+            "echo:no",
+            "--bg",
+            "--json",
+            "--transcript-file",
+            str(tmp_path / "bad.ndjson"),
+        ],
+    )
+    assert bad.exit_code == vocab.EXIT_USAGE
+    error = json.loads(bad.stderr)["error"]
+    assert error["kind"] == "invalid_input"
+    assert error["hint"] == "--transcript-file belongs to: acpc wait <id> --transcript-file FILE"
+    assert sessions.list_sessions() == []
+    started = cli.invoke(main, ["run", "judge", "slow:2 pending", "--bg", "--json"])
+    session_id = json.loads(started.stdout)["session_id"]
+    timed = cli.invoke(
+        main,
+        [
+            "wait",
+            session_id,
+            "--timeout",
+            "0.1",
+            "--json",
+            "--transcript-file",
+            str(tmp_path / "timeout.ndjson"),
+        ],
+    )
+    assert timed.exit_code == vocab.EXIT_TIMEOUT
+    assert timed.stdout == ""
+    assert not (tmp_path / "timeout.ndjson").exists()
+    assert sessions.transcript_path(session_id).exists()
+    target = tmp_path / "wait.ndjson"
+    waited = cli.invoke(main, ["wait", session_id, "--json", "--transcript-file", str(target)])
+    assert waited.exit_code == 0, waited.stderr
+    assert json.loads(waited.stdout)["transcript_file"] == str(target)
+    assert any(json.loads(line).get("type") == "state" for line in target.read_bytes().splitlines())
+    assert sorted(p.name for p in sessions.session_dir(session_id).iterdir()) == [
+        "lock",
+        "meta.json",
+    ]
+
+
+def test_daemon_foreground_consumes_once(state_root: Path, live_daemon: None) -> None:
+    write_judge_entry(state_root, "one_shot = true\n")
+    cli = CliRunner()
+    result = cli.invoke(main, ["run", "judge", "echo:foreground", "--json", "--quiet"])
+    assert result.exit_code == 0, result.stderr
+    document = json.loads(result.stdout)
+    assert document["answer"] == "foreground"
+    meta = sessions.read_meta(document["session_id"])
+    assert meta.pid != os.getpid()
+    assert sorted(p.name for p in sessions.session_dir(meta.session_id).iterdir()) == [
+        "lock",
+        "meta.json",
+    ]
+
+
+def test_a_daemon_run_sends_the_entry_setting_sources_on_session_new(
+    state_root: Path, live_daemon: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wire_file = tmp_path / "wire.jsonl"
+    monkeypatch.setenv("ACPC_MOCK_WIRE_FILE", str(wire_file))
+    write_judge_entry(state_root, 'setting_sources = ["user", "project"]\n')
+
+    result = CliRunner().invoke(main, ["run", "judge", "echo:settings", "--quiet", "--json"])
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    assert sessions.read_meta(json.loads(result.stdout)["session_id"]).pid != os.getpid()
+    events = [json.loads(line) for line in wire_file.read_text(encoding="utf-8").splitlines()]
+    options = {"settingSources": ["user", "project"]}
+    assert [e["params"]["meta"] for e in events if e["method"] == "session/new"] == [
+        {"claudeCode": {"options": options}}
+    ]
