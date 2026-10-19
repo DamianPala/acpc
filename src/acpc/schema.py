@@ -256,6 +256,7 @@ _RESOLUTION_FIELD = _object(
         "grants": _STRING,
         "delegates": _BOOLEAN,
         "escalates": _BOOLEAN,
+        "selectable": _BOOLEAN,
         "clamp": _RESOLUTION_CLAMP,
     },
     ("value", "source"),
@@ -586,8 +587,13 @@ _LOG_EVENT = _object(
     ("i", "ts", "type"),
 )
 _MODE_FACTS = _object(
-    {"grants": _STRING, "delegates": _BOOLEAN, "escalates": _BOOLEAN},
-    ("grants", "delegates", "escalates"),
+    {
+        "grants": _STRING,
+        "delegates": _BOOLEAN,
+        "escalates": _BOOLEAN,
+        "selectable": _BOOLEAN,
+    },
+    ("grants", "delegates", "escalates", "selectable"),
 )
 _PROBE = _object(
     {

@@ -46,6 +46,13 @@ command = "definitely-not-installed-phantom-xyz"
 install_command = "false"
 """
 
+# Claude-shaped: plan grants edit and is not selectable, so policy edit lands on default.
+GATED_ENTRY = """
+extends = "mock"
+[modes]
+plan = { grants = "edit", delegates = true, escalates = false, selectable = false }
+"""
+
 
 @pytest.fixture(autouse=True)
 def state_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
@@ -421,6 +428,63 @@ def test_resolve_renders_and_serializes_mode_escalation(cli: CliRunner) -> None:
     assert plain["resolved"]["mode"]["escalates"] is False
 
 
+def test_resolve_under_edit_policy_selects_default_over_a_non_selectable_plan(
+    cli: CliRunner, state_root: Path
+) -> None:
+    (state_root / "agents" / "gated.toml").write_text(GATED_ENTRY, encoding="utf-8")
+
+    payload = json.loads(invoke(cli, "resolve", "gated", "--permissions", "edit", "--json").stdout)
+
+    assert payload["resolved"]["mode"]["value"] == "default"
+    assert payload["resolved"]["mode"]["selectable"] is True
+
+
+def test_resolve_marks_an_explicit_non_selectable_mode_in_text_and_json(
+    cli: CliRunner, state_root: Path
+) -> None:
+    (state_root / "agents" / "gated.toml").write_text(GATED_ENTRY, encoding="utf-8")
+
+    text_result = invoke(
+        cli, "resolve", "gated", "--mode", "plan", "--permissions", "edit", "--format", "text"
+    )
+    mode_line = next(
+        line for line in text_result.stdout.splitlines() if line.startswith("mode         ")
+    )
+    assert mode_line.endswith("· acpc-delegated · not selectable")
+
+    payload = json.loads(
+        invoke(cli, "resolve", "gated", "--mode", "plan", "--permissions", "edit", "--json").stdout
+    )
+    assert payload["resolved"]["mode"]["value"] == "plan"
+    assert payload["resolved"]["mode"]["selectable"] is False
+
+
+def test_agents_detail_marks_a_mode_that_policy_does_not_select(
+    cli: CliRunner, state_root: Path
+) -> None:
+    # The mode table prints for a base entry only, so the non-selectable plan goes on mock itself.
+    gated_mock = MOCK_ENTRY.replace(
+        'plan = { grants = "read", delegates = true, escalates = true }',
+        'plan = { grants = "edit", delegates = true, escalates = false, selectable = false }',
+    )
+    (state_root / "agents" / "mock.toml").write_text(gated_mock, encoding="utf-8")
+    cache.refresh_advertised("mock", {"modes": ["default", "plan"]}, clock=lambda: 100.0)
+
+    result = invoke(cli, "agents", "get", "mock", "--format", "text")
+
+    assert result.exit_code == vocab.EXIT_OK
+    assert (
+        "modes        2 · default (read · delegates) · plan (edit · delegates · not selectable)"
+        in result.stdout
+    )
+
+    payload = json.loads(invoke(cli, "agents", "get", "mock", "--json").stdout)
+    assert payload["advertised"]["mode_specs"] == {
+        "default": {"grants": "read", "delegates": True, "escalates": False, "selectable": True},
+        "plan": {"grants": "edit", "delegates": True, "escalates": False, "selectable": False},
+    }
+
+
 def test_agents_detail_renders_an_unset_mode_with_its_source(cli: CliRunner) -> None:
     result = invoke(cli, "agents", "get", "mock", "--format", "text")
 
@@ -606,9 +670,19 @@ def test_adapter_detail_caps_models_and_commands_but_never_modes(cli: CliRunner)
         "extra-mode",
     ]
     assert payload["advertised"]["mode_specs"] == {
-        "default": {"grants": "read", "delegates": True, "escalates": False},
-        "acceptEdits": {"grants": "execute", "delegates": True, "escalates": False},
-        "plan": {"grants": "read", "delegates": True, "escalates": True},
+        "default": {
+            "grants": "read",
+            "delegates": True,
+            "escalates": False,
+            "selectable": True,
+        },
+        "acceptEdits": {
+            "grants": "execute",
+            "delegates": True,
+            "escalates": False,
+            "selectable": True,
+        },
+        "plan": {"grants": "read", "delegates": True, "escalates": True, "selectable": True},
         "yolo": None,
         "extra-mode": None,
     }

@@ -231,6 +231,67 @@ def test_mode_escalation_rejects_non_boolean_values(tmp_path: Path) -> None:
         AgentRegistry(agents)
 
 
+def test_mode_selectable_defaults_true_and_round_trips_false(tmp_path: Path) -> None:
+    agents = tmp_path / "agents"
+    write_entry(
+        agents,
+        "facts",
+        'command = "python"\n'
+        "[modes]\n"
+        'plan = { grants = "edit", delegates = true, selectable = false }\n'
+        'default = { grants = "read", delegates = true }\n',
+    )
+
+    modes = AgentRegistry(agents).resolve("facts").modes
+
+    assert modes["plan"].selectable is False
+    assert modes["default"].selectable is True
+
+
+def test_mode_selectable_is_inherited_by_a_variant(tmp_path: Path) -> None:
+    agents = tmp_path / "agents"
+    write_entry(
+        agents,
+        "base",
+        'command = "python -m base"\n'
+        "[modes]\n"
+        'plan = { grants = "edit", delegates = true, selectable = false }\n',
+    )
+    write_entry(agents, "child", 'extends = "base"\n')
+
+    modes = AgentRegistry(agents).resolve("child").modes
+
+    assert modes["plan"].selectable is False
+
+
+def test_mode_selectable_rejects_non_boolean_values(tmp_path: Path) -> None:
+    agents = tmp_path / "agents"
+    write_entry(
+        agents,
+        "invalid",
+        'command = "python"\n'
+        "[modes]\n"
+        'default = { grants = "read", delegates = true, selectable = "no" }\n',
+    )
+
+    with pytest.raises(RegistryError, match=r"\[modes\.default\]\.selectable must be a boolean"):
+        AgentRegistry(agents)
+
+
+def test_mode_unknown_key_next_to_selectable_is_still_rejected(tmp_path: Path) -> None:
+    agents = tmp_path / "agents"
+    write_entry(
+        agents,
+        "invalid",
+        'command = "python"\n'
+        "[modes]\n"
+        'default = { grants = "read", delegates = true, selectable = true, selectabel = true }\n',
+    )
+
+    with pytest.raises(RegistryError, match="unknown key"):
+        AgentRegistry(agents)
+
+
 def test_mode_grants_reject_ask_and_name_the_source_file(tmp_path: Path) -> None:
     agents = tmp_path / "agents"
     write_entry(

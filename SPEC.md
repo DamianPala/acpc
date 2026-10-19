@@ -203,7 +203,7 @@ resolve AGENT [--cwd DIR] [--model M] [--effort E] [--permissions P]
     [--mode MODE] [--home DIR] [--format text|json]
 ```
 
-`resolve` previews the same call resolution that a later `run` would use. It creates no session, starts no daemon, and asks no question. The result contains `entry`, `base_adapter`, `command`, `cwd`, `env`, `env_passthrough` and `resolved`; each resolved field contains its value and provenance, with mode facts `grants`, `delegates` and `escalates` where applicable. A policy that cannot be served by a declared mode is `permission_denied` with exit 2.
+`resolve` previews the same call resolution that a later `run` would use. It creates no session, starts no daemon, and asks no question. The result contains `entry`, `base_adapter`, `command`, `cwd`, `env`, `env_passthrough` and `resolved`; each resolved field contains its value and provenance, with mode facts `grants`, `delegates`, `escalates` and `selectable` where applicable. A policy that cannot be served by a declared mode is `permission_denied` with exit 2.
 
 ### `run`
 
@@ -515,7 +515,7 @@ MODEL_PROVIDER = "openrouter"
 
 `acpc agents get NAME` shows each resolved field and its source. `resolve` shows one concrete call. The adapter environment is constructed from a base system set, declared variables and explicitly named pass-through variables; the rest of the caller environment is not inherited. Secrets are read at dispatch time and are never written to state.
 
-The permission scale is `none`, `read`, `edit`, `execute`, `all`, with `ask` as a separate policy that prompts for categories above read. `write` and `prompt` are deprecated aliases for `execute` and `ask`. Categories come from ACP tool-call kinds: reads, searches, fetches and thoughts are read; edits are edit; execute, delete and move are execute; unknown kinds are unknown. A mode is eligible only when its measured `grants` does not exceed the requested policy. Among eligible modes acpc prefers delegation and then the highest grant. `delegates` and `escalates` are descriptive facts, not extra policy levels.
+The permission scale is `none`, `read`, `edit`, `execute`, `all`, with `ask` as a separate policy that prompts for categories above read. `write` and `prompt` are deprecated aliases for `execute` and `ask`. Categories come from ACP tool-call kinds: reads, searches, fetches and thoughts are read; edits are edit; execute, delete and move are execute; unknown kinds are unknown. A mode is eligible only when its measured `grants` does not exceed the requested policy. Among eligible modes acpc prefers delegation and then the highest grant. A mode declared `selectable = false` is never chosen by policy selection and is reached only through `--mode`, under the same grants check. `delegates`, `escalates` and `selectable` are descriptive facts, not extra policy levels.
 
 `ACPC_CEILING` carries an inherited ceiling into nested dispatch. A child cannot request more authority than its parent. When the ceiling is below the lowest policy an entry runs under, the refusal names the ceiling rather than suggesting `--permissions`, which the ceiling would clamp again. A denied category is recorded in the answer result and does not itself make the turn fail; the adapter can also suppress a request by handling an action internally.
 

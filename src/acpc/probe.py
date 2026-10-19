@@ -125,6 +125,7 @@ def _mode_payload(modes: dict[str, ModeSpec] | Any) -> dict[str, dict[str, Any]]
             "grants": spec.grants,
             "delegates": spec.delegates,
             "escalates": spec.escalates,
+            "selectable": spec.selectable,
         }
         for name, spec in modes.items()
     }

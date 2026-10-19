@@ -32,7 +32,7 @@ MOCK_PROBE_BEHAVIOR = "{behavior}"{turns}
 [modes]
 default = {{ grants = "none", delegates = false }}
 acceptEdits = {{ grants = "execute", delegates = true }}
-legacy = {{ grants = "all", delegates = false }}
+legacy = {{ grants = "all", delegates = false, selectable = false }}
 '''
 
 
@@ -95,6 +95,7 @@ def test_discover_reads_catalogue_and_sends_zero_turns(state_root: Path) -> None
             "grants": "all",
             "delegates": False,
             "escalates": False,
+            "selectable": False,
         },
         "proposed": None,
     }

@@ -2232,6 +2232,7 @@ def resolution_payload(
         resolved["mode"]["grants"] = resolution.mode_spec.grants
         resolved["mode"]["delegates"] = resolution.mode_spec.delegates
         resolved["mode"]["escalates"] = resolution.mode_spec.escalates
+        resolved["mode"]["selectable"] = resolution.mode_spec.selectable
     try:
         spawn_command = " ".join(resolution.command)
     except RegistryError:

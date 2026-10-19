@@ -82,10 +82,13 @@ def select_mode(
     survivors = [
         (name, spec)
         for name, spec in modes.items()
-        if PermissionLevel(spec.grants).rank <= ceiling.rank
+        if spec.selectable and PermissionLevel(spec.grants).rank <= ceiling.rank
     ]
     if not survivors:
-        declared = ", ".join(f"{name} (grants {spec.grants})" for name, spec in modes.items())
+        declared = ", ".join(
+            f"{name} (grants {spec.grants}{'' if spec.selectable else ', not selectable'})"
+            for name, spec in modes.items()
+        )
         detail = f"; declared modes: {declared}" if declared else "; the adapter declares no modes"
         raise ModeSelectionError(
             f"no mode grants at most policy {policy_value}{detail}",

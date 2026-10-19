@@ -50,12 +50,16 @@ claude-opus-5-5 = ["low", "medium", "high", "xhigh", "max"]
 #   not delegate — never treat it as a read-ceiling mode.
 # - `plan` wrote an arbitrary file with no permission request after nudging;
 #   it resists but is not a boundary. `edit` is the honest ceiling.
+# `selectable = false` on plan (2026-10-19): plan mode refuses ordinary file
+# writes and, measured 2026-10-15, can answer on a different model than the
+# session's. Policy selection skips it, so `edit` lands on `default`;
+# `--mode plan` still reaches it.
 # `escalates = true` on auto records exactly that: the classifier can raise the
 # effective ceiling with nothing reaching acpc, so `grants` there is a measurement
 # and not a bound.
 [modes]
 default = { grants = "read", delegates = true }
-plan = { grants = "edit", delegates = true }
+plan = { grants = "edit", delegates = true, selectable = false }
 auto = { grants = "all", delegates = false, escalates = true }
 acceptEdits = { grants = "execute", delegates = true }
 bypassPermissions = { grants = "all", delegates = false }

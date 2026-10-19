@@ -342,6 +342,7 @@ def test_resolve_reports_mode_for_entry_flag_and_unset_sources(
         "grants": "read",
         "delegates": True,
         "escalates": False,
+        "selectable": True,
     }
     assert flag["resolved"]["mode"] == {
         "value": "plan",
@@ -349,6 +350,7 @@ def test_resolve_reports_mode_for_entry_flag_and_unset_sources(
         "grants": "read",
         "delegates": True,
         "escalates": False,
+        "selectable": True,
     }
     assert unset["resolved"]["mode"] == {
         "value": "default",
@@ -356,6 +358,7 @@ def test_resolve_reports_mode_for_entry_flag_and_unset_sources(
         "grants": "read",
         "delegates": True,
         "escalates": False,
+        "selectable": True,
     }
 
 
@@ -1824,6 +1827,25 @@ def test_an_execute_floor_refuses_policies_below_execute(
     assert "the lowest policy grok-floor runs under is execute" in envelope["message"]
     assert "declared modes: bypass (grants all), default (grants execute)" in envelope["message"]
     assert envelope["hint"] == "Run: acpc run grok-floor --permissions execute"
+
+
+def test_a_non_selectable_mode_neither_sets_the_floor_nor_hides_in_the_listing(
+    cli: CliRunner, state_root: Path
+) -> None:
+    (state_root / "agents" / "gated-floor.toml").write_text(
+        'command = "true"\n[modes]\n'
+        'plan = { grants = "edit", delegates = true, selectable = false }\n'
+        'runner = { grants = "execute", delegates = true }\n',
+        encoding="utf-8",
+    )
+
+    result = invoke(cli, "run", "gated-floor", "probe", "--permissions", "edit")
+
+    envelope = error_envelope(result)
+    assert envelope["kind"] == "permission_denied"
+    assert "the lowest policy gated-floor runs under is execute" in envelope["message"]
+    assert "plan (grants edit, not selectable), runner (grants execute)" in envelope["message"]
+    assert envelope["hint"] == "Run: acpc run gated-floor --permissions execute"
 
 
 def test_inherited_ceiling_below_an_entry_floor_names_the_ceiling(

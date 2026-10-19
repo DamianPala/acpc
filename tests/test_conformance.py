@@ -446,7 +446,7 @@ _COMPACTIONS_PROPERTIES = frozenset({"count", "unaccounted", "context_before", "
 _STATUS_PERMISSIONS_PROPERTIES = frozenset({"policy", "mode", "source", "clamp"})
 _RESOLUTION_PROPERTIES = frozenset({"model", "effort", "mode", "permissions", "home"})
 _RESOLUTION_FIELD_PROPERTIES = frozenset(
-    {"value", "source", "grants", "delegates", "escalates", "clamp"}
+    {"value", "source", "grants", "delegates", "escalates", "selectable", "clamp"}
 )
 _RESOLUTION_FIELD_REQUIRED = frozenset({"value", "source"})
 _RESOLUTION_CLAMP_REQUIRED = frozenset({"requested", "ceiling", "effective"})
@@ -753,12 +753,12 @@ EXPECTED_OUTPUT_ORACLES: dict[str, dict[str, tuple[frozenset[str], frozenset[str
             frozenset({"mode", "status", "description", "current", "proposed"}),
         ),
         "output.diff[].current": (
-            frozenset({"grants", "delegates", "escalates"}),
-            frozenset({"grants", "delegates", "escalates"}),
+            frozenset({"grants", "delegates", "escalates", "selectable"}),
+            frozenset({"grants", "delegates", "escalates", "selectable"}),
         ),
         "output.diff[].proposed": (
-            frozenset({"grants", "delegates", "escalates"}),
-            frozenset({"grants", "delegates", "escalates"}),
+            frozenset({"grants", "delegates", "escalates", "selectable"}),
+            frozenset({"grants", "delegates", "escalates", "selectable"}),
         ),
     },
     "prune": {

@@ -114,6 +114,13 @@ def test_claude_selection_prefers_delegation_then_grants() -> None:
     assert select_mode(entry.modes, "all")[0] == "acceptEdits"
 
 
+def test_claude_edit_policy_lands_on_default_and_plan_stays_reachable_by_flag() -> None:
+    entry = AgentRegistry().resolve("claude")
+
+    assert select_mode(entry.modes, "edit")[0] == "default"
+    assert select_mode(entry.modes, "edit", "plan")[0] == "plan"
+
+
 def test_claude_has_no_mode_for_a_ceiling_below_read() -> None:
     # claude-agent-acp 0.75.1 dropped `dontAsk`; no remaining mode grants none.
     entry = AgentRegistry().resolve("claude")
@@ -156,6 +163,43 @@ def test_explicit_mode_keeps_the_ceiling_and_allows_an_undeclared_mode_only_at_a
     mode, spec = select_mode(modes, "all", "vendor-new-mode")
     assert mode == "vendor-new-mode"
     assert spec == ModeSpec(grants="all", delegates=False)
+
+
+def _claude_shaped_modes() -> dict[str, ModeSpec]:
+    return {
+        "default": ModeSpec(grants="read", delegates=True),
+        "plan": ModeSpec(grants="edit", delegates=True, selectable=False),
+    }
+
+
+def test_policy_selection_skips_a_mode_declared_not_selectable() -> None:
+    modes = _claude_shaped_modes()
+
+    assert select_mode(modes, "edit") == ("default", modes["default"])
+
+
+def test_explicit_mode_reaches_a_non_selectable_mode_within_the_ceiling() -> None:
+    modes = _claude_shaped_modes()
+
+    assert select_mode(modes, "edit", "plan") == ("plan", modes["plan"])
+
+
+def test_explicit_non_selectable_mode_is_still_checked_by_grants() -> None:
+    with pytest.raises(ModeSelectionError, match="mode plan grants edit, above policy read"):
+        select_mode(_claude_shaped_modes(), "read", "plan")
+
+
+def test_error_names_a_non_selectable_mode_when_it_is_the_only_one_within_the_ceiling() -> None:
+    modes = {
+        "plan": ModeSpec(grants="edit", delegates=True, selectable=False),
+        "runner": ModeSpec(grants="execute", delegates=True),
+    }
+
+    with pytest.raises(ModeSelectionError) as error:
+        select_mode(modes, "edit")
+
+    assert "plan (grants edit, not selectable)" in str(error.value)
+    assert "runner (grants execute)" in str(error.value)
 
 
 class TestMinimumPolicy:

@@ -24,7 +24,7 @@ from acpc.vocab import EFFORT_VALUES, PERMISSION_ALIASES, PERMISSION_VALUES, nor
 
 MODEL_TIERS: Final = frozenset({"fast", "standard", "max"})
 _NON_INHERITABLE_FIELDS: Final = frozenset({"description"})
-_MODE_KEYS: Final = frozenset({"grants", "delegates", "escalates"})
+_MODE_KEYS: Final = frozenset({"grants", "delegates", "escalates", "selectable"})
 _MODE_GRANTS: Final = frozenset(PERMISSION_VALUES[:-1])
 _MODEL_VIA_VALUES: Final = frozenset({"config_option", "set_model"})
 _EFFORT_VIA_VALUES: Final = frozenset({"config_option", "cli"})
@@ -147,6 +147,7 @@ class ModeSpec:
     grants: str
     delegates: bool
     escalates: bool = False
+    selectable: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -624,6 +625,8 @@ def _parse_entry(
                 raise RegistryError(f"{path}: [modes.{mode}].delegates must be a boolean")
             if "escalates" in spec and not isinstance(spec["escalates"], bool):
                 raise RegistryError(f"{path}: [modes.{mode}].escalates must be a boolean")
+            if "selectable" in spec and not isinstance(spec["selectable"], bool):
+                raise RegistryError(f"{path}: [modes.{mode}].selectable must be a boolean")
 
     if not allow_partial and "command" not in raw and "extends" not in raw:
         raise RegistryError(f"{path}: an entry must define 'command' or 'extends'")
@@ -707,6 +710,7 @@ def _to_resolved(
             grants=str(raw_mode["grants"]),
             delegates=bool(raw_mode["delegates"]),
             escalates=bool(raw_mode.get("escalates", False)),
+            selectable=bool(raw_mode.get("selectable", True)),
         )
 
     def string_or_none(key: str) -> str | None:
@@ -866,6 +870,7 @@ class AgentRegistry:
                     "grants": spec.grants,
                     "delegates": spec.delegates,
                     "escalates": spec.escalates,
+                    "selectable": spec.selectable,
                 }
                 for mode, spec in parent.modes.items()
             }

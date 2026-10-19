@@ -1495,7 +1495,10 @@ def _mode_list(modes: Mapping[str, ModeSpec]) -> str:
     """Render declared modes in their TOML order for a selection error."""
     if not modes:
         return "none"
-    return ", ".join(f"{name} (grants {spec.grants})" for name, spec in modes.items())
+    return ", ".join(
+        f"{name} (grants {spec.grants}{'' if spec.selectable else ', not selectable'})"
+        for name, spec in modes.items()
+    )
 
 
 def _mode_selection_error(
@@ -1539,8 +1542,12 @@ def _mode_selection_error(
     # the entry refuses it, which is a denial rather than a malformed flag.
     if not error.modes:
         return UsageProblem(f"{reason}; declared modes: {modes}", kind=errors.PERMISSION_DENIED)
+    # Policy selection never lands on a non-selectable mode, so it sets no floor.
+    floor_specs = [spec for spec in error.modes.values() if spec.selectable] or list(
+        error.modes.values()
+    )
     floor = min(
-        (PermissionLevel(spec.grants) for spec in error.modes.values()),
+        (PermissionLevel(spec.grants) for spec in floor_specs),
         key=lambda level: level.rank,
     ).value
     reason = f"{reason} — the lowest policy {entry.entry} runs under is {floor}"
@@ -1610,7 +1617,8 @@ def _emit_resolution(payload: dict[str, Any], *, json_mode: bool) -> None:
                 reason = f"selected for permissions {policy}"
             delegation = "acpc-delegated" if item["delegates"] else "vendor-decided"
             escalation = " · escalates" if item.get("escalates") else ""
-            lines.append(f"{name:<12} {value} ({reason}) · {delegation}{escalation}")
+            selection = "" if item.get("selectable", True) else " · not selectable"
+            lines.append(f"{name:<12} {value} ({reason}) · {delegation}{escalation}{selection}")
         else:
             lines.append(f"{name:<12} {value} ({item['source']})")
     if payload["cwd"]:
@@ -1840,7 +1848,8 @@ def _mode_display(name: str, entry: ResolvedEntry) -> str:
         return f"{name} (undeclared)"
     delegates = " · delegates" if spec.delegates else ""
     escalates = " · escalates" if spec.escalates else ""
-    return f"{name} ({spec.grants}{delegates}{escalates})"
+    selection = "" if spec.selectable else " · not selectable"
+    return f"{name} ({spec.grants}{delegates}{escalates}{selection})"
 
 
 def _advertised_payload(record: cache.CachedAdvertised | None) -> dict[str, Any]:
@@ -1892,6 +1901,7 @@ def _render_advertised_detail(
                         "grants": entry.modes[mode].grants,
                         "delegates": entry.modes[mode].delegates,
                         "escalates": entry.modes[mode].escalates,
+                        "selectable": entry.modes[mode].selectable,
                     }
                     if mode in entry.modes
                     else None

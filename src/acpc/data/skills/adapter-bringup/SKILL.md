@@ -122,7 +122,7 @@ acpc cannot select a mode over an empty table: `run` and `resolve` refuse.
 Mode **ids** come from this binary, not from another adapter's table.
 
 **Path A — discovery non-empty.** Write every advertised id. Facts
-(`grants` / `delegates` / `escalates`) are **assumed** until measured on disk:
+(`grants` / `delegates` / `escalates` / `selectable`) are **assumed** until measured on disk:
 
 ```toml
 [modes]
@@ -148,6 +148,9 @@ Rules that do not move:
   `request_permission`; `false`: the vendor handles (or ignores) it alone.
 - `escalates = true`: in-vendor auto-approver can raise the effective ceiling
   with nothing reaching acpc — so `grants` is a measurement, not a bound.
+- `selectable = false`: policy selection never picks the mode (keep its
+  measured `grants`); only `--mode <id>` reaches it. Use it for a mode that
+  misbehaves under its ceiling, like claude's `plan`.
 - A mode id missing from the table is selectable only with `--mode <id>` and
   only under `--permissions all`; otherwise selection never leaves the table.
 - Bridge without a full table:
