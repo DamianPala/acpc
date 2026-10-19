@@ -93,7 +93,7 @@ def _paths_for(meta: sessions.SessionMeta, *, turn: int | None) -> dict[str, str
     since rotated past names that turn's parked `prompt.<n>.md` and
     `answer.<n>.md`, never the current session's files.
     """
-    result = sessions.session_paths(meta.session_id)
+    result = sessions.session_paths(meta.session_id, meta=meta)
     if turn is not None:
         result["answer"] = str(sessions.turn_path(meta.session_id, "answer", turn))
         result["prompt"] = str(sessions.turn_path(meta.session_id, "prompt", turn))
@@ -141,13 +141,15 @@ def result_envelope(
             "started_at": _timestamp_or_none(meta.started_at),
             "finished_at": _timestamp_or_none(meta.finished_at),
             "paths": paths_for_turn,
+            "retained": meta.retained,
             "truncated": False,
             "partial": False,
             "denied": _denial_payload(meta),
             "permissions_clamp": _permissions_clamp(meta),
             "capabilities": session_capabilities(meta),
-            "next": ["acpc", "wait", meta.session_id],
         }
+        if meta.retained:
+            envelope["next"] = ["acpc", "wait", meta.session_id]
         if not include_partial:
             envelope.pop("partial")
         if resume := _resume_status(meta):
@@ -171,13 +173,16 @@ def result_envelope(
         "context": meta.context,
         "usage": meta.usage,
         "paths": paths_for_turn,
+        "retained": meta.retained,
         "answer": answer,
         "truncated": truncated,
         "denied": _denial_payload(meta),
         "permissions_clamp": _permissions_clamp(meta),
         "capabilities": session_capabilities(meta),
-        "next": ["acpc", "continue", meta.session_id],
     }
+    # A reduced one-shot session cannot be continued, so no `next` points there.
+    if meta.retained:
+        envelope["next"] = ["acpc", "continue", meta.session_id]
     if include_partial:
         envelope["partial"] = partial
     if resume := _resume_status(meta):
@@ -867,7 +872,8 @@ def format_summary(
     if truncated_output_file is not None:
         parts.append(f"truncated → {truncated_output_file}")
     parts.extend(_session_segments(meta))
-    parts.append(f"Next: acpc continue {meta.session_id}")
+    if meta.retained:
+        parts.append(f"Next: acpc continue {meta.session_id}")
     if route_note:
         parts.append(route_note)
     return "-- " + " | ".join(parts)

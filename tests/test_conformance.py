@@ -136,6 +136,7 @@ EXPECTED_REQUIRED_FIELDS = {
         "started_at",
         "finished_at",
         "paths",
+        "retained",
         "truncated",
         "partial",
         "denied",
@@ -174,6 +175,7 @@ EXPECTED_REQUIRED_FIELDS = {
         "started_at",
         "finished_at",
         "paths",
+        "retained",
         "truncated",
         "partial",
         "denied",
@@ -204,6 +206,7 @@ EXPECTED_REQUIRED_FIELDS = {
         "pending_corrections",
         "permissions",
         "paths",
+        "retained",
         "created_at",
         "started_at",
         "finished_at",
@@ -215,6 +218,7 @@ EXPECTED_REQUIRED_FIELDS = {
         "started_at",
         "finished_at",
         "paths",
+        "retained",
         "truncated",
         "denied",
         "permissions_clamp",
@@ -235,6 +239,7 @@ EXPECTED_REQUIRED_FIELDS = {
         "usage",
         "answer",
         "paths",
+        "retained",
         "truncated",
         "partial",
         "denied",
@@ -411,6 +416,7 @@ _SESSION_OUTPUT_PROPERTIES = frozenset(
         "context",
         "usage",
         "paths",
+        "retained",
         "answer",
         "truncated",
         "partial",
@@ -446,7 +452,7 @@ _COMPACTIONS_PROPERTIES = frozenset({"count", "unaccounted", "context_before", "
 # R2d's inspection object `status` reports: policy, mode, source and clamp, all required.
 _STATUS_PERMISSIONS_PROPERTIES = frozenset({"policy", "mode", "source", "clamp"})
 _RESOLUTION_REQUIRED = frozenset({"model", "effort", "mode", "permissions", "home"})
-_RESOLUTION_PROPERTIES = _RESOLUTION_REQUIRED | {"system_prompt", "tools"}
+_RESOLUTION_PROPERTIES = _RESOLUTION_REQUIRED | {"system_prompt", "tools", "one_shot"}
 _RESOLUTION_FIELD_PROPERTIES = frozenset(
     {"value", "source", "grants", "delegates", "escalates", "selectable", "clamp"}
 )
@@ -519,6 +525,7 @@ EXPECTED_OUTPUT_ORACLES: dict[str, dict[str, tuple[frozenset[str], frozenset[str
                     "tools",
                     "system_prompt_via",
                     "tools_via",
+                    "one_shot",
                     "refused",
                     "description",
                     "resolved",
@@ -656,6 +663,7 @@ EXPECTED_OUTPUT_ORACLES: dict[str, dict[str, tuple[frozenset[str], frozenset[str
                     "prompt_snippet",
                     "runtime_seconds",
                     "idle_seconds",
+                    "retained",
                     "created_at",
                     "started_at",
                     "finished_at",
@@ -671,6 +679,7 @@ EXPECTED_OUTPUT_ORACLES: dict[str, dict[str, tuple[frozenset[str], frozenset[str
                     "prompt_snippet",
                     "runtime_seconds",
                     "idle_seconds",
+                    "retained",
                     "created_at",
                     "started_at",
                     "finished_at",
@@ -819,6 +828,10 @@ EXPECTED_OUTPUT_ORACLES: dict[str, dict[str, tuple[frozenset[str], frozenset[str
             frozenset({"value", "source"}),
             frozenset({"value", "source"}),
         ),
+        "output.resolved.one_shot": (
+            frozenset({"value", "source"}),
+            frozenset({"value", "source"}),
+        ),
     },
     "skills get": {
         "output": (
@@ -857,6 +870,7 @@ EXPECTED_OUTPUT_ORACLES: dict[str, dict[str, tuple[frozenset[str], frozenset[str
                     "pending_corrections",
                     "permissions",
                     "paths",
+                    "retained",
                     "created_at",
                     "started_at",
                     "finished_at",

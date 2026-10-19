@@ -47,6 +47,7 @@ _DEFAULT_FIELDS: Final = frozenset(
         "usage_profile",
         "system_prompt_via",
         "tools_via",
+        "one_shot",
     }
 )
 _ENTRY_KEYS: Final = frozenset(
@@ -55,6 +56,7 @@ _ENTRY_KEYS: Final = frozenset(
         "tools",
         "system_prompt_via",
         "tools_via",
+        "one_shot",
         "name",
         "author",
         "command",
@@ -87,6 +89,7 @@ _FIELD_NAMES: Final = (
     "tools",
     "system_prompt_via",
     "tools_via",
+    "one_shot",
     "name",
     "author",
     "command",
@@ -223,6 +226,8 @@ class CallResolution:
     permissions_clamp: tuple[str, str] | None = None
     system_prompt: SystemPrompt | None = None
     tools: tuple[str, ...] | None = None
+    # A session of this call is consumed once (`sessions.finalize_turn(reduce=True)`).
+    one_shot: bool = False
 
     @property
     def adapter_environment(self) -> dict[str, str]:
@@ -291,6 +296,8 @@ class ResolvedEntry:
     # Adapter facts: which wire route carries the prompt and the tool list.
     system_prompt_via: str
     tools_via: str
+    # Each session of the entry is consumed once; no adapter refuses it.
+    one_shot: bool
 
     @property
     def is_variant(self) -> bool:
@@ -417,6 +424,7 @@ class ResolvedEntry:
         else:
             sources["system_prompt"] = self.source_for("system_prompt_file")
         sources["tools"] = self.source_for("tools")
+        sources["one_shot"] = self.source_for("one_shot")
 
         return CallResolution(
             entry=self,
@@ -431,6 +439,7 @@ class ResolvedEntry:
             provenance=sources,
             system_prompt=system_prompt,
             tools=self.tools,
+            one_shot=self.one_shot,
         )
 
     def _resolve_model_and_effort(
@@ -668,6 +677,8 @@ def _validate_judge_keys(path: Path, raw: dict[str, Any]) -> None:
         )
     if "tools" in raw:
         _expect_string_list(path, "tools", raw["tools"])
+    if "one_shot" in raw and not isinstance(raw["one_shot"], bool):
+        raise RegistryError(f"{path}: key 'one_shot' must be a boolean")
     for key, allowed in (
         ("system_prompt_via", SYSTEM_PROMPT_VIA_VALUES),
         ("tools_via", TOOLS_VIA_VALUES),
@@ -949,7 +960,7 @@ def _to_resolved(
 
 
 def _session_keys(data: Mapping[str, Any]) -> dict[str, Any]:
-    """The prompt file, tool list and routes of a merged entry, defaults filled in.
+    """The prompt file, tool list, routes and `one_shot` of a merged entry, defaults filled in.
 
     `tools` is decided by key presence: an absent key is None, an empty list is
     "no tools", so a child's `tools = []` overrides its parent's list.
@@ -957,6 +968,7 @@ def _session_keys(data: Mapping[str, Any]) -> dict[str, Any]:
     prompt_file, tools = data.get("system_prompt_file"), data.get("tools")
     prompt_via, tools_via = data.get("system_prompt_via"), data.get("tools_via")
     return {
+        "one_shot": data.get("one_shot") is True,
         "system_prompt_file": prompt_file if isinstance(prompt_file, str) else None,
         "tools": tuple(tools) if isinstance(tools, (list, tuple)) else None,
         "system_prompt_via": prompt_via if isinstance(prompt_via, str) and prompt_via else "none",

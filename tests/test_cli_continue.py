@@ -3073,3 +3073,71 @@ def test_continue_refuses_a_system_prompt_file_the_session_never_had(
     message = json.loads(result.stderr)["error"]["message"]
     assert "stored system prompt file null; given" in message
     assert sessions.read_meta(session_id).turns == 1
+
+
+# --- one_shot is a stored session fact ----------------------------------------
+
+STERILITY = {"persistSession": False, "settingSources": [], "strictMcpConfig": True}
+
+
+def fail_first_turn(cli: CliRunner, entry: str = "judge") -> str:
+    failed = invoke(cli, "run", entry, "auth:vendor rejected the request", "--quiet", "--json")
+    assert failed.exit_code == vocab.EXIT_AGENT_ERROR, failed.stderr
+    return json.loads(failed.stdout)["session_id"]
+
+
+# `--permissions` sends the continuation through the live-entry selection path.
+@pytest.mark.parametrize("flags", [(), ("--permissions", "read")])
+def test_a_failed_one_shot_session_continues_under_its_stored_flag_and_is_then_reduced(
+    cli: CliRunner,
+    state_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    flags: tuple[str, ...],
+) -> None:
+    wire_file = tmp_path / "wire.jsonl"
+    monkeypatch.setenv("ACPC_MOCK_WIRE_FILE", str(wire_file))
+    write_judge_entry(state_root, "one_shot = true\n")
+    session_id = fail_first_turn(cli)
+    assert (sessions.session_dir(session_id) / "prompt.md").exists()
+    # The entry no longer says one_shot; the session began as one and stays one.
+    write_judge_entry(state_root)
+
+    result = invoke(cli, "continue", session_id, "echo:second try", "--quiet", "--json", *flags)
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    assert json.loads(result.stdout)["retained"] is False
+    assert wire_meta(wire_file, "session/load") == [{"claudeCode": {"options": STERILITY}}]
+    assert sorted(item.name for item in sessions.session_dir(session_id).iterdir()) == [
+        "answer.md",
+        "lock",
+        "meta.json",
+    ]
+    assert sessions.read_meta(session_id).state == "succeeded"
+
+
+@pytest.mark.parametrize("flags", [(), ("--permissions", "read")])
+def test_an_entry_that_gains_one_shot_does_not_reduce_a_session_that_began_without_it(
+    cli: CliRunner,
+    state_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    flags: tuple[str, ...],
+) -> None:
+    wire_file = tmp_path / "wire.jsonl"
+    monkeypatch.setenv("ACPC_MOCK_WIRE_FILE", str(wire_file))
+    write_judge_entry(state_root)
+    session_id = fail_first_turn(cli)
+    write_judge_entry(state_root, "one_shot = true\n")
+
+    result = invoke(cli, "continue", session_id, "echo:second try", "--quiet", "--json", *flags)
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    assert json.loads(result.stdout)["retained"] is True
+    assert wire_meta(wire_file, "session/load") == [{}]
+    names = {item.name for item in sessions.session_dir(session_id).iterdir()}
+    assert {"prompt.md", "prompt.1.md", "transcript.ndjson", "meta.1.json"} <= names
+    # A later success on a session that did not start one-shot never reduces it.
+    again = invoke(cli, "continue", session_id, "echo:third try", "--quiet", "--json", *flags)
+    assert again.exit_code == vocab.EXIT_OK, again.stderr
+    assert json.loads(again.stdout)["retained"] is True

@@ -1072,3 +1072,43 @@ def test_a_key_without_a_route_is_refused_naming_entry_and_adapter(
 
     assert needle in str(error.value)
     assert "bad" in str(error.value)
+
+
+def test_one_shot_defaults_false_and_parses_true(tmp_path: Path) -> None:
+    agents = tmp_path / "agents"
+    write_entry(agents, "plain", 'command = "python -m plain"\n')
+    write_entry(agents, "once", 'command = "python -m once"\none_shot = true\n')
+    registry = AgentRegistry(agents)
+
+    plain, once = registry.resolve("plain"), registry.resolve("once")
+
+    assert plain.one_shot is False
+    assert plain.provenance["one_shot"].kind == "default"
+    assert once.one_shot is True
+    assert once.provenance["one_shot"].path == agents / "once.toml"
+    assert registry.resolve_call("once").one_shot is True
+    assert registry.resolve_call("plain").one_shot is False
+
+
+def test_one_shot_inherits_and_a_child_can_turn_it_off(tmp_path: Path) -> None:
+    agents = tmp_path / "agents"
+    write_entry(agents, "base", 'command = "python -m base"\none_shot = true\n')
+    write_entry(agents, "inherits", 'extends = "base"\n')
+    write_entry(agents, "off", 'extends = "base"\none_shot = false\n')
+    write_entry(agents, "plain", 'command = "python -m plain"\n')
+    write_entry(agents, "plain-child", 'extends = "plain"\none_shot = true\n')
+    registry = AgentRegistry(agents)
+
+    assert registry.resolve("inherits").one_shot is True
+    assert registry.resolve("inherits").provenance["one_shot"].path == agents / "base.toml"
+    assert registry.resolve("off").one_shot is False
+    assert registry.resolve("plain-child").one_shot is True
+
+
+@pytest.mark.parametrize("line", ['one_shot = "yes"', "one_shot = 1", "one_shot = []"])
+def test_a_non_boolean_one_shot_is_rejected(tmp_path: Path, line: str) -> None:
+    agents = tmp_path / "agents"
+    write_entry(agents, "bad", f'command = "python -m bad"\n{line}\n')
+
+    with pytest.raises(RegistryError, match="one_shot"):
+        AgentRegistry(agents)

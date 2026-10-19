@@ -785,6 +785,8 @@ def render_status_detail(
     ]
     if usage_text := format_usage(meta.usage):
         lines.insert(1, usage_text)
+    if not meta.retained:
+        lines.append("retained no · one_shot session reduced to meta.json and answer.md")
     if meta.failure is not None:
         lines.append(
             f"failure  {safe_text(meta.failure)} · continue: acpc continue {meta.session_id}"
@@ -841,6 +843,7 @@ def status_list_json(
                 "prompt_snippet": meta.prompt_snippet,
                 "runtime_seconds": runtime_seconds,
                 "idle_seconds": _idle_seconds(meta, now=now),
+                "retained": meta.retained,
                 "created_at": _timestamp_or_none(meta.created_at),
                 "started_at": _timestamp_or_none(meta.started_at),
                 "finished_at": _timestamp_or_none(meta.finished_at),
@@ -881,7 +884,8 @@ def status_detail_json(
         # V4c: acpc never has grounds to report a pending-correction count.
         "pending_corrections": None,
         "permissions": status_permissions(meta),
-        "paths": sessions.session_paths(meta.session_id),
+        "paths": sessions.session_paths(meta.session_id, meta=meta),
+        "retained": meta.retained,
         "created_at": _timestamp_or_none(meta.created_at),
         "started_at": _timestamp_or_none(meta.started_at),
         "finished_at": _timestamp_or_none(meta.finished_at),

@@ -474,6 +474,114 @@ class TestSystemPromptFile:
         assert "system" in sessions.session_paths(meta.session_id)
 
 
+class TestRetained:
+    def test_every_session_writes_retained_true_and_an_older_meta_reads_as_true(self) -> None:
+        meta = make_session()
+        path = sessions.meta_path(meta.session_id)
+        assert json.loads(path.read_text())["retained"] is True
+        payload = json.loads(path.read_text())
+        del payload["retained"]
+        path.write_text(json.dumps(payload))
+
+        assert sessions.read_meta(meta.session_id).retained is True
+
+    def test_a_non_boolean_retained_is_damage(self) -> None:
+        meta = make_session()
+        payload = json.loads(sessions.meta_path(meta.session_id).read_text())
+        payload["retained"] = "no"
+        sessions.meta_path(meta.session_id).write_text(json.dumps(payload))
+
+        with pytest.raises(sessions.CorruptSessionError, match="retained"):
+            sessions.read_meta(meta.session_id)
+
+    def test_reducing_a_succeeded_session_keeps_only_lock_meta_and_answer(self) -> None:
+        meta = sessions.create_session(
+            entry="builder", base_adapter="builder", prompt="p", system_prompt="be a judge"
+        )
+        session_id = meta.session_id
+        sessions.mark_running(session_id, pid=1, process_start_time="token", clock=at(1.0))
+        directory = sessions.session_dir(session_id)
+        (directory / "prompt.1.md").write_text("parked")
+        (directory / "meta.1.json").write_text("{}")
+        (directory / ".direct-request").write_text("{}")
+        (directory / "nested").mkdir()
+        (directory / "nested" / "x").write_text("x")
+
+        sessions.finalize_turn(
+            session_id, "succeeded", answer="the answer", exit_code=0, reduce=True
+        )
+
+        assert sorted(item.name for item in directory.iterdir()) == [
+            "answer.md",
+            "lock",
+            "meta.json",
+        ]
+        reread = sessions.read_meta(session_id)
+        assert reread.retained is False
+        assert reread.state == "succeeded"
+        assert sessions.answer_path(session_id).read_text() == "the answer"
+        assert reread.prompt_snippet == "p"
+
+    def test_a_reduced_session_is_deleted_like_any_finished_one(self) -> None:
+        meta = make_session()
+        session_id = meta.session_id
+        sessions.mark_running(session_id, pid=1, process_start_time="token", clock=at(1.0))
+        sessions.finalize_turn(session_id, "succeeded", answer="done", exit_code=0, reduce=True)
+
+        sessions.delete_session(session_id)
+
+        assert sorted(item.name for item in sessions.session_dir(session_id).iterdir()) == [
+            ".tombstone",
+            "lock",
+        ]
+
+    def test_finalizing_with_reduce_publishes_the_reduced_meta_in_one_step(self) -> None:
+        meta = make_session()
+        sessions.mark_running(meta.session_id, pid=1, process_start_time="token", clock=at(1.0))
+
+        finalized = sessions.finalize_turn(
+            meta.session_id, "succeeded", answer="the answer", exit_code=0, reduce=True
+        )
+
+        assert finalized is not None and finalized.retained is False
+        reread = sessions.read_meta(meta.session_id)
+        assert (reread.state, reread.retained) == ("succeeded", False)
+        assert sorted(item.name for item in sessions.session_dir(meta.session_id).iterdir()) == [
+            "answer.md",
+            "lock",
+            "meta.json",
+        ]
+
+    @pytest.mark.parametrize("state", ["failed", "canceled"])
+    def test_finalizing_with_reduce_keeps_a_turn_that_did_not_succeed(self, state: str) -> None:
+        meta = make_session()
+        sessions.mark_running(meta.session_id, pid=1, process_start_time="token", clock=at(1.0))
+
+        sessions.finalize_turn(meta.session_id, state, answer="partial", exit_code=1, reduce=True)
+
+        assert sessions.read_meta(meta.session_id).retained is True
+        assert "transcript.ndjson" in {
+            item.name for item in sessions.session_dir(meta.session_id).iterdir()
+        }
+
+    def test_a_removal_that_fails_midway_still_reads_as_reduced(self) -> None:
+        meta = make_session()
+        session_id = meta.session_id
+        sessions.mark_running(session_id, pid=1, process_start_time="token", clock=at(1.0))
+        stuck = sessions.session_dir(session_id) / "stuck"
+        stuck.mkdir()
+        (stuck / "file").write_text("x")
+        stuck.chmod(0o500)
+        try:
+            # The answer and the final state are published; the failed removal is not an error.
+            sessions.finalize_turn(session_id, "succeeded", answer="kept", exit_code=0, reduce=True)
+            reread = sessions.read_meta(session_id)
+        finally:
+            stuck.chmod(0o700)
+        assert (reread.state, reread.retained) == ("succeeded", False)
+        assert sessions.answer_path(session_id).read_text() == "kept"
+
+
 class TestTurnRotation:
     def test_rotation_parks_both_artifacts_and_counts_the_turn(self) -> None:
         session_id = finished_session()

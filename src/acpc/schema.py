@@ -225,6 +225,7 @@ _SESSION_RESULT_PROPERTIES = {
     "context": _CONTEXT,
     "usage": _USAGE,
     "paths": _PATHS,
+    "retained": _BOOLEAN,
     "answer": _STRING,
     "truncated": _BOOLEAN,
     "partial": _BOOLEAN,
@@ -266,6 +267,7 @@ _RESOLUTION_SYSTEM_PROMPT = _object(
     {"value": _STRING, "source": _STRING, "bytes": _INTEGER}, ("value", "source", "bytes")
 )
 _RESOLUTION_TOOLS = _object({"value": _array(_STRING), "source": _STRING}, ("value", "source"))
+_RESOLUTION_ONE_SHOT = _object({"value": _BOOLEAN, "source": _STRING}, ("value", "source"))
 _RESOLUTION = _object(
     {
         "entry": _STRING,
@@ -284,6 +286,7 @@ _RESOLUTION = _object(
                 },
                 "system_prompt": _RESOLUTION_SYSTEM_PROMPT,
                 "tools": _RESOLUTION_TOOLS,
+                "one_shot": _RESOLUTION_ONE_SHOT,
             },
             ("model", "effort", "mode", "permissions", "home"),
         ),
@@ -316,7 +319,7 @@ def _session_result_schema(
     required = ["status", "session_id", "turn", "created_at", "started_at", "finished_at"]
     if foreground_only:
         required += ["stop_reason", "context", "usage", "answer"]
-    required += ["paths", "truncated"]
+    required += ["paths", "retained", "truncated"]
     if include_partial:
         required.append("partial")
     required += ["denied", "permissions_clamp", "capabilities"]
@@ -394,6 +397,7 @@ _AGENTS_GET = _object(
         "tools": {"type": ["array", "null"], "items": _STRING},
         "system_prompt_via": _STRING,
         "tools_via": _STRING,
+        "one_shot": _BOOLEAN,
         "refused": _NULLABLE_STRING,
         "description": _NULLABLE_STRING,
         "resolved": _object(
@@ -470,6 +474,7 @@ _STATUS_LIST_ITEM = _object(
         "prompt_snippet": _STRING,
         "runtime_seconds": _NUMBER,
         "idle_seconds": _NULLABLE_NUMBER,
+        "retained": _BOOLEAN,
         "created_at": _NULLABLE_STRING,
         "started_at": _NULLABLE_STRING,
         "finished_at": _NULLABLE_STRING,
@@ -483,6 +488,7 @@ _STATUS_LIST_ITEM = _object(
         "prompt_snippet",
         "runtime_seconds",
         "idle_seconds",
+        "retained",
         "created_at",
         "started_at",
         "finished_at",
@@ -530,6 +536,7 @@ _STATUS_DETAIL = _object(
         "pending_corrections": {"type": ["integer", "null"]},
         "permissions": _STATUS_PERMISSIONS,
         "paths": _PATHS,
+        "retained": _BOOLEAN,
         "created_at": _NULLABLE_STRING,
         "started_at": _NULLABLE_STRING,
         "finished_at": _NULLABLE_STRING,
@@ -555,6 +562,7 @@ _STATUS_DETAIL = _object(
         "pending_corrections",
         "permissions",
         "paths",
+        "retained",
         "created_at",
         "started_at",
         "finished_at",

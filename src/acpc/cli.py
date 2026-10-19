@@ -6,6 +6,7 @@ delegates everything else to the layer that owns it.
 """
 
 import asyncio
+import contextlib
 import json
 import os
 import signal
@@ -13,7 +14,7 @@ import subprocess
 import sys
 import textwrap
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -1664,6 +1665,9 @@ def _emit_resolution(payload: dict[str, Any], *, json_mode: bool) -> None:
         elif name == "tools":
             names = " · ".join(item["value"]) if item["value"] else "none"
             lines.append(f"{name:<12} {names} ({item['source']})")
+        elif name == "one_shot":
+            if item["value"]:
+                lines.append(f"{'one-shot':<12} yes ({item['source']})")
         else:
             lines.append(f"{name:<12} {value} ({item['source']})")
     if payload["cwd"]:
@@ -1991,6 +1995,8 @@ def _entry_session_rows(entry: ResolvedEntry) -> list[str]:
     if entry.tools is not None:
         tool_names = " · ".join(entry.tools) if entry.tools else "none"
         rows.append(f"{'tools':<12} {tool_names} ({_source_text(entry.provenance.get('tools'))})")
+    if entry.one_shot:
+        rows.append(f"{'one-shot':<12} yes ({_source_text(entry.provenance.get('one_shot'))})")
     refused = entry.route_refusal()
     if refused is not None:
         rows.append(f"{'refused':<12} {refused}")
@@ -2004,6 +2010,7 @@ def _entry_session_payload(entry: ResolvedEntry) -> dict[str, Any]:
         "tools": list(entry.tools) if entry.tools is not None else None,
         "system_prompt_via": entry.system_prompt_via,
         "tools_via": entry.tools_via,
+        "one_shot": entry.one_shot,
         "refused": entry.route_refusal(),
     }
 
@@ -3238,7 +3245,7 @@ def delete_command(
     """
     selected_format = _select_format(format_name, json_mode)
     meta = _load_view_session(selector)
-    advertised_paths = sessions.session_paths(meta.session_id)
+    advertised_paths = sessions.session_paths(meta.session_id, meta=meta)
     try:
         # Both checks run before the gate: an unknown or still-running session
         # fails as itself, and neither failure is one --yes could resolve.
@@ -3766,57 +3773,59 @@ def log_command(
         raise UsageProblem("--timeout requires --wait-new or --follow")
 
     meta = _load_view_session(selector)
-    try:
-        transcript_file = transcript.Transcript(sessions.transcript_path(meta.session_id))
-    except transcript.TranscriptError as error:
-        raise AcpcError(
-            str(error), kind=errors.CORRUPT_STATE, context={"session_id": meta.session_id}
-        ) from None
-    explicit_since = since is not None
-    cursor = 0 if since is None else since
-    # Only an explicit --since is checked, so the extra read that finds the
-    # transcript's end is only paid for when there is something to check.
-    since_note = None
-    if explicit_since:
-        highest_cursor = _read_transcript_page(transcript_file).next_cursor
-        if cursor > highest_cursor:
-            since_note = _since_past_end_note(cursor, highest_cursor)
-    selection_tail = tail
-    if selection_tail is None and limit is None and not explicit_since and not follow:
-        selection_tail = _LOG_DEFAULT_TAIL
+    _reject_reduced_session(meta, verb="log")
+    with _reduction_ends_the_read(meta.session_id):
+        try:
+            transcript_file = transcript.Transcript(sessions.transcript_path(meta.session_id))
+        except transcript.TranscriptError as error:
+            raise AcpcError(
+                str(error), kind=errors.CORRUPT_STATE, context={"session_id": meta.session_id}
+            ) from None
+        explicit_since = since is not None
+        cursor = 0 if since is None else since
+        # Only an explicit --since is checked, so the extra read that finds the
+        # transcript's end is only paid for when there is something to check.
+        since_note = None
+        if explicit_since:
+            highest_cursor = _read_transcript_page(transcript_file).next_cursor
+            if cursor > highest_cursor:
+                since_note = _since_past_end_note(cursor, highest_cursor)
+        selection_tail = tail
+        if selection_tail is None and limit is None and not explicit_since and not follow:
+            selection_tail = _LOG_DEFAULT_TAIL
 
-    if follow:
-        _follow_log(
+        if follow:
+            _follow_log(
+                meta,
+                transcript_file,
+                cursor=cursor,
+                limit=limit,
+                replay_tail=tail,
+                prose=prose,
+                json_mode=json_mode,
+                max_output=max_output,
+                timeout=timeout,
+                quiet=quiet,
+                since_note=since_note,
+                condense=not prose and not json_mode,
+            )
+            return
+
+        _render_log_page(
             meta,
             transcript_file,
             cursor=cursor,
+            tail=selection_tail,
             limit=limit,
-            replay_tail=tail,
             prose=prose,
             json_mode=json_mode,
             max_output=max_output,
+            wait_new=wait_new,
+            explicit_since=explicit_since,
             timeout=timeout,
             quiet=quiet,
             since_note=since_note,
-            condense=not prose and not json_mode,
         )
-        return
-
-    _render_log_page(
-        meta,
-        transcript_file,
-        cursor=cursor,
-        tail=selection_tail,
-        limit=limit,
-        prose=prose,
-        json_mode=json_mode,
-        max_output=max_output,
-        wait_new=wait_new,
-        explicit_since=explicit_since,
-        timeout=timeout,
-        quiet=quiet,
-        since_note=since_note,
-    )
 
 
 def _select_log_page(
@@ -4840,6 +4849,44 @@ def _continue_conflict_hint(meta: sessions.SessionMeta) -> str:
     )
 
 
+@contextlib.contextmanager
+def _reduction_ends_the_read(session_id: str) -> Iterator[None]:
+    """End a `log` read that the one-shot reduction pulled the transcript from under.
+
+    A `log` that is reading when the session is reduced (plain, `--wait-new`
+    or `--follow`) loses `transcript.ndjson` mid-read. The meta is read again:
+    a reduced session ends with the same `conflict` as a `log` that started
+    after the reduction, anything else is the original error.
+    """
+    try:
+        yield
+    except FileNotFoundError:
+        _reject_reduced_session(_load_view_session(session_id), verb="log")
+        raise
+
+
+def _reject_reduced_session(meta: sessions.SessionMeta, *, verb: str) -> None:
+    """Refuse `continue` or `log` on a one-shot session that was reduced after success.
+
+    Its prompt, transcript and parked turns are gone, so there is nothing to
+    continue from or to read; `status` and `wait` still serve the result.
+    """
+    if meta.retained:
+        return
+    if verb == "continue":
+        what, hint = "cannot be continued", f"Start a new session: acpc run {meta.entry} ..."
+    else:
+        what, hint = "has no transcript to read", f"Run: acpc wait {meta.session_id}"
+    raise AcpcError(
+        f"session {meta.session_id} is a one_shot session that succeeded and was reduced to "
+        f"meta.json and answer.md; it {what}",
+        kind=errors.CONFLICT,
+        retryable=False,
+        hint=hint,
+        context={"session_id": meta.session_id},
+    )
+
+
 def _reject_removed_session_cwd(meta: sessions.SessionMeta) -> None:
     """Refuse a new turn when the session's recorded directory is unavailable."""
     cwd = meta.resolution.get("cwd")
@@ -5033,6 +5080,7 @@ def continue_command(
     permissions = _normalize_permission(permissions)
     has_message = prompt_text is not None or prompt_file is not None
     meta = _load_view_session(selector)
+    _reject_reduced_session(meta, verb="continue")
     _reject_removed_session_cwd(meta)
     resolved_cwd = _resolve_existing_cwd(cwd) if cwd is not None else None
     _validate_continue_flags(

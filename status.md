@@ -2,6 +2,27 @@
 
 ## Now
 
+**1.2 in progress on `feat/1.2` (worktree `acpc.feat-1.2`, from `main` `ded1479`, 2026-10-19).**
+Landed, one commit per slice: 1 `6181dc4` (`selectable` mode fact, `edit` on claude lands on
+`default`), 2 `00736b7` (judge keys `system_prompt_file` and `tools`, `run --system-prompt-file`,
+adapter routes `system_prompt_via`/`tools_via`, `not_supported` before any session exists), 3
+(`one_shot`: a succeeded judge session is reduced to `meta.json` + `answer.md` inside the
+finalizing lock, `retained: false`, `continue`/`log` refuse with `conflict`, sterility options
+`persistSession: false`, `settingSources: []`, `strictMcpConfig: true` on the `acp_meta` route; the
+review also caught a slice-2 gap, a daemon `continue` loaded the adapter session without the stored
+`_meta`). Each slice: two builder rounds at most, Opus reviewer with mutation testing on a
+`git archive` copy, live on claude-agent-acp 0.89.1 with a bare Haiku judge (vendor writes no
+session file, ctx 9,5k → 4,1k with the sterility options). Build contract since 2026-10-19 (local
+to this repo): builder and builder-light through the installed acpc (Codex), reviewer and explorer
+through the Agent tool. Next: slice 3b (`agents list`/`agents check`/`skills list` default window
+100, text roster fitted to the terminal width; Damian's call 2026-10-19), then slice 4
+(`served_model`, `failure {class, message, next_step}`, `--limit-wait` + `limit_wait_max`), then
+effort capture and resolution (BREAKING), codex `codex_config` route, `data_residency` + windows,
+the import floor; plan and briefs in `docs/plans/1.2/`. Known flakes under `-n auto`:
+`test_continue_rejects_an_adapter_without_load_session`, the steer `cancel_then_start` wait test,
+and `test_agents_check_reports_has_more_past_the_default_limit` hitting the 30 s timeout on a
+loaded desktop (21 mock spawns; passes alone in 11 s). Nothing of 1.2 pushed yet.
+
 **1.1.1 released 2026-10-19: `fix/1.1.1` fast-forwarded into `main` (`c9240a2`, bump `f9a4e7a`
 and the CHANGELOG on top of slice 1), tag `v1.1.1`, release page
 https://github.com/DamianPala/acpc/releases/tag/v1.1.1, CI green on both laps, host reinstalled

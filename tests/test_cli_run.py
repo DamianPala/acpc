@@ -2451,3 +2451,417 @@ def test_the_system_prompt_file_survives_delete_listing_and_status(
     assert status["paths"]["system"].endswith("/system.md")
     deleted = json.loads(invoke(cli, "delete", session_id, "--yes", "--json").stdout)
     assert deleted["paths"]["system"] == status["paths"]["system"]
+
+
+# --- one_shot (judge entries consumed once) -----------------------------------
+
+STERILITY = {"persistSession": False, "settingSources": [], "strictMcpConfig": True}
+
+
+def session_files(session_id: str) -> list[str]:
+    return sorted(item.name for item in paths.session_dir(session_id).iterdir())
+
+
+def dir_snapshot(session_id: str) -> dict[str, bytes]:
+    directory = paths.session_dir(session_id)
+    return {item.name: item.read_bytes() for item in sorted(directory.iterdir())}
+
+
+def run_one_shot(cli: CliRunner, state_root: Path, prompt: str = "echo:one shot answer") -> dict:
+    write_judge_entry(state_root, "one_shot = true\n")
+    result = invoke(cli, "run", "judge", prompt, "--quiet", "--json")
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    return json.loads(result.stdout)
+
+
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [
+        ("one_shot = true\n", {"claudeCode": {"options": STERILITY}}),
+        (
+            "one_shot = true\ntools = []\n",
+            {"claudeCode": {"options": {"tools": [], **STERILITY}}},
+        ),
+        (
+            'one_shot = true\ntools = ["Read"]\n',
+            {"claudeCode": {"options": {"tools": ["Read"], **STERILITY}}},
+        ),
+    ],
+)
+def test_a_one_shot_session_sends_the_sterility_options_with_or_without_tools(
+    cli: CliRunner,
+    state_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    extra: str,
+    expected: dict,
+) -> None:
+    wire_file = state_root / "wire.jsonl"
+    monkeypatch.setenv("ACPC_MOCK_WIRE_FILE", str(wire_file))
+    write_judge_entry(state_root, extra)
+
+    result = invoke(cli, "run", "judge", "case", "--quiet", "--json")
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    assert session_new_meta(wire_file) == [expected]
+
+
+def test_a_one_shot_entry_on_an_adapter_without_a_tool_route_sends_nothing_extra(
+    cli: CliRunner, state_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wire_file = state_root / "wire.jsonl"
+    monkeypatch.setenv("ACPC_MOCK_WIRE_FILE", str(wire_file))
+    text = MOCK_ENTRY.replace("\n[modes]", "\none_shot = true\n\n[modes]", 1)
+    (state_root / "agents" / "plain-once.toml").write_text(text, encoding="utf-8")
+
+    result = invoke(cli, "run", "plain-once", "echo:still reduced", "--quiet", "--json")
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    assert session_new_meta(wire_file) == [{}]
+    # The reduction is acpc's own part and needs no adapter route.
+    document = json.loads(result.stdout)
+    assert document["retained"] is False
+    assert session_files(document["session_id"]) == ["answer.md", "lock", "meta.json"]
+
+
+def test_a_succeeded_one_shot_session_keeps_only_lock_meta_and_answer(
+    cli: CliRunner, state_root: Path
+) -> None:
+    document = run_one_shot(cli, state_root)
+
+    session_id = document["session_id"]
+    assert session_files(session_id) == ["answer.md", "lock", "meta.json"]
+    assert document["retained"] is False
+    assert document["answer"] == "one shot answer"
+    assert paths.session_dir(session_id).joinpath("answer.md").read_text() == "one shot answer"
+    assert (
+        json.loads(paths.session_dir(session_id).joinpath("meta.json").read_text())["retained"]
+        is False
+    )
+
+
+def test_status_list_and_wait_serve_a_reduced_session(cli: CliRunner, state_root: Path) -> None:
+    document = run_one_shot(cli, state_root)
+    session_id = document["session_id"]
+
+    status = json.loads(invoke(cli, "status", session_id, "--json").stdout)
+    listed = json.loads(invoke(cli, "list", "--json").stdout)["items"]
+    text = invoke(cli, "status", session_id, "--format", "text").stdout
+    waited = invoke(cli, "wait", session_id, "--json")
+    waited_again = invoke(cli, "wait", session_id, "--json")
+
+    assert status["retained"] is False
+    assert status["status"] == "succeeded"
+    # `paths` still names the files that were removed.
+    assert status["paths"]["prompt"].endswith("/prompt.md")
+    assert status["paths"]["transcript"].endswith("/transcript.ndjson")
+    assert [item["retained"] for item in listed if item["session_id"] == session_id] == [False]
+    assert "retained no" in text
+    for result in (waited, waited_again):
+        assert result.exit_code == vocab.EXIT_OK, result.stderr
+        delivered = json.loads(result.stdout)
+        assert delivered["answer"] == "one shot answer"
+        assert delivered["status"] == "succeeded"
+        assert delivered["retained"] is False
+
+
+def test_a_plain_session_stays_retained_in_every_document(cli: CliRunner, state_root: Path) -> None:
+    write_judge_entry(state_root)
+    result = invoke(cli, "run", "judge", "echo:plain", "--quiet", "--json")
+    session_id = json.loads(result.stdout)["session_id"]
+
+    status = json.loads(invoke(cli, "status", session_id, "--json").stdout)
+    listed = json.loads(invoke(cli, "list", "--json").stdout)["items"]
+
+    assert json.loads(result.stdout)["retained"] is True
+    assert status["retained"] is True
+    assert [item["retained"] for item in listed] == [True]
+    assert "retained" not in invoke(cli, "status", session_id, "--format", "text").stdout
+    assert "prompt.md" in session_files(session_id)
+    assert (
+        json.loads(paths.session_dir(session_id).joinpath("meta.json").read_text())["retained"]
+        is True
+    )
+
+
+def test_a_failed_one_shot_turn_keeps_the_whole_session(cli: CliRunner, state_root: Path) -> None:
+    write_judge_entry(state_root, "one_shot = true\n")
+
+    result = invoke(cli, "run", "judge", "auth:vendor rejected the request", "--json", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    document = json.loads(result.stdout)
+    session_id = document["session_id"]
+    assert document["status"] == "failed"
+    assert document["retained"] is True
+    files = session_files(session_id)
+    for name in ("answer.md", "lock", "meta.json", "prompt.md", "transcript.ndjson"):
+        assert name in files
+    assert json.loads(invoke(cli, "status", session_id, "--json").stdout)["retained"] is True
+
+
+def test_continue_and_log_refuse_a_reduced_session_and_change_nothing(
+    cli: CliRunner, state_root: Path
+) -> None:
+    session_id = run_one_shot(cli, state_root)["session_id"]
+    before = dir_snapshot(session_id)
+
+    attempts = [
+        ("continue", session_id, "more", "--quiet"),
+        ("continue", session_id, "--quiet"),
+        ("log", session_id),
+        ("log", session_id, "--wait-new", "--timeout", "1"),
+        ("log", session_id, "--follow", "--timeout", "1"),
+    ]
+    for args in attempts:
+        result = invoke(cli, *args)
+        assert result.exit_code == vocab.EXIT_AGENT_ERROR, (args, result.stderr)
+        envelope = error_envelope(result)
+        assert envelope["kind"] == "conflict", args
+        assert "one_shot" in envelope["message"], args
+        assert session_id in envelope["message"], args
+        assert envelope["context"]["session_id"] == session_id, args
+
+    assert dir_snapshot(session_id) == before
+
+
+def test_continue_on_a_reduced_session_hints_at_a_new_run(cli: CliRunner, state_root: Path) -> None:
+    session_id = run_one_shot(cli, state_root)["session_id"]
+
+    envelope = error_envelope(invoke(cli, "continue", session_id, "more", "--quiet"))
+
+    assert envelope["hint"] == "Start a new session: acpc run judge ..."
+
+
+def test_steer_on_a_reduced_session_gives_the_finished_session_conflict(
+    cli: CliRunner, state_root: Path
+) -> None:
+    session_id = run_one_shot(cli, state_root)["session_id"]
+    before = dir_snapshot(session_id)
+
+    result = invoke(cli, "steer", session_id, "stop", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    envelope = error_envelope(result)
+    assert envelope["kind"] == "conflict"
+    assert "there is no turn to interrupt" in envelope["message"]
+    assert dir_snapshot(session_id) == before
+
+
+def test_delete_and_prune_work_on_a_reduced_session(cli: CliRunner, state_root: Path) -> None:
+    first = run_one_shot(cli, state_root)["session_id"]
+    second = json.loads(invoke(cli, "run", "judge", "echo:second", "--quiet", "--json").stdout)[
+        "session_id"
+    ]
+
+    deleted = invoke(cli, "delete", first, "--yes", "--json")
+    pruned = invoke(cli, "prune", "--older-than", "0d", "--yes", "--json")
+
+    assert deleted.exit_code == vocab.EXIT_OK, deleted.stderr
+    assert json.loads(deleted.stdout)["removed"] is True
+    assert session_files(first) == [".tombstone", "lock"]
+    assert pruned.exit_code == vocab.EXIT_OK, pruned.stderr
+    assert json.loads(pruned.stdout)["targets"] == [second]
+    assert session_files(second) == [".tombstone", "lock"]
+    assert invoke(cli, "status", second).exit_code == vocab.EXIT_AGENT_ERROR
+
+
+def test_a_later_run_prunes_a_reduced_session_without_choking(
+    cli: CliRunner, state_root: Path
+) -> None:
+    session_id = run_one_shot(cli, state_root)["session_id"]
+    meta_file = paths.session_dir(session_id) / "meta.json"
+    data = json.loads(meta_file.read_text())
+    data["finished_at"] = "2020-01-01T00:00:00Z"
+    meta_file.write_text(json.dumps(data), encoding="utf-8")
+
+    other = invoke(cli, "run", "judge", "echo:next", "--quiet", "--json")
+
+    assert other.exit_code == vocab.EXIT_OK, other.stderr
+    assert session_files(session_id) == [".tombstone", "lock"]
+
+
+def test_resolve_and_agents_get_show_one_shot(cli: CliRunner, state_root: Path) -> None:
+    write_judge_entry(state_root, "one_shot = true\n")
+    write_judge_entry(state_root, name="judge-plain")
+
+    resolved = json.loads(invoke(cli, "resolve", "judge", "--json").stdout)
+    resolved_plain = json.loads(invoke(cli, "resolve", "judge-plain", "--json").stdout)
+    text = invoke(cli, "resolve", "judge").stdout
+    text_plain = invoke(cli, "resolve", "judge-plain").stdout
+    got = json.loads(invoke(cli, "agents", "get", "judge", "--json").stdout)
+    got_plain = json.loads(invoke(cli, "agents", "get", "judge-plain", "--json").stdout)
+    got_text = invoke(cli, "agents", "get", "judge", "--format", "text").stdout
+    got_text_plain = invoke(cli, "agents", "get", "judge-plain", "--format", "text").stdout
+
+    assert resolved["resolved"]["one_shot"]["value"] is True
+    assert resolved["resolved"]["one_shot"]["source"].startswith("entry")
+    assert resolved_plain["resolved"]["one_shot"] == {"value": False, "source": "default"}
+    assert re.search(r"^one-shot +yes\b", text, re.MULTILINE)
+    assert "one-shot" not in text_plain
+    assert got["one_shot"] is True
+    assert got_plain["one_shot"] is False
+    assert re.search(r"^one-shot +yes\b", got_text, re.MULTILINE)
+    assert "one-shot" not in got_text_plain
+
+
+def test_the_session_snapshot_records_one_shot_with_its_source(
+    cli: CliRunner, state_root: Path
+) -> None:
+    session_id = run_one_shot(cli, state_root)["session_id"]
+
+    stored = sessions.read_meta(session_id).resolution["resolved"]["one_shot"]
+
+    assert stored["value"] is True
+    assert stored["source"].startswith("entry")
+
+
+def test_a_timeout_worker_reduces_the_session_on_its_own(cli: CliRunner, state_root: Path) -> None:
+    """`--timeout` hands the turn to a detached worker; it finalizes, so it reduces.
+
+    The client gives up after 0.1 s while the turn needs a second, so only the
+    worker, never the client, can be the process that reduces the session.
+    """
+    write_judge_entry(state_root, "one_shot = true\n")
+
+    result = invoke(cli, "run", "judge", "slow:1 detached", "--timeout", "0.1", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_TIMEOUT
+    session_id = error_envelope(result)["context"]["session_id"]
+    deadline = time.monotonic() + 15
+    while sessions.read_meta(session_id).retained and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert sessions.read_meta(session_id).retained is False
+    assert sessions.read_meta(session_id).state == "succeeded"
+    assert session_files(session_id) == ["answer.md", "lock", "meta.json"]
+    waited = json.loads(invoke(cli, "wait", session_id, "--json").stdout)
+    assert waited["answer"] != ""
+    assert waited["retained"] is False
+
+
+def test_a_reduced_session_result_carries_no_next(cli: CliRunner, state_root: Path) -> None:
+    document = run_one_shot(cli, state_root)
+    waited = json.loads(invoke(cli, "wait", document["session_id"], "--json").stdout)
+    write_judge_entry(state_root, name="judge-plain")
+    plain = json.loads(invoke(cli, "run", "judge-plain", "echo:x", "--quiet", "--json").stdout)
+
+    assert "next" not in document
+    assert "next" not in waited
+    assert plain["next"] == ["acpc", "continue", plain["session_id"]]
+
+
+def test_the_summary_of_a_reduced_session_has_no_next_segment(
+    cli: CliRunner, state_root: Path
+) -> None:
+    write_judge_entry(state_root, "one_shot = true\n")
+    write_judge_entry(state_root, name="judge-plain")
+
+    reduced = invoke(cli, "run", "judge", "echo:once")
+    plain = invoke(cli, "run", "judge-plain", "echo:again")
+
+    def summary(result) -> str:
+        return next(line for line in result.stderr.splitlines() if "exit 0" in line)
+
+    assert reduced.exit_code == vocab.EXIT_OK, reduced.stderr
+    assert "Next:" not in summary(reduced)
+    assert "Next: acpc continue" in summary(plain)
+
+
+def test_a_session_recorded_before_one_shot_existed_is_never_reduced(
+    cli: CliRunner, state_root: Path
+) -> None:
+    write_judge_entry(state_root)
+    session_id = json.loads(invoke(cli, "run", "judge", "echo:a", "--quiet", "--json").stdout)[
+        "session_id"
+    ]
+    meta_file = paths.session_dir(session_id) / "meta.json"
+    data = json.loads(meta_file.read_text())
+    del data["resolution"]["resolved"]["one_shot"]
+    meta_file.write_text(json.dumps(data), encoding="utf-8")
+
+    result = invoke(cli, "continue", session_id, "echo:b", "--quiet", "--json")
+
+    assert json.loads(result.stdout)["retained"] is True
+    assert "prompt.1.md" in session_files(session_id)
+
+
+def test_log_follow_across_the_reduction_ends_with_conflict_not_a_crash(
+    cli: CliRunner, state_root: Path
+) -> None:
+    """The detached worker reduces the session while `log --follow` is reading it."""
+    write_judge_entry(state_root, "one_shot = true\n")
+    started = invoke(cli, "run", "judge", "chunkslow:2", "--timeout", "0.3", "--quiet")
+    assert started.exit_code == vocab.EXIT_TIMEOUT
+    session_id = error_envelope(started)["context"]["session_id"]
+
+    followed = invoke(cli, "log", session_id, "--follow", "--timeout", "20")
+
+    assert followed.exit_code == vocab.EXIT_AGENT_ERROR, followed.stderr
+    assert "Traceback" not in followed.stderr
+    envelope = error_envelope(followed)
+    assert envelope["kind"] == "conflict"
+    assert "one_shot" in envelope["message"]
+    assert envelope["context"]["session_id"] == session_id
+
+
+def test_a_reduced_judge_run_still_names_its_system_prompt_path(
+    cli: CliRunner, state_root: Path
+) -> None:
+    write_judge_entry(state_root, "one_shot = true\n")
+    prompt_file = state_root / "judge-prompt.md"
+    prompt_file.write_text("You are a judge.\n", encoding="utf-8")
+
+    result = invoke(
+        cli,
+        "run",
+        "judge",
+        "echo:verdict",
+        "--system-prompt-file",
+        str(prompt_file),
+        "--quiet",
+        "--json",
+    )
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    run_document = json.loads(result.stdout)
+    session_id = run_document["session_id"]
+    status = json.loads(invoke(cli, "status", session_id, "--json").stdout)
+    waited = json.loads(invoke(cli, "wait", session_id, "--json").stdout)
+
+    assert "system.md" not in session_files(session_id)
+    expected = str(paths.session_dir(session_id) / "system.md")
+    for document in (run_document, status, waited):
+        assert document["paths"]["system"] == expected
+    # A reduced session that never had a system prompt names none.
+    plain = run_one_shot(cli, state_root)
+    assert "system" not in plain["paths"]
+
+
+def test_no_reader_sees_a_succeeded_one_shot_session_that_is_still_whole(
+    cli: CliRunner, state_root: Path
+) -> None:
+    write_judge_entry(state_root, "one_shot = true\n")
+    seen: list[tuple[str, bool]] = []
+    stop = threading.Event()
+
+    def poll() -> None:
+        while not stop.is_set():
+            root = paths.sessions_dir()
+            for meta_file in root.glob("*/meta.json") if root.exists() else ():
+                try:
+                    data = json.loads(meta_file.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                seen.append((data["status"], data.get("retained", True)))
+
+    reader = threading.Thread(target=poll)
+    reader.start()
+    try:
+        for _ in range(8):
+            result = invoke(cli, "run", "judge", "echo:poll", "--quiet", "--json")
+            assert result.exit_code == vocab.EXIT_OK, result.stderr
+    finally:
+        stop.set()
+        reader.join()
+
+    succeeded = [retained for state, retained in seen if state == "succeeded"]
+    assert succeeded, "the reader never saw a finished session"
+    assert not any(succeeded)

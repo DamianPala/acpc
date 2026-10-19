@@ -176,9 +176,10 @@ An eval runner can use one entry as a stateless judge: its own system prompt, no
 extends = "bare"
 permissions = "read"
 tools = []
+one_shot = true
 ```
 
-`acpc run judge --model claude-sonnet-5-5 --effort low --system-prompt-file judge-v2.md --prompt-file case.md --cancel-after 120 --json` answers with the judge prompt in place of Claude Code's own and no tool available; the prompt in force is kept as `system.md` in the session directory, and `system_prompt_file` on the entry pins one prompt for every call instead. Killing the client does not cancel the turn, `--cancel-after` does. The keys need an adapter with a route (`system_prompt_via`, `tools_via` in `agents get`); on one without, the call fails `not_supported` before any session exists, and acpc never falls back to the vendor's prompt.
+`acpc run judge --model claude-sonnet-5-5 --effort low --system-prompt-file judge-v2.md --prompt-file case.md --cancel-after 120 --json` answers with the judge prompt in place of Claude Code's own and no tool available; the prompt in force is kept as `system.md` in the session directory, and `system_prompt_file` on the entry pins one prompt for every call instead. Killing the client does not cancel the turn, `--cancel-after` does. The keys need an adapter with a route (`system_prompt_via`, `tools_via` in `agents get`); on one without, the call fails `not_supported` before any session exists, and acpc never falls back to the vendor's prompt. `one_shot = true` consumes each session once: after a successful answer acpc keeps only `meta.json` and `answer.md`, the vendor keeps no transcript and loads no settings of its own, and `continue` or `log` on that session refuse with `conflict`; a failed call keeps its full session for diagnosis.
 
 ## Teaching agents about acpc
 

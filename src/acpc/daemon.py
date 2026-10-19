@@ -62,6 +62,10 @@ STEER_REQUEST_TIMEOUT = 10.0
 # can lower this bound; a hung adapter must never hold a session in `starting`.
 HOST_START_TIMEOUT = 60.0
 
+# How long the adapter may take to close a consumed session. Past it the daemon
+# moves on: the mapping is already dropped, so nothing waits on the adapter.
+CLOSE_SESSION_TIMEOUT = 5.0
+
 # Frames name their operation under this key.
 OP = "op"
 
@@ -421,6 +425,21 @@ class AdapterHost:
         self.steering_supported = False
         self.adapter_sessions.clear()
 
+    async def close_adapter_session(self, adapter_session_id: str) -> None:
+        """Let the adapter forget a session nothing can continue, when it can be told.
+
+        An adapter that does not advertise `session/close` keeps the session
+        until it exits; the daemon has already dropped its own mapping.
+        """
+        self.mux.release(adapter_session_id)
+        if self._conn is None or not runner.has_close_session_capability(self.agent_capabilities):
+            return
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(
+                self._conn.close_session(session_id=adapter_session_id),
+                timeout=CLOSE_SESSION_TIMEOUT,
+            )
+
     def start_restore(self, adapter_session_id: str, coroutine: Any) -> asyncio.Task[Any]:
         """Track one uncancellable adapter restore until its response settles."""
         previous = self._restore_tasks.get(adapter_session_id)
@@ -468,7 +487,7 @@ def _endpoint_identity(path: Path | None) -> tuple[int, int] | None:
 
 
 def _stored_call(payload: Mapping[str, Any]) -> CallResolution:
-    """Resolve the payload's entry with the session's own prompt, tools and routes.
+    """Resolve the payload's entry with the session's own prompt, tools, routes and `one_shot`.
 
     They come from the payload, so an entry edited since the session began
     cannot change a running session's facts, or refuse it.
@@ -483,11 +502,14 @@ def _stored_call(payload: Mapping[str, Any]) -> CallResolution:
             else runner.system_prompt_from_payload(raw_prompt, context=context)
         )
         tools = runner.tools_from_payload(payload.get("tools"), context=context)
+        one_shot = runner.one_shot_from_payload(payload.get("one_shot"), context=context)
     except runner.RunnerError as error:
         raise DaemonError(str(error)) from None
     entry = AgentRegistry().resolve(payload["entry"])
     entry = entry.without_session_keys(system_prompt_via=prompt_via, tools_via=tools_via)
-    return replace(entry.resolve_call(), system_prompt=system_prompt, tools=tools)
+    return replace(
+        entry.resolve_call(), system_prompt=system_prompt, tools=tools, one_shot=one_shot
+    )
 
 
 class Daemon:
@@ -1324,6 +1346,7 @@ class Daemon:
                         self._request_cwd(request),
                         session_id,
                         abandon_event=abandon_event,
+                        adapter_meta=runner.adapter_session_meta(session_id, request.resolution),
                     ),
                 )
                 resume_status = await asyncio.shield(restore_task)
@@ -1390,6 +1413,7 @@ class Daemon:
             events = transcript.Transcript(sessions.transcript_path(session_id))
             outcome = runner.TurnOutcome(state="failed", stop_reason="error", answer="")
             error: BaseException | None = None
+            consumed_adapter_session: str | None = None
             # Where this turn's own output starts in the shared per-target log:
             # the file is append-only across every session the target ever ran,
             # so without this mark a failure would quote a stranger's stderr.
@@ -1467,13 +1491,31 @@ class Daemon:
                     adapter_log_from=log_from,
                     expected_turn=outcome.turn_token,
                 )
+                consumed_adapter_session = self._retire_if_reduced(session_id)
             finally:
                 # Only a turn that could not be *started* travels back as an
                 # error: the client raises on it. A turn that ran and failed is
                 # already finalized on disk, and the client mirrors that result
                 # so the caller still gets the answer, the summary and --json.
                 self._finish(session_id, outcome, error=error)
+                if consumed_adapter_session is not None:
+                    await self.host.close_adapter_session(consumed_adapter_session)
             return outcome
+
+    def _retire_if_reduced(self, session_id: str) -> str | None:
+        """Stop serving a session the finalization just reduced (a one-shot success).
+
+        Nothing can continue it, so the warm mapping goes. A late adapter
+        update finds no client: `_drive` released the turn's routing before
+        the finalization ran. Returns the adapter session to close, if any.
+        """
+        try:
+            reduced = not sessions.read_meta(session_id).retained
+        except sessions.SessionError:
+            return None
+        if not reduced:
+            return None
+        return self.host.adapter_sessions.pop(session_id, None)
 
     async def _drive(
         self,

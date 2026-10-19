@@ -74,6 +74,10 @@ per steering request (plus one ``idle:`` line naming the ``idleBehavior`` it
 asked for) and per ``session/cancel`` — the evidence a test uses to see what
 acpc asked for and whether it cancelled the turn the adapter started on its own.
 
+``ACPC_MOCK_LATE_UPDATE=1`` sends one ``usage_update`` 0.2 s after every prompt
+response; ``ACPC_MOCK_ADVERTISE_CLOSE=1`` advertises ``session/close`` and
+``ACPC_MOCK_SESSION_METHOD_FILE`` then receives a ``close:<session>`` line.
+
 ``ACPC_MOCK_IGNORE_CANCEL=1`` drops every ``session/cancel`` notification on
 the floor: the running scenario's own timer is the only thing that ends the
 turn, which is what a cancel-deadline test needs.
@@ -158,6 +162,7 @@ from acp.schema import (
     ResourceContentBlock,
     ResumeSessionResponse,
     SessionCapabilities,
+    SessionCloseCapabilities,
     SessionConfigOptionBoolean,
     SessionConfigOptionSelect,
     SessionConfigSelectOption,
@@ -373,6 +378,7 @@ class MockAgent(Agent):
         # Sessions with a prompt in flight, and the corrections each of those
         # turns has accepted but not yet acknowledged in its stream.
         self._prompt_active: set[str] = set()
+        self._late_updates: list[asyncio.Task[None]] = []
         self._steered: dict[str, list[str]] = {}
         self._limit_prompt_counts: dict[str, int] = {}
 
@@ -497,6 +503,9 @@ class MockAgent(Agent):
         if os.environ.get("ACPC_MOCK_ADVERTISE_RESUME") == "1":
             session_capabilities = session_capabilities or SessionCapabilities()
             session_capabilities.resume = SessionResumeCapabilities()
+        if os.environ.get("ACPC_MOCK_ADVERTISE_CLOSE") == "1":
+            session_capabilities = session_capabilities or SessionCapabilities()
+            session_capabilities.close = SessionCloseCapabilities()
         capabilities = AgentCapabilities(
             load_session=True, session_capabilities=session_capabilities
         )
@@ -730,9 +739,18 @@ class MockAgent(Agent):
         # anywhere in here is a correction to *this* turn.
         self._prompt_active.add(session_id)
         try:
-            return await self._run_scenario(session_id, prompt_text, history, cancel_event)
+            response = await self._run_scenario(session_id, prompt_text, history, cancel_event)
         finally:
             self._prompt_active.discard(session_id)
+        if os.environ.get("ACPC_MOCK_LATE_UPDATE") == "1":
+            # An adapter that reports usage after its prompt response, which
+            # a session already finalized by then must not turn into a write.
+            self._late_updates.append(asyncio.create_task(self._send_late_usage(session_id)))
+        return response
+
+    async def _send_late_usage(self, session_id: str) -> None:
+        await asyncio.sleep(0.2)
+        await self._send_usage(session_id, used=7)
 
     async def _run_scenario(
         self,
@@ -1504,6 +1522,7 @@ class MockAgent(Agent):
         self._cancel_events.setdefault(session_id, asyncio.Event()).set()
 
     async def close_session(self, session_id: str, **kwargs: Any) -> CloseSessionResponse:
+        self._record_session_method(f"close:{session_id}")
         if session_id not in self._sessions:
             raise ValueError(f"unknown session id: {session_id}")
         self._session_history[session_id] = list(self._sessions[session_id])
@@ -1734,9 +1753,11 @@ async def main() -> None:
     # traceback) to stderr, racing the JSON-RPC error into the daemon log; tests
     # that assert on the log tail need stderr to hold only what a scenario prints.
     logging.disable(logging.ERROR)
-    await run_agent(
-        MockAgent(), use_unstable_protocol=os.environ.get("ACPC_MOCK_ADVERTISE_RESUME") == "1"
+    unstable = "1" in (
+        os.environ.get("ACPC_MOCK_ADVERTISE_RESUME"),
+        os.environ.get("ACPC_MOCK_ADVERTISE_CLOSE"),
     )
+    await run_agent(MockAgent(), use_unstable_protocol=unstable)
 
 
 if __name__ == "__main__":

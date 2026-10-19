@@ -9,6 +9,7 @@ boundaries, so mocking them out would test nothing.
 import asyncio
 import contextlib
 import json
+import os
 import sys
 import threading
 import time
@@ -2289,3 +2290,180 @@ def test_a_daemon_cold_resume_sends_the_stored_prompt_and_tools_again(
     assert [e["params"]["meta"] for e in events if e["method"] == "session/new"] == [expected]
     assert [e["params"]["meta"] for e in events if e["method"] == "session/load"] == [expected]
     asyncio.run(_stop_judge_target(resolution))
+
+
+# --- one_shot through the daemon ----------------------------------------------
+
+
+def test_the_dispatch_payload_carries_one_shot_and_the_daemon_keeps_the_session_fact(
+    state_root: Path,
+) -> None:
+    write_judge_entry(state_root, "one_shot = true\n")
+    on = runner.daemon_payload(runner.TurnRequest(resolution=judge_resolution(), prompt="x"))
+    write_judge_entry(state_root)
+    off = runner.daemon_payload(runner.TurnRequest(resolution=judge_resolution(), prompt="x"))
+
+    # The live entry says the opposite of each payload by now.
+    rebuilt_on = daemon.Daemon("judge")._rebuild_request(on)
+    write_judge_entry(state_root, "one_shot = true\n")
+    rebuilt_off = daemon.Daemon("judge")._rebuild_request(off)
+
+    assert (on["one_shot"], off["one_shot"]) == (True, False)
+    assert rebuilt_on.resolution.one_shot is True
+    assert rebuilt_off.resolution.one_shot is False
+
+
+@pytest.mark.parametrize("value", ["yes", 1, [], {"value": True}])
+def test_a_malformed_one_shot_payload_is_rejected(state_root: Path, value: object) -> None:
+    write_judge_entry(state_root)
+    payload = runner.daemon_payload(runner.TurnRequest(resolution=judge_resolution(), prompt="x"))
+    payload["one_shot"] = value
+
+    with pytest.raises(daemon.DaemonError):
+        daemon.Daemon("judge")._rebuild_request(payload)
+
+
+def test_a_daemon_reduces_a_one_shot_session_and_wait_returns_the_same_answer_twice(
+    state_root: Path, live_daemon: None
+) -> None:
+    write_judge_entry(state_root, "one_shot = true\n")
+    cli = CliRunner()
+
+    started = cli.invoke(
+        main, ["run", "judge", "echo:daemon one shot", "--bg", "--json"], catch_exceptions=False
+    )
+    assert started.exit_code == vocab.EXIT_OK, started.stderr
+    session_id = json.loads(started.stdout)["session_id"]
+    first = cli.invoke(main, ["wait", session_id, "--json"], catch_exceptions=False)
+    second = cli.invoke(main, ["wait", session_id, "--json"], catch_exceptions=False)
+
+    meta = sessions.read_meta(session_id)
+    # The turn ran in the daemon, so the daemon's `_finalize` did the reducing.
+    assert meta.pid is not None and meta.pid != os.getpid()
+    assert meta.retained is False
+    assert sorted(item.name for item in sessions.session_dir(session_id).iterdir()) == [
+        "answer.md",
+        "lock",
+        "meta.json",
+    ]
+    for result in (first, second):
+        assert result.exit_code == vocab.EXIT_OK, result.stderr
+        document = json.loads(result.stdout)
+        assert document["answer"] == "daemon one shot"
+        assert document["retained"] is False
+    assert json.loads(first.stdout) == json.loads(second.stdout)
+    status = json.loads(cli.invoke(main, ["status", session_id, "--json"]).stdout)
+    assert status["retained"] is False and status["status"] == "succeeded"
+
+
+def test_a_late_adapter_update_never_writes_into_a_reduced_session(
+    state_root: Path, live_daemon: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ACPC_MOCK_LATE_UPDATE", "1")
+    write_judge_entry(state_root, "one_shot = true\n")
+    cli = CliRunner()
+
+    started = cli.invoke(
+        main, ["run", "judge", "echo:late update", "--bg", "--json"], catch_exceptions=False
+    )
+    session_id = json.loads(started.stdout)["session_id"]
+    waited = cli.invoke(main, ["wait", session_id, "--json"], catch_exceptions=False)
+    # The mock sends its usage update 0,2 s after the prompt response.
+    time.sleep(0.5)
+
+    assert waited.exit_code == vocab.EXIT_OK, waited.stderr
+    assert sorted(item.name for item in sessions.session_dir(session_id).iterdir()) == [
+        "answer.md",
+        "lock",
+        "meta.json",
+    ]
+    status = cli.invoke(main, ["status", session_id, "--json"], catch_exceptions=False)
+    assert status.exit_code == vocab.EXIT_OK, status.stderr
+    assert json.loads(status.stdout)["retained"] is False
+
+
+def test_the_daemon_closes_the_adapter_session_of_a_reduced_one_shot_session(
+    state_root: Path, live_daemon: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    method_file = tmp_path / "session-method"
+    monkeypatch.setenv("ACPC_MOCK_ADVERTISE_CLOSE", "1")
+    monkeypatch.setenv("ACPC_MOCK_SESSION_METHOD_FILE", str(method_file))
+    write_judge_entry(state_root, "one_shot = true\n")
+    cli = CliRunner()
+
+    started = cli.invoke(
+        main, ["run", "judge", "echo:close me", "--bg", "--json"], catch_exceptions=False
+    )
+    session_id = json.loads(started.stdout)["session_id"]
+    cli.invoke(main, ["wait", session_id, "--json"], catch_exceptions=False)
+    adapter_session_id = sessions.read_meta(session_id).adapter_session_id
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and not method_file.exists():
+        time.sleep(0.05)
+
+    assert method_file.read_text(encoding="utf-8") == f"close:{adapter_session_id}\n"
+
+
+def test_a_session_that_is_not_one_shot_keeps_its_adapter_session_open(
+    state_root: Path, live_daemon: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    method_file = tmp_path / "session-method"
+    monkeypatch.setenv("ACPC_MOCK_ADVERTISE_CLOSE", "1")
+    monkeypatch.setenv("ACPC_MOCK_SESSION_METHOD_FILE", str(method_file))
+    write_judge_entry(state_root)
+    cli = CliRunner()
+
+    started = cli.invoke(
+        main, ["run", "judge", "echo:stay", "--bg", "--json"], catch_exceptions=False
+    )
+    session_id = json.loads(started.stdout)["session_id"]
+    cli.invoke(main, ["wait", session_id, "--json"], catch_exceptions=False)
+    time.sleep(0.5)
+
+    assert not method_file.exists()
+    assert sessions.read_meta(session_id).retained is True
+
+
+def test_a_daemon_continue_loads_the_adapter_session_with_the_stored_meta(
+    state_root: Path, live_daemon: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wire_file = tmp_path / "wire.jsonl"
+    monkeypatch.setenv("ACPC_MOCK_WIRE_FILE", str(wire_file))
+    write_judge_entry(state_root, "one_shot = true\ntools = []\n")
+    cli = CliRunner()
+    failed = cli.invoke(main, ["run", "judge", "auth:rejected", "--quiet", "--json"])
+    session_id = json.loads(failed.stdout)["session_id"]
+    # A cold daemon holds no warm mapping, so `continue` loads the adapter session.
+    asyncio.run(_stop_judge_target(judge_resolution()))
+
+    result = cli.invoke(main, ["continue", session_id, "echo:again", "--quiet", "--json"])
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    assert sessions.read_meta(session_id).pid != os.getpid()
+    events = [json.loads(line) for line in wire_file.read_text(encoding="utf-8").splitlines()]
+    options = {"tools": [], "persistSession": False, "settingSources": [], "strictMcpConfig": True}
+    assert [e["params"]["meta"] for e in events if e["method"] == "session/load"] == [
+        {"claudeCode": {"options": options}}
+    ]
+
+
+def test_log_follow_across_the_daemon_reduction_ends_with_conflict(
+    state_root: Path, live_daemon: None
+) -> None:
+    write_judge_entry(state_root, "one_shot = true\n")
+    cli = CliRunner()
+
+    started = cli.invoke(
+        main, ["run", "judge", "chunkslow:2", "--bg", "--json"], catch_exceptions=False
+    )
+    session_id = json.loads(started.stdout)["session_id"]
+    followed = cli.invoke(
+        main, ["log", session_id, "--follow", "--timeout", "20"], catch_exceptions=False
+    )
+
+    assert followed.exit_code == vocab.EXIT_AGENT_ERROR, followed.stderr
+    assert "Traceback" not in followed.stderr
+    lines = [line for line in followed.stderr.splitlines() if line.strip()]
+    error = json.loads(lines[-1])["error"]
+    assert error["kind"] == "conflict"
+    assert "one_shot" in error["message"]

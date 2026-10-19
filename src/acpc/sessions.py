@@ -209,6 +209,9 @@ class SessionMeta:
     # turn or is waited out is a config-time question (`limit_wait_max`), not
     # session state.
     limit: dict[str, Any] | None = None
+    # `false` once a one-shot session was reduced to `meta.json` and `answer.md`;
+    # a `meta.json` written before the field existed reads as `true`.
+    retained: bool = True
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -287,10 +290,13 @@ def system_path(session_id: str) -> Path:
     return session_dir(session_id) / SYSTEM_NAME
 
 
-def session_paths(session_id: str) -> dict[str, str]:
+def session_paths(session_id: str, *, meta: SessionMeta | None = None) -> dict[str, str]:
     """The advertised paths, as the `--json` envelope's `paths` object.
 
-    `system` appears only when the session has a system prompt file.
+    `system` appears when the session has a system prompt file. A reduced
+    session no longer has the file, but `paths` still names what was removed,
+    so a caller that holds the meta passes it and `system` is named whenever
+    the session's own snapshot recorded a system prompt.
     """
     result = {
         "dir": str(session_dir(session_id)),
@@ -298,9 +304,16 @@ def session_paths(session_id: str) -> dict[str, str]:
         "transcript": str(transcript_path(session_id)),
         "answer": str(answer_path(session_id)),
     }
-    if system_path(session_id).is_file():
+    if system_path(session_id).is_file() or (
+        meta is not None and not meta.retained and _recorded_system_prompt(meta)
+    ):
         result["system"] = str(system_path(session_id))
     return result
+
+
+def _recorded_system_prompt(meta: SessionMeta) -> bool:
+    resolved = meta.resolution.get("resolved")
+    return isinstance(resolved, Mapping) and "system_prompt" in resolved
 
 
 def turn_path(session_id: str, stem: str, turn: int, *, ext: str = "md") -> Path:
@@ -503,6 +516,14 @@ def _coerce_steer_mode(value: Any, key: str, path: Path) -> str | None:
         if not isinstance(mode, str) or not mode:
             raise CorruptSessionError(f"{path}: {key} has an invalid mode")
     return vocab.STEER_IN_PLACE if vocab.STEER_IN_PLACE in value else vocab.STEER_CANCEL_THEN_START
+
+
+def _coerce_retained(value: Any, path: Path) -> bool:
+    if value is None:
+        return True
+    if not isinstance(value, bool):
+        raise CorruptSessionError(f"{path}: key 'retained' must be a boolean")
+    return value
 
 
 def _coerce_limit(value: Any, key: str, path: Path) -> dict[str, Any] | None:
@@ -717,6 +738,7 @@ def meta_from_dict(data: Mapping[str, Any], *, path: Path) -> SessionMeta:
             path,
         ),
         limit=_coerce_limit(known.get("limit"), "limit", path),
+        retained=_coerce_retained(known.get("retained"), path),
         extra=extra,
     )
 
@@ -926,9 +948,10 @@ def _is_tombstone(directory: Path) -> bool:
     return (directory / TOMBSTONE_NAME).is_file()
 
 
-def _clear_directory(directory: Path) -> None:
+def _clear_directory(directory: Path, *, keep: frozenset[str] = frozenset()) -> None:
+    """Remove every child except the lock and the names in `keep`."""
     for child in sorted(directory.iterdir(), reverse=True):
-        if child.name == LOCK_NAME:
+        if child.name == LOCK_NAME or child.name in keep:
             continue
         if child.is_dir() and not child.is_symlink():
             _remove_tree(child)
@@ -1089,6 +1112,7 @@ def finalize_turn(
     clock: Clock | None = None,
     error_event: Mapping[str, Any] | None = None,
     delivery_record_incomplete: bool = False,
+    reduce: bool = False,
     **changes: Any,
 ) -> SessionMeta | None:
     """Publish a turn answer and terminal state as one token-checked claim.
@@ -1096,6 +1120,12 @@ def finalize_turn(
     ``continue`` can rotate a finished turn immediately after a stop. Keeping
     the answer write and terminal transition under this lock prevents a stale
     owner from writing its answer into the replacement turn.
+
+    ``reduce`` is a one-shot session's consume-once rule (SPEC.md *Agent
+    variants*): when the turn succeeds, the final `meta.json` is published
+    already carrying `retained: false` and the files go before the lock is
+    released, so no reader sees a succeeded one-shot session that is still
+    whole. A turn that did not succeed keeps the whole session for diagnosis.
     """
     resolved_clock = _resolve_clock(clock)
     to_state = vocab.normalize_session_state(to_state)
@@ -1134,8 +1164,21 @@ def finalize_turn(
             if meta.finished_at is None:
                 meta.finished_at = now
             _close_limit(meta)
+        reduced = reduce and to_state == "succeeded"
+        if reduced:
+            meta.retained = False
         write_meta(meta)
+        if reduced:
+            # The reduction is already published; a failed removal must not
+            # fail the finalization that wrote the answer.
+            with contextlib.suppress(OSError):
+                _drop_consumed_files(session_id)
         return meta
+
+
+def _drop_consumed_files(session_id: str) -> None:
+    """Remove everything a reduced session no longer keeps; the lock is held."""
+    _clear_directory(session_dir(session_id), keep=frozenset({META_NAME, ANSWER_NAME}))
 
 
 def mark_running(

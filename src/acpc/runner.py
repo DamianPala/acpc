@@ -217,6 +217,12 @@ def has_resume_session_capability(capabilities: Any) -> bool:
     return getattr(session_capabilities, "resume", None) is not None
 
 
+def has_close_session_capability(capabilities: Any) -> bool:
+    """Return whether initialize advertised ACP ``session/close``."""
+    session_capabilities = getattr(capabilities, "session_capabilities", None)
+    return getattr(session_capabilities, "close", None) is not None
+
+
 def has_list_session_capability(capabilities: Any) -> bool:
     """Return whether initialize advertised ACP ``session/list``."""
     session_capabilities = getattr(capabilities, "session_capabilities", None)
@@ -318,12 +324,15 @@ def _stored_prompt_items(session_id: str) -> list[tuple[Path, str]]:
 
 
 def adapter_session_meta(session_id: str, resolution: CallResolution) -> dict[str, Any]:
-    """The `_meta` keys a session's system prompt and tool list travel in.
+    """The `_meta` keys a session's system prompt, tool list and sterility travel in.
 
-    Empty when the session has neither, so a plain session stays byte-identical
-    on the wire. The prompt text is read from the session's `system.md` here,
-    at the call that sends it, so no payload or snapshot carries it. Only the
-    `acp_meta` routes are served by this function; the adapter facts decide.
+    Empty when the session has none of them, so a plain session stays
+    byte-identical on the wire. The prompt text is read from the session's
+    `system.md` here, at the call that sends it, so no payload or snapshot
+    carries it. Only the `acp_meta` routes are served by this function; the
+    adapter facts decide. A one-shot session adds the three options that keep
+    the vendor from storing a transcript or loading settings of its own, in
+    the same `claudeCode.options` object as the tool list.
     """
     meta: dict[str, Any] = {}
     if resolution.system_prompt is not None and resolution.entry.system_prompt_via == "acp_meta":
@@ -335,8 +344,14 @@ def adapter_session_meta(session_id: str, resolution: CallResolution) -> dict[st
                 f"session {session_id}: its system prompt {path} is unreadable ({error}); "
                 "acpc never falls back to the vendor's own prompt"
             ) from None
-    if resolution.tools is not None and resolution.entry.tools_via == "acp_meta":
-        meta["claudeCode"] = {"options": {"tools": list(resolution.tools)}}
+    if resolution.entry.tools_via == "acp_meta":
+        options: dict[str, Any] = {}
+        if resolution.tools is not None:
+            options["tools"] = list(resolution.tools)
+        if resolution.one_shot:
+            options.update(persistSession=False, settingSources=[], strictMcpConfig=True)
+        if options:
+            meta["claudeCode"] = {"options": options}
     return meta
 
 
@@ -1460,6 +1475,7 @@ def daemon_payload(request: TurnRequest) -> dict[str, Any]:
         "tools": list(resolution.tools) if resolution.tools is not None else None,
         "system_prompt_via": resolution.entry.system_prompt_via,
         "tools_via": resolution.entry.tools_via,
+        "one_shot": resolution.one_shot,
     }
 
 
@@ -2052,6 +2068,7 @@ def _finalize(
                 else None
             ),
             delivery_record_incomplete=outcome.delivery_record_incomplete,
+            reduce=_reduces_on_success(current),
             adapter_session_id=(
                 outcome.adapter_session_id
                 if outcome.adapter_session_id is not None
@@ -2070,9 +2087,29 @@ def _finalize(
     if finalized is None:
         return
 
+    _after_finalize(finalized, outcome)
+
+
+def _after_finalize(finalized: sessions.SessionMeta, outcome: TurnOutcome) -> None:
+    """What follows a written answer and final `meta.json`; it may not fail finalization."""
     if outcome.advertised:
         with contextlib.suppress(Exception):
-            cache.refresh_advertised(_agent_of(session_id), outcome.advertised)
+            cache.refresh_advertised(_agent_of(finalized.session_id), outcome.advertised)
+
+
+def _reduces_on_success(current: sessions.SessionMeta | None) -> bool:
+    """Whether a succeeding turn of this session consumes it (a one-shot session).
+
+    The session's own snapshot, not the live entry, decides, and a turn that
+    does not succeed keeps its full session for diagnosis whatever this says.
+    A snapshot that cannot be read leaves the session whole.
+    """
+    if current is None:
+        return False
+    try:
+        return stored_one_shot(current)
+    except RunnerError:
+        return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -2297,6 +2334,10 @@ def resolution_payload(
             "value": list(resolution.tools),
             "source": _source_label(provenance.get("tools")),
         }
+    resolved["one_shot"] = {
+        "value": resolution.one_shot,
+        "source": _source_label(provenance.get("one_shot")),
+    }
     try:
         spawn_command = " ".join(resolution.command)
     except RegistryError:
@@ -2364,6 +2405,15 @@ def tools_from_payload(raw: object, *, context: str) -> tuple[str, ...] | None:
     if not isinstance(raw, list) or any(not isinstance(item, str) for item in raw):
         raise RunnerError(f"{context} has an invalid stored tool list")
     return tuple(raw)
+
+
+def one_shot_from_payload(raw: object, *, context: str) -> bool:
+    """Rebuild the stored `one_shot` fact; absent means `false`, anything but a boolean is refused."""
+    if raw is None:
+        return False
+    if not isinstance(raw, bool):
+        raise RunnerError(f"{context} has an invalid stored one_shot")
+    return raw
 
 
 def routes_from_payload(raw: Mapping[str, Any], *, context: str) -> tuple[str, str]:
@@ -2501,6 +2551,7 @@ def resolution_from_session(meta: sessions.SessionMeta) -> CallResolution:
     context = f"session {meta.session_id}"
     system_prompt_via, tools_via = routes_from_payload(adapter, context=context)
     system_prompt, tools = _stored_prompt_and_tools(meta)
+    one_shot = stored_one_shot(meta)
     env_passthrough = stored_strings("env_passthrough", payload)
     stored_mode, mode_spec, modes = _stored_modes(meta)
 
@@ -2536,6 +2587,7 @@ def resolution_from_session(meta: sessions.SessionMeta) -> CallResolution:
         tools=None,
         system_prompt_via=system_prompt_via,
         tools_via=tools_via,
+        one_shot=one_shot,
     )
     return CallResolution(
         entry=entry,
@@ -2550,6 +2602,7 @@ def resolution_from_session(meta: sessions.SessionMeta) -> CallResolution:
         provenance={},
         system_prompt=system_prompt,
         tools=tools,
+        one_shot=one_shot,
     )
 
 
@@ -2599,6 +2652,21 @@ def _stored_prompt_and_tools(
     if not isinstance(raw_tools, Mapping) or "value" not in raw_tools:
         raise RunnerError(f"{context} has an invalid stored tool list")
     return prompt, tools_from_payload(raw_tools["value"], context=context)
+
+
+def stored_one_shot(meta: sessions.SessionMeta) -> bool:
+    """Whether the session's own snapshot says it is consumed once.
+
+    The snapshot, not the live entry, decides: an entry edited after the
+    session started neither turns the reduction on nor off for it.
+    """
+    resolved = meta.resolution.get("resolved")
+    raw = resolved.get("one_shot") if isinstance(resolved, Mapping) else None
+    if raw is None:
+        return False
+    if not isinstance(raw, Mapping):
+        raise RunnerError(f"session {meta.session_id} has an invalid stored one_shot")
+    return one_shot_from_payload(raw.get("value"), context=f"session {meta.session_id}")
 
 
 def continue_request(
