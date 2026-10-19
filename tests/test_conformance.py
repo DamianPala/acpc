@@ -522,7 +522,7 @@ EXPECTED_OUTPUT_ORACLES: dict[str, dict[str, tuple[frozenset[str], frozenset[str
     "agents check": {
         "output": (frozenset({"items", "has_more"}), frozenset({"items", "has_more"})),
         "output.items[]": (
-            frozenset({"agent", "ok", "models", "error"}),
+            frozenset({"agent", "ok", "models", "efforts", "error"}),
             frozenset({"agent", "ok"}),
         ),
     },
@@ -588,8 +588,8 @@ EXPECTED_OUTPUT_ORACLES: dict[str, dict[str, tuple[frozenset[str], frozenset[str
             frozenset({"value", "source"}),
         ),
         "output.advertised": (
-            frozenset({"modes", "mode_specs", "models", "commands"}),
-            frozenset({"modes", "mode_specs", "models", "commands"}),
+            frozenset({"modes", "mode_specs", "models", "commands", "efforts"}),
+            frozenset({"modes", "mode_specs", "models", "commands", "efforts"}),
         ),
         "output.commands[]": (
             frozenset({"name", "description"}),
@@ -944,6 +944,7 @@ EXPECTED_OUTPUT_ORACLES["wait"] = _session_output_oracle(
 )
 
 EXPECTED_EMPTY_OUTPUT_OBJECTS = {
+    "agents get.output.advertised.efforts": "per-model adapter observations are free-form",
     "agents get.output.env": "free-form environment values are intentionally untyped",
     "agents get.output.advertised.mode_specs": "adapter mode reports are vendor-defined",
     "agents get.output.advertised.commands[]": "adapter command details are vendor-defined",
@@ -1231,6 +1232,8 @@ def _assert_schema_value(schema: dict[str, Any], value: Any, path: str) -> None:
         return
     if "object" in allowed:
         assert isinstance(value, dict), path
+        if schema == {"type": "object"}:
+            return
         properties = schema.get("properties", {})
         assert set(schema.get("required", [])) <= set(value), path
         assert set(value) <= set(properties), (path, set(value) - set(properties))
@@ -1623,7 +1626,7 @@ def test_D6a_index_D6b_flat_entries_and_D7_detail_shape(cli: CliRunner) -> None:
 
 def _check_schema_shape(schema: dict[str, Any], path: str) -> None:
     assert set(schema) <= SCHEMA_KEYS, path
-    if not schema:
+    if not schema or schema == {"type": "object"}:
         return
     assert "type" in schema, path
     types = schema["type"] if isinstance(schema["type"], list) else [schema["type"]]
@@ -1668,7 +1671,7 @@ def _schema_nodes(schema: dict[str, Any], path: str = "output") -> dict[str, dic
 
 def _empty_schema_paths(schema: dict[str, Any], path: str = "output") -> set[str]:
     paths: set[str] = set()
-    if not schema:
+    if not schema or schema == {"type": "object"}:
         paths.add(path)
         return paths
     types = schema.get("type", [])

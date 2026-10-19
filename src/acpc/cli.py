@@ -2001,7 +2001,7 @@ def _mode_display(name: str, entry: ResolvedEntry) -> str:
 
 def _advertised_payload(record: cache.CachedAdvertised | None) -> dict[str, Any]:
     if record is None:
-        return {"modes": [], "models": [], "commands": []}
+        return {"modes": [], "models": [], "commands": [], "efforts": {}}
     return record.advertised
 
 
@@ -2030,6 +2030,12 @@ def _render_advertised_detail(
     # from, and unlike models/commands there is no fuller view behind it.
     visible_modes = [_mode_display(mode, entry) for mode in modes]
     visible_models = models[:3] + (["…"] if len(models) > 3 else [])
+    efforts = advertised.get("efforts", {})
+    visible_efforts = [
+        f"{key} {' · '.join(row['levels']) or 'none'}" for key, row in list(efforts.items())[:3]
+    ]
+    if len(efforts) > 3:
+        visible_efforts.append("…")
     visible_commands = [_command_name(item) for item in commands[:3]]
     if len(commands) > 3:
         visible_commands.append("…")
@@ -2037,6 +2043,7 @@ def _render_advertised_detail(
         f"modes        {len(modes)} · {' · '.join(visible_modes) if visible_modes else '·'}",
         f"models       {len(models)} · {' · '.join(visible_models) if visible_models else '·'}",
         f"commands     {len(commands)} · {' · '.join(visible_commands) if visible_commands else '·'}",
+        f"efforts      {len(efforts)} · {' · '.join(visible_efforts) or '·'}",
         _cache_footer(record),
     ]
     payload = {
@@ -2057,6 +2064,7 @@ def _render_advertised_detail(
             },
             "models": models,
             "commands": [dict(item) for item in commands],
+            "efforts": efforts,
         }
     }
     return "\n".join(lines) + "\n", payload
@@ -2197,6 +2205,10 @@ def _render_models(
     )
     models = [str(item) for item in advertised.get("models", [])]
     lines.append("models    " + ("\n          ".join(models) if models else "·"))
+    for key, row in advertised.get("efforts", {}).items():
+        levels = " · ".join(row["levels"]) or "none"
+        age = cache.cache_age(row["observed_at"])
+        lines.append(f"  {key}  {levels}  current {row['current'] or '·'}  observed {age}")
     lines.append(_cache_footer(record))
     return "\n".join(lines) + "\n", {
         "agent": entry.entry,
@@ -2447,7 +2459,12 @@ def _check_one(entry: ResolvedEntry, timeout: float) -> dict[str, Any]:
         advertised = runner.run_with_sigint_deferred(
             lambda: asyncio.wait_for(cache.probe_advertised(resolution), timeout=timeout)
         )
-        return {"agent": entry.entry, "ok": True, "models": len(advertised["models"])}
+        return {
+            "agent": entry.entry,
+            "ok": True,
+            "models": len(advertised["models"]),
+            "efforts": len(advertised.get("efforts", {})),
+        }
     except (cache.ProbeError, TimeoutError) as error:
         message = "check timed out" if isinstance(error, TimeoutError) else str(error)
         return {"agent": entry.entry, "ok": False, "error": message}

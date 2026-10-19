@@ -409,3 +409,92 @@ def test_write_file_goes_through_permission_and_client_fs(tmp_path: Path) -> Non
             assert written_path in client.written_files
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("knobs", [False, True])
+def test_model_dependent_config_responses_and_restore_payloads(tmp_path: Path, knobs: bool) -> None:
+    async def scenario() -> None:
+        updates: list[Any] = []
+
+        class ConfigClient(DriverClient):
+            async def session_update(self, session_id: str, update: Any, **kwargs: Any) -> None:
+                updates.append(update)
+                await super().session_update(session_id, update, **kwargs)
+
+        client = ConfigClient()
+        env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "ACPC_MOCK_ADVERTISE_RESUME": "1"}
+        if knobs:
+            env.update(
+                {
+                    "ACPC_MOCK_EFFORTS_BY_MODEL": json.dumps(
+                        {"mock-opus-5": ["low", "high"], "mock-haiku-4-5": []}
+                    ),
+                    "ACPC_MOCK_MODEL_ALIASES": "1",
+                    "ACPC_MOCK_CONFIG_UPDATE": "1",
+                    "ACPC_MOCK_LOAD_CONFIG": "1",
+                }
+            )
+        async with spawn_adapter(
+            client, sys.executable, MOCK_AGENT_SCRIPT, env=env, cwd=str(tmp_path)
+        ) as (conn, _process):
+            await conn.initialize(protocol_version=PROTOCOL_VERSION)
+            session = await conn.new_session(cwd=str(tmp_path))
+            sid = session.session_id
+            await conn.set_session_mode(session_id=sid, mode_id="plan")
+            opus = await conn.set_config_option(
+                session_id=sid, config_id="model", value="mock-opus-5"
+            )
+            options = {option.id: option for option in opus.config_options}
+            assert options["model"].current_value == ("opus" if knobs else "mock-opus-5")
+            assert [choice.value for choice in options["model"].options] == (
+                ["opus", "sonnet", "haiku"]
+                if knobs
+                else ["mock-opus-5", "mock-sonnet-5", "mock-haiku-4-5"]
+            )
+            assert [choice.value for choice in options["reasoning_effort"].options] == (
+                ["low", "high"] if knobs else ["low", "medium", "high", "xhigh"]
+            )
+            assert options["reasoning_effort"].current_value == ("low" if knobs else "medium")
+            high = await conn.set_config_option(
+                session_id=sid, config_id="reasoning_effort", value="high"
+            )
+            assert (
+                next(o for o in high.config_options if o.id == "reasoning_effort").current_value
+                == "high"
+            )
+            again = await conn.set_config_option(
+                session_id=sid, config_id="model", value="mock-opus-5"
+            )
+            assert (
+                next(o for o in again.config_options if o.id == "reasoning_effort").current_value
+                == "high"
+            )
+            haiku = await conn.set_config_option(
+                session_id=sid, config_id="model", value="mock-haiku-4-5"
+            )
+            assert (len(haiku.config_options) == 1) is knobs
+            if knobs:
+                with pytest.raises(RequestError):
+                    await conn.set_config_option(
+                        session_id=sid, config_id="reasoning_effort", value="high"
+                    )
+            restored = await conn.load_session(session_id=sid, cwd=str(tmp_path))
+            assert bool(restored.config_options) is knobs
+            resumed = await conn.resume_session(session_id=sid, cwd=str(tmp_path))
+            assert bool(resumed.config_options) is knobs
+            if knobs:
+                await eventually(lambda: len(_config_updates(updates)) == 4)
+                assert [u.config_options[0].current_value for u in _config_updates(updates)] == [
+                    "sonnet",
+                    "opus",
+                    "opus",
+                    "haiku",
+                ]
+            else:
+                assert not _config_updates(updates)
+
+    asyncio.run(scenario())
+
+
+def _config_updates(updates: list[Any]) -> list[Any]:
+    return [u for u in updates if getattr(u, "session_update", None) == "config_option_update"]

@@ -1478,19 +1478,14 @@ class Daemon:
                 usage_value = (
                     client.finish_usage() if usage_finalized and client is not None else None
                 )
-                outcome = runner.TurnOutcome(
-                    state=("canceled" if preparing_cancel else turn.cancel.state or "failed"),
-                    stop_reason=(
-                        runner.PREPARATION_CANCELLED_REASON
-                        if preparing_cancel
-                        else turn.cancel.stop_reason or "error"
-                    ),
-                    answer=answer,
-                    context=client.context if client is not None else None,
-                    served_model=client.served_model if client is not None else None,
-                    usage=usage_value,
+                outcome = self._failed_turn_outcome(
+                    request,
+                    turn,
+                    client,
+                    preparing_cancel,
+                    answer,
+                    usage_value=usage_value,
                     usage_finalized=usage_finalized,
-                    turn_token=request.turn_token,
                 )
                 runner._finalize(
                     session_id,
@@ -1539,14 +1534,40 @@ class Daemon:
             return None
         return self.host.adapter_sessions.pop(session_id, None)
 
-    async def _drive(
+    @staticmethod
+    def _failed_turn_outcome(
+        request: runner.TurnRequest,
+        turn: _Turn,
+        client: AcpcClient | None,
+        preparing_cancel: bool,
+        answer: str,
+        *,
+        usage_value: dict[str, Any] | None,
+        usage_finalized: bool,
+    ) -> runner.TurnOutcome:
+        return runner.TurnOutcome(
+            state=("canceled" if preparing_cancel else turn.cancel.state or "failed"),
+            stop_reason=(
+                runner.PREPARATION_CANCELLED_REASON
+                if preparing_cancel
+                else turn.cancel.stop_reason or "error"
+            ),
+            answer=answer,
+            context=client.context if client is not None else None,
+            served_model=client.served_model if client is not None else None,
+            usage=usage_value,
+            usage_finalized=usage_finalized,
+            turn_token=request.turn_token,
+            advertised=client.advertised if client is not None else {},
+        )
+
+    async def _prepare_drive(
         self,
         session_id: str,
         request: runner.TurnRequest,
         events: transcript.Transcript,
         turn: _Turn,
-    ) -> runner.TurnOutcome:
-        """Prompt the adapter, reusing this session's warm ACP session if it has one."""
+    ) -> tuple[Any, AcpcClient, str, runner.TurnRequest]:
         cancel = turn.cancel
         conn = await self.host.ensure(request.resolution)
         level = PermissionLevel(request.resolution.permissions or "read")
@@ -1555,6 +1576,7 @@ class Daemon:
             events,
             level,
             modes=request.resolution.entry.modes,
+            effort_config_id=request.resolution.entry.effort_config_id,
             end_turn=cancel.end_turn,
             cancellation_dispatched=cancel.cancellation_dispatched,
             previous_context=stored.context,
@@ -1570,7 +1592,6 @@ class Daemon:
         runner.record_usage_identity(session_id, client.adapter_identity)
         turn.client = client
 
-        turn_error: BaseException | None = None
         warm = self.host.adapter_sessions.get(session_id)
         if warm is not None:
             # The adapter still holds this session, so its own history is
@@ -1619,11 +1640,26 @@ class Daemon:
             # killed mid-turn still leaves a continuable session.
             sessions.update_meta(session_id, adapter_session_id=adapter_session_id)
 
+        return conn, client, adapter_session_id, request
+
+    async def _drive(
+        self,
+        session_id: str,
+        request: runner.TurnRequest,
+        events: transcript.Transcript,
+        turn: _Turn,
+    ) -> runner.TurnOutcome:
+        """Prompt the adapter, reusing this session's warm ACP session if it has one."""
+        cancel = turn.cancel
+        conn, client, adapter_session_id, request = await self._prepare_drive(
+            session_id, request, events, turn
+        )
+        turn_error: BaseException | None = None
         self.host.mux.bind(adapter_session_id, client)
         prompt_started = False
         try:
             try:
-                await runner.apply_call_options(conn, adapter_session_id, request)
+                await runner.apply_call_options(conn, adapter_session_id, request, observer=client)
                 if cancel.requested.is_set() and request.resume_prepared:
                     return runner.TurnOutcome(
                         state="canceled",

@@ -768,22 +768,16 @@ def preparation_cancelled_answer(session_id: str) -> str:
     return f"Session {session_id} was canceled during preparation; no prompt was sent.\n"
 
 
-async def _drive_turn(
-    session_id: str,
-    request: TurnRequest,
-    events: transcript.Transcript,
-    cancel: _CancelSignal,
-) -> TurnOutcome:
-    """Run one turn against a directly spawned adapter."""
+def _direct_turn_client(
+    session_id: str, request: TurnRequest, events: transcript.Transcript, cancel: _CancelSignal
+) -> AcpcClient:
     resolution = request.resolution
-    command, args = adapter_command(resolution)
-    env = resolution.adapter_environment
-    level = PermissionLevel(resolution.permissions or "read")
     stored = sessions.read_meta(session_id)
-    client = AcpcClient(
+    return AcpcClient(
         events,
-        level,
+        PermissionLevel(resolution.permissions or "read"),
         modes=resolution.entry.modes,
+        effort_config_id=resolution.entry.effort_config_id,
         end_turn=cancel.end_turn,
         cancellation_dispatched=cancel.cancellation_dispatched,
         permission_prompt=request.permission_prompt,
@@ -796,6 +790,19 @@ async def _drive_turn(
         turn_number=stored.turns,
         session_id=session_id,
     )
+
+
+async def _drive_turn(
+    session_id: str,
+    request: TurnRequest,
+    events: transcript.Transcript,
+    cancel: _CancelSignal,
+) -> TurnOutcome:
+    """Run one turn against a directly spawned adapter."""
+    resolution = request.resolution
+    command, args = adapter_command(resolution)
+    env = resolution.adapter_environment
+    client = _direct_turn_client(session_id, request, events, cancel)
     turn_error: BaseException | None = None
     prompt_sent = False
     usage_value: dict[str, Any] | None = None
@@ -837,7 +844,8 @@ async def _drive_turn(
                     client=client,
                     on_delivered=mark_prompt_sent,
                 )
-                finalize_usage()
+                if delivery is not None:
+                    finalize_usage()
         finally:
             client.flush()
     except Exception as error:
@@ -935,11 +943,11 @@ async def _prompt_direct_turn(
     cancel: _CancelSignal,
     client: AcpcClient,
     on_delivered: Callable[[], None],
-) -> tuple[str | None, BaseException | None, PromptDelivery, dict[str, Any] | None]:
+) -> tuple[str | None, BaseException | None, PromptDelivery | None, dict[str, Any] | None]:
     """Apply options and send a prompt, preserving setup-failure handling."""
     prompt_started = False
     try:
-        await apply_call_options(conn, adapter_session_id, request)
+        await apply_call_options(conn, adapter_session_id, request, observer=client)
         prompt_started = True
         return await run_prompt_with_limits(
             conn,
@@ -951,9 +959,14 @@ async def _prompt_direct_turn(
             on_delivered=on_delivered,
         )
     except BaseException as error:
-        if prompt_started or request.turn_token is None:
+        if prompt_started or (request.turn_token is None and not isinstance(error, Exception)):
             raise
-        _finalize_claimed_setup_failure(session_id, request.turn_token, error, adapter_session_id)
+        if request.turn_token is None:
+            # No delivery: the caller finalizes no usage for a prompt never started.
+            return "error", error, None, None
+        _finalize_claimed_setup_failure(
+            session_id, request.turn_token, error, adapter_session_id, advertised=client.advertised
+        )
         if isinstance(error, asyncio.CancelledError):
             raise
         raise ResumeSetupError(describe_error(error), turn_token=request.turn_token) from None
@@ -1036,6 +1049,8 @@ def _finalize_claimed_setup_failure(
     turn_token: int,
     error: BaseException,
     adapter_session_id: str | None = None,
+    *,
+    advertised: dict[str, Any] | None = None,
 ) -> None:
     """Close a claimed turn when setup failed before an owner was installed."""
     _finalize(
@@ -1046,6 +1061,7 @@ def _finalize_claimed_setup_failure(
             answer="",
             adapter_session_id=adapter_session_id,
             error=error,
+            advertised=advertised or {},
             turn_token=turn_token,
         ),
         error=error,
@@ -1058,7 +1074,13 @@ def _finalize_claimed_setup_failure(
 _DEFAULT_EFFORT_CONFIG_ID = "reasoning_effort"
 
 
-async def apply_call_options(conn: Any, adapter_session_id: str, request: TurnRequest) -> None:
+async def apply_call_options(
+    conn: Any,
+    adapter_session_id: str,
+    request: TurnRequest,
+    *,
+    observer: AcpcClient | Callable[[list[Any], str | None], None] | None = None,
+) -> None:
     """Apply resolved mode/model/effort to the adapter session before prompting."""
     resolution = request.resolution
     await _configure(
@@ -1072,7 +1094,7 @@ async def apply_call_options(conn: Any, adapter_session_id: str, request: TurnRe
                 f"model {resolution.model!r} (session/set_model)",
             )
         else:
-            await _configure(
+            response = await _configure(
                 conn.set_config_option(
                     config_id="model",
                     session_id=adapter_session_id,
@@ -1080,10 +1102,11 @@ async def apply_call_options(conn: Any, adapter_session_id: str, request: TurnRe
                 ),
                 f"model {resolution.model!r}",
             )
+            observe_config_options(observer, response, resolution.model)
     # effort_via=cli is applied on the spawn argv (CallResolution.command).
     if resolution.effort is not None and resolution.entry.effort_via != "cli":
         effort_config_id = resolution.entry.effort_config_id or _DEFAULT_EFFORT_CONFIG_ID
-        await _configure(
+        response = await _configure(
             conn.set_config_option(
                 config_id=effort_config_id,
                 session_id=adapter_session_id,
@@ -1095,6 +1118,22 @@ async def apply_call_options(conn: Any, adapter_session_id: str, request: TurnRe
                 "drop --effort, or drop effort from the preset in the entry TOML"
             ),
         )
+        observe_config_options(observer, response, resolution.model)
+
+
+def observe_config_options(
+    observer: AcpcClient | Callable[[list[Any], str | None], None] | None,
+    response: Any,
+    model_key: str | None,
+) -> None:
+    """Forward options only when the response actually carries them."""
+    options = getattr(response, "config_options", None)
+    if options is None or observer is None:
+        return
+    if isinstance(observer, AcpcClient):
+        observer.capture_config_options(options, model_key=model_key)
+    else:
+        observer(options, model_key)
 
 
 async def _set_session_model(conn: Any, session_id: str, model_id: str) -> Any:
@@ -1127,7 +1166,7 @@ class AdapterRejection(RuntimeError):
     error, so the message lands in answer.md and the transcript."""
 
 
-async def _configure(call: Any, what: str, *, unknown_option_hint: str | None = None) -> None:
+async def _configure(call: Any, what: str, *, unknown_option_hint: str | None = None) -> Any:
     """Name the rejected option: the bare JSON-RPC reply doesn't say which.
 
     An adapter that does not offer an option at all answers with a generic
@@ -1136,7 +1175,7 @@ async def _configure(call: Any, what: str, *, unknown_option_hint: str | None = 
     names what the caller can actually change.
     """
     try:
-        await call
+        return await call
     except RequestError as error:
         detail = describe_error(error)
         message = f"the adapter rejected {what}: {detail}"

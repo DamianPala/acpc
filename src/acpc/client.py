@@ -1,6 +1,7 @@
 """ACP client callbacks for transcript-backed acpc sessions."""
 
 import asyncio
+import copy
 import inspect
 import json
 import logging
@@ -537,6 +538,7 @@ class AcpcClient:
         permission_level: PermissionLevel,
         *,
         modes: Mapping[str, ModeSpec] | None = None,
+        effort_config_id: str | None = None,
         end_turn: _EndTurn | None = None,
         cancellation_dispatched: asyncio.Event | None = None,
         permission_prompt: _PermissionPrompt | None = None,
@@ -553,6 +555,7 @@ class AcpcClient:
         self.transcript = transcript
         self.permission_level = permission_level
         self.modes = {} if modes is None else modes
+        self._effort_config_id = effort_config_id or "reasoning_effort"
         self.end_turn = end_turn
         self.cancellation_dispatched = cancellation_dispatched
         self.permission_prompt = permission_prompt
@@ -597,6 +600,7 @@ class AcpcClient:
             "modes": [],
             "models": [],
             "commands": [],
+            "efforts": {},
         }
 
     @property
@@ -677,11 +681,7 @@ class AcpcClient:
     @property
     def advertised(self) -> dict[str, Any]:
         """Return the latest adapter modes, models, and commands advertisement."""
-        return {
-            "modes": [dict(item) for item in self._advertised["modes"]],
-            "models": list(self._advertised["models"]),
-            "commands": [dict(item) for item in self._advertised["commands"]],
-        }
+        return copy.deepcopy(self._advertised)
 
     def capture_advertised(self, session: NewSessionResponse) -> None:
         """Capture modes and models announced by ``session/new``."""
@@ -693,6 +693,49 @@ class AcpcClient:
         if not models:
             models = self._models_from_session_meta(session)
         self._advertised["models"] = models
+        self.capture_config_options(session.config_options or [], model_key=None)
+
+    def capture_config_options(self, options: list[Any], *, model_key: str | None) -> None:
+        """Record the effort choices offered for one observed model."""
+        if model_key is None:
+            model = next((option for option in options if option.id == "model"), None)
+            model_key = getattr(model, "current_value", None)
+        if not isinstance(model_key, str) or not model_key:
+            return
+        effort = self._effort_option(options)
+        levels = self._select_values(effort)
+        current = getattr(effort, "current_value", None)
+        self._advertised["efforts"][model_key] = {
+            "levels": levels,
+            "current": current if isinstance(current, str) else None,
+            "observed_at": time.time(),
+        }
+
+    def _effort_option(self, options: list[Any]) -> Any:
+        effort = next(
+            (option for option in options if getattr(option, "category", None) == "thought_level"),
+            None,
+        )
+        if effort is None:
+            effort = next(
+                (option for option in options if option.id == self._effort_config_id), None
+            )
+        return effort
+
+    @staticmethod
+    def _select_values(option: Any) -> list[str]:
+        levels: list[str] = []
+        for choice in getattr(option, "options", []):
+            value = getattr(choice, "value", None)
+            if isinstance(value, str):
+                levels.append(value)
+            else:
+                levels.extend(
+                    nested.value
+                    for nested in getattr(choice, "options", [])
+                    if isinstance(getattr(nested, "value", None), str)
+                )
+        return levels
 
     def capture_adapter(self, initialize_response: Any) -> None:
         """Capture the adapter identity announced by ACP ``initialize``."""
@@ -932,6 +975,7 @@ class AcpcClient:
             self._advertised["models"] = self._models_from_options(
                 getattr(update, "config_options", [])
             )
+            self.capture_config_options(getattr(update, "config_options", []), model_key=None)
             return
 
         if update_type == "current_mode_update" and isinstance(update, CurrentModeUpdate):

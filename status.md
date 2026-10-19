@@ -18,26 +18,45 @@ the pending `answer.md`/`transcript.ndjson`, delivered once by the foreground `r
 `continue`/`log` → `conflict`; `--transcript-file` on `run`/`wait`; `setting_sources` entry key
 (`user|project|local`, `[]` → `strictMcpConfig`), `one_shot` alone sends only
 `persistSession: false`; the review reversed the builder's "cleanup error blocks the terminal
-publish": an undeletable child is named on stderr and the state is still published), 4 (this
-commit: per-turn `served_model` from the adapter's `_claude/model` or codex `model_usage`, a
-stderr note when a requested versioned id came back as another; `failure {class, message,
-next_step}` on results and `status` with six classes `auth | rate_limit | adapter_limit |
-connection | adapter_error | acpc`, the on-disk observation stays a string with the class and next
-step as sibling fields and pre-1.2 records derive the class from `stop_reason`; `--limit-wait` on
+publish": an undeletable child is named on stderr and the state is still published), 4 `0249a1a`
+(per-turn `served_model` from the adapter's `_claude/model` or codex `model_usage`, a stderr note
+when a requested versioned id came back as another; `failure {class, message, next_step}` on
+results and `status` with six classes `auth | rate_limit | adapter_limit | connection |
+adapter_error | acpc`, the on-disk observation stays a string with the class and next step as
+sibling fields and pre-1.2 records derive the class from `stop_reason`; `--limit-wait` on
 `run`/`continue` over the entry's `limit_wait_max` over the global; `SCHEMA_VERSION` "2"; the
 review moved the spawn-argv refusal to class `acpc` and removed a dead copy of the legacy class
-derivation; backlog: `--cancel-after` does not bound `_sleep_through_limit`, pre-existing). Each slice:
-two builder rounds at most, Opus reviewer with mutation testing on a `git archive` copy with its
-own venv (a copied `.venv` runs the worktree's code), live on claude-agent-acp 0.89.1 with a bare
-judge (3c: daemon route, session dir = `meta.json` + `lock`, `~/.claude-bare` file listing
-unchanged after the run). Build contract since 2026-10-19 (local to this repo): builder and
-builder-light through the installed acpc (Codex), reviewer and explorer through the Agent tool.
-Next: the HOME roster column cut in the middle at 24 (Damian's ruling 2026-10-19), then slices 5–9:
-effort capture and resolution (BREAKING), codex `codex_config` route, `data_residency` + windows,
-the import floor; plan and briefs in `docs/plans/1.2/`. Known flakes under `-n auto`:
+derivation; backlog: `--cancel-after` does not bound `_sleep_through_limit`, pre-existing),
+`1e7818f` (the roster's HOME column cut in the middle at 24, Damian's ruling 2026-10-19), 5 (this
+commit: the effort levels each adapter offers are observed per model, never configured: rows
+`{levels, current, observed_at}` under `advertised.efforts` in `cache/<adapter>/advertised.json`,
+captured from `session/new`, from every `set_config_option` response during option setup, keyed by
+the id acpc sent because claude answers with aliases, and from `config_option_update`; a turn that
+fails while its options are applied still publishes what it saw; `agents check` and the probe
+behind a cache miss switch the probe session through every advertised, preset and
+`[effort_by_model]` model and always rewrite the cache, a run rewrites only on changed data,
+timestamps excluded from the comparison; `agents get` shows the rows, `--models` lists them with
+`current` and the observation age, `agents check` counts them; the mock answers
+`set_config_option` with the full option list like both real adapters and gains four opt-in knobs;
+the rows inform only, validation stays on `[effort_by_model]` until slice 6. Live: `agents check`
+on claude-agent-acp 0.89.1 (bare judge) records 7 rows in 1,8 s, on codex-acp 2.2.2 7 rows in
+4,6 s, the two `luna` models without `ultra`; claude advertises `default` as a level, which slice
+6 drops). Each slice: two builder rounds at most, Opus reviewer with mutation testing on a `git
+archive` copy with its own venv (a copied `.venv` runs the worktree's code), live on
+claude-agent-acp 0.89.1 with a bare judge (3c: daemon route, session dir = `meta.json` + `lock`,
+`~/.claude-bare` file listing unchanged after the run). Build contract since 2026-10-19 (local to
+this repo): builder and builder-light through the installed acpc (Codex), reviewer and explorer
+through the Agent tool. Next: slice 6, effort resolved against the advertised rows (BREAKING:
+allowed = advertised ∩ operator row ∩ scale, shipped row only until observed, no union, `default`
+never selectable, an entry that names a model and no effort sends none and gets the vendor
+default; Fable arbiter ruling 2026-10-19, Damian may still revert it to "advertised > entry row >
+union"), then 7 codex `codex_config` route, 8 `data_residency` + windows, 9 the import floor;
+plan and briefs in `docs/plans/1.2/`. Known flakes under `-n auto`:
 `test_continue_rejects_an_adapter_without_load_session`, the steer `cancel_then_start` wait test,
 and `test_agents_check_reports_has_more_past_the_default_limit` hitting the 30 s timeout on a
-loaded desktop (21 mock spawns; passes alone in 11 s). Nothing of 1.2 pushed yet.
+loaded desktop (21 mock spawns; passes alone in 11 s). `feat/1.2` is on origin through `1e7818f`
+(fast-forward pushes and `gate.yml` laps under Damian's standing grant, both green on ubuntu and
+macos); main, merge, tags and the release wait for his go.
 
 **1.1.1 released 2026-10-19: `fix/1.1.1` fast-forwarded into `main` (`c9240a2`, bump `f9a4e7a`
 and the CHANGELOG on top of slice 1), tag `v1.1.1`, release page

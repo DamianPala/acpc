@@ -85,3 +85,54 @@ def test_refresh_swallows_a_non_serializable_cache_value(state_root: Path) -> No
     cache.refresh_advertised("mock", {"models": [object()]})
 
     assert not (state_root / "cache" / "mock" / "advertised.json").exists()
+
+
+def test_effort_rows_merge_by_model_and_ignore_observation_age(state_root: Path) -> None:
+    first = {"levels": ["low", "high"], "current": "high", "observed_at": 100.0}
+    other = {"levels": [], "current": None, "observed_at": 200.0}
+    cache.refresh_advertised("mock", {"efforts": {"first": first}}, clock=lambda: 100.0)
+    cache.refresh_advertised("mock", {"efforts": {"other": other}}, clock=lambda: 200.0)
+    cache_file = state_root / "cache/mock/advertised.json"
+    before = cache_file.read_bytes()
+    cache.refresh_advertised("mock", {"efforts": {"first": {**first, "observed_at": 300.0}}})
+    assert cache_file.read_bytes() == before
+    record = cache.read_advertised("mock")
+    assert record is not None
+    assert record.advertised["efforts"] == {"first": first, "other": other}
+    changed = {**first, "current": "low", "observed_at": 400.0}
+    cache.refresh_advertised("mock", {"efforts": {"first": changed}})
+    record = cache.read_advertised("mock")
+    assert record is not None
+    assert record.advertised["efforts"] == {"first": changed, "other": other}
+
+
+def test_forced_refresh_publishes_fresh_timestamps(state_root: Path) -> None:
+    row = {"levels": [], "current": None, "observed_at": 100.0}
+    cache.refresh_advertised("mock", {"efforts": {"model": row}}, clock=lambda: 100.0)
+    row = {**row, "observed_at": 200.0}
+    cache.refresh_advertised("mock", {"efforts": {"model": row}}, clock=lambda: 200.0, force=True)
+    record = cache.read_advertised("mock")
+    assert record is not None
+    assert record.cached_at == 200.0
+    assert record.advertised["efforts"]["model"]["observed_at"] == 200.0
+
+
+@pytest.mark.parametrize("legacy_efforts", [None, [], "broken"])
+def test_legacy_cache_reads_and_gains_effort_rows(state_root: Path, legacy_efforts: object) -> None:
+    import json
+
+    cache_file = state_root / "cache/mock/advertised.json"
+    cache_file.parent.mkdir(parents=True)
+    advertised: dict[str, object] = {"models": ["legacy"]}
+    if legacy_efforts is not None:
+        advertised["efforts"] = legacy_efforts
+    cache_file.write_text(json.dumps({"cached_at": 100.0, "advertised": advertised}))
+    record = cache.read_advertised("mock")
+    assert record is not None
+    assert record.advertised["efforts"] == {}
+    row = {"levels": [], "current": None, "observed_at": 200.0}
+    cache.refresh_advertised("mock", {"efforts": {"legacy": row}})
+    record = cache.read_advertised("mock")
+    assert record is not None
+    assert record.advertised["efforts"] == {"legacy": row}
+    assert record.advertised["models"] == ["legacy"]

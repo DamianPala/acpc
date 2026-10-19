@@ -148,6 +148,7 @@ from acp.schema import (
     AvailableCommand,
     AvailableCommandsUpdate,
     CloseSessionResponse,
+    ConfigOptionUpdate,
     Cost,
     DeniedOutcome,
     EmbeddedResourceContentBlock,
@@ -521,6 +522,31 @@ class MockAgent(Agent):
             field_meta=field_meta,
         )
 
+    @staticmethod
+    def _model_alias(model: str) -> str:
+        if os.environ.get("ACPC_MOCK_MODEL_ALIASES") == "1":
+            aliases: dict[str, str] = dict(zip(MODELS, ("opus", "sonnet", "haiku"), strict=True))
+            return aliases.get(model, model)
+        return model
+
+    def _model_efforts(self, session_id: str) -> list[str]:
+        configured = os.environ.get("ACPC_MOCK_EFFORTS_BY_MODEL")
+        if configured is None:
+            return list(EFFORTS)
+        return json.loads(configured).get(
+            self._models.get(session_id, DEFAULT_MODEL), list(EFFORTS)
+        )
+
+    async def _send_config_update(self, session_id: str) -> None:
+        if os.environ.get("ACPC_MOCK_CONFIG_UPDATE") == "1":
+            await self._conn.session_update(
+                session_id=session_id,
+                update=ConfigOptionUpdate(
+                    session_update="config_option_update",
+                    config_options=self._config_options(session_id),
+                ),
+            )
+
     def _config_options(
         self, session_id: str
     ) -> list[SessionConfigOptionSelect | SessionConfigOptionBoolean]:
@@ -529,11 +555,15 @@ class MockAgent(Agent):
             id="model",
             name="Model",
             category="model",
-            current_value=self._models.get(session_id, DEFAULT_MODEL),
+            current_value=self._model_alias(self._models.get(session_id, DEFAULT_MODEL)),
             options=[
-                SessionConfigSelectOption(name=model_id, value=model_id) for model_id in MODELS
+                SessionConfigSelectOption(name=model_id, value=self._model_alias(model_id))
+                for model_id in MODELS
             ],
         )
+        efforts = self._model_efforts(session_id)
+        if not efforts:
+            return [model_option]
         effort_option = SessionConfigOptionSelect(
             type="select",
             id="reasoning_effort",
@@ -542,7 +572,7 @@ class MockAgent(Agent):
             current_value=self._efforts.get(session_id, DEFAULT_EFFORT),
             options=[
                 SessionConfigSelectOption(name=effort.capitalize(), value=effort)
-                for effort in EFFORTS
+                for effort in efforts
             ],
         )
         return [model_option, effort_option]
@@ -661,7 +691,11 @@ class MockAgent(Agent):
                 await asyncio.sleep(0.2)
         self._restore_settled.set()
         self._record_event(f"restore-end:{session_id}")
-        return LoadSessionResponse()
+        return LoadSessionResponse(
+            config_options=self._config_options(session_id)
+            if os.environ.get("ACPC_MOCK_LOAD_CONFIG") == "1"
+            else None
+        )
 
     async def set_session_mode(
         self, session_id: str, mode_id: str, **kwargs: Any
@@ -682,6 +716,7 @@ class MockAgent(Agent):
             raise RequestError(400, f"unknown mode: {mode_id}")
         self._modes[session_id] = mode_id
         self._mode_calls[session_id] = self._mode_calls.get(session_id, 0) + 1
+        await self._send_config_update(session_id)
         return SetSessionModeResponse()
 
     async def set_config_option(
@@ -700,17 +735,26 @@ class MockAgent(Agent):
                 -32603, "Internal error", {"details": f"Unknown config option: {config_id}"}
             )
         if config_id == "model" and isinstance(value, str):
-            if value not in MODELS and os.environ.get("ACPC_MOCK_ACCEPT_ANY_MODEL") != "1":
-                raise RequestError(400, f"unsupported model: {value}")
-            self._models[session_id] = value
-            self._model_calls[session_id] = self._model_calls.get(session_id, 0) + 1
+            await self._switch_model(session_id, value)
         if config_id == "reasoning_effort" and isinstance(value, str):
-            if value not in EFFORTS:
-                supported = ", ".join(EFFORTS)
+            if value not in self._model_efforts(session_id):
+                supported = ", ".join(self._model_efforts(session_id))
                 raise RequestError(400, f"unsupported effort: {value} (supported: {supported})")
             self._efforts[session_id] = value
             self._effort_calls[session_id] = self._effort_calls.get(session_id, 0) + 1
-        return SetSessionConfigOptionResponse(config_options=[])
+        return SetSessionConfigOptionResponse(config_options=self._config_options(session_id))
+
+    async def _switch_model(self, session_id: str, value: str) -> None:
+        if os.environ.get("ACPC_MOCK_MODEL_ALIASES") == "1":
+            value = {self._model_alias(model): model for model in MODELS}.get(value, value)
+        if value not in MODELS and os.environ.get("ACPC_MOCK_ACCEPT_ANY_MODEL") != "1":
+            raise RequestError(400, f"unsupported model: {value}")
+        self._models[session_id] = value
+        self._model_calls[session_id] = self._model_calls.get(session_id, 0) + 1
+        efforts = self._model_efforts(session_id)
+        if efforts and self._efforts.get(session_id, DEFAULT_EFFORT) not in efforts:
+            self._efforts[session_id] = efforts[0]
+        await self._send_config_update(session_id)
 
     async def prompt(
         self,
@@ -1607,7 +1651,11 @@ class MockAgent(Agent):
         self._persist_session(session_id)
         self._restore_settled.set()
         self._record_event(f"restore-end:{session_id}")
-        return ResumeSessionResponse()
+        return ResumeSessionResponse(
+            config_options=self._config_options(session_id)
+            if os.environ.get("ACPC_MOCK_LOAD_CONFIG") == "1"
+            else None
+        )
 
     async def _send_replayed_user_messages(self, session_id: str, messages: list[str]) -> None:
         if os.environ.get("ACPC_MOCK_REPLAY_EXTRA_EVENTS") == "1":

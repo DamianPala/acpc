@@ -218,7 +218,7 @@ Keep it to purpose only. Models, efforts and flags belong to the tool — `acpc 
 ~/.acpc/                     # ACPC_HOME overrides it — the only env var acpc reads for itself
   config.toml                # retention, daemon_ttl, daemon_max_concurrent — the whole file
   agents/<name>.toml         # variants, adapter overrides, new adapters
-  cache/<agent>/             # advertised models, modes, commands
+  cache/<agent>/             # advertised models, modes, commands, effort levels per model
   daemon/<target>.log        # adapter stderr per target
   sessions/<id>/
     meta.json                # full resolved invocation + state, timing, context occupancy, exit code

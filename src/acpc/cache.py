@@ -19,7 +19,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from acp import PROTOCOL_VERSION
+from acp import PROTOCOL_VERSION, RequestError
 
 from acpc import paths
 from acpc.client import AcpcClient
@@ -74,6 +74,7 @@ def refresh_advertised(
     advertised: Mapping[str, Any],
     *,
     clock: Clock | None = None,
+    force: bool = False,
 ) -> None:
     """Atomically publish an adapter's advertised modes, models and commands.
 
@@ -96,28 +97,46 @@ def refresh_advertised(
             "modes": catalog("modes"),
             "models": catalog("models"),
             "commands": catalog("commands"),
+            "efforts": {**previous_data.get("efforts", {}), **advertised.get("efforts", {})},
         }
-        if previous is not None and merged == previous.advertised:
+        if (
+            not force
+            and previous is not None
+            and _without_observed_at(merged) == _without_observed_at(previous.advertised)
+        ):
             return
 
         cache_root = paths.ensure_private_dir(_cache_path(agent))
         payload = {"cached_at": _resolve_clock(clock)(), "advertised": merged}
         paths.atomic_write(cache_root / _CACHE_FILE, payload)
 
-        commands = payload["advertised"]["commands"]
-        lines: list[str] = []
-        if isinstance(commands, list):
-            for command in commands:
-                if not isinstance(command, Mapping):
-                    continue
-                name = command.get("name", "")
-                description = command.get("description", "")
-                if not isinstance(name, str) or not isinstance(description, str):
-                    continue
-                lines.extend((f"# /{name.lstrip('/')}", "", description, ""))
-        paths.atomic_write(commands_path(agent), "\n".join(lines))
+        paths.atomic_write(commands_path(agent), _commands_markdown(merged["commands"]))
     except Exception:  # noqa: BLE001
         return
+
+
+def _commands_markdown(commands: Any) -> str:
+    lines: list[str] = []
+    if isinstance(commands, list):
+        for command in commands:
+            if not isinstance(command, Mapping):
+                continue
+            name = command.get("name", "")
+            description = command.get("description", "")
+            if not isinstance(name, str) or not isinstance(description, str):
+                continue
+            lines.extend((f"# /{name.lstrip('/')}", "", description, ""))
+    return "\n".join(lines)
+
+
+def _without_observed_at(advertised: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        **advertised,
+        "efforts": {
+            key: {field: value for field, value in row.items() if field != "observed_at"}
+            for key, row in advertised.get("efforts", {}).items()
+        },
+    }
 
 
 def read_advertised(agent: str) -> CachedAdvertised | None:
@@ -139,11 +158,27 @@ def read_advertised(agent: str) -> CachedAdvertised | None:
                 "modes": list(advertised.get("modes", [])),
                 "models": list(advertised.get("models", [])),
                 "commands": list(advertised.get("commands", [])),
+                "efforts": _effort_rows(advertised.get("efforts")),
             },
             cached_at=float(cached_at),
         )
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
         return None
+
+
+def _effort_rows(value: Any) -> dict[str, Any]:
+    """Keep the well-formed rows; a damaged one must not break readers or later merges."""
+    if not isinstance(value, Mapping):
+        return {}
+    return {
+        key: dict(row)
+        for key, row in value.items()
+        if isinstance(row, Mapping)
+        and isinstance(row.get("levels"), list)
+        and all(isinstance(level, str) for level in row["levels"])
+        and (row.get("current", 0) is None or isinstance(row.get("current"), str))
+        and type(row.get("observed_at")) in (int, float)
+    }
 
 
 def cache_age(cached_at: float, *, clock: Clock | None = None) -> str:
@@ -183,6 +218,7 @@ async def probe_advertised(resolution: CallResolution) -> dict[str, Any]:
             transcript,
             PermissionLevel.READ,
             modes={},
+            effort_config_id=resolution.entry.effort_config_id,
         )
         try:
             async with spawn_adapter(
@@ -221,7 +257,9 @@ async def probe_advertised(resolution: CallResolution) -> dict[str, Any]:
                         connection,
                         session.session_id,
                         runner_module.TurnRequest(resolution=resolution, prompt=""),
+                        observer=client,
                     )
+                await _probe_models(connection, session.session_id, resolution, client)
                 deadline = time.monotonic() + _PROBE_UPDATE_WAIT
                 while not client.advertised["commands"] and time.monotonic() < deadline:
                     await asyncio.sleep(0.01)
@@ -229,5 +267,32 @@ async def probe_advertised(resolution: CallResolution) -> dict[str, Any]:
             raise ProbeError(f"{resolution.entry.entry}: live probe failed: {error}") from None
 
         advertised = client.advertised
-    refresh_advertised(resolution.entry.base_adapter, advertised)
+    refresh_advertised(resolution.entry.base_adapter, advertised, force=True)
     return advertised
+
+
+async def _probe_models(
+    connection: Any, session_id: str, resolution: CallResolution, client: AcpcClient
+) -> None:
+    from acpc import runner
+
+    if resolution.entry.model_via == "set_model":
+        # session/set_model answers without config options: a switch would record nothing.
+        return
+    candidates = [
+        resolution.model,
+        *client.advertised["models"],
+        *(preset.model for preset in resolution.entry.presets.values()),
+        *resolution.entry.effort_by_model,
+    ]
+    for model in dict.fromkeys(candidates):
+        if not model:
+            continue
+        try:
+            response = await connection.set_config_option(
+                session_id=session_id, config_id="model", value=model
+            )
+            runner.observe_config_options(client, response, model)
+        except RequestError:
+            # Catalogs and presets can contain models unavailable to this account.
+            continue

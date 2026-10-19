@@ -360,6 +360,8 @@ def validate_json(value: Any, contract: Mapping[str, Any], path: str = "$") -> N
     assert any(_matches_type(value, item) for item in types), (path, expected, value)
     if "enum" in contract:
         assert value in contract["enum"], (path, value)
+    if contract == {"type": "object"}:
+        return
     if isinstance(value, dict):
         properties = contract.get("properties", {})
         additional = contract.get("additionalProperties")
@@ -398,7 +400,7 @@ def _matches_type(value: Any, expected: str) -> bool:
 
 
 def _assert_o4_schema(contract: Mapping[str, Any], path: str = "$") -> None:
-    if not contract:
+    if not contract or contract == {"type": "object"}:
         return
     assert set(contract) <= O4_KEYWORDS, path
     assert "type" in contract, path
@@ -534,12 +536,19 @@ def test_real_document_payloads_match_their_published_schemas(
     monkeypatch: pytest.MonkeyPatch,
     live_daemon: None,
 ) -> None:
-    assert_json_payload(cli, "agents get", "mock")
+    detail = assert_json_payload(cli, "agents get", "mock")
+    assert detail["advertised"]["efforts"]["mock-sonnet-5"]["levels"] == [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+    ]
     assert_json_payload(cli, "agents get", "mock", "--models")
     assert_json_payload(cli, "agents get", "mock", "--commands")
     single_check = assert_json_payload(cli, "agents check", "mock")
     assert single_check["has_more"] is False
     assert len(single_check["items"]) == 1
+    assert single_check["items"][0]["efforts"] == 3
     assert_json_payload(cli, "agents create", "work", "--extends", "mock")
     assert_json_payload(cli, "agents delete", "work", "--yes")
     assert_json_payload(cli, "install", "mock", "--yes")
