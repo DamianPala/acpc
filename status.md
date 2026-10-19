@@ -2,7 +2,17 @@
 
 ## Now
 
-**1.1.1 in progress on `fix/1.1.1` (2026-10-18, from `main` `02d3ac0`): slice 1 committed as
+**1.1.1 released 2026-10-19: `fix/1.1.1` fast-forwarded into `main` (`c9240a2`, bump `f9a4e7a`
+and the CHANGELOG on top of slice 1), tag `v1.1.1`, release page
+https://github.com/DamianPala/acpc/releases/tag/v1.1.1, CI green on both laps, host reinstalled
+(`acpc -V` 1.1.1, daemons stopped). The branch and worktree are deleted, as are the stale
+`slice12/*` and `provibench-rec` worktrees (their one-commit branches and the uncommitted
+provibench test edits are kept as patches in `docs/plans/archive-worktrees/`; `probe-engine-r13`
+stays as a branch). The `ai-lab` container is updated with 1.2. Next: 1.2 step 0, the judge-call
+measurement (20 raw ACP calls with `_meta.systemPrompt` + `tools: []` against `claude -p`, the
+client import floor), then the slices in the expert's order.**
+
+**1.1.1 slice 1 on `fix/1.1.1` (2026-10-18, from `main` `02d3ac0`): committed as
 `20feb4d` (every value-taking option without a value answers `invalid_input` instead of a
 traceback; `run_with_sigint_deferred` keeps SIGINT blocked only while the loop is built, with the
 after-first-step restore reserved for `execute_turn`; `delete` names `status <id>` as its
