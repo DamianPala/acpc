@@ -16,6 +16,7 @@ from acpc.cli import main
 @pytest.fixture(autouse=True)
 def state_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ACPC_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("COLUMNS", "200")
 
 
 @pytest.fixture
@@ -121,29 +122,40 @@ def test_list_has_header_alignment_sorting_and_bounded_rendered_description(
         "_bundled_resources",
         lambda: iter((root / "zeta", root / "alpha-name-longer-than-header")),
     )
+    monkeypatch.setenv("COLUMNS", "80")
 
     result = invoke(cli, "skills", "list", "--format", "text")
 
     assert result.exit_code == vocab.EXIT_OK
     lines = result.stdout.splitlines()
     assert lines[0].split() == ["NAME", "DESCRIPTION"]
-    assert [line.split()[0] for line in lines[1:]] == [
+    assert [line.split()[0] for line in lines[1:3]] == [
         "alpha-name-longer-than-header",
         "zeta",
     ]
     header = lines[0]
     alpha = lines[1]
     assert alpha.index("A long") == header.index("DESCRIPTION")
-    assert "..." in alpha
-    assert "full: acpc skills get alpha-name-longer-than-header" in alpha
-    assert "repeated whitespace and" in alpha
+    preview = alpha[header.index("DESCRIPTION") :]
+    normalized = (
+        "A long description with repeated whitespace and enough words to exceed the "
+        "eighty character roster budget safely."
+    )
+    assert preview.endswith("...")
+    assert normalized.startswith(preview[:-3])
+    assert normalized[len(preview[:-3])] == " "
+    footer = "-- descriptions cut to the terminal width; full: acpc skills get NAME"
+    assert result.stdout.count(footer) == 1
+    assert "(full:" not in result.stdout
+    assert "repeated whitespace" in alpha
+    assert max(map(len, lines)) <= 80
 
     listed = json.loads(invoke(cli, "skills", "list", "--json").stdout)
     assert [item["name"] for item in listed["items"]] == [
         "alpha-name-longer-than-header",
         "zeta",
     ]
-    assert len(listed["items"]) <= 20
+    assert len(listed["items"]) <= 100
 
 
 def test_list_reports_has_more_past_the_default_limit(
@@ -152,13 +164,13 @@ def test_list_reports_has_more_past_the_default_limit(
     """Mutation coverage: nothing else in the suite proves this truncation
     signal for `skills list` (recon D, mutation 10)."""
     root = _resource_root(tmp_path, monkeypatch)
-    for index in range(21):
+    for index in range(101):
         _write_skill(root, f"skill-{index:02d}", f"---\ndescription: entry {index}\n---\nbody\n")
 
     result = invoke(cli, "skills", "list", "--json")
 
     payload = json.loads(result.stdout)
-    assert len(payload["items"]) == 20
+    assert len(payload["items"]) == 100
     assert payload["has_more"] is True
 
 

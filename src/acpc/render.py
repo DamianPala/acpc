@@ -1,6 +1,7 @@
 """On-demand rendering for transcript and session status views."""
 
 import json
+import shutil
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -22,6 +23,7 @@ from acpc.output import (
 
 Clock = Callable[[], float]
 DEFAULT_LOG_MAX_OUTPUT = 128 * 1024
+DEFAULT_ROSTER_LIMIT = 100
 DEFAULT_STATUS_LIMIT = 20
 
 
@@ -83,9 +85,7 @@ def format_table(
         return []
 
     column_count = len(measured_rows[0])
-    if any(len(row) != column_count for row in measured_rows):
-        raise ValueError("table rows must have the same number of columns")
-    widths = [max(len(row[index]) for row in measured_rows) for index in range(column_count)]
+    widths = column_widths(measured_rows)
 
     lines: list[str] = []
     all_rows = measured_rows
@@ -100,6 +100,32 @@ def format_table(
             line_prefix = continuation_prefix
         lines.append(line_prefix + separator.join(cells).rstrip())
     return lines
+
+
+def column_widths(rows: Sequence[Sequence[str]]) -> tuple[int, ...]:
+    """Return each column's maximum width after checking row shape."""
+    if not rows:
+        return ()
+    column_count = len(rows[0])
+    if any(len(row) != column_count for row in rows):
+        raise ValueError("table rows must have the same number of columns")
+    return tuple(max(len(row[index]) for row in rows) for index in range(column_count))
+
+
+def remaining_column_width(
+    width: int,
+    fixed_widths: Sequence[int],
+    *,
+    prefix: str = "",
+    separator: str = "  ",
+) -> int:
+    """Return the space left for a final free-running column."""
+    return width - len(prefix) - sum(fixed_widths) - len(separator) * len(fixed_widths)
+
+
+def terminal_width() -> int:
+    """Read the terminal width, honoring COLUMNS and using a stable fallback."""
+    return shutil.get_terminal_size(fallback=(100, 24)).columns
 
 
 def _validate_max_output(max_output: int) -> None:
@@ -148,6 +174,26 @@ def snippet(text: str, *, limit: int = 200) -> str:
     boundary that does not exist would return nothing.
     """
     return _truncate_snippet(_single_line(text), limit)
+
+
+def fit_text(text: str, *, width: int) -> tuple[str, bool]:
+    """Fit terminal-safe single-line text and report whether it was cut."""
+    safe = safe_text(text)
+    available = max(0, width)
+    if len(safe) <= available:
+        return safe, False
+    if available < len("..."):
+        return safe[:available], True
+    return snippet(safe, limit=available), True
+
+
+def middle_cut(text: str, *, limit: int) -> str:
+    """Keep both ends of a long value, replacing its middle with an ellipsis."""
+    if len(text) <= limit:
+        return text
+    left = (limit - 1) // 2
+    right = limit - left - 1
+    return f"{text[:left]}…{text[-right:]}"
 
 
 def _truncate_snippet(normalized: str, limit: int) -> str:

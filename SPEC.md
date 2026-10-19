@@ -68,14 +68,14 @@ agents create NAME --extends AGENT [--model M] [--effort E] [--mode MODE] [--per
 agents delete NAME [--yes] [--format text|json]
 ```
 
-`agents list` returns a bounded collection with `items` and `has_more`, defaulting to 20 entries. Entries are ordered by adapter name, ascending; each adapter is followed by its variants in name order, and the default window is the first 20 of that order. `--plain` prints one adapter or variant name per line and requires an explicit `--limit`.
+`agents list` returns a bounded collection with `items` and `has_more`, defaulting to 100 entries. Entries are ordered by adapter name, ascending; each adapter is followed by its variants in name order, and the default window is the first 100 of that order. `--plain` prints one adapter or variant name per line and requires an explicit `--limit`. The text rendering fits the terminal width: each adapter heads its variants, a model longer than 35 characters is cut in the middle, the description takes the width that remains, the home column is left out when that remainder is too short for a description, and a roster whose descriptions were cut says so once in a footer naming `agents get`; the machine formats carry every field in full.
 
 `agents get` renders one adapter or variant.
 The detail contains resolved values with provenance, environment declarations, and the adapter's advertised modes, models and slash commands.
 `--models` and `--commands` select the corresponding advertised view, and they are mutually exclusive.
 A variant points at its base adapter rather than duplicating the catalog.
 
-`agents check` runs the adapter connection check without sending a prompt. Without `NAME` it checks every registered adapter and variant, bounded by the default limit of 20. Entries are ordered by name, ascending, and the default window is the first 20 of that order. With `NAME` it checks exactly one entry and returns a one-item collection with `has_more: false`; `NAME` cannot be combined with `--limit` or `--plain`. The default connection timeout is 30 seconds. A check that reaches the adapter and reports `ok: false` is still a successful command with exit code 0; failed checks are summarized on stderr.
+`agents check` runs the adapter connection check without sending a prompt. Without `NAME` it checks every registered adapter and variant, bounded by the default limit of 100. Entries are ordered by name, ascending, and the default window is the first 100 of that order. With `NAME` it checks exactly one entry and returns a one-item collection with `has_more: false`; `NAME` cannot be combined with `--limit` or `--plain`. The default connection timeout is 30 seconds. A check that reaches the adapter and reports `ok: false` is still a successful command with exit code 0; failed checks are summarized on stderr.
 
 `agents create` writes a strict local variant under `ACPC_HOME/agents`. Existing names are a `conflict`, and names that are path-like or collide with an `agents` subcommand are invalid. It requires `--extends` and does not ask for confirmation.
 
@@ -234,7 +234,7 @@ skills list [--limit N] [--plain] [--format text|json|plain]
 skills get NAME [--format text|json]
 ```
 
-`skills list` returns a bounded collection of bundled skills with `name`, `description` and `path`. Entries are ordered by name, ascending, and the default window is the first 20 of that order. `--plain` prints one name per line and requires an explicit limit. `skills get` prints the skill body in text mode and writes its source directory to stderr; its machine result contains `name`, `description`, `path` and `body`. Bundled skills are read-only package data.
+`skills list` returns a bounded collection of bundled skills with `name`, `description` and `path`. Entries are ordered by name, ascending, and the default window is the first 100 of that order. `--plain` prints one name per line and requires an explicit limit. The text rendering cuts a description to the terminal width and says so once in a footer naming `skills get`. `skills get` prints the skill body in text mode and writes its source directory to stderr; its machine result contains `name`, `description`, `path` and `body`. Bundled skills are read-only package data.
 
 ### `status`
 

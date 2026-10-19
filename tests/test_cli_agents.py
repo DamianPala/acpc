@@ -63,6 +63,7 @@ def state_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     (agents / "builder.toml").write_text(BUILDER_ENTRY, encoding="utf-8")
     (agents / "phantom.toml").write_text(PHANTOM_ENTRY, encoding="utf-8")
     monkeypatch.setenv("ACPC_HOME", str(root))
+    monkeypatch.setenv("COLUMNS", "200")
     return root
 
 
@@ -121,7 +122,7 @@ def test_agents_list_reports_has_more_past_the_default_limit(
 ) -> None:
     """Mutation coverage: nothing else in the suite proves this truncation
     signal for `agents list` (recon D, mutation 10)."""
-    for index in range(20):
+    for index in range(24):
         (state_root / "agents" / f"variant-{index:02d}.toml").write_text(
             'extends = "mock"\n', encoding="utf-8"
         )
@@ -129,17 +130,25 @@ def test_agents_list_reports_has_more_past_the_default_limit(
     result = invoke(cli, "agents", "list", "--json")
 
     payload = json.loads(result.stdout)
-    assert len(payload["items"]) == 20
-    assert payload["has_more"] is True
+    assert sum(item["kind"] == "variant" for item in payload["items"]) == 25
+    assert sum(item["kind"] == "adapter" for item in payload["items"]) > 0
+    assert payload["has_more"] is False
+
+    limited = invoke(cli, "agents", "list", "--limit", "20", "--json")
+    limited_payload = json.loads(limited.stdout)
+    assert len(limited_payload["items"]) == 20
+    assert limited_payload["has_more"] is True
 
 
+# 100 sequential checks take ~11 s alone; the default 30 s timeout trips under -n auto.
+@pytest.mark.timeout(120)
 def test_agents_check_reports_has_more_past_the_default_limit(
     cli: CliRunner, state_root: Path
 ) -> None:
     """Mutation coverage: nothing else in the suite proves this truncation
     signal for `agents check` (recon D, mutation 10). Every extra entry is a
-    fast-failing phantom so the check does not spawn 20 real subprocesses."""
-    for index in range(20):
+    fast-failing phantom so the check does not spawn 100 real subprocesses."""
+    for index in range(98):
         (state_root / "agents" / f"phantom-{index:02d}.toml").write_text(
             PHANTOM_ENTRY, encoding="utf-8"
         )
@@ -147,7 +156,7 @@ def test_agents_check_reports_has_more_past_the_default_limit(
     result = invoke(cli, "agents", "check", "--json")
 
     payload = json.loads(result.stdout)
-    assert len(payload["items"]) == 20
+    assert len(payload["items"]) == 100
     assert payload["has_more"] is True
 
 
@@ -211,10 +220,10 @@ def test_agents_check_uses_name_order_for_its_collection(
 
 
 def test_agents_list_labels_variant_columns_and_adapts_to_long_values(
-    cli: CliRunner, state_root: Path
+    cli: CliRunner, state_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     long_entry = "variant-name-longer-than-the-old-column"
-    long_model = "vendor/model-with-a-deliberately-long-identifier"
+    long_model = "0123456789" * 5 + "ab"
     (state_root / "agents" / f"{long_entry}.toml").write_text(
         f'''
 extends = "mock"
@@ -226,6 +235,7 @@ home = "~/.home-longer-than-the-old-column"
         encoding="utf-8",
     )
 
+    monkeypatch.setenv("COLUMNS", "200")
     result = invoke(cli, "agents", "list", "--format", "text")
     assert result.exit_code == vocab.EXIT_OK
     lines = result.stdout.splitlines()
@@ -235,9 +245,13 @@ home = "~/.home-longer-than-the-old-column"
 
     assert header.split() == list(headings)
     assert lines.count(header) == 1
-    assert [row.index(value) for value in (long_entry, long_model, "xhigh", "execute")] == [
+    model_preview = f"{long_model[:17]}…{long_model[-17:]}"
+    assert [row.index(value) for value in (long_entry, model_preview, "xhigh", "execute")] == [
         header.index(value) for value in headings[:4]
     ]
+    assert len(model_preview) == 35
+    assert "~/.home-longer-than-the-old-column" in row
+    assert "(full:" not in result.stdout
     assert not any(line.startswith("ENTRY") for line in lines)
 
 
@@ -250,6 +264,8 @@ def test_agents_views_render_present_and_absent_descriptions(cli: CliRunner) -> 
     assert builder_row.endswith("Implements a task against a plan.")
     assert mock_row.endswith("installed")
     assert "description" not in mock_row
+    assert "descriptions cut" not in listed.stdout
+    assert "descriptions hidden" not in listed.stdout
 
     builder_detail = invoke(cli, "agents", "get", "builder", "--format", "text")
     assert "description  Implements a task against a plan." in builder_detail.stdout
@@ -269,14 +285,15 @@ def test_agents_views_render_present_and_absent_descriptions(cli: CliRunner) -> 
 
 
 def test_agents_list_truncates_but_detail_and_json_keep_full_description(
-    cli: CliRunner, state_root: Path
+    cli: CliRunner, state_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     full_description = (
         "A deliberately long description with   repeated whitespace\n"
         "and enough words to exceed the list view budget while preserving its full detail value."
     )
     adapter_description = (
-        "An adapter description with   enough words to exercise the same list-only truncation path."
+        "An adapter description with   enough words to exercise the same list-only truncation path. "
+        "Additional adapter words make this longer than its terminal column budget. " * 2
     )
     (state_root / "agents" / "mock.toml").write_text(
         MOCK_ENTRY.replace(
@@ -293,20 +310,26 @@ def test_agents_list_truncates_but_detail_and_json_keep_full_description(
         encoding="utf-8",
     )
 
+    monkeypatch.setenv("COLUMNS", "120")
     listed = invoke(cli, "agents", "list", "--format", "text")
     builder_row = next(line for line in listed.stdout.splitlines() if line.startswith("  builder"))
     mock_row = next(line for line in listed.stdout.splitlines() if line.startswith("mock"))
-    builder_snippet = (
-        "A deliberately long description with repeated whitespace and enough words to..."
-    )
-    mock_snippet = "An adapter description with enough words to exercise the same list-only..."
-    assert builder_snippet in builder_row
-    assert mock_snippet in mock_row
-    assert "full: acpc agents get builder" in builder_row
-    assert "full: acpc agents get mock" in mock_row
+    header = next(line for line in listed.stdout.splitlines() if line.startswith("  ENTRY"))
+    builder_snippet = builder_row[header.index("DESCRIPTION") :]
+    mock_snippet = mock_row.removeprefix("mock  Mock Agent  installed  ")
+    assert builder_snippet.endswith("...")
+    assert mock_snippet.endswith("...")
+    normalized_builder = " ".join(full_description.split())
+    normalized_mock = " ".join(adapter_description.split())
+    assert normalized_builder.startswith(builder_snippet[:-3])
+    assert normalized_builder[len(builder_snippet[:-3])] == " "
+    assert normalized_mock.startswith(mock_snippet[:-3])
+    assert normalized_mock[len(mock_snippet[:-3])] == " "
+    footer = "-- descriptions cut to the terminal width; full: acpc agents get NAME"
+    assert listed.stdout.count(footer) == 1
+    assert "(full:" not in listed.stdout
     assert full_description not in listed.stdout
-    assert len(builder_snippet) <= 80
-    assert len(mock_snippet) <= 80
+    assert max(map(len, listed.stdout.splitlines())) <= 120
 
     detail = invoke(cli, "agents", "get", "builder", "--format", "text")
     collapsed_description = " ".join(full_description.split())
@@ -588,7 +611,9 @@ def test_agents_list_lists_variants(cli: CliRunner) -> None:
     assert "mock" in result.stdout and "builder" in result.stdout
 
 
-def test_agents_list_labels_long_variant_values(cli: CliRunner, state_root: Path) -> None:
+def test_agents_list_labels_long_variant_values(
+    cli: CliRunner, state_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     long_entry = "variant-name-longer-than-the-old-column"
     long_model = "vendor/model-with-a-deliberately-long-identifier"
     (state_root / "agents" / f"{long_entry}.toml").write_text(
@@ -600,6 +625,7 @@ effort = "xhigh"
         encoding="utf-8",
     )
 
+    monkeypatch.setenv("COLUMNS", "200")
     result = invoke(cli, "agents", "list", "--format", "text")
 
     assert result.exit_code == vocab.EXIT_OK
@@ -607,10 +633,89 @@ effort = "xhigh"
     header = next(line for line in lines if line.startswith("  ENTRY"))
     variant_row = next(line for line in lines if long_entry in line)
 
+    model_preview = f"{long_model[:17]}…{long_model[-17:]}"
     assert header.split() == ["ENTRY", "MODEL", "EFFORT", "PERMISSIONS", "HOME", "DESCRIPTION"]
-    assert [variant_row.index(value) for value in (long_entry, long_model, "xhigh")] == [
+    assert [variant_row.index(value) for value in (long_entry, model_preview, "xhigh")] == [
         header.index(value) for value in ("ENTRY", "MODEL", "EFFORT")
     ]
+
+
+def test_agents_list_drops_home_when_it_would_leave_too_little_description(
+    cli: CliRunner, state_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entry = "variant-123456"
+    home = "~/.home-with-a-long-value-that-will-be-removed"
+    model = "0123456789" * 5 + "ab"
+    (state_root / "agents" / f"{entry}.toml").write_text(
+        f'extends = "mock"\nmodel = "{model}"\nhome = "{home}"\n', encoding="utf-8"
+    )
+    monkeypatch.setenv("COLUMNS", "100")
+
+    listed = invoke(cli, "agents", "list", "--format", "text")
+    json_result = invoke(cli, "agents", "list", "--json")
+
+    assert listed.exit_code == vocab.EXIT_OK
+    lines = listed.stdout.splitlines()
+    header = next(line for line in lines if line.startswith("  ENTRY"))
+    row = next(line for line in lines if entry in line)
+    assert header.split() == ["ENTRY", "MODEL", "EFFORT", "PERMISSIONS", "DESCRIPTION"]
+    assert "HOME" not in header
+    assert home not in row
+    listed_items = json.loads(json_result.stdout)["items"]
+    assert next(item for item in listed_items if item["name"] == entry)["home"] == home
+
+
+def test_agents_list_hides_descriptions_when_terminal_is_too_narrow(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("COLUMNS", "60")
+
+    result = invoke(cli, "agents", "list", "--format", "text")
+
+    lines = result.stdout.splitlines()
+    header = next(line for line in lines if line.startswith("  ENTRY"))
+    assert header.split() == ["ENTRY", "MODEL", "EFFORT", "PERMISSIONS"]
+    assert "-- descriptions hidden: terminal too narrow; full: acpc agents get NAME" in lines
+    assert not any("descriptions cut" in line for line in lines)
+
+
+# The fixture's variant grid takes 51 columns before DESCRIPTION with HOME, 45 without.
+@pytest.mark.parametrize(
+    ("columns", "headings"),
+    [
+        ("75", "ENTRY MODEL EFFORT PERMISSIONS HOME DESCRIPTION"),
+        ("74", "ENTRY MODEL EFFORT PERMISSIONS DESCRIPTION"),
+        ("69", "ENTRY MODEL EFFORT PERMISSIONS DESCRIPTION"),
+        ("68", "ENTRY MODEL EFFORT PERMISSIONS"),
+    ],
+)
+def test_agents_list_drops_columns_below_a_24_character_description(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch, columns: str, headings: str
+) -> None:
+    monkeypatch.setenv("COLUMNS", columns)
+
+    lines = invoke(cli, "agents", "list", "--format", "text").stdout.splitlines()
+
+    assert next(line for line in lines if line.startswith("  ENTRY")).split() == headings.split()
+
+
+def test_agents_list_groups_variants_under_their_adapter(cli: CliRunner, state_root: Path) -> None:
+    (state_root / "agents" / "phantom.toml").unlink()
+    (state_root / "agents" / "other.toml").write_text(
+        MOCK_ENTRY.replace('name = "Mock Agent"', 'name = "Other Agent"'), encoding="utf-8"
+    )
+    (state_root / "agents" / "other-child.toml").write_text('extends = "other"\n', encoding="utf-8")
+
+    result = invoke(cli, "agents", "list", "--format", "text")
+
+    lines = result.stdout.splitlines()
+    mock = next(index for index, line in enumerate(lines) if line.startswith("mock  "))
+    builder = next(index for index, line in enumerate(lines) if line.startswith("  builder"))
+    other = next(index for index, line in enumerate(lines) if line.startswith("other  "))
+    child = next(index for index, line in enumerate(lines) if line.startswith("  other-child"))
+    header = next(index for index, line in enumerate(lines) if line.startswith("  ENTRY"))
+    assert mock < header < builder < other < child
+    assert sum(line.startswith("  ENTRY") for line in lines) == 1
 
 
 def test_variant_models_view_delegates_to_parent_catalog(cli: CliRunner) -> None:

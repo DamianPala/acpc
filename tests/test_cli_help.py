@@ -155,6 +155,21 @@ def test_root_help_command_catalog_does_not_present_groups_as_commands(
     assert all(line.strip() not in {"agents", "skills", "daemon"} for line in commands.splitlines())
 
 
+def test_roster_help_uses_100_while_session_list_keeps_20(runner: CliRunner) -> None:
+    agents_list = " ".join(invoke(runner, "agents", "list", "--help").stdout.split())
+    agents_check = " ".join(invoke(runner, "agents", "check", "--help").stdout.split())
+    skills_list = " ".join(invoke(runner, "skills", "list", "--help").stdout.split())
+    session_list = " ".join(invoke(runner, "list", "--help").stdout.split())
+
+    assert "Return at most N agents in the collection; default 100." in agents_list
+    assert "Return at most N check results; default 100; only valid without NAME." in agents_check
+    assert "Return at most N skills in the collection; default 100." in skills_list
+    assert "[default: 100;" in agents_list
+    assert "[default: 100;" in agents_check
+    assert "[default: 100;" in skills_list
+    assert "[default: 20;" in session_list
+
+
 def test_permission_help_names_the_tier_gloss(runner: CliRunner) -> None:
     root_help = invoke(runner, "--help")
     run_help = invoke(runner, "run", "--help")

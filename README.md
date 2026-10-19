@@ -73,9 +73,9 @@ daemon status|stop [target] [--force]   # plumbing escape hatch — never needed
 `acpc --help` is a self-contained cheat sheet; `acpc <cmd> --help` is that command's full reference. `<id>` accepts a session id or a `--name` alias; `last` works on a TTY only.
 
 `list` uses this order for its first N entries: active sessions first, newest by creation time, then finished sessions, newest by finish time, falling back to creation time when a session has none; ties are broken by session id, descending in both groups.
-`agents list` orders adapter names ascending, followed by each adapter's variants in name order; its default window is the first 20 entries in that order.
-`agents check` orders entries by name, ascending, with the default window being the first 20 entries in that order.
-`skills list` orders entries by name, ascending, with the default window being the first 20 entries in that order.
+`agents list` orders adapter names ascending, followed by each adapter's variants in name order; its default window is the first 100 entries in that order, and the text view fits the terminal width (`--json` carries every field in full).
+`agents check` orders entries by name, ascending, with the default window being the first 100 entries in that order.
+`skills list` orders entries by name, ascending, with the default window being the first 100 entries in that order.
 `daemon status` orders entries by target name, ascending, with the default window being the first 20 entries in that order.
 `prune` fixes its target set before confirmation, then locks and rechecks every target before clearing any session; a target that changed meanwhile fails with `conflict` and leaves the set intact.
 

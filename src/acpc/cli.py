@@ -1773,17 +1773,14 @@ def _local_variant_value(entry: ResolvedEntry, field: str) -> str | None:
     return _display_home(value) if field == "home" else str(value)
 
 
-# SPEC: the roster bounds a description so a long one cannot bloat the
-# context of the agent reading it; the detail view and --json stay full.
-_ROSTER_DESCRIPTION_LIMIT = 80
-
-
 def _agent_row(entry: ResolvedEntry) -> tuple[str, ...]:
     status = entry.roster_install_status()
-    description = _roster_description(
-        entry.description, full_command=f"acpc agents get {entry.entry}"
+    return (
+        render.safe_text(entry.entry),
+        render.safe_text(entry.name),
+        render.safe_text(status),
+        _roster_description(entry.description),
     )
-    return (entry.entry, entry.name, status, description)
 
 
 def _variant_row(entry: ResolvedEntry) -> tuple[str, ...]:
@@ -1791,34 +1788,80 @@ def _variant_row(entry: ResolvedEntry) -> tuple[str, ...]:
         field: _local_variant_value(entry, field)
         for field in ("model", "effort", "permissions", "home")
     }
-    description = _roster_description(
-        entry.description, full_command=f"acpc agents get {entry.entry}"
-    )
+    model = render.middle_cut(render.safe_text(values["model"] or "·"), limit=35)
     return (
-        entry.entry,
-        values["model"] or "·",
-        values["effort"] or "·",
-        values["permissions"] or "·",
-        values["home"] or "·",
-        description,
+        render.safe_text(entry.entry),
+        model,
+        render.safe_text(values["effort"] or "·"),
+        render.safe_text(values["permissions"] or "·"),
+        render.safe_text(values["home"] or "·"),
+        _roster_description(entry.description),
     )
 
 
 def _skill_row(skill: skills.Skill) -> tuple[str, ...]:
-    description = _roster_description(
-        skill.description, full_command=f"acpc skills get {skill.name}"
+    return (render.safe_text(skill.name), _roster_description(skill.description))
+
+
+def _roster_description(value: str | None) -> str:
+    return render.safe_text(value) if value is not None else ""
+
+
+def _roster_description_budget(
+    rows: Sequence[tuple[str, ...]], header: tuple[str, ...], *, width: int, prefix: str = ""
+) -> int:
+    measured_rows = [header, *rows]
+    widths = render.column_widths(measured_rows)
+    return render.remaining_column_width(width, widths[:-1], prefix=prefix)
+
+
+def _fit_roster_descriptions(
+    rows: Sequence[tuple[str, ...]], *, width: int
+) -> tuple[list[tuple[str, ...]], bool]:
+    fitted_rows: list[tuple[str, ...]] = []
+    was_cut = False
+    for row in rows:
+        description, cut = render.fit_text(row[-1], width=width)
+        fitted_rows.append((*row[:-1], description))
+        was_cut = was_cut or cut
+    return fitted_rows, was_cut
+
+
+def _agent_variant_grid(
+    rows: Sequence[tuple[str, ...]], *, width: int
+) -> tuple[list[str], bool, bool]:
+    if not rows:
+        return [], False, False
+
+    header = ("entry", "model", "effort", "permissions", "home", "description")
+    selected_rows = list(rows)
+    budget = _roster_description_budget(selected_rows, header, width=width, prefix="  ")
+    if budget < 24:
+        header = ("entry", "model", "effort", "permissions", "description")
+        selected_rows = [(*row[:4], row[5]) for row in selected_rows]
+        budget = _roster_description_budget(selected_rows, header, width=width, prefix="  ")
+        if budget < 24:
+            hidden_header = header[:-1]
+            hidden_rows = [row[:-1] for row in selected_rows]
+            return (
+                render.format_table(hidden_rows, header=hidden_header, prefix="  "),
+                False,
+                True,
+            )
+
+    fitted_rows, was_cut = _fit_roster_descriptions(selected_rows, width=budget)
+    return (
+        render.format_table(fitted_rows, header=header, prefix="  "),
+        was_cut,
+        False,
     )
-    return (skill.name, description)
 
 
-def _roster_description(value: str | None, *, full_command: str) -> str:
-    if value is None:
-        return ""
-    safe = render.safe_text(value)
-    preview = render.snippet(safe, limit=_ROSTER_DESCRIPTION_LIMIT)
-    if preview != safe:
-        return f"{preview} (full: {full_command})"
-    return preview
+def _render_agent_heading(row: tuple[str, ...], *, width: int) -> tuple[str, bool]:
+    fixed = row[:3]
+    budget = width - sum(len(value) for value in fixed) - 2 * len(fixed)
+    description, was_cut = render.fit_text(row[3], width=budget)
+    return ("  ".join((*fixed, description)).rstrip(), was_cut)
 
 
 def _skill_payload(skill: skills.Skill, *, include_body: bool) -> dict[str, Any]:
@@ -2130,22 +2173,38 @@ def _emit_json(payload: Mapping[str, Any]) -> None:
 
 def _render_agent_roster(registry: AgentRegistry, items: list[dict[str, Any]], total: int) -> str:
     selected_names = {str(item["name"]) for item in items}
-    adapter_lines = render.format_table(
-        [_agent_row(adapter) for adapter in registry.adapters if adapter.entry in selected_names],
-        separator="  ",
-    )
-    variants = [variant for variant in registry.variants if variant.entry in selected_names]
-    variant_lines = (
-        render.format_table(
-            [_variant_row(variant) for variant in variants],
-            header=("entry", "model", "effort", "permissions", "home", "description"),
-            prefix="  ",
-            separator="  ",
-        )
-        if variants
-        else []
-    )
-    lines = [*adapter_lines, *variant_lines]
+    adapters = {
+        adapter.entry: _agent_row(adapter)
+        for adapter in registry.adapters
+        if adapter.entry in selected_names
+    }
+    variants = {
+        variant.entry: _variant_row(variant)
+        for variant in registry.variants
+        if variant.entry in selected_names
+    }
+    variant_rows = [variants[str(item["name"])] for item in items if item["kind"] == "variant"]
+    width = render.terminal_width()
+    variant_lines, variant_cut, descriptions_hidden = _agent_variant_grid(variant_rows, width=width)
+    variant_line_iter = iter(variant_lines[1:])
+    lines: list[str] = []
+    description_cut = variant_cut
+    header_written = False
+    for item in items:
+        name = str(item["name"])
+        if item["kind"] == "adapter":
+            heading, was_cut = _render_agent_heading(adapters[name], width=width)
+            lines.append(heading)
+            description_cut = description_cut or was_cut
+            continue
+        if not header_written:
+            lines.append(variant_lines[0])
+            header_written = True
+        lines.append(next(variant_line_iter))
+    if descriptions_hidden:
+        lines.append("-- descriptions hidden: terminal too narrow; full: acpc agents get NAME")
+    elif description_cut:
+        lines.append("-- descriptions cut to the terminal width; full: acpc agents get NAME")
     if len(items) < total:
         lines.append(f"-- {len(items)} of {total} — use --limit to change")
     return "\n".join(lines) + ("\n" if lines else "")
@@ -2186,9 +2245,9 @@ def agents_group(ctx: click.Context) -> None:
 @click.option(
     "--limit",
     type=click.IntRange(min=0),
-    default=render.DEFAULT_STATUS_LIMIT,
+    default=render.DEFAULT_ROSTER_LIMIT,
     show_default=True,
-    help="Return at most N agents in the collection; default 20.",
+    help="Return at most N agents in the collection; default 100.",
 )
 @click.option(
     "--plain",
@@ -2213,7 +2272,7 @@ def agents_list_command(
 ) -> None:
     """List adapters and variants.
     Entries are ordered by adapter name, ascending; each adapter is followed by its variants in
-    name order, and the default window is the first 20 of that order.
+    name order, and the default window is the first 100 of that order.
 
     The collection is grouped by adapter so a variant is shown with its base adapter.
     """
@@ -2379,9 +2438,9 @@ _CHECK_TIMEOUT_DEFAULT = "30s"
 @click.option(
     "--limit",
     type=click.IntRange(min=0),
-    default=render.DEFAULT_STATUS_LIMIT,
+    default=render.DEFAULT_ROSTER_LIMIT,
     show_default=True,
-    help="Return at most N check results; default 20; only valid without NAME.",
+    help="Return at most N check results; default 100; only valid without NAME.",
 )
 @click.option(
     "--plain",
@@ -2419,7 +2478,7 @@ def agents_check_command(
     json_mode: bool,
 ) -> None:
     """Check registered adapters and variants, then report advertised data.
-    Entries are ordered by name, ascending, and the default window is the first 20 of that order.
+    Entries are ordered by name, ascending, and the default window is the first 100 of that order.
 
     With NAME, check one registered entry, including one whose adapter is not
     installed. Without NAME, check every registered adapter and variant.
@@ -2732,10 +2791,16 @@ def _run_skills_list(selected_format: str, limit: int) -> None:
     elif selected_format == "plain":
         _write_stdout("".join(f"{item['name']}\n" for item in items))
     else:
+        rows = [_skill_row(skill) for skill in bundled[:limit]]
+        header = ("name", "description")
+        budget = _roster_description_budget(rows, header, width=render.terminal_width())
+        fitted_rows, descriptions_cut = _fit_roster_descriptions(rows, width=budget)
         rows = render.format_table(
-            [_skill_row(skill) for skill in bundled[:limit]],
-            header=("name", "description"),
+            fitted_rows,
+            header=header,
         )
+        if descriptions_cut:
+            rows.append("-- descriptions cut to the terminal width; full: acpc skills get NAME")
         if len(items) < len(bundled):
             rows.append(f"-- {len(items)} of {len(bundled)} — use --limit to change")
         _write_stdout("\n".join(rows) + "\n")
@@ -2770,9 +2835,9 @@ def skills_group(ctx: click.Context) -> None:
 @click.option(
     "--limit",
     type=click.IntRange(min=0),
-    default=render.DEFAULT_STATUS_LIMIT,
+    default=render.DEFAULT_ROSTER_LIMIT,
     show_default=True,
-    help="Return at most N skills in the collection; default 20.",
+    help="Return at most N skills in the collection; default 100.",
 )
 @click.option(
     "--plain",
@@ -2796,7 +2861,7 @@ def skills_list_command(
     ctx: click.Context, limit: int, plain: bool, format_name: str | None, json_mode: bool
 ) -> None:
     """List bundled skills.
-    Entries are ordered by name, ascending, and the default window is the first 20 of that order.
+    Entries are ordered by name, ascending, and the default window is the first 100 of that order.
     """
     selected_format = _select_format(format_name, json_mode, plain=plain)
     if (

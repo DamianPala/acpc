@@ -53,6 +53,8 @@ declare -A SECTION_RESULT=()
 
 ACPC_HOME="$(mktemp -d "${TMPDIR:-/tmp}/acpc-smoke.home.XXXXXX")"
 export ACPC_HOME
+# Text rosters fit the terminal width; pin it so roster assertions ignore the caller's COLUMNS.
+export COLUMNS=100
 SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/acpc-smoke.scratch.XXXXXX")"
 
 PASS_COUNT=0
@@ -1087,7 +1089,7 @@ if begin_section S10-agents "agents views, variants, advertised data, install"; 
     # absent values remain absent in text and become null in JSON.
     run_acpc agents list --format text
     assert_contains "agents list appends the variant description" "$LAST_OUT" \
-        "Implements a task against a plan."
+        "Implements a task against..."
     run_acpc agents get builder --format text
     assert_contains "agents detail renders the variant description" "$LAST_OUT" \
         "description  Implements a task against a plan."
@@ -1116,7 +1118,7 @@ EOF
     assert_eq "long and multiline description does not break dispatch" "0" "$LAST_RC"
     run_acpc agents list --format text
     assert_contains "agents list normalizes and truncates descriptions" "$LAST_OUT" \
-        "A deliberately long description with repeated whitespace and enough words to..."
+        "A deliberately long..."
     run_acpc agents get long-description --format text
     assert_contains "agents detail keeps the normalized description" "$LAST_OUT" \
         "A deliberately long description with repeated whitespace and enough words to exceed the list view budget while preserving its full detail value."

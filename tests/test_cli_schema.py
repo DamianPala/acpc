@@ -364,6 +364,20 @@ def test_agents_check_publishes_its_scope_and_conflicts(runner: CliRunner) -> No
     assert "only valid without NAME" in flags["plain"]["description"]
 
 
+def test_roster_limit_defaults_are_published(runner: CliRunner) -> None:
+    expected = {
+        "agents list": 100,
+        "agents check": 100,
+        "skills list": 100,
+        "list": 20,
+    }
+
+    for command, default in expected.items():
+        detail = read_detail(runner, command)
+        limit = next(flag for flag in detail["flags"] if flag["name"] == "limit")
+        assert limit["default"] == default, command
+
+
 def test_descriptors_are_well_formed(runner: CliRunner) -> None:
     for entry in read_index(runner)["commands"]:
         for descriptor in descriptors(read_detail(runner, entry["name"])):
