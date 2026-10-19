@@ -584,6 +584,8 @@ class AcpcClient:
         self._usage_update_seen = False
         self._meta_usage_recorded = False
         self._adapter_info: dict[str, str | None] = {"name": None, "version": None}
+        self._served_model: str | None = None
+        self._claude_model_seen = False
         self._rate_limit_info: dict[str, Any] | None = None
         self._recorded_progress = False
         self._denied: dict[str, int] = {}
@@ -601,6 +603,11 @@ class AcpcClient:
     def answer(self) -> str:
         """Return the agent-message content received so far."""
         return "".join(self._answer_parts)
+
+    @property
+    def served_model(self) -> str | None:
+        """The last model named by the adapter in this turn."""
+        return self._served_model
 
     @property
     def context(self) -> ContextOccupancy | None:
@@ -730,6 +737,14 @@ class AcpcClient:
             "usage": self._raw_prompt_usage(prompt_result),
             "_meta": self._raw_response_meta(prompt_result),
         }
+        if not self._claude_model_seen:
+            meta = self._prompt_response["_meta"]
+            quota = meta.get("quota") if isinstance(meta, Mapping) else None
+            rows = quota.get("model_usage") if isinstance(quota, Mapping) else None
+            if isinstance(rows, list):
+                for row in rows:
+                    if isinstance(row, Mapping) and isinstance(row.get("model"), str):
+                        self._served_model = row["model"]
         self.flush()
         self.transcript.append(
             "usage",
@@ -1273,6 +1288,10 @@ class AcpcClient:
         # prompt with, but only once this session has already sent one
         # assistant message with usage — a fresh session has none yet.
         meta = self._prompt_meta(update)
+        model = meta.get("_claude/model")
+        if isinstance(model, str) and model:
+            self._served_model = model
+            self._claude_model_seen = True
         rate_limit_info = meta.get("_claude/rateLimit")
         if isinstance(rate_limit_info, Mapping):
             self._rate_limit_info = dict(rate_limit_info)

@@ -9,6 +9,7 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -1758,6 +1759,20 @@ def _echo_metadata(line: str) -> None:
         line = "\n" + line
         _stdout_line_open = False
     click.echo(line, err=True)
+
+
+def _emit_served_model_note(meta: sessions.SessionMeta, *, quiet: bool) -> None:
+    requested, served = meta.resolved_model, meta.served_model
+    if not requested or not served or not any(char.isdigit() for char in requested):
+        return
+    normalized_requested = re.sub(r"\[[^\]]*\]$", "", requested)
+    normalized_served = re.sub(r"\[[^\]]*\]$", "", served)
+    if normalized_requested.startswith(normalized_served) or normalized_served.startswith(
+        normalized_requested
+    ):
+        return
+    if sessions.claim_served_model_note(meta.session_id, meta.turns) and not quiet:
+        _echo_metadata(f"acpc: requested model {requested}, {meta.base_adapter} served {served}")
 
 
 def _emit_usage_drift_note(meta: sessions.SessionMeta, *, quiet: bool) -> None:
@@ -4623,6 +4638,7 @@ def _run_foreground(
         )
         _end_turn_for(meta.session_id, outcome)
     _emit_usage_drift_note(final, quiet=quiet)
+    _emit_served_model_note(final, quiet=quiet)
     if not quiet:
         _echo_metadata(
             output.format_summary(
@@ -4694,6 +4710,15 @@ def _reject_background_flags(
     help=_TIMEOUT_HELP,
 )
 @click.option(
+    "--limit-wait",
+    type=TimeoutParamType(allow_zero=True),
+    metavar="DURATION",
+    help=(
+        "Cap the usage-limit waiting of this turn (e.g. 0s, 30m, 1h30m); "
+        "overrides the entry's limit_wait_max and the global one."
+    ),
+)
+@click.option(
     "--cancel-after",
     type=TimeoutParamType(),
     metavar="S",
@@ -4746,6 +4771,7 @@ def run_command(
     format_name: str | None,
     timeout: float | None,
     cancel_after: float | None,
+    limit_wait: float | None,
     alias: str | None,
     background: bool,
     max_output: int,
@@ -4807,6 +4833,7 @@ def run_command(
         cwd=resolved_cwd,
         wait_timeout=timeout,
         cancel_after=cancel_after,
+        limit_wait_max=limit_wait,
         permission_prompt=_tty_permission_prompt if policy == "ask" else None,
     )
 
@@ -5176,6 +5203,15 @@ def _continuation_prompt(meta: sessions.SessionMeta) -> str:
     help=_TIMEOUT_HELP,
 )
 @click.option(
+    "--limit-wait",
+    type=TimeoutParamType(allow_zero=True),
+    metavar="DURATION",
+    help=(
+        "Cap the usage-limit waiting of this turn (e.g. 0s, 30m, 1h30m); "
+        "overrides the entry's limit_wait_max and the global one."
+    ),
+)
+@click.option(
     "--cancel-after",
     type=TimeoutParamType(),
     metavar="S",
@@ -5204,6 +5240,7 @@ def continue_command(
     background: bool,
     timeout: float | None,
     cancel_after: float | None,
+    limit_wait: float | None,
     max_output: int,
     quiet: bool,
     json_mode: bool,
@@ -5276,6 +5313,7 @@ def continue_command(
         background=background,
         timeout=timeout,
         cancel_after=cancel_after,
+        limit_wait=limit_wait,
         max_output=max_output,
         quiet=quiet,
         presentation=_select_presentation(selected_format),
@@ -5370,6 +5408,7 @@ def _follow_up_request(
     background: bool,
     timeout: float | None,
     cancel_after: float | None,
+    limit_wait: float | None = None,
 ) -> tuple[sessions.SessionMeta, runner.TurnRequest]:
     """Build the next turn on a finished session from its stored resolution.
 
@@ -5432,6 +5471,7 @@ def _follow_up_request(
             prompt,
             wait_timeout=timeout,
             cancel_after=cancel_after,
+            limit_wait_max=limit_wait,
             permission_prompt=(_tty_permission_prompt if policy == "ask" and interactive else None),
             resolution=request_resolution,
             defer_rotation=True,
@@ -5459,6 +5499,7 @@ def _dispatch_follow_up(
     background: bool,
     timeout: float | None,
     cancel_after: float | None,
+    limit_wait: float | None = None,
     max_output: int,
     quiet: bool,
     presentation: str,
@@ -5479,6 +5520,7 @@ def _dispatch_follow_up(
         background=background,
         timeout=timeout,
         cancel_after=cancel_after,
+        limit_wait=limit_wait,
     )
 
     if background:
@@ -5542,6 +5584,7 @@ def _dispatch_follow_up(
         )
         _end_turn_for(meta.session_id, outcome)
     _emit_usage_drift_note(final, quiet=quiet)
+    _emit_served_model_note(final, quiet=quiet)
     if not quiet:
         _echo_metadata(
             output.format_summary(
@@ -6218,6 +6261,7 @@ def _observe_steered_turn(
         )
         _emit_turn_result(result, output_file=output_file, json_mode=presentation == "json")
         _emit_usage_drift_note(final, quiet=quiet)
+        _emit_served_model_note(final, quiet=quiet)
         if not quiet:
             _echo_metadata(
                 output.format_summary(
@@ -6342,6 +6386,7 @@ def wait_command(
             json_mode=presentation == "json",
         )
         _emit_usage_drift_note(final, quiet=quiet)
+        _emit_served_model_note(final, quiet=quiet)
         if not quiet:
             summary = output.format_summary(
                 final, truncated_output_file=result.output_file if result.truncated else None

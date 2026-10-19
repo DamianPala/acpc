@@ -193,6 +193,7 @@ EXPECTED_REQUIRED_FIELDS = {
         "entry",
         "base_adapter",
         "model",
+        "served_model",
         "name",
         "runtime_seconds",
         "idle_seconds",
@@ -237,6 +238,8 @@ EXPECTED_REQUIRED_FIELDS = {
         "stop_reason",
         "context",
         "usage",
+        "served_model",
+        "failure",
         "answer",
         "paths",
         "retained",
@@ -366,6 +369,14 @@ EXPECTED_OUTPUT_ENUMS: dict[str, set[Any]] = {
     "wait.output.capabilities.steer_mode": {"in-place", "cancel-then-start"},
 }
 for _name in ("continue", "run", "status", "steer", "wait"):
+    EXPECTED_OUTPUT_ENUMS[f"{_name}.output.failure.class"] = {
+        "auth",
+        "rate_limit",
+        "adapter_limit",
+        "connection",
+        "adapter_error",
+        "acpc",
+    }
     EXPECTED_OUTPUT_ENUMS[f"{_name}.output.usage.quality"] = {"exact", "estimate"}
     EXPECTED_OUTPUT_ENUMS[f"{_name}.output.usage.billing"] = {None, "subscription", "api"}
 
@@ -415,6 +426,8 @@ _SESSION_OUTPUT_PROPERTIES = frozenset(
         "stop_reason",
         "context",
         "usage",
+        "served_model",
+        "failure",
         "paths",
         "retained",
         "answer",
@@ -486,6 +499,10 @@ def _session_output_oracle(
         "output": (properties, frozenset(required)),
         "output.capabilities": (_STEER_CAPABILITIES_PROPERTIES, _STEER_CAPABILITIES_PROPERTIES),
         "output.context": (_CONTEXT_PROPERTIES, _CONTEXT_PROPERTIES),
+        "output.failure": (
+            frozenset({"class", "message", "next_step"}),
+            frozenset({"class", "message", "next_step"}),
+        ),
         "output.usage": (_USAGE_PROPERTIES, _USAGE_PROPERTIES),
         "output.usage.drift": (_USAGE_DRIFT_PROPERTIES, _USAGE_DRIFT_PROPERTIES),
         "output.usage.models": (frozenset(), frozenset()),
@@ -714,6 +731,7 @@ EXPECTED_OUTPUT_ORACLES: dict[str, dict[str, tuple[frozenset[str], frozenset[str
                     "message",
                     "observation",
                     "next_step",
+                    "class",
                     "adapter_log",
                     "adapter_log_tail",
                     "from",
@@ -868,6 +886,7 @@ EXPECTED_OUTPUT_ORACLES: dict[str, dict[str, tuple[frozenset[str], frozenset[str
                     "entry",
                     "base_adapter",
                     "model",
+                    "served_model",
                     "name",
                     "runtime_seconds",
                     "idle_seconds",
@@ -891,6 +910,10 @@ EXPECTED_OUTPUT_ORACLES: dict[str, dict[str, tuple[frozenset[str], frozenset[str
         ),
         "output.capabilities": (_STEER_CAPABILITIES_PROPERTIES, _STEER_CAPABILITIES_PROPERTIES),
         "output.context": (_CONTEXT_PROPERTIES, _CONTEXT_PROPERTIES),
+        "output.failure": (
+            frozenset({"class", "message", "next_step"}),
+            frozenset({"class", "message", "next_step"}),
+        ),
         "output.usage": (_USAGE_PROPERTIES, _USAGE_PROPERTIES),
         "output.usage.drift": (_USAGE_DRIFT_PROPERTIES, _USAGE_DRIFT_PROPERTIES),
         "output.usage.models": (frozenset(), frozenset()),
@@ -2827,6 +2850,10 @@ def _assert_reachable_output_enums(
         )
     assert declared == EXPECTED_OUTPUT_ENUMS
     for path, values in declared.items():
+        if ".output.failure." in path:
+            # Six failure classes are exercised over ACP in test_result_fields.py,
+            # test_limits.py and test_daemon.py, including process termination.
+            continue
         if ".output.usage." in path:
             # Usage appears only for entries with a declared profile; profile
             # specific CLI cases cover both quality values and all billing

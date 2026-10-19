@@ -428,6 +428,8 @@ def test_run_codex_try_again_later_fails_with_an_unknown_resume_time(
     document = json.loads(result.stdout)
     assert document["status"] == "failed"
     assert document["stop_reason"] == "rate_limit"
+    assert document["failure"]["class"] == "rate_limit"
+    assert document["failure"]["next_step"] == "retry later; acpc cannot tell when the limit lifts"
     assert document["limit"]["source"] == "text"
     assert document["limit"]["resume_at"] is None
 
@@ -891,8 +893,9 @@ def test_steer_cancel_then_start_on_a_waiting_session_starts_turn_two(
     assert sessions.load(session_id).turns == 2
 
 
+@pytest.mark.parametrize("cap_source", ["global", "entry"])
 def test_steer_cancel_then_start_fails_turn_two_when_limit_wait_max_is_zero(
-    cli: CliRunner, monkeypatch: pytest.MonkeyPatch, state_root: Path
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch, state_root: Path, cap_source: str
 ) -> None:
     """Scenario 9 combined with a lowered `limit_wait_max`: the cap is read
     fresh when each turn starts sending, so tightening it between turn 1 and
@@ -920,7 +923,11 @@ def test_steer_cancel_then_start_fails_turn_two_when_limit_wait_max_is_zero(
     session_id = _await_alias("limit-wait-cts-fail")
     _wait_for_state(session_id, "waiting")
 
-    (state_root / "config.toml").write_text('limit_wait_max = "0s"\n', encoding="utf-8")
+    if cap_source == "global":
+        (state_root / "config.toml").write_text('limit_wait_max = "0s"\n', encoding="utf-8")
+    else:
+        entry = state_root / "agents" / "mock.toml"
+        entry.write_text('limit_wait_max = "0s"\n' + entry.read_text())
 
     result = invoke(
         cli,
@@ -929,6 +936,8 @@ def test_steer_cancel_then_start_fails_turn_two_when_limit_wait_max_is_zero(
         "z",
         "--steer-mode",
         "cancel-then-start",
+        "--cancel-after",
+        "1s",
         "--json",
         "--quiet",
     )
@@ -950,6 +959,7 @@ def test_steer_cancel_then_start_fails_turn_two_when_limit_wait_max_is_zero(
     assert final.turns == 2
     assert final.state == "failed"
     assert final.stop_reason == "rate_limit"
+    assert final.failure_class == "rate_limit"
 
 
 # --- behavior: 11. --timeout during the wait reports waiting, not failed ---
@@ -1025,3 +1035,131 @@ def test_old_meta_json_with_on_limit_and_limit_waited_seconds_keys_reads_cleanly
 
     status_result = invoke(cli, "status", meta.session_id, "--json")
     assert status_result.exit_code == vocab.EXIT_OK
+
+
+@pytest.mark.parametrize(
+    ("entry_cap", "inherit", "flag"),
+    [(None, False, "0s"), ("0s", False, None), ("0s", True, None), ("1h", False, "0s")],
+)
+def test_turn_limit_wait_fail_fast_precedence(
+    cli, state_root, monkeypatch, entry_cap, inherit, flag
+):
+    (state_root / "config.toml").write_text('limit_wait_max = "8h"\n')
+    entry = state_root / "agents" / "mock.toml"
+    if entry_cap:
+        entry.write_text(f'limit_wait_max = "{entry_cap}"\n' + entry.read_text())
+    agent = "mock"
+    if inherit:
+        (state_root / "agents" / "child.toml").write_text('extends = "mock"\n')
+        agent = "child"
+    monkeypatch.setenv("ACPC_MOCK_LIMIT_PROMPTS", "1")
+    monkeypatch.setenv("ACPC_MOCK_LIMIT_META", "1")
+    monkeypatch.setenv("ACPC_MOCK_LIMIT_RESET_S", "60")
+    flags = ["--limit-wait", flag] if flag else []
+    result = invoke(
+        cli, "run", agent, "echo:x", "--json", "--quiet", "--cancel-after", "1s", *flags
+    )
+    assert result.exit_code == 1, result.stderr
+    document = json.loads(result.stdout)
+    assert document["status"] == "failed"
+    assert document["stop_reason"] == "rate_limit"
+    assert document["failure"]["class"] == "rate_limit"
+    assert document["failure"]["next_step"] == (
+        f"retry after {document['limit']['resume_at']}, or raise the limit wait cap"
+    )
+
+
+@pytest.mark.parametrize("entry_cap", [None, "0s"])
+def test_limit_wait_flag_authorizes_wait_over_zero_cap(cli, state_root, monkeypatch, entry_cap):
+    (state_root / "config.toml").write_text('limit_wait_max = "0s"\n')
+    if entry_cap:
+        entry = state_root / "agents" / "mock.toml"
+        entry.write_text(f'limit_wait_max = "{entry_cap}"\n' + entry.read_text())
+    monkeypatch.setenv("ACPC_MOCK_LIMIT_PROMPTS", "1")
+    monkeypatch.setenv("ACPC_MOCK_LIMIT_META", "1")
+    monkeypatch.setenv("ACPC_MOCK_LIMIT_RESET_S", "60")
+    result = invoke(
+        cli,
+        "run",
+        "mock",
+        "echo:x",
+        "--name",
+        "cap-wait",
+        "--limit-wait",
+        "1h",
+        "--timeout",
+        "1s",
+        "--json",
+        "--quiet",
+    )
+    session_id = _await_alias("cap-wait")
+    try:
+        assert result.exit_code == vocab.EXIT_TIMEOUT, result.stderr
+        _wait_for_state(session_id, "waiting")
+    finally:
+        invoke(cli, "cancel", session_id, "--quiet")
+
+
+def test_continue_limit_wait_zero(cli, state_root, monkeypatch):
+    first = invoke(cli, "run", "mock", "echo:x", "--json", "--quiet")
+    session_id = json.loads(first.stdout)["session_id"]
+    monkeypatch.setenv("ACPC_MOCK_LIMIT_PROMPTS", "1")
+    monkeypatch.setenv("ACPC_MOCK_LIMIT_META", "1")
+    monkeypatch.setenv("ACPC_MOCK_LIMIT_RESET_S", "60")
+    result = invoke(
+        cli,
+        "continue",
+        session_id,
+        "echo:y",
+        "--limit-wait",
+        "0s",
+        "--json",
+        "--quiet",
+        "--cancel-after",
+        "1s",
+    )
+    assert result.exit_code == 1, result.stderr
+    document = json.loads(result.stdout)
+    assert document["turn"] == 2
+    assert document["failure"]["class"] == "rate_limit"
+
+
+def test_background_limit_wait_zero(cli, live_daemon, monkeypatch):
+    monkeypatch.setenv("ACPC_MOCK_LIMIT_PROMPTS", "1")
+    monkeypatch.setenv("ACPC_MOCK_LIMIT_META", "1")
+    monkeypatch.setenv("ACPC_MOCK_LIMIT_RESET_S", "60")
+    receipt = invoke(
+        cli, "run", "mock", "echo:x", "--bg", "--limit-wait", "0s", "--cancel-after", "1s", "--json"
+    )
+    assert receipt.exit_code == 0, receipt.stderr
+    session_id = json.loads(receipt.stdout)["session_id"]
+    result = invoke(cli, "wait", session_id, "--json", "--quiet", "--timeout", "10s")
+    assert result.exit_code == 1, result.stderr
+    assert json.loads(result.stdout)["failure"]["class"] == "rate_limit"
+
+
+def test_detached_direct_worker_limit_wait_override(cli, monkeypatch, state_root):
+    (state_root / "config.toml").write_text('limit_wait_max = "0s"\n')
+    monkeypatch.setenv("ACPC_MOCK_LIMIT_PROMPTS", "1")
+    monkeypatch.setenv("ACPC_MOCK_LIMIT_META", "1")
+    monkeypatch.setenv("ACPC_MOCK_LIMIT_RESET_S", "60")
+    result = invoke(
+        cli,
+        "run",
+        "mock",
+        "echo:x",
+        "--limit-wait",
+        "1h",
+        "--timeout",
+        "0.1",
+        "--name",
+        "direct-cap",
+        "--json",
+        "--quiet",
+    )
+    session_id = _await_alias("direct-cap")
+    try:
+        assert result.exit_code == vocab.EXIT_TIMEOUT, result.stderr
+        _wait_for_state(session_id, "waiting")
+    finally:
+        invoke(cli, "cancel", session_id, "--quiet")

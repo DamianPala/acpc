@@ -72,6 +72,7 @@ _ENTRY_KEYS: Final = frozenset(
         "model_via",
         "usage_profile",
         "billing",
+        "limit_wait_max",
         "env_passthrough",
         "extends",
         "description",
@@ -106,6 +107,7 @@ _FIELD_NAMES: Final = (
     "model_via",
     "usage_profile",
     "billing",
+    "limit_wait_max",
     "env_passthrough",
     "description",
     "model",
@@ -280,6 +282,7 @@ class ResolvedEntry:
     effort_cli_flag: str | None
     usage_profile: str
     billing: str | None
+    limit_wait_max: str | None
     env_passthrough: tuple[str, ...]
     description: str | None
     model: str | None
@@ -765,6 +768,14 @@ def _parse_entry(
         if value not in _USAGE_PROFILES:
             supported = ", ".join(sorted(_USAGE_PROFILES))
             raise RegistryError(f"{path}: key 'usage_profile' must be one of: {supported}")
+    if "limit_wait_max" in raw:
+        from acpc.config import parse_duration
+
+        value = _expect_string(path, "limit_wait_max", raw["limit_wait_max"])
+        try:
+            parse_duration(value, allow_zero=True)
+        except ValueError as error:
+            raise RegistryError(f"{path}: key 'limit_wait_max': {error}") from None
     if "billing" in raw:
         value = _expect_string(path, "billing", raw["billing"])
         if value not in _BILLING_VALUES:
@@ -967,6 +978,7 @@ def _to_resolved(
         effort_cli_flag=string_or_none("effort_cli_flag"),
         usage_profile=string_or_none("usage_profile") or "none",
         billing=string_or_none("billing"),
+        limit_wait_max=string_or_none("limit_wait_max"),
         env_passthrough=strings("env_passthrough"),
         description=string_or_none("description"),
         model=string_or_none("model"),

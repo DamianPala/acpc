@@ -134,6 +134,7 @@ EXPECTED_REQUIRED: dict[str, tuple[str, ...]] = {
         "entry",
         "base_adapter",
         "model",
+        "served_model",
         "name",
         "runtime_seconds",
         "idle_seconds",
@@ -178,6 +179,8 @@ EXPECTED_REQUIRED: dict[str, tuple[str, ...]] = {
         "stop_reason",
         "context",
         "usage",
+        "served_model",
+        "failure",
         "answer",
         "paths",
         "retained",
@@ -205,6 +208,14 @@ EXPECTED_ENUMS: dict[str, dict[str, tuple[Any, ...]]] = {
         "$.capabilities.steer_mode": ("in-place", "cancel-then-start"),
         "$.usage.quality": ("exact", "estimate"),
         "$.usage.billing": ("subscription", "api", None),
+        "$.failure.class": (
+            "auth",
+            "rate_limit",
+            "adapter_limit",
+            "connection",
+            "adapter_error",
+            "acpc",
+        ),
     },
     "log": {
         "$.type": tuple(
@@ -231,6 +242,14 @@ EXPECTED_ENUMS: dict[str, dict[str, tuple[Any, ...]]] = {
         "$.capabilities.steer_mode": ("in-place", "cancel-then-start"),
         "$.usage.quality": ("exact", "estimate"),
         "$.usage.billing": ("subscription", "api", None),
+        "$.failure.class": (
+            "auth",
+            "rate_limit",
+            "adapter_limit",
+            "connection",
+            "adapter_error",
+            "acpc",
+        ),
     },
     "list": {
         "$.items[].status": (
@@ -258,18 +277,42 @@ EXPECTED_ENUMS: dict[str, dict[str, tuple[Any, ...]]] = {
         "$.capabilities.steer_mode": ("in-place", "cancel-then-start"),
         "$.usage.quality": ("exact", "estimate"),
         "$.usage.billing": ("subscription", "api", None),
+        "$.failure.class": (
+            "auth",
+            "rate_limit",
+            "adapter_limit",
+            "connection",
+            "adapter_error",
+            "acpc",
+        ),
     },
     "steer": {
         "$.status": ("running", "succeeded"),
         "$.capabilities.steer_mode": ("in-place", "cancel-then-start"),
         "$.usage.quality": ("exact", "estimate"),
         "$.usage.billing": ("subscription", "api", None),
+        "$.failure.class": (
+            "auth",
+            "rate_limit",
+            "adapter_limit",
+            "connection",
+            "adapter_error",
+            "acpc",
+        ),
     },
     "wait": {
         "$.status": ("succeeded", "failed", "canceled", "unknown"),
         "$.capabilities.steer_mode": ("in-place", "cancel-then-start"),
         "$.usage.quality": ("exact", "estimate"),
         "$.usage.billing": ("subscription", "api", None),
+        "$.failure.class": (
+            "auth",
+            "rate_limit",
+            "adapter_limit",
+            "connection",
+            "adapter_error",
+            "acpc",
+        ),
     },
 }
 

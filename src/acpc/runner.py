@@ -578,6 +578,7 @@ class TurnRequest:
     rotation_resolution: Mapping[str, Any] | None = None
     resume_prepared: bool = False
     turn_token: int | None = None
+    limit_wait_max: float | None = None
 
 
 @dataclass(slots=True)
@@ -589,6 +590,7 @@ class TurnOutcome:
     answer: str
     context: vocab.ContextOccupancy | None = None
     usage: dict[str, Any] | None = None
+    served_model: str | None = None
     usage_finalized: bool = False
     denied: dict[str, int] = field(default_factory=dict)
     denial_details: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -856,6 +858,7 @@ async def _drive_turn(
         stop_reason=stop_reason,
         answer=client.answer,
         context=client.context,
+        served_model=client.served_model,
         usage=usage_value,
         usage_finalized=usage_finalized,
         denied=client.denied,
@@ -1139,7 +1142,7 @@ async def _configure(call: Any, what: str, *, unknown_option_hint: str | None = 
         message = f"the adapter rejected {what}: {detail}"
         if unknown_option_hint is not None and "unknown config option" in detail.lower():
             message += f" — {unknown_option_hint}"
-        raise AdapterRejection(message) from None
+        raise AdapterRejection(message) from error
 
 
 async def _await_prompt(
@@ -1250,9 +1253,17 @@ def continuation_instruction(cause: str) -> str:
 LIMIT_RESUME_FIXED_DELAY_SECONDS = 5.0
 
 
-def _limit_wait_max_seconds() -> float:
-    from acpc.config import load_config
+def _limit_wait_max_seconds(request: TurnRequest) -> float:
+    from acpc.config import load_config, parse_duration
 
+    if request.limit_wait_max is not None:
+        return request.limit_wait_max
+    try:
+        entry = AgentRegistry().resolve(request.resolution.entry.entry)
+    except RegistryError:
+        entry = None
+    if entry is not None and entry.limit_wait_max is not None:
+        return parse_duration(entry.limit_wait_max, allow_zero=True)
     return load_config().limit_wait_max_seconds
 
 
@@ -1318,7 +1329,7 @@ async def run_prompt_with_limits(
     built inline, plus the final ``limit`` record for ``meta.json`` (``None``
     when no limit ever touched this turn).
     """
-    limit_wait_max = _limit_wait_max_seconds()
+    limit_wait_max = _limit_wait_max_seconds(request)
     limit_waited_seconds = 0.0
     limit_record: dict[str, Any] | None = None
     prompt_text = request.prompt
@@ -1460,6 +1471,7 @@ def daemon_payload(request: TurnRequest) -> dict[str, Any]:
         "home": resolution.home,
         "cwd": cwd,
         "cancel_after": request.cancel_after,
+        "limit_wait_max": request.limit_wait_max,
         "prompt": request.prompt,
         "resume_adapter_session": request.resume_adapter_session,
         "defer_rotation": request.defer_rotation,
@@ -1969,6 +1981,7 @@ def _direct_worker_request(session_id: str) -> TurnRequest:
             prompt=payload.get("prompt", ""),
             cwd=payload.get("cwd"),
             cancel_after=payload.get("cancel_after"),
+            limit_wait_max=payload.get("limit_wait_max"),
             resume_adapter_session=payload.get("resume_adapter_session"),
             defer_rotation=bool(payload.get("defer_rotation", False)),
             rotation_resolution=payload.get("rotation_resolution"),
@@ -2039,17 +2052,7 @@ def _finalize(
     if state == "detached":
         state = "running"
 
-    error_event: dict[str, Any] | None = None
-    if failure is not None:
-        error_event = {
-            "message": failure.message,
-            "observation": failure.observation,
-            "next_step": failure.next_step,
-        }
-        if failure.adapter_log is not None:
-            error_event["adapter_log"] = failure.adapter_log
-        if failure.adapter_log_tail is not None:
-            error_event["adapter_log_tail"] = failure.adapter_log_tail
+    error_event = failure.error_event() if failure is not None else None
 
     try:
         finalized = sessions.finalize_turn(
@@ -2072,6 +2075,13 @@ def _finalize(
                 _single_line(_strip_ansi(failure.observation))[:MESSAGE_TAIL_CHARS]
                 if failure is not None
                 else None
+            ),
+            failure_class=failure.failure_class if failure is not None else None,
+            failure_next_step=failure.next_step if failure is not None else None,
+            served_model=(
+                outcome.served_model
+                if outcome.served_model is not None
+                else (current.served_model if current is not None else None)
             ),
             delivery_record_incomplete=outcome.delivery_record_incomplete,
             reduce=_reduces_at_end(current),
@@ -2123,9 +2133,24 @@ class _FailureDetails:
 
     message: str
     observation: str
-    next_step: str
+    next_step: str | None
+    failure_class: str
     adapter_log: str | None = None
     adapter_log_tail: str | None = None
+
+    def error_event(self) -> dict[str, Any]:
+        """The transcript `error` event's fields."""
+        event: dict[str, Any] = {
+            "message": self.message,
+            "observation": self.observation,
+            "next_step": self.next_step,
+            "class": self.failure_class,
+        }
+        if self.adapter_log is not None:
+            event["adapter_log"] = self.adapter_log
+        if self.adapter_log_tail is not None:
+            event["adapter_log_tail"] = self.adapter_log_tail
+        return event
 
 
 def _failure_details(
@@ -2157,7 +2182,28 @@ def _failure_details(
     )
     adapter_log = _adapter_log_path(meta) if adapter_log_from is not None else None
     adapter_log_tail = _read_adapter_log_tail(adapter_log, adapter_log_from or 0)
-    if authentication_refused and meta is not None:
+    failure_class = _failure_class(
+        error,
+        outcome.stop_reason,
+        authentication_refused=authentication_refused,
+        ended_by_acpc=isinstance(error, TurnEndedByAcpc),
+    )
+    if failure_class == "acpc":
+        if isinstance(error, TurnEndedByAcpc):
+            next_step = f"continue the session: acpc continue {session_id}"
+        elif isinstance(error, AdapterUnavailable):
+            next_step = str(error)
+        else:
+            next_step = None
+    elif failure_class == "rate_limit":
+        limit = outcome.limit or (meta.limit if meta is not None else None)
+        resume_at = limit.get("resume_at") if limit else None
+        next_step = (
+            f"retry after {resume_at}, or raise the limit wait cap"
+            if resume_at
+            else "retry later; acpc cannot tell when the limit lifts"
+        )
+    elif authentication_refused and meta is not None:
         next_step = f"run '{meta.base_adapter} login'"
     elif outcome.stop_reason in _ADAPTER_LIMIT_STOP_REASONS:
         next_step = "split the task into smaller turns, or raise the adapter's own limit"
@@ -2172,14 +2218,44 @@ def _failure_details(
         # answer.md and into `wait`'s single-line summary, where 8 KiB on one
         # line would bury the summary. `log` renders the full field.
         parts.append(f"adapter log tail: {_single_line(adapter_log_tail)[:MESSAGE_TAIL_CHARS]}")
-    parts.append(f"next step: {next_step}")
+    if next_step is not None:
+        parts.append(f"next step: {next_step}")
     return _FailureDetails(
         message="; ".join(parts),
         observation=observation,
         next_step=next_step,
+        failure_class=failure_class,
         adapter_log=str(adapter_log) if adapter_log is not None else None,
         adapter_log_tail=adapter_log_tail,
     )
+
+
+def _failure_class(
+    error: BaseException | None,
+    stop_reason: str | None,
+    *,
+    authentication_refused: bool,
+    ended_by_acpc: bool,
+) -> str:
+    """Classify observed failures without reading session state."""
+    if ended_by_acpc:
+        return "acpc"
+    if authentication_refused:
+        return "auth"
+    if stop_reason == "rate_limit":
+        return "rate_limit"
+    if stop_reason in _ADAPTER_LIMIT_STOP_REASONS:
+        return "adapter_limit"
+    text = describe_error(error).lower() if error is not None else ""
+    if (
+        isinstance(error, ConnectionError)
+        or getattr(error, "handshake_timeout", False)
+        or any(marker in text for marker in ("connection closed", "broken pipe", "eof"))
+    ):
+        return "connection"
+    if isinstance(error, RunnerError) or getattr(error, "acpc_refusal", False):
+        return "acpc"
+    return "adapter_error"
 
 
 def _failure_observation(
@@ -2209,6 +2285,8 @@ def _failure_observation(
 
 def _is_authentication_failure(error: BaseException | None) -> bool:
     """Recognize the narrow ACP auth refusal shape used by vendor adapters."""
+    if isinstance(error, AdapterRejection):
+        return _is_authentication_failure(error.__cause__)
     if not isinstance(error, RequestError) or error.code != -32000:
         return False
     data = error.data
@@ -2598,6 +2676,7 @@ def resolution_from_session(meta: sessions.SessionMeta) -> CallResolution:
         effort_cli_flag=effort_cli_flag,
         usage_profile=usage_profile,
         billing=billing,
+        limit_wait_max=None,
         env_passthrough=env_passthrough,
         description=None,
         model=None,
@@ -2711,6 +2790,7 @@ def continue_request(
     *,
     wait_timeout: float | None = None,
     cancel_after: float | None = None,
+    limit_wait_max: float | None = None,
     permissions: str | None = None,
     permission_prompt: Callable[[str, str], bool] | None = None,
     resolution: CallResolution | None = None,
@@ -2735,6 +2815,7 @@ def continue_request(
         cwd=cwd,
         wait_timeout=wait_timeout,
         cancel_after=cancel_after,
+        limit_wait_max=limit_wait_max,
         permission_prompt=permission_prompt,
         resume_adapter_session=meta.adapter_session_id,
         defer_rotation=defer_rotation,

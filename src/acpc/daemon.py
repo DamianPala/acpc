@@ -27,6 +27,7 @@ at `daemon/<target>.log`, which is where adapter stderr lands too.
 import asyncio
 import contextlib
 import functools
+import math
 import os
 import shlex
 import sys
@@ -108,9 +109,13 @@ class DaemonError(Exception):
 class SpawnArgvMismatch(DaemonError):
     """The live entry now requires a different adapter process argv."""
 
+    acpc_refusal = True
+
 
 class AdapterHandshakeTimeout(DaemonError):
     """The adapter did not answer the ACP initialize handshake in time."""
+
+    handshake_timeout = True
 
 
 def log_path_for_target(target: str) -> Path:
@@ -1299,11 +1304,20 @@ class Daemon:
                     f"mode {resolution.mode} grants {required}, exceeding policy {policy}; "
                     f"the lowest policy that admits it is {required}"
                 )
+        limit_wait_max = payload.get("limit_wait_max")
+        if limit_wait_max is not None and (
+            isinstance(limit_wait_max, bool)
+            or not isinstance(limit_wait_max, (int, float))
+            or not math.isfinite(limit_wait_max)
+            or limit_wait_max < 0
+        ):
+            raise DaemonError("daemon dispatch limit_wait_max must be a non-negative number")
         return runner.TurnRequest(
             resolution=resolution,
             prompt=payload.get("prompt", ""),
             cwd=cwd,
             cancel_after=payload.get("cancel_after"),
+            limit_wait_max=limit_wait_max,
             resume_adapter_session=payload.get("resume_adapter_session"),
             defer_rotation=bool(payload.get("defer_rotation", False)),
             rotation_resolution=payload.get("rotation_resolution"),
@@ -1473,6 +1487,7 @@ class Daemon:
                     ),
                     answer=answer,
                     context=client.context if client is not None else None,
+                    served_model=client.served_model if client is not None else None,
                     usage=usage_value,
                     usage_finalized=usage_finalized,
                     turn_token=request.turn_token,
@@ -1660,6 +1675,7 @@ class Daemon:
             stop_reason=stop_reason,
             answer=client.answer,
             context=client.context,
+            served_model=client.served_model,
             usage=usage_value,
             usage_finalized=True,
             denied=client.denied,

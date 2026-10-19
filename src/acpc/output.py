@@ -108,6 +108,17 @@ def collection_envelope(items: Sequence[Any], *, has_more: bool) -> dict[str, An
     return {"items": list(items), "has_more": has_more}
 
 
+def failure_object(meta: sessions.SessionMeta) -> dict[str, Any] | None:
+    """Render the persisted observation; `meta_from_dict` derives a pre-1.2 record's class."""
+    if meta.failure is None:
+        return None
+    return {
+        "class": meta.failure_class or "adapter_error",
+        "message": meta.failure,
+        "next_step": meta.failure_next_step,
+    }
+
+
 def result_envelope(
     meta: sessions.SessionMeta,
     answer: str,
@@ -172,6 +183,8 @@ def result_envelope(
         "stop_reason": meta.stop_reason,
         "context": meta.context,
         "usage": meta.usage,
+        "served_model": meta.served_model,
+        "failure": failure_object(meta),
         "paths": paths_for_turn,
         "retained": meta.retained,
         "answer": answer,
@@ -335,8 +348,9 @@ _ANSWER_TAG_TRIGGERS = (
 # answer-boundary line count above depends on the LF characters staying LF.
 _PRESERVED_ANSWER_WHITESPACE = frozenset({0x09, 0x0A, 0x0D})
 
-_METADATA_LEAD_FIELDS = ("turn", "capabilities", "context", "stop_reason")
+_METADATA_LEAD_FIELDS = ("turn", "capabilities", "context", "served_model", "stop_reason")
 _METADATA_OPTIONAL_FIELDS = (
+    "failure",
     "correction_result",
     "denied",
     "permissions_clamp",

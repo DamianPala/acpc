@@ -2447,3 +2447,41 @@ def test_commands_update_replaces_the_advertised_command_list(
 
     asyncio.run(scenario())
     assert client.advertised["commands"] == [{"name": "review", "description": "Review"}]
+
+
+@pytest.mark.parametrize("ignored", [None, "", 42, False])
+def test_served_model_usage_last_valid_string_wins(tmp_path: Path, ignored: Any) -> None:
+    client, _ = _make_client(tmp_path, PermissionLevel.READ)
+    for model in ("first-1", "last-2", ignored):
+        asyncio.run(
+            client.session_update(
+                "adapter-session",
+                UsageUpdate(
+                    session_update="usage_update",
+                    used=100,
+                    size=200,
+                    field_meta={"_claude/model": model},
+                ),
+            )
+        )
+    client.record_prompt_usage({"_meta": {"quota": {"model_usage": [{"model": "cumulative-3"}]}}})
+    assert client.served_model == "last-2"
+
+
+def test_served_model_prompt_rows_last_string_wins(tmp_path: Path) -> None:
+    client, _ = _make_client(tmp_path, PermissionLevel.READ)
+    client.record_prompt_usage(
+        {
+            "_meta": {
+                "quota": {
+                    "model_usage": [
+                        {"model": "first-1"},
+                        {"model": "last-2"},
+                        {"model": 42},
+                        None,
+                    ]
+                }
+            }
+        }
+    )
+    assert client.served_model == "last-2"

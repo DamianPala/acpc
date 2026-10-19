@@ -171,6 +171,7 @@ def test_hung_initialize_fails_the_session_with_a_handshake_diagnosis(
     assert meta.state == "failed"
     assert meta.stop_reason == "error"
     assert "handshake" in (meta.failure or "")
+    assert meta.failure_class == "connection"
     assert meta.steer_mode == vocab.STEER_CANCEL_THEN_START
 
 
@@ -448,6 +449,7 @@ def test_warm_daemon_rejects_a_changed_spawn_argv(
     failed = sessions.read_meta(meta.session_id)
     assert failed.state == "failed"
     assert failed.context == {"used": 1234, "size": None, "peak": 1234}
+    assert failed.failure_class == "acpc"
     answer = sessions.answer_path(meta.session_id).read_text(encoding="utf-8")
     assert "argv mismatch" in answer
     assert "--mock-effort high" in answer
@@ -1220,6 +1222,15 @@ def test_a_dispatch_without_a_working_directory_is_rejected(state_root: Path) ->
         daemon.Daemon(target())._rebuild_request(payload)
 
 
+@pytest.mark.parametrize("value", [-1, "0s", True, float("nan")])
+def test_a_dispatch_with_an_invalid_limit_wait_is_rejected(state_root: Path, value: Any) -> None:
+    payload = dispatch_payload()
+    assert rebuild(payload).limit_wait_max is None
+    assert rebuild({**payload, "limit_wait_max": 0.0}).limit_wait_max == 0.0
+    with pytest.raises(daemon.DaemonError, match="limit_wait_max"):
+        rebuild({**payload, "limit_wait_max": value})
+
+
 def test_one_daemon_serves_several_sessions(state_root: Path, live_daemon: None) -> None:
     first = new_session("first session")
     second = new_session("second session")
@@ -1419,6 +1430,9 @@ def test_daemon_stop_fails_its_active_sessions_rather_than_orphaning_them(
     error_events = [event for event in _events(session_id) if event.get("type") == "error"]
     assert error_events
     assert "daemon was stopped" in error_events[-1]["message"]
+    assert meta.failure_class == "acpc"
+    assert meta.failure_next_step == f"continue the session: acpc continue {session_id}"
+    assert error_events[-1]["class"] == "acpc"
     # acpc ended this turn. Blaming the adapter would send the reader hunting
     # for a vendor problem that never happened.
     assert error_events[-1]["observation"].startswith("acpc ended the turn")
@@ -1449,6 +1463,7 @@ def test_killed_adapter_records_a_failure_event(state_root: Path, live_daemon: N
 
     meta = _wait_for_finished(session_id)
     assert meta.state == "failed"
+    assert meta.failure_class == "connection"
     error_events = [event for event in _events(session_id) if event.get("type") == "error"]
     assert error_events
     assert "adapter" in error_events[-1]["message"].lower(), error_events

@@ -194,9 +194,12 @@ class SessionMeta:
     exit_code: int | None = None
     stop_reason: str | None = None
     failure: str | None = None
+    failure_class: str | None = None
+    failure_next_step: str | None = None
     # SPEC.md V6c: usage the tool never observed is `null`, never `0`.
     context: vocab.ContextOccupancy | None = None
     usage: dict[str, Any] | None = None
+    served_model: str | None = None
     denied: dict[str, int] = field(default_factory=dict)
     denial_details: dict[str, dict[str, Any]] = field(default_factory=dict)
     prompt_snippet: str = ""
@@ -709,6 +712,16 @@ def meta_from_dict(data: Mapping[str, Any], *, path: Path) -> SessionMeta:
         exit_code = vocab.EXIT_AGENT_ERROR
         stop_reason = "error"
 
+    failure = _coerce_str(known.get("failure"), "failure", path)
+    failure_class = _coerce_str(known.get("failure_class"), "failure_class", path)
+    if failure is not None and failure_class is None:
+        if stop_reason == "rate_limit":
+            failure_class = "rate_limit"
+        elif stop_reason in {"max_tokens", "max_turn_requests"}:
+            failure_class = "adapter_limit"
+        else:
+            failure_class = "adapter_error"
+
     return SessionMeta(
         session_id=session_id,
         name=_coerce_str(known.get("name"), "name", path),
@@ -723,7 +736,10 @@ def meta_from_dict(data: Mapping[str, Any], *, path: Path) -> SessionMeta:
         turns=_coerce_int(known.get("turns"), "turns", path) or 1,
         exit_code=exit_code,
         stop_reason=stop_reason,
-        failure=_coerce_str(known.get("failure"), "failure", path),
+        failure=failure,
+        failure_class=failure_class,
+        failure_next_step=_coerce_str(known.get("failure_next_step"), "failure_next_step", path),
+        served_model=_coerce_str(known.get("served_model"), "served_model", path),
         context=_coerce_context(known, data, path),
         usage=_coerce_usage(known.get("usage"), path),
         denied=_coerce_denied(known.get("denied"), "denied", path),
@@ -769,6 +785,18 @@ def read_meta(session_id: str) -> SessionMeta:
         meta_path(session_id),
         not_found=lambda: SessionNotFound(f"unknown session {session_id!r}"),
     )
+
+
+def claim_served_model_note(session_id: str, turn: int) -> bool:
+    """Claim a note only for the live, finished turn, never a parked result."""
+    with session_lock(session_id):
+        meta = read_meta(session_id)
+        key = f"served_model_note_emitted_{turn}"
+        if meta.turns != turn or not meta.is_finished or meta.extra.get(key):
+            return False
+        meta.extra[key] = True
+        write_meta(meta)
+        return True
 
 
 def claim_usage_drift_note(session_id: str) -> dict[str, Any] | None:
@@ -1324,6 +1352,9 @@ def rotate_turn(
         meta.exit_code = None
         meta.stop_reason = None
         meta.failure = None
+        meta.failure_class = None
+        meta.failure_next_step = None
+        meta.served_model = None
         meta.denied = {}
         meta.denial_details = {}
         meta.steer_mode = steer_mode

@@ -29,7 +29,7 @@ from acpc import __version__, effects, transcript, vocab
 # Introspection format version.  It changes when a required field is added, a
 # field is removed, or a field's type or meaning changes — not when an
 # optional field appears.
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"
 
 # The first argument reserved for introspection; it is not a command entry.
 COMMAND_NAME = "schema"
@@ -217,6 +217,28 @@ _USAGE = {
     "type": ["object", "null"],
 }
 
+_FAILURE = {
+    **_object(
+        {
+            "class": {
+                "type": "string",
+                "enum": [
+                    "auth",
+                    "rate_limit",
+                    "adapter_limit",
+                    "connection",
+                    "adapter_error",
+                    "acpc",
+                ],
+            },
+            "message": _STRING,
+            "next_step": _NULLABLE_STRING,
+        },
+        required=["class", "message", "next_step"],
+    ),
+    "type": ["object", "null"],
+}
+
 _SESSION_RESULT_PROPERTIES = {
     "session_id": _STRING,
     "turn": _INTEGER,
@@ -224,6 +246,8 @@ _SESSION_RESULT_PROPERTIES = {
     "stop_reason": _NULLABLE_STRING,
     "context": _CONTEXT,
     "usage": _USAGE,
+    "served_model": _NULLABLE_STRING,
+    "failure": _FAILURE,
     "paths": _PATHS,
     "retained": _BOOLEAN,
     "answer": _STRING,
@@ -320,7 +344,7 @@ def _session_result_schema(
         properties.pop("changed")
     required = ["status", "session_id", "turn", "created_at", "started_at", "finished_at"]
     if foreground_only:
-        required += ["stop_reason", "context", "usage", "answer"]
+        required += ["stop_reason", "context", "usage", "served_model", "failure", "answer"]
     required += ["paths", "retained", "truncated"]
     if include_partial:
         required.append("partial")
@@ -523,6 +547,7 @@ _STATUS_DETAIL = _object(
         "entry": _STRING,
         "base_adapter": _STRING,
         "model": _NULLABLE_STRING,
+        "served_model": _NULLABLE_STRING,
         "name": _NULLABLE_STRING,
         "runtime_seconds": _NUMBER,
         "idle_seconds": _NULLABLE_NUMBER,
@@ -530,7 +555,7 @@ _STATUS_DETAIL = _object(
         "usage": _USAGE,
         "exit_code": _NULLABLE_INTEGER,
         "stop_reason": _NULLABLE_STRING,
-        "failure": _NULLABLE_STRING,
+        "failure": _FAILURE,
         "capabilities": _CAPABILITIES,
         "limit": _NULLABLE_LIMIT,
         # V4c: acpc cannot observe whether a forwarded correction is still
@@ -552,6 +577,7 @@ _STATUS_DETAIL = _object(
         "entry",
         "base_adapter",
         "model",
+        "served_model",
         "name",
         "runtime_seconds",
         "idle_seconds",
@@ -592,7 +618,8 @@ _LOG_EVENT = _object(
         "outcome": _STRING,
         "message": _STRING,
         "observation": _STRING,
-        "next_step": _STRING,
+        "next_step": _NULLABLE_STRING,
+        "class": _STRING,
         "adapter_log": _STRING,
         "adapter_log_tail": _STRING,
         "from": _STRING,

@@ -108,6 +108,8 @@ def test_unobserved_context_is_omitted_while_other_lead_fields_stay() -> None:
 def test_optional_fields_land_between_the_lead_fields_and_next() -> None:
     result = output.render_tagged(
         envelope(
+            served_model="gpt-6-sol",
+            failure={"class": "adapter_error", "message": "refused", "next_step": None},
             denied=[{"category": "edit", "count": 1, "minimum_policy": "edit", "remedy": "x"}],
             permissions_clamp={"requested": "all", "ceiling": "edit", "effective": "edit"},
             resume="warm",
@@ -122,7 +124,9 @@ def test_optional_fields_land_between_the_lead_fields_and_next() -> None:
         "turn",
         "capabilities",
         "context",
+        "served_model",
         "stop_reason",
+        "failure",
         "denied",
         "permissions_clamp",
         "resume",

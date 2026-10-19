@@ -691,6 +691,8 @@ class MockAgent(Agent):
             "session/set_config_option",
             {"configId": config_id, "sessionId": session_id, "value": value},
         )
+        if os.environ.get("ACPC_MOCK_CONFIG_AUTH") == "1":
+            raise RequestError(-32000, "Authentication required")
         if config_id not in {"model", "reasoning_effort"}:
             # Vendor-faithful: claude-agent-acp 0.64.0 answers an unknown
             # config id with exactly this JSON-RPC shape.
@@ -698,7 +700,7 @@ class MockAgent(Agent):
                 -32603, "Internal error", {"details": f"Unknown config option: {config_id}"}
             )
         if config_id == "model" and isinstance(value, str):
-            if value not in MODELS:
+            if value not in MODELS and os.environ.get("ACPC_MOCK_ACCEPT_ANY_MODEL") != "1":
                 raise RequestError(400, f"unsupported model: {value}")
             self._models[session_id] = value
             self._model_calls[session_id] = self._model_calls.get(session_id, 0) + 1
@@ -1077,6 +1079,8 @@ class MockAgent(Agent):
             await self._send_text(session_id, prompt_text.split(":", 1)[1])
             return PromptResponse(stop_reason="end_turn")
 
+        if prompt_text == "stop:max_tokens":
+            return PromptResponse(stop_reason="max_tokens")
         if prompt_text.startswith("auth:"):
             raise RequestError(-32000, "Authentication required")
 
@@ -1451,6 +1455,9 @@ class MockAgent(Agent):
     ) -> None:
         update = UsageUpdate(
             session_update="usage_update",
+            field_meta={"_claude/model": os.environ["ACPC_MOCK_SERVED_MODEL"]}
+            if os.environ.get("ACPC_MOCK_SERVED_MODEL")
+            else None,
             used=used,
             size=size,
             cost=Cost(amount=cost, currency="USD") if cost is not None else None,

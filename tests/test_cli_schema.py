@@ -97,7 +97,7 @@ def descriptors(detail: dict[str, Any]) -> Iterator[dict[str, Any]]:
 def test_index_carries_every_field(runner: CliRunner) -> None:
     index = read_index(runner)
     assert set(index) == D7_FIELDS
-    assert index["schema_version"] == "1"
+    assert index["schema_version"] == "2"
     assert index["schema_version"].isdecimal() and int(index["schema_version"]) > 0
     assert index["conformance"] == {
         "name": "cli-design-standard",
@@ -408,7 +408,16 @@ def test_no_descriptor_publishes_a_sentinel_default(runner: CliRunner) -> None:
 def test_run_time_resolved_values_are_not_published_as_defaults(runner: CliRunner) -> None:
     """A value that comes from the registry or the environment is not a default."""
     flags = {flag["name"]: flag for flag in read_detail(runner, "run")["flags"]}
-    for name in ("permissions", "model", "effort", "cwd", "home", "timeout", "cancel-after"):
+    for name in (
+        "permissions",
+        "model",
+        "effort",
+        "cwd",
+        "home",
+        "timeout",
+        "cancel-after",
+        "limit-wait",
+    ):
         assert "default" not in flags[name], name
         assert flags[name]["description"].strip()
     # A real built-in default, on the other hand, is published.

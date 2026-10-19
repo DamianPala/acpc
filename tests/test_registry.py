@@ -1136,3 +1136,22 @@ def test_setting_sources_inherits_and_child_replaces(tmp_path: Path) -> None:
     assert registry.resolve_call("inherits").setting_sources == ("user", "project")
     assert registry.resolve_call("empty").setting_sources == ()
     assert registry.resolve_call("local").setting_sources == ("local",)
+
+
+@pytest.mark.parametrize("duration", ["0s", "1h30m"])
+def test_limit_wait_registry_inheritance(tmp_path: Path, duration: str) -> None:
+    agents = tmp_path / "agents"
+    write_entry(agents, "base", f'command = "true"\nlimit_wait_max = "{duration}"\n')
+    write_entry(agents, "child", 'extends = "base"\n')
+    write_entry(agents, "override", 'extends = "child"\nlimit_wait_max = "2h"\n')
+    registry = AgentRegistry(agents)
+    assert registry.resolve("child").limit_wait_max == duration
+    assert registry.resolve("override").limit_wait_max == "2h"
+
+
+@pytest.mark.parametrize("value", ['"abc"', '"-1s"', "42"])
+def test_limit_wait_registry_rejects_invalid(tmp_path: Path, value: str) -> None:
+    agents = tmp_path / "agents"
+    write_entry(agents, "bad", f'command = "true"\nlimit_wait_max = {value}\n')
+    with pytest.raises(RegistryError, match=r"bad.toml.*limit_wait_max"):
+        AgentRegistry(agents)

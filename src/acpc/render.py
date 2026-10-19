@@ -13,6 +13,7 @@ from acpc import sessions, transcript, vocab
 from acpc.output import (
     collection_envelope,
     escape_answer_controls,
+    failure_object,
     format_context,
     format_duration,
     format_k,
@@ -819,11 +820,14 @@ def render_status_detail(
     name = safe_text(meta.name) if meta.name else "·"
     directory = _display_path(sessions.session_dir(meta.session_id))
     model = meta.resolved_model or "·"
+    served = (
+        f" · served model: {safe_text(meta.served_model)}" if meta.served_model is not None else ""
+    )
     lines = [
         f"status   {safe_text(meta.state)}{idle} · {exit_text} · {runtime} · {context_text}",
         (
             f"agent    {safe_text(meta.entry)} ({safe_text(meta.base_adapter)}) · "
-            f"model: {safe_text(model)} · name: {name}"
+            f"model: {safe_text(model)}{served} · name: {name}"
         ),
         f"dir      {directory} · answer: {Path(sessions.answer_path(meta.session_id)).name}",
         f"steer: {_steer_mode_text(meta)}",
@@ -833,10 +837,10 @@ def render_status_detail(
         lines.insert(1, usage_text)
     if not meta.retained:
         lines.append("retained no · one_shot session, data pending delivery or removed")
-    if meta.failure is not None:
-        lines.append(
-            f"failure  {safe_text(meta.failure)} · continue: acpc continue {meta.session_id}"
-        )
+    if failure := failure_object(meta):
+        lines.append(f"failure  {failure['class']}: {safe_text(failure['message'])}")
+        if failure["next_step"] is not None:
+            lines.append(f"next     {safe_text(failure['next_step'])}")
     if meta.limit is not None:
         resume_at = meta.limit.get("resume_at") or "·"
         lines.append(
@@ -917,6 +921,7 @@ def status_detail_json(
         "entry": meta.entry,
         "base_adapter": meta.base_adapter,
         "model": meta.resolved_model,
+        "served_model": meta.served_model,
         "name": meta.name,
         "runtime_seconds": runtime_seconds,
         "idle_seconds": _idle_seconds(meta, now=now),
@@ -924,7 +929,7 @@ def status_detail_json(
         "usage": meta.usage,
         "exit_code": meta.exit_code,
         "stop_reason": meta.stop_reason,
-        "failure": meta.failure,
+        "failure": failure_object(meta),
         "capabilities": session_capabilities(meta),
         "limit": dict(meta.limit) if meta.limit is not None else None,
         # V4c: acpc never has grounds to report a pending-correction count.

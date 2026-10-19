@@ -10,22 +10,29 @@ adapter routes `system_prompt_via`/`tools_via`, `not_supported` before any sessi
 caught a slice-2 gap, a daemon `continue` loaded the adapter session without the stored `_meta`),
 3b `ddf2943` (`agents list`/`agents check`/`skills list` default window 100, the text roster
 fitted to the terminal width: adapter headings, model cut in the middle at 35, description takes
-the rest, HOME and then the description dropped when the width runs out, one footer), 3c (this
-commit: `one_shot` = zero data retention, Damian's ruling with the preflight and dictation-cleanup
+the rest, HOME and then the description dropped when the width runs out, one footer), 3c `e1b1fb6`
+(`one_shot` = zero data retention, Damian's ruling with the preflight and dictation-cleanup
 sessions 2026-10-19: every terminal state, `unknown` included, reduces to `meta.json` + `lock` plus
 the pending `answer.md`/`transcript.ndjson`, delivered once by the foreground `run` or the first
 `wait` under an flock on the answer inode and removed after the write closed, later `wait` and any
 `continue`/`log` → `conflict`; `--transcript-file` on `run`/`wait`; `setting_sources` entry key
 (`user|project|local`, `[]` → `strictMcpConfig`), `one_shot` alone sends only
 `persistSession: false`; the review reversed the builder's "cleanup error blocks the terminal
-publish": an undeletable child is named on stderr and the state is still published). Each slice:
+publish": an undeletable child is named on stderr and the state is still published), 4 (this
+commit: per-turn `served_model` from the adapter's `_claude/model` or codex `model_usage`, a
+stderr note when a requested versioned id came back as another; `failure {class, message,
+next_step}` on results and `status` with six classes `auth | rate_limit | adapter_limit |
+connection | adapter_error | acpc`, the on-disk observation stays a string with the class and next
+step as sibling fields and pre-1.2 records derive the class from `stop_reason`; `--limit-wait` on
+`run`/`continue` over the entry's `limit_wait_max` over the global; `SCHEMA_VERSION` "2"; the
+review moved the spawn-argv refusal to class `acpc` and removed a dead copy of the legacy class
+derivation; backlog: `--cancel-after` does not bound `_sleep_through_limit`, pre-existing). Each slice:
 two builder rounds at most, Opus reviewer with mutation testing on a `git archive` copy with its
 own venv (a copied `.venv` runs the worktree's code), live on claude-agent-acp 0.89.1 with a bare
 judge (3c: daemon route, session dir = `meta.json` + `lock`, `~/.claude-bare` file listing
 unchanged after the run). Build contract since 2026-10-19 (local to this repo): builder and
 builder-light through the installed acpc (Codex), reviewer and explorer through the Agent tool.
-Next: slice 4 (`served_model`, `failure {class, message, next_step}`, `--limit-wait` +
-`limit_wait_max`; its SPEC delta anchors drifted with 3c), then
+Next: the HOME roster column cut in the middle at 24 (Damian's ruling 2026-10-19), then slices 5–9:
 effort capture and resolution (BREAKING), codex `codex_config` route, `data_residency` + windows,
 the import floor; plan and briefs in `docs/plans/1.2/`. Known flakes under `-n auto`:
 `test_continue_rejects_an_adapter_without_load_session`, the steer `cancel_then_start` wait test,

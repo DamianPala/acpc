@@ -324,8 +324,13 @@ def test_status_detail_surfaces_current_failure_and_json(cli: CliRunner) -> None
     text_result = invoke(cli, "status", session_id, "--format", "text")
     json_result = invoke(cli, "status", session_id, "--json")
 
-    assert f"failure  {meta.failure} · continue: acpc continue {session_id}" in text_result.stdout
-    assert json.loads(json_result.stdout)["failure"] == meta.failure
+    assert f"failure  {meta.failure_class}: {meta.failure}" in text_result.stdout
+    assert f"next     {meta.failure_next_step}" in text_result.stdout
+    assert json.loads(json_result.stdout)["failure"] == {
+        "class": meta.failure_class,
+        "message": meta.failure,
+        "next_step": meta.failure_next_step,
+    }
 
 
 def test_status_detail_omits_failure_for_successful_turn(cli: CliRunner) -> None:

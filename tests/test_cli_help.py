@@ -239,6 +239,9 @@ def test_help_names_behavioral_defaults_and_global_output_default(runner: CliRun
     assert "the session keeps running" in run_help
     assert "the session keeps running" in continue_help
     assert "the session keeps running" in steer_help
+    assert "--limit-wait DURATION" in run_help
+    assert "--limit-wait DURATION" in continue_help
+    assert "--limit-wait" not in steer_help
     assert "--cancel-after" in run_help
     assert "--cancel-after" in continue_help
     assert "--cancel-after" in steer_help
