@@ -557,6 +557,7 @@ class MockAgent(Agent):
     ) -> NewSessionResponse:
         if not self._initialized:
             raise RuntimeError("initialize must run before session/new")
+        self._record_wire("session/new", {"cwd": cwd, "meta": kwargs})
         session_id = uuid4().hex[:12]
         self._sessions[session_id] = []
         self._session_cwds[session_id] = Path(cwd)
@@ -614,6 +615,7 @@ class MockAgent(Agent):
     ) -> LoadSessionResponse | None:
         if not self._initialized:
             raise RuntimeError("initialize must run before session/load")
+        self._record_wire("session/load", {"cwd": cwd, "meta": kwargs})
         self._record_session_method("load")
         self._record_event(f"restore-start:{session_id}")
         self._last_restored_session = session_id
@@ -1564,6 +1566,7 @@ class MockAgent(Agent):
         | None = None,
         **kwargs: Any,
     ) -> ResumeSessionResponse:
+        self._record_wire("session/resume", {"cwd": cwd, "meta": kwargs})
         self._record_session_method("resume")
         self._record_event(f"restore-start:{session_id}")
         self._last_restored_session = session_id

@@ -253,7 +253,7 @@ def _supports_session_close(initialize_response: Any) -> bool:
 
 
 async def _run_async(entry: ResolvedEntry) -> ProbeReport:
-    resolution = entry.resolve_call()
+    resolution = entry.without_session_keys().resolve_call()
     command, args = runner.adapter_command(resolution)
     root = paths.ensure_private_dir(paths.acpc_home() / "probes")
     async with spawn_adapter(

@@ -13,7 +13,7 @@ import shutil
 import subprocess
 import tomllib
 from collections.abc import Callable, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from importlib.resources import files
 from pathlib import Path
 from typing import Any, Final, Literal
@@ -32,8 +32,29 @@ _USAGE_PROFILES: Final = frozenset(
     {"claude_model_usage", "codex_usage_updates", "grok_meta_usage", "none"}
 )
 _BILLING_VALUES: Final = frozenset({"subscription", "api"})
+SYSTEM_PROMPT_VIA_VALUES: Final = frozenset({"acp_meta", "codex_config", "none"})
+TOOLS_VIA_VALUES: Final = frozenset({"acp_meta", "none"})
+# Provenance defaults to `default` (not `unset`) for these fields.
+_DEFAULT_FIELDS: Final = frozenset(
+    {
+        "effort_by_model",
+        "env_passthrough",
+        "env",
+        "modes",
+        "presets",
+        "model_via",
+        "effort_via",
+        "usage_profile",
+        "system_prompt_via",
+        "tools_via",
+    }
+)
 _ENTRY_KEYS: Final = frozenset(
     {
+        "system_prompt_file",
+        "tools",
+        "system_prompt_via",
+        "tools_via",
         "name",
         "author",
         "command",
@@ -62,6 +83,10 @@ _ENTRY_KEYS: Final = frozenset(
 )
 _PRESET_KEYS: Final = frozenset({"model", "effort"})
 _FIELD_NAMES: Final = (
+    "system_prompt_file",
+    "tools",
+    "system_prompt_via",
+    "tools_via",
     "name",
     "author",
     "command",
@@ -87,6 +112,12 @@ _FIELD_NAMES: Final = (
     "presets",
 )
 _DEFAULT_EFFORT_CLI_FLAG = "--reasoning-effort"
+_NO_ROUTE_HINT = (
+    "{drop}, or use an adapter that declares the route: "
+    "claude declares system_prompt_via and tools_via = acp_meta (acpc agents get claude --json)."
+)
+_DROP_KEY_HINT = _NO_ROUTE_HINT.format(drop="Drop the key")
+_DROP_FLAG_HINT = _NO_ROUTE_HINT.format(drop="Drop the flag")
 
 
 class RegistryError(ValueError):
@@ -117,6 +148,18 @@ class InstallNotSupported(RegistryError):
     A documented refusal rather than a defect: the entry exists, the call is
     well formed, and the next step is the vendor's own instructions.
     """
+
+
+class RouteNotSupported(RegistryError):
+    """The entry or call sets a key its adapter has no route for.
+
+    A documented refusal like `InstallNotSupported`, but a call-shaped one:
+    the caller can drop the key, so it exits 2 and carries a hint.
+    """
+
+    def __init__(self, message: str, *, hint: str | None = None) -> None:
+        super().__init__(message)
+        self.hint = hint
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +194,19 @@ class ModeSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class SystemPrompt:
+    """The system prompt in force for a call: where it came from, never its text.
+
+    The text lives in the session's `system.md`; carrying only the source and
+    the size keeps a 1 MiB prompt out of every payload and snapshot.
+    """
+
+    path: str
+    source: Literal["entry", "call"]
+    size: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class CallResolution:
     """One concrete call after entry and command-line values are resolved."""
 
@@ -165,6 +221,8 @@ class CallResolution:
     env_passthrough: tuple[str, ...]
     provenance: Mapping[str, FieldSource]
     permissions_clamp: tuple[str, str] | None = None
+    system_prompt: SystemPrompt | None = None
+    tools: tuple[str, ...] | None = None
 
     @property
     def adapter_environment(self) -> dict[str, str]:
@@ -225,6 +283,14 @@ class ResolvedEntry:
     presets: Mapping[str, Preset]
     extends: str | None
     provenance: Mapping[str, FieldSource]
+    # An absolute path: a relative one was resolved against the declaring
+    # entry file when it was parsed, so an inherited value keeps its own base.
+    system_prompt_file: str | None
+    # None when the key is absent; () means "no tools", which is a setting.
+    tools: tuple[str, ...] | None
+    # Adapter facts: which wire route carries the prompt and the tool list.
+    system_prompt_via: str
+    tools_via: str
 
     @property
     def is_variant(self) -> bool:
@@ -305,12 +371,74 @@ class ResolvedEntry:
         mode: str | None = None,
         permissions: str | None = None,
         home: str | None = None,
+        system_prompt_file: str | None = None,
     ) -> CallResolution:
         """Resolve optional run flags and validate the resulting combination."""
+        system_prompt = self._resolve_system_prompt(system_prompt_file)
+        self._check_tools_route()
+        sources: dict[str, FieldSource] = {}
+        resolved_model, resolved_effort = self._resolve_model_and_effort(model, effort, sources)
+
+        if resolved_effort is not None:
+            self._validate_effort(resolved_effort, resolved_model)
+
+        resolved_mode = self.mode if mode is None else mode
+        if resolved_mode is not None:
+            sources["mode"] = self.source_for("mode") if mode is None else FieldSource("call")
+        else:
+            sources["mode"] = FieldSource("unset")
+
+        resolved_permissions = normalize_permission(
+            self.permissions if permissions is None else permissions
+        )
+        if resolved_permissions is not None and resolved_permissions not in PERMISSION_VALUES:
+            supported = ", ".join(PERMISSION_VALUES)
+            raise RegistryError(
+                f"{self.entry}: unsupported permissions '{resolved_permissions}'; "
+                f"supported values: {supported}"
+            )
+        if resolved_permissions is not None:
+            sources["permissions"] = (
+                self.source_for("permissions") if permissions is None else FieldSource("call")
+            )
+        else:
+            sources["permissions"] = FieldSource("unset")
+
+        resolved_home = self.home if home is None else home
+        if resolved_home is not None:
+            sources["home"] = self.source_for("home") if home is None else FieldSource("call")
+        else:
+            sources["home"] = FieldSource("unset")
+        sources["env"] = self.source_for("env")
+        if system_prompt is None:
+            sources["system_prompt"] = FieldSource("unset")
+        elif system_prompt.source == "call":
+            sources["system_prompt"] = FieldSource("call")
+        else:
+            sources["system_prompt"] = self.source_for("system_prompt_file")
+        sources["tools"] = self.source_for("tools")
+
+        return CallResolution(
+            entry=self,
+            model=resolved_model,
+            effort=resolved_effort,
+            mode=resolved_mode,
+            mode_spec=None,
+            permissions=resolved_permissions,
+            home=resolved_home,
+            declared_env=dict(self.env),
+            env_passthrough=self.env_passthrough,
+            provenance=sources,
+            system_prompt=system_prompt,
+            tools=self.tools,
+        )
+
+    def _resolve_model_and_effort(
+        self, model: str | None, effort: str | None, sources: dict[str, FieldSource]
+    ) -> tuple[str | None, str | None]:
+        """Pick the model and effort for a call and record where each came from."""
         resolved_model: str | None
         resolved_effort: str | None
-        sources: dict[str, FieldSource] = {}
-
         if model is not None and model in MODEL_TIERS:
             preset = self.presets.get(model)
             if preset is None:
@@ -363,51 +491,81 @@ class ResolvedEntry:
 
         if resolved_model is None:
             sources["model"] = FieldSource("unset")
+        return resolved_model, resolved_effort
 
-        if resolved_effort is not None:
-            self._validate_effort(resolved_effort, resolved_model)
+    def _resolve_system_prompt(self, call_file: str | None) -> SystemPrompt | None:
+        """Pick the prompt file in force, or refuse a key the adapter cannot carry.
 
-        resolved_mode = self.mode if mode is None else mode
-        if resolved_mode is not None:
-            sources["mode"] = self.source_for("mode") if mode is None else FieldSource("call")
-        else:
-            sources["mode"] = FieldSource("unset")
-
-        resolved_permissions = normalize_permission(
-            self.permissions if permissions is None else permissions
-        )
-        if resolved_permissions is not None and resolved_permissions not in PERMISSION_VALUES:
-            supported = ", ".join(PERMISSION_VALUES)
-            raise RegistryError(
-                f"{self.entry}: unsupported permissions '{resolved_permissions}'; "
-                f"supported values: {supported}"
+        Refusing is the only safe answer: an adapter with no route would run
+        the vendor's own prompt, and a judge must never fall back to that.
+        """
+        route = self.system_prompt_via
+        if call_file is not None:
+            if route == "acp_meta":
+                return SystemPrompt(call_file, "call")
+            if route == "codex_config":
+                raise RouteNotSupported(
+                    f"--system-prompt-file: adapter {self.base_adapter} takes its system prompt "
+                    "per entry, not per call (system_prompt_via = codex_config); "
+                    "set system_prompt_file on the entry",
+                    hint="Put system_prompt_file in an entry file instead of passing the flag.",
+                )
+            raise RouteNotSupported(
+                f"--system-prompt-file: adapter {self.base_adapter} has no system prompt route "
+                "(system_prompt_via = none)",
+                hint=_DROP_FLAG_HINT,
             )
-        if resolved_permissions is not None:
-            sources["permissions"] = (
-                self.source_for("permissions") if permissions is None else FieldSource("call")
+        if self.system_prompt_file is None:
+            return None
+        if route == "acp_meta":
+            return SystemPrompt(self.system_prompt_file, "entry")
+        if route == "codex_config":
+            raise RouteNotSupported(
+                f"entry {self.entry} sets system_prompt_file, but this acpc does not carry "
+                f"the codex_config route of adapter {self.base_adapter} yet",
+                hint=_DROP_KEY_HINT,
             )
-        else:
-            sources["permissions"] = FieldSource("unset")
-
-        resolved_home = self.home if home is None else home
-        if resolved_home is not None:
-            sources["home"] = self.source_for("home") if home is None else FieldSource("call")
-        else:
-            sources["home"] = FieldSource("unset")
-        sources["env"] = self.source_for("env")
-
-        return CallResolution(
-            entry=self,
-            model=resolved_model,
-            effort=resolved_effort,
-            mode=resolved_mode,
-            mode_spec=None,
-            permissions=resolved_permissions,
-            home=resolved_home,
-            declared_env=dict(self.env),
-            env_passthrough=self.env_passthrough,
-            provenance=sources,
+        raise RouteNotSupported(
+            f"entry {self.entry} sets system_prompt_file, but adapter {self.base_adapter} "
+            "has no system prompt route (system_prompt_via = none)",
+            hint=_DROP_KEY_HINT,
         )
+
+    def _check_tools_route(self) -> None:
+        if self.tools is not None and self.tools_via == "none":
+            raise RouteNotSupported(
+                f"entry {self.entry} sets tools, but adapter {self.base_adapter} "
+                "has no tool list route (tools_via = none)",
+                hint=_DROP_KEY_HINT,
+            )
+
+    def without_session_keys(
+        self, *, system_prompt_via: str | None = None, tools_via: str | None = None
+    ) -> "ResolvedEntry":
+        """The entry with its own `system_prompt_file` and `tools` taken out.
+
+        `resolve_call` refuses an entry whose keys have no route, which is right
+        for a call that would run with the vendor's prompt. Inspection, the
+        adapter connection checks and a session that stored its own facts need
+        the rest of the entry without that refusal. Stored routes, when given,
+        replace the entry's, so a session keeps the routes it started with.
+        """
+        return replace(
+            self,
+            system_prompt_file=None,
+            tools=None,
+            system_prompt_via=system_prompt_via or self.system_prompt_via,
+            tools_via=tools_via or self.tools_via,
+        )
+
+    def route_refusal(self) -> str | None:
+        """The refusal `resolve_call` gives this entry's own keys, or None when routable."""
+        try:
+            self._resolve_system_prompt(None)
+            self._check_tools_route()
+        except RouteNotSupported as error:
+            return str(error)
+        return None
 
     def derived_effort_union(self) -> tuple[str, ...]:
         """Unique values from non-empty ``[effort_by_model]`` rows, in vocab order."""
@@ -495,6 +653,33 @@ def _expect_string_list(path: Path, key: str, value: Any) -> tuple[str, ...]:
     return tuple(value)
 
 
+def _validate_judge_keys(path: Path, raw: dict[str, Any]) -> None:
+    """Validate the system prompt and tool keys; make the prompt path absolute.
+
+    A relative `system_prompt_file` is resolved here, against the file that
+    declares it, because after `extends` merges the entry no longer knows
+    which file a value came from.
+    """
+    if "system_prompt_file" in raw:
+        prompt_file = Path(_expect_string(path, "system_prompt_file", raw["system_prompt_file"]))
+        prompt_file = prompt_file.expanduser()
+        raw["system_prompt_file"] = str(
+            prompt_file if prompt_file.is_absolute() else path.parent / prompt_file
+        )
+    if "tools" in raw:
+        _expect_string_list(path, "tools", raw["tools"])
+    for key, allowed in (
+        ("system_prompt_via", SYSTEM_PROMPT_VIA_VALUES),
+        ("tools_via", TOOLS_VIA_VALUES),
+    ):
+        if key in raw:
+            value = _expect_string(path, key, raw[key])
+            if value not in allowed:
+                raise RegistryError(
+                    f"{path}: key '{key}' must be one of: {', '.join(sorted(allowed))}"
+                )
+
+
 def _parse_entry(
     path: Path,
     *,
@@ -553,6 +738,7 @@ def _parse_entry(
             raise RegistryError(f"{path}: key 'billing' must be one of: {supported}")
     if "effort_cli_flag" in raw:
         _expect_string(path, "effort_cli_flag", raw["effort_cli_flag"])
+    _validate_judge_keys(path, raw)
     permission_alias: str | None = None
     if "permissions" in raw:
         permission = _expect_string(path, "permissions", raw["permissions"])
@@ -726,19 +912,9 @@ def _to_resolved(
     raw_env = data.get("env", {})
     env = dict(raw_env) if isinstance(raw_env, dict) else {}
     provenance = dict(parsed.provenance)
-    default_fields = {
-        "effort_by_model",
-        "env_passthrough",
-        "env",
-        "modes",
-        "presets",
-        "model_via",
-        "effort_via",
-        "usage_profile",
-    }
     for field_name in _FIELD_NAMES:
         if field_name not in provenance:
-            kind = "default" if field_name in default_fields or field_name == "name" else "unset"
+            kind = "default" if field_name in _DEFAULT_FIELDS or field_name == "name" else "unset"
             provenance[field_name] = FieldSource(kind)
     return ResolvedEntry(
         entry=name,
@@ -768,7 +944,24 @@ def _to_resolved(
         presets=presets,
         extends=extends,
         provenance=provenance,
+        **_session_keys(data),
     )
+
+
+def _session_keys(data: Mapping[str, Any]) -> dict[str, Any]:
+    """The prompt file, tool list and routes of a merged entry, defaults filled in.
+
+    `tools` is decided by key presence: an absent key is None, an empty list is
+    "no tools", so a child's `tools = []` overrides its parent's list.
+    """
+    prompt_file, tools = data.get("system_prompt_file"), data.get("tools")
+    prompt_via, tools_via = data.get("system_prompt_via"), data.get("tools_via")
+    return {
+        "system_prompt_file": prompt_file if isinstance(prompt_file, str) else None,
+        "tools": tuple(tools) if isinstance(tools, (list, tuple)) else None,
+        "system_prompt_via": prompt_via if isinstance(prompt_via, str) and prompt_via else "none",
+        "tools_via": tools_via if isinstance(tools_via, str) and tools_via else "none",
+    }
 
 
 class AgentRegistry:
@@ -901,6 +1094,7 @@ class AgentRegistry:
         mode: str | None = None,
         permissions: str | None = None,
         home: str | None = None,
+        system_prompt_file: str | None = None,
     ) -> CallResolution:
         return self.resolve(name).resolve_call(
             model=model,
@@ -908,6 +1102,7 @@ class AgentRegistry:
             mode=mode,
             permissions=permissions,
             home=home,
+            system_prompt_file=system_prompt_file,
         )
 
     def install_command(self, name: str) -> str:

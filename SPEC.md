@@ -93,7 +93,7 @@ cancel SELECTOR [--format text|json]
 
 ```text
 continue SELECTOR [PROMPT | -] [--prompt-file FILE] [--permissions P]
-    [--model M] [--effort E] [--mode MODE] [--cwd DIR] [--home DIR] [--name ALIAS]
+    [--model M] [--effort E] [--mode MODE] [--cwd DIR] [--home DIR] [--name ALIAS] [--system-prompt-file FILE]
     [--output-file FILE] [--format text|json] [--background]
     [--timeout S] [--cancel-after S]
     [--max-output BYTES] [--quiet]
@@ -105,7 +105,7 @@ A `continue` without a message, neither `PROMPT`, `-` nor `--prompt-file`, conti
 
 The adapter session is verified before a cold resume sends the new prompt. A listing check and a replay check are independent; an unavailable check leaves the resume unverified rather than inventing certainty. If acpc cannot account for every prompt known to have crossed the adapter boundary, the result says `resume: unverified — delivery record incomplete`. A mismatch fails before the new prompt is sent.
 
-Replay from `session/load` or `session/resume` is silent. It does not add old messages to the answer, transcript, stderr or context occupancy. A session in `starting`, `running`, `preparing` or `waiting` cannot be continued; the `conflict` error's hint names `steer` and `wait`, and for a session that has nothing in flight to correct in place (`starting`, `preparing`, `waiting`) it names `--steer-mode cancel-then-start`, so the hinted command never fails with a second `conflict`. Resolution flags that belong to a new dispatch (`--model`, `--effort`, `--mode`, `--cwd`, `--home`, `--name`) are accepted only when they name the session's stored value, compared after the normalization `run` applies (a path resolved against the caller's directory, a preset name resolved through the session's adapter table); such a flag changes nothing. A different value, including one given where the session stores none, is a usage error that prints the stored and the given value, with a hint to drop the flag or use `run`. `--timeout` and `--cancel-after` behave as for `run`, counted from the call: a deadline that expires during the cold resume, before the new turn was observed, leaves stdout empty with `error.context.status` `starting` or `preparing`. A usage limit on the turn this call starts is handled as for `run`.
+Replay from `session/load` or `session/resume` is silent. It does not add old messages to the answer, transcript, stderr or context occupancy. A session in `starting`, `running`, `preparing` or `waiting` cannot be continued; the `conflict` error's hint names `steer` and `wait`, and for a session that has nothing in flight to correct in place (`starting`, `preparing`, `waiting`) it names `--steer-mode cancel-then-start`, so the hinted command never fails with a second `conflict`. Resolution flags that belong to a new dispatch (`--model`, `--effort`, `--mode`, `--cwd`, `--home`, `--name`, `--system-prompt-file`) are accepted only when they name the session's stored value, compared after the normalization `run` applies (a path resolved against the caller's directory, a preset name resolved through the session's adapter table); such a flag changes nothing. A different value, including one given where the session stores none, is a usage error that prints the stored and the given value, with a hint to drop the flag or use `run`. `--timeout` and `--cancel-after` behave as for `run`, counted from the call: a deadline that expires during the cold resume, before the new turn was observed, leaves stdout empty with `error.context.status` `starting` or `preparing`. A usage limit on the turn this call starts is handled as for `run`. A cold resume sends the session's stored system prompt and tool list again with `session/load` or `session/resume`, so a restored session runs under the same prompt as the first turn.
 A session whose recorded working directory no longer exists cannot be continued: the call fails with `conflict` naming the directory, before anything is sent or any turn file rotates.
 
 ### `daemon`
@@ -203,12 +203,12 @@ resolve AGENT [--cwd DIR] [--model M] [--effort E] [--permissions P]
     [--mode MODE] [--home DIR] [--format text|json]
 ```
 
-`resolve` previews the same call resolution that a later `run` would use. It creates no session, starts no daemon, and asks no question. The result contains `entry`, `base_adapter`, `command`, `cwd`, `env`, `env_passthrough` and `resolved`; each resolved field contains its value and provenance, with mode facts `grants`, `delegates`, `escalates` and `selectable` where applicable. A policy that cannot be served by a declared mode is `permission_denied` with exit 2.
+`resolve` previews the same call resolution that a later `run` would use. It creates no session, starts no daemon, and asks no question. The result contains `entry`, `base_adapter`, `command`, `cwd`, `env`, `env_passthrough` and `resolved`; each resolved field contains its value and provenance, with mode facts `grants`, `delegates`, `escalates` and `selectable` where applicable. `resolved` also carries `system_prompt` (the file path and its size in bytes) and `tools` when the entry sets them, with their provenance; the adapter facts `system_prompt_via` and `tools_via` appear beside `base_adapter`. A policy that cannot be served by a declared mode is `permission_denied` with exit 2.
 
 ### `run`
 
 ```text
-run AGENT [PROMPT | -] [--prompt-file FILE] [--cwd DIR] [--model M]
+run AGENT [PROMPT | -] [--prompt-file FILE] [--system-prompt-file FILE] [--cwd DIR] [--model M]
     [--effort E] [--permissions P] [--mode MODE] [--home DIR]
     [--output-file FILE] [--format text|json] [--timeout S]
     [--cancel-after S] [--name ALIAS]
@@ -224,6 +224,8 @@ A usage limit that blocks the turn is handled in the same turn. acpc recognizes 
 `--timeout` is invalid with `--background`, because a background call does not wait. `--cancel-after` remains valid with `--background`. `--permissions` selects a ceiling and the adapter mode; absent, its value comes from the registry or the TTY rules below. Deprecated permission spellings remain accepted as aliases and are reported as such.
 
 `--output-file` writes exactly what stdout would have received and leaves stdout empty, on success and on a failure that returns a result; a call that returns no result creates no file. It expands a leading `~`, creates a missing parent directory and overwrites the target; a target that exists and is not a regular file, such as `/dev/null` or a FIFO, is written in place rather than replaced. A target acpc cannot write fails with `permission_denied` naming the output path. The complete `answer.md` remains in the session directory. `--max-output` caps stdout bytes at 131 072 by default, preserves a UTF-8 boundary, sets `truncated: true` in a machine result and names the complete answer path. For `run`, `continue`, `steer` and `wait` it accepts `0`, which disables the cap, or at least 4 096 bytes; a smaller value is a usage error. The cap never cuts the result's envelope: when the envelope alone exceeds it, the answer is reduced to the truncation marker.
+
+`--system-prompt-file FILE` replaces the system prompt for this call and overrides the entry's `system_prompt_file`. It follows the prompt-file rules: the path resolves against the caller's directory with a leading `~` expanded, the content is limited to 1 MiB, an unreadable file is `permission_denied`, a missing one a usage error. It needs an adapter whose `system_prompt_via` is `acp_meta`; on `codex_config` it is `not_supported`, exit 2, naming `system_prompt_file` on the entry as the route. The system prompt in force is written to the session directory as `system.md` before dispatch and named by `paths.system`.
 
 ### `skills`
 
@@ -326,7 +328,7 @@ Machine success documents are the shapes published by `acpc schema`. Collections
 
 The shared answer result for `run` and `continue` has required `status`, `session_id`, `turn`, `created_at`, `started_at`, `finished_at`, `paths`, `truncated`, `partial`, `denied`, `permissions_clamp`, `capabilities` and `changed`. Foreground success adds `stop_reason`, `context`, `usage` and `answer`; background success omits them and points `next` at `wait`. `context` is the context occupancy recorded for the session so far, the same object `status` shows; it is `null` until the adapter has reported usage for the session, never an object of zeros in that case, so a turn that ended before any usage arrived reports `null`. `usage` is the session's cumulative consumption, the same object `status` shows. `resume`, `next`, `output_file` and `limit` are optional; `limit` appears when a usage limit touched the turn and has the shape described under `status`. `steer` uses the same document with `status` limited to `running` and `succeeded`, without `partial`, plus required `correction_result`. `capabilities` is the session-capability object described under `steer`, `{"steer_mode": "in-place" | "cancel-then-start", "continue_without_message": true}`, and is the same object in every command that carries it. `wait` is read-only, so its result has no `changed` field. `turn` is the one-based number of the turn the document describes. Each schema entry declares one `output` shared by the success and failure results of that command, and `run`, `continue` and `wait` state in `output_description` which failures return a result and which fields are required only on success. Every command with a conversation role names its identifier field `session_id`, its answer field `answer` and its capability object `capabilities` in `output_description`.
 
-`paths` contains `dir`, `prompt`, `transcript` and `answer`. `denied` records permission denials by category, and `permissions_clamp` records a requested policy, the entry ceiling and the effective policy when a clamp occurred. `run`, `continue` and `wait` return their result document on stdout when acpc observed the end of the turn and holds its content, including when the turn failed or was canceled. A client deadline never produces a result document: the answer recorded so far stays in the session files and `log` reads it. `partial` is `false` when the content is the complete answer for that call, a refusal included, and `true` when the turn ended before the answer did; a result carrying `partial: true` always exits non-zero. A call that never observed a turn — an unknown agent, a rejected flag combination, a session that does not exist, a start that failed — writes nothing to stdout. The structured error stays on stderr in every case.
+`paths` contains `dir`, `prompt`, `transcript` and `answer`, and `system` when the session has a system prompt. `denied` records permission denials by category, and `permissions_clamp` records a requested policy, the entry ceiling and the effective policy when a clamp occurred. `run`, `continue` and `wait` return their result document on stdout when acpc observed the end of the turn and holds its content, including when the turn failed or was canceled. A client deadline never produces a result document: the answer recorded so far stays in the session files and `log` reads it. `partial` is `false` when the content is the complete answer for that call, a refusal included, and `true` when the turn ended before the answer did; a result carrying `partial: true` always exits non-zero. A call that never observed a turn — an unknown agent, a rejected flag combination, a session that does not exist, a start that failed — writes nothing to stdout. The structured error stays on stderr in every case.
 
 ### Text presentation
 
@@ -452,6 +454,7 @@ ACPC_HOME/
     meta.json
     prompt.md
     prompt.<n>.md
+    system.md
     transcript.ndjson
     answer.md
     answer.<n>.md
@@ -499,7 +502,7 @@ Once allocated, a session id is never assigned to another session. The allocator
 
 ## Agent variants
 
-An adapter TOML shipped in the package or defined locally supplies `command`, optional `install_command` and `install_docs`, default `home`, `home_env`, modes, presets, effort tables, environment declarations, pass-through variable names and the model/effort application paths. `usage_profile` names how acpc reads the adapter's consumption reports (`claude_model_usage`, `codex_usage_updates`, `grok_meta_usage`, or `none`, the default); `billing` declares whether the entry's sessions are paid by subscription (`subscription`) or per token (`api`) and is `null` when undeclared. Both are inherited through `extends`. A local file with `extends` is a variant; a local file with `command` and no `extends` is a new adapter; a local file under a shipped adapter name is an override.
+An adapter TOML shipped in the package or defined locally supplies `command`, optional `install_command` and `install_docs`, default `home`, `home_env`, modes, presets, effort tables, environment declarations, pass-through variable names and the model/effort application paths. `usage_profile` names how acpc reads the adapter's consumption reports (`claude_model_usage`, `codex_usage_updates`, `grok_meta_usage`, or `none`, the default); `billing` declares whether the entry's sessions are paid by subscription (`subscription`) or per token (`api`) and is `null` when undeclared. Both are inherited through `extends`. `system_prompt_file` names a file whose content replaces the vendor's own system prompt in every session of the entry; `tools` lists the vendor tools those sessions may use, and `[]` leaves none. Both are inherited through `extends`, and a child's `tools = []` overrides the parent's list. The adapter declares the routes it has: `system_prompt_via` is `acp_meta` (sent as `_meta.systemPrompt` on `session/new`), `codex_config` (a per-entry instructions file through the adapter's own configuration) or `none`, the default; `tools_via` is `acp_meta` (sent as `_meta.claudeCode.options.tools`) or `none`, the default. An entry that sets a key its adapter has no route for fails `run` with `not_supported`, exit 2, before any session exists, naming the adapter and the alternative where one exists; `resolve` reports the same refusal. `agents get` shows such an entry with the refusal in a `refused` row and field (`null` when the keys have a route), and `agents check`, `agents get --models`, `probe` and `continue` work on it, because they send no prompt and no tool list of their own. acpc never falls back to the vendor's own prompt. `agents check` tests the adapter connection only and sends no system prompt. A local file with `extends` is a variant; a local file with `command` and no `extends` is a new adapter; a local file under a shipped adapter name is an override.
 
 ```toml
 extends = "codex"
@@ -511,6 +514,14 @@ env_passthrough = ["OPENROUTER_API_KEY"]
 
 [env]
 MODEL_PROVIDER = "openrouter"
+```
+
+A judge entry leaves the model, effort and system prompt to the call (`run judge --model M --effort E --system-prompt-file FILE`); `system_prompt_file` on the entry pins a prompt instead:
+
+```toml
+extends = "bare"
+permissions = "read"
+tools = []
 ```
 
 `acpc agents get NAME` shows each resolved field and its source. `resolve` shows one concrete call. The adapter environment is constructed from a base system set, declared variables and explicitly named pass-through variables; the rest of the caller environment is not inherited. Secrets are read at dispatch time and are never written to state.

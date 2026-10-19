@@ -995,6 +995,8 @@ def test_continue_migrates_legacy_mode_and_target_metadata(cli: CliRunner) -> No
         "effort_cli_flag": None,
         "usage_profile": "none",
         "billing": None,
+        "system_prompt_via": "none",
+        "tools_via": "none",
         "modes": {
             "default": {"grants": "read", "delegates": True},
             "plan": {"grants": "read", "delegates": True},
@@ -2510,6 +2512,19 @@ def test_continue_rejects_a_malformed_stored_resolution(cli: CliRunner) -> None:
     assert "stored permission resolution" in envelope["message"]
 
 
+@pytest.mark.parametrize("stored", [["Read"], {"source": "entry"}])
+def test_continue_rejects_a_malformed_stored_tool_list(cli: CliRunner, stored: object) -> None:
+    session_id = start_session(cli)
+    meta = sessions.load(session_id)
+    meta.resolution["resolved"]["tools"] = stored
+    with sessions.session_lock(session_id):
+        sessions.write_meta(meta)
+
+    result = invoke(cli, "continue", session_id, "turn two")
+
+    assert json.loads(result.stderr)["error"]["kind"] == "corrupt_state"
+
+
 def test_continue_write_alias_is_canonical_and_warns(
     cli: CliRunner, fresh_permission_alias_warnings: None, tmp_path: Path
 ) -> None:
@@ -2882,3 +2897,179 @@ def test_background_policy_change_updates_wait_and_stop_target(
     assert stopped.exit_code == vocab.EXIT_OK
     assert sessions.load(session_id).state == "canceled"
     assert connected == [new_target]
+
+
+# --- system prompt and tool list across a cold resume ------------------------
+
+
+def write_judge_entry(state_root: Path, extra: str = "") -> None:
+    facts = 'system_prompt_via = "acp_meta"\ntools_via = "acp_meta"\n'
+    text = MOCK_ENTRY.replace("\n[modes]", f"\n{facts}{extra}\n[modes]", 1)
+    (state_root / "agents" / "judge.toml").write_text(text, encoding="utf-8")
+
+
+def start_judge_session(cli: CliRunner, *options: str) -> str:
+    result = invoke(cli, "run", "judge", "case one", *options, "--quiet", "--json")
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    return json.loads(result.stdout)["session_id"]
+
+
+def wire_meta(wire_file: Path, method: str) -> list[dict[str, Any]]:
+    events = [json.loads(line) for line in wire_file.read_text(encoding="utf-8").splitlines()]
+    return [event["params"]["meta"] for event in events if event["method"] == method]
+
+
+@pytest.mark.parametrize(
+    ("advertise_resume", "method"), [("0", "session/load"), ("1", "session/resume")]
+)
+def test_a_cold_resume_sends_the_stored_prompt_and_tools_again(
+    cli: CliRunner,
+    state_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    advertise_resume: str,
+    method: str,
+) -> None:
+    wire_file = tmp_path / "wire.jsonl"
+    monkeypatch.setenv("ACPC_MOCK_WIRE_FILE", str(wire_file))
+    monkeypatch.setenv("ACPC_MOCK_ADVERTISE_RESUME", advertise_resume)
+    (state_root / "agents" / "p.md").write_text("judge prompt", encoding="utf-8")
+    write_judge_entry(state_root, 'system_prompt_file = "p.md"\ntools = ["Read"]\n')
+    session_id = start_judge_session(cli)
+    # An edit after the session began must change nothing about it.
+    write_judge_entry(state_root, "tools = []\n")
+
+    result = invoke(cli, "continue", session_id, "case two", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    expected = {"systemPrompt": "judge prompt", "claudeCode": {"options": {"tools": ["Read"]}}}
+    assert wire_meta(wire_file, "session/new") == [expected]
+    assert wire_meta(wire_file, method) == [expected]
+    assert sessions.system_path(session_id).read_text(encoding="utf-8") == "judge prompt"
+
+
+def test_a_session_without_prompt_or_tools_resumes_without_meta(
+    cli: CliRunner, state_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wire_file = tmp_path / "wire.jsonl"
+    monkeypatch.setenv("ACPC_MOCK_WIRE_FILE", str(wire_file))
+    write_judge_entry(state_root)
+    session_id = start_judge_session(cli)
+
+    result = invoke(cli, "continue", session_id, "case two", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    assert wire_meta(wire_file, "session/load") == [{}]
+
+
+def test_continue_keeps_the_prompt_when_the_entry_loses_its_route(
+    cli: CliRunner, state_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wire_file = tmp_path / "wire.jsonl"
+    monkeypatch.setenv("ACPC_MOCK_WIRE_FILE", str(wire_file))
+    prompt = tmp_path / "p.md"
+    prompt.write_text("stored prompt", encoding="utf-8")
+    write_judge_entry(state_root)
+    session_id = start_judge_session(cli, "--system-prompt-file", str(prompt))
+    # The live entry now claims a tool list on an adapter with no route; the
+    # stored session must still continue under its own facts.
+    (state_root / "agents" / "judge.toml").write_text(
+        MOCK_ENTRY.replace("\n[modes]", "\ntools = []\n\n[modes]", 1), encoding="utf-8"
+    )
+
+    result = invoke(cli, "continue", session_id, "case two", "--permissions", "read", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    assert wire_meta(wire_file, "session/load") == [{"systemPrompt": "stored prompt"}]
+
+
+def gain_a_key_without_a_route(state_root: Path) -> None:
+    """Edit `plain` so it sets `tools` on an adapter that has no tool route."""
+    (state_root / "agents" / "plain.toml").write_text(
+        MOCK_ENTRY.replace("\n[modes]", "\ntools = []\n\n[modes]", 1), encoding="utf-8"
+    )
+
+
+def test_continue_ignores_a_key_the_live_entry_gained_without_a_route(
+    cli: CliRunner, state_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wire_file = tmp_path / "wire.jsonl"
+    monkeypatch.setenv("ACPC_MOCK_WIRE_FILE", str(wire_file))
+    (state_root / "agents" / "plain.toml").write_text(MOCK_ENTRY, encoding="utf-8")
+    started = invoke(cli, "run", "plain", "case one", "--quiet", "--json")
+    assert started.exit_code == vocab.EXIT_OK, started.stderr
+    session_id = json.loads(started.stdout)["session_id"]
+    # The session began with no tool list; the entry's later `tools = []` has no
+    # route on this adapter and must neither refuse nor reach the wire.
+    gain_a_key_without_a_route(state_root)
+
+    result = invoke(cli, "continue", session_id, "case two", "--permissions", "read", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    assert wire_meta(wire_file, "session/load") == [{}]
+
+
+def test_continue_with_a_model_tier_resolves_an_entry_that_gained_a_key_without_a_route(
+    cli: CliRunner, state_root: Path
+) -> None:
+    (state_root / "agents" / "plain.toml").write_text(MOCK_ENTRY, encoding="utf-8")
+    started = invoke(cli, "run", "plain", "case one", "--quiet", "--json")
+    assert started.exit_code == vocab.EXIT_OK, started.stderr
+    session_id = json.loads(started.stdout)["session_id"]
+    gain_a_key_without_a_route(state_root)
+
+    result = invoke(cli, "continue", session_id, "case two", "--model", "standard", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    assert sessions.read_meta(session_id).turns == 2
+
+
+def test_continue_accepts_the_stored_system_prompt_file_and_refuses_another(
+    cli: CliRunner, state_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prompt = tmp_path / "p.md"
+    prompt.write_text("stored prompt", encoding="utf-8")
+    other = tmp_path / "other.md"
+    other.write_text("other prompt", encoding="utf-8")
+    write_judge_entry(state_root)
+    session_id = start_judge_session(cli, "--system-prompt-file", str(prompt))
+
+    same = invoke(
+        cli, "continue", session_id, "case two", "--system-prompt-file", str(prompt), "--quiet"
+    )
+    monkeypatch.chdir(tmp_path)
+    relative = invoke(
+        cli, "continue", session_id, "case three", "--system-prompt-file", "p.md", "--quiet"
+    )
+    different = invoke(cli, "continue", session_id, "case four", "--system-prompt-file", str(other))
+
+    assert same.exit_code == vocab.EXIT_OK, same.stderr
+    assert relative.exit_code == vocab.EXIT_OK, relative.stderr
+    assert sessions.read_meta(session_id).turns == 3
+    assert different.exit_code == vocab.EXIT_USAGE
+    error = json.loads(different.stderr)["error"]
+    assert error["kind"] == "invalid_input"
+    assert error["message"] == (
+        "--system-prompt-file: continue reuses the session's stored system prompt file "
+        f"{prompt.resolve()}; given {other.resolve()}"
+    )
+    assert error["hint"] == (
+        "Drop --system-prompt-file, or start a new session: acpc run judge ..."
+    )
+    assert sessions.read_meta(session_id).turns == 3
+
+
+def test_continue_refuses_a_system_prompt_file_the_session_never_had(
+    cli: CliRunner, state_root: Path, tmp_path: Path
+) -> None:
+    prompt = tmp_path / "p.md"
+    prompt.write_text("late prompt", encoding="utf-8")
+    write_judge_entry(state_root)
+    session_id = start_judge_session(cli)
+
+    result = invoke(cli, "continue", session_id, "case two", "--system-prompt-file", str(prompt))
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    message = json.loads(result.stderr)["error"]["message"]
+    assert "stored system prompt file null; given" in message
+    assert sessions.read_meta(session_id).turns == 1

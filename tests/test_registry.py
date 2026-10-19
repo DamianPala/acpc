@@ -916,3 +916,159 @@ def test_preset_effort_rejected_when_model_row_disallows_it(tmp_path: Path) -> N
 
     with pytest.raises(RegistryError, match="supported levels: low"):
         AgentRegistry(agents).resolve_call("local", model="fast")
+
+
+def test_shipped_adapters_declare_the_system_prompt_and_tool_routes(tmp_path: Path) -> None:
+    registry = AgentRegistry(tmp_path / "agents")
+
+    claude = registry.resolve("claude")
+
+    assert (claude.system_prompt_via, claude.tools_via) == ("acp_meta", "acp_meta")
+    assert claude.provenance["system_prompt_via"].kind == "adapter-default"
+    for name in ("codex", "grok"):
+        entry = registry.resolve(name)
+        assert (entry.system_prompt_via, entry.tools_via) == ("none", "none")
+        assert entry.system_prompt_file is None
+        assert entry.tools is None
+
+
+def test_prompt_and_tool_keys_default_when_absent(tmp_path: Path) -> None:
+    agents = tmp_path / "agents"
+    write_entry(agents, "plain", 'command = "python -m plain"\n')
+
+    plain = AgentRegistry(agents).resolve("plain")
+
+    assert plain.system_prompt_file is None
+    assert plain.tools is None
+    assert (plain.system_prompt_via, plain.tools_via) == ("none", "none")
+    assert plain.provenance["system_prompt_via"].kind == "default"
+    assert plain.provenance["tools_via"].kind == "default"
+    assert plain.provenance["tools"].kind == "unset"
+    assert plain.provenance["system_prompt_file"].kind == "unset"
+
+
+def test_prompt_file_resolves_against_its_own_entry_file_and_expands_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    agents = tmp_path / "agents"
+    write_entry(
+        agents,
+        "base",
+        'command = "python -m base"\nsystem_prompt_via = "acp_meta"\nsystem_prompt_file = "p.md"\n',
+    )
+    write_entry(agents, "child", 'extends = "base"\n')
+    write_entry(agents, "tilde", 'extends = "base"\nsystem_prompt_file = "~/judge.md"\n')
+
+    registry = AgentRegistry(agents)
+
+    assert registry.resolve("base").system_prompt_file == str(agents / "p.md")
+    assert registry.resolve("child").system_prompt_file == str(agents / "p.md")
+    assert registry.resolve("tilde").system_prompt_file == str(tmp_path / "home" / "judge.md")
+    assert registry.resolve("child").provenance["system_prompt_file"].kind == "entry"
+
+
+def test_tools_inherit_and_an_empty_child_list_overrides_a_parent_list(tmp_path: Path) -> None:
+    agents = tmp_path / "agents"
+    write_entry(agents, "base", 'command = "python -m base"\ntools = ["Read", "Grep"]\n')
+    write_entry(agents, "inherits", 'extends = "base"\n')
+    write_entry(agents, "none", 'extends = "base"\ntools = []\n')
+    write_entry(agents, "other", 'extends = "base"\ntools = ["Bash"]\n')
+    write_entry(agents, "bare", 'command = "python -m bare"\n')
+    write_entry(agents, "bare-child", 'extends = "bare"\n')
+
+    registry = AgentRegistry(agents)
+
+    assert registry.resolve("inherits").tools == ("Read", "Grep")
+    assert registry.resolve("none").tools == ()
+    assert registry.resolve("other").tools == ("Bash",)
+    assert registry.resolve("bare-child").tools is None
+    assert registry.resolve("none").provenance["tools"].path == agents / "none.toml"
+    assert registry.resolve("inherits").provenance["tools"].path == agents / "base.toml"
+
+
+def test_route_facts_inherit_through_extends(tmp_path: Path) -> None:
+    agents = tmp_path / "agents"
+    write_entry(
+        agents,
+        "base",
+        'command = "python -m base"\nsystem_prompt_via = "codex_config"\ntools_via = "acp_meta"\n',
+    )
+    write_entry(agents, "child", 'extends = "base"\n')
+
+    child = AgentRegistry(agents).resolve("child")
+
+    assert (child.system_prompt_via, child.tools_via) == ("codex_config", "acp_meta")
+
+
+@pytest.mark.parametrize(
+    ("line", "key"),
+    [
+        ('system_prompt_file = ""', "system_prompt_file"),
+        ("system_prompt_file = 3", "system_prompt_file"),
+        ('tools = "Read"', "tools"),
+        ('tools = ["Read", ""]', "tools"),
+        ("tools = [1]", "tools"),
+        ('system_prompt_via = "env"', "system_prompt_via"),
+        ('tools_via = "codex_config"', "tools_via"),
+        ("tools_via = 1", "tools_via"),
+    ],
+)
+def test_invalid_prompt_and_tool_keys_are_rejected(tmp_path: Path, line: str, key: str) -> None:
+    agents = tmp_path / "agents"
+    write_entry(agents, "bad", f'command = "python -m bad"\n{line}\n')
+
+    with pytest.raises(RegistryError, match=key):
+        AgentRegistry(agents)
+
+
+def test_call_resolution_records_prompt_and_tool_sources(tmp_path: Path) -> None:
+    agents = tmp_path / "agents"
+    write_entry(
+        agents,
+        "judge",
+        'command = "python -m judge"\nsystem_prompt_via = "acp_meta"\ntools_via = "acp_meta"\n'
+        'system_prompt_file = "entry.md"\ntools = []\n',
+    )
+    registry = AgentRegistry(agents)
+
+    from_entry = registry.resolve_call("judge")
+    from_call = registry.resolve_call("judge", system_prompt_file="/x/call.md")
+
+    assert from_entry.system_prompt is not None
+    assert (from_entry.system_prompt.path, from_entry.system_prompt.source) == (
+        str(agents / "entry.md"),
+        "entry",
+    )
+    assert from_entry.provenance["system_prompt"].kind == "entry"
+    assert from_entry.tools == ()
+    assert from_call.system_prompt is not None
+    assert (from_call.system_prompt.path, from_call.system_prompt.source) == ("/x/call.md", "call")
+    assert from_call.provenance["system_prompt"].kind == "call"
+
+
+@pytest.mark.parametrize(
+    ("entry_text", "kwargs", "needle"),
+    [
+        ('system_prompt_file = "p.md"\n', {}, "entry bad sets system_prompt_file"),
+        ("tools = []\n", {}, "entry bad sets tools"),
+        ("", {"system_prompt_file": "/x/p.md"}, "--system-prompt-file"),
+        (
+            'system_prompt_via = "codex_config"\n',
+            {"system_prompt_file": "/x/p.md"},
+            "system_prompt_file on",
+        ),
+        ('system_prompt_via = "codex_config"\nsystem_prompt_file = "p.md"\n', {}, "codex_config"),
+    ],
+)
+def test_a_key_without_a_route_is_refused_naming_entry_and_adapter(
+    tmp_path: Path, entry_text: str, kwargs: dict, needle: str
+) -> None:
+    agents = tmp_path / "agents"
+    write_entry(agents, "bad", f'command = "python -m bad"\n{entry_text}')
+
+    with pytest.raises(RegistryError) as error:
+        AgentRegistry(agents).resolve_call("bad", **kwargs)
+
+    assert needle in str(error.value)
+    assert "bad" in str(error.value)

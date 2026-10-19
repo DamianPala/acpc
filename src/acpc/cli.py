@@ -54,6 +54,7 @@ from acpc.registry import (
     ModeSpec,
     RegistryError,
     ResolvedEntry,
+    RouteNotSupported,
 )
 
 # How every command that addresses one session names it.  One sentence,
@@ -471,6 +472,16 @@ def _registry_problem(error: RegistryError) -> AcpcError:
         # The entry exists and the call is well formed; acpc simply has no
         # trusted installer to run for it, and no flag turns one up.
         return AcpcError(str(error), kind=errors.NOT_SUPPORTED, action="user")
+    if isinstance(error, RouteNotSupported):
+        # The caller wrote a key the adapter cannot carry; dropping it fixes
+        # the call, so unlike the installer refusal this one is a usage exit.
+        return AcpcError(
+            str(error),
+            kind=errors.NOT_SUPPORTED,
+            action="user",
+            hint=error.hint,
+            exit_code=vocab.EXIT_USAGE,
+        )
     return UsageProblem(str(error))
 
 
@@ -1154,20 +1165,22 @@ def _read_stdin_prompt() -> str:
     return _checked_prompt(sys.stdin.read(vocab.MAX_PROMPT_BYTES + 1), "-", exact=False)
 
 
-def _prompt_file_problem(prompt_file: str, error: OSError) -> AcpcError:
-    """Classify a `--prompt-file` that could not be read.
+def _prompt_file_problem(
+    prompt_file: str, error: OSError, flag: str = "--prompt-file"
+) -> AcpcError:
+    """Classify a prompt file (`--prompt-file` or a system prompt) that could not be read.
 
     A path that is not there is the caller's own argument, so it stays a usage
     error.  A path that is there and refused is the filesystem's answer, and
     no rewriting of the call changes it.
     """
-    message = f"--prompt-file {prompt_file}: {error.strerror}"
+    message = f"{flag} {prompt_file}: {error.strerror}"
     if isinstance(error, PermissionError):
         return AcpcError(message, kind=errors.PERMISSION_DENIED, action="user")
     return UsageProblem(message)
 
 
-def _read_prompt_file(prompt_file: str) -> str:
+def _read_prompt_file(prompt_file: str, flag: str = "--prompt-file") -> str:
     """Read the prompt file without buffering more than the limit.
 
     `stat` stays as the cheap refusal that never opens the file, but it can
@@ -1175,20 +1188,42 @@ def _read_prompt_file(prompt_file: str) -> str:
     `/proc` entry all report zero bytes and would hand an unbounded stream to
     an unbounded read.  So the read is capped exactly the way stdin's is, and
     `--prompt-file <(...)` costs no more memory than the limit allows.
+    `flag` names the option or entry key in every message.
     """
     path = Path(prompt_file).expanduser()
     try:
         size = path.stat().st_size
     except OSError as error:
-        raise _prompt_file_problem(prompt_file, error) from None
+        raise _prompt_file_problem(prompt_file, error, flag) from None
     if size > vocab.MAX_PROMPT_BYTES:
-        raise _oversized_prompt("--prompt-file", size)
+        raise _oversized_prompt(flag, size)
     try:
         with path.open(encoding="utf-8") as stream:
             text = stream.read(vocab.MAX_PROMPT_BYTES + 1)
     except OSError as error:
-        raise _prompt_file_problem(prompt_file, error) from None
-    return _checked_prompt(text, "--prompt-file", exact=False)
+        raise _prompt_file_problem(prompt_file, error, flag) from None
+    return _checked_prompt(text, flag, exact=False)
+
+
+def _load_system_prompt(resolution: CallResolution) -> tuple[CallResolution, str | None]:
+    """Read the system prompt in force, and record its size on the resolution.
+
+    Runs before any session exists, so a missing, oversized or empty prompt
+    file leaves nothing behind.  An empty one is refused: an adapter could read
+    "" as "no prompt" and fall back to the vendor's own.
+    """
+    system_prompt = resolution.system_prompt
+    if system_prompt is None:
+        return resolution, None
+    flag = "--system-prompt-file" if system_prompt.source == "call" else "system_prompt_file"
+    text = _read_prompt_file(system_prompt.path, flag)
+    if not text.strip():
+        raise UsageProblem(
+            f"{flag} {system_prompt.path}: the file is empty",
+            hint="A system prompt needs content; acpc never falls back to the vendor's own.",
+        )
+    sized = replace(system_prompt, size=len(text.encode("utf-8")))
+    return replace(resolution, system_prompt=sized), text
 
 
 def _read_prompt(
@@ -1300,8 +1335,13 @@ def _continue_selection(
         explicit_mode = stored.mode if stored.mode is not None and source != "selected" else None
         # Live [effort_by_model] must not reject a stored model/effort pair.
         # Mode/permissions re-read the current table; effort stays as persisted.
+        # The session's prompt, tool list and routes are stored facts too: the
+        # live entry's keys are dropped so an edit cannot change or refuse them.
         entry = replace(
-            entry,
+            entry.without_session_keys(
+                system_prompt_via=stored.entry.system_prompt_via,
+                tools_via=stored.entry.tools_via,
+            ),
             effort_by_model={},
             usage_profile=stored.entry.usage_profile,
             billing=stored.entry.billing,
@@ -1619,6 +1659,11 @@ def _emit_resolution(payload: dict[str, Any], *, json_mode: bool) -> None:
             escalation = " · escalates" if item.get("escalates") else ""
             selection = "" if item.get("selectable", True) else " · not selectable"
             lines.append(f"{name:<12} {value} ({reason}) · {delegation}{escalation}{selection}")
+        elif name == "system_prompt":
+            lines.append(f"{'prompt file':<12} {value} ({item['bytes']} bytes, {item['source']})")
+        elif name == "tools":
+            names = " · ".join(item["value"]) if item["value"] else "none"
+            lines.append(f"{name:<12} {names} ({item['source']})")
         else:
             lines.append(f"{name:<12} {value} ({item['source']})")
     if payload["cwd"]:
@@ -1866,7 +1911,7 @@ def _ensure_cache(entry: ResolvedEntry) -> cache.CachedAdvertised:
     if not entry.installed:
         raise cache.ProbeError(entry.missing_binary_error())
     advertised = runner.run_with_sigint_deferred(
-        lambda: cache.probe_advertised(entry.resolve_call())
+        lambda: cache.probe_advertised(entry.without_session_keys().resolve_call())
     )
     refreshed = cache.read_advertised(entry.base_adapter)
     return refreshed or cache.CachedAdvertised(advertised=advertised, cached_at=time.time())
@@ -1915,10 +1960,58 @@ def _render_advertised_detail(
     return "\n".join(lines) + "\n", payload
 
 
+def _system_prompt_text(path: str) -> str:
+    """The entry's prompt file with its size, or a plain note when it cannot be read."""
+    try:
+        return f"{path} · {Path(path).stat().st_size} bytes"
+    except OSError as error:
+        return f"{path} · {error.strerror or 'unreadable'}"
+
+
+def _entry_env_row(entry: ResolvedEntry) -> str:
+    """The `agents get` env row: declared variables, their source, the passthrough list."""
+    declared = [f"{key}={value}" for key, value in entry.env.items()]
+    env_text = " · ".join(declared) if declared else "·"
+    env_source = _source_text(entry.provenance.get("env"))
+    if entry.env_passthrough:
+        env_text += f" ({env_source}) · passthrough: {' · '.join(entry.env_passthrough)}"
+    else:
+        env_text += f" ({env_source})"
+    return f"env          {env_text}"
+
+
+def _entry_session_rows(entry: ResolvedEntry) -> list[str]:
+    """The `agents get` rows for the prompt file, tool list and a refusal, when set."""
+    rows: list[str] = []
+    if entry.system_prompt_file is not None:
+        rows.append(
+            f"{'prompt file':<12} {_system_prompt_text(entry.system_prompt_file)} "
+            f"({_source_text(entry.provenance.get('system_prompt_file'))})"
+        )
+    if entry.tools is not None:
+        tool_names = " · ".join(entry.tools) if entry.tools else "none"
+        rows.append(f"{'tools':<12} {tool_names} ({_source_text(entry.provenance.get('tools'))})")
+    refused = entry.route_refusal()
+    if refused is not None:
+        rows.append(f"{'refused':<12} {refused}")
+    return rows
+
+
+def _entry_session_payload(entry: ResolvedEntry) -> dict[str, Any]:
+    """The `agents get --json` fields for the prompt file, tools, routes and a refusal."""
+    return {
+        "system_prompt_file": entry.system_prompt_file,
+        "tools": list(entry.tools) if entry.tools is not None else None,
+        "system_prompt_via": entry.system_prompt_via,
+        "tools_via": entry.tools_via,
+        "refused": entry.route_refusal(),
+    }
+
+
 def _render_entry_detail(
     registry: AgentRegistry, entry: ResolvedEntry
 ) -> tuple[str, dict[str, Any], str | None]:
-    resolution = registry.resolve_call(entry.entry)
+    resolution = entry.without_session_keys().resolve_call()
     lines: list[str] = []
     if entry.is_variant:
         lines.append(f"extends      {entry.extends}")
@@ -1944,14 +2037,8 @@ def _render_entry_detail(
         rendered_source = _source_text(resolution.provenance.get(field))
         lines.append(f"{field:<12} {rendered} ({rendered_source})")
 
-    declared = [f"{key}={value}" for key, value in entry.env.items()]
-    env_text = " · ".join(declared) if declared else "·"
-    env_source = _source_text(entry.provenance.get("env"))
-    if entry.env_passthrough:
-        env_text += f" ({env_source}) · passthrough: {' · '.join(entry.env_passthrough)}"
-    else:
-        env_text += f" ({env_source})"
-    lines.append(f"env          {env_text}")
+    lines.append(_entry_env_row(entry))
+    lines.extend(_entry_session_rows(entry))
     if not entry.is_variant:
         variants = [item.entry for item in registry.variants if item.base_adapter == entry.entry]
         lines.append(f"variants     {' · '.join(variants) if variants else 'none'}")
@@ -1959,6 +2046,7 @@ def _render_entry_detail(
     payload = {
         "agent": entry.entry,
         "base_adapter": entry.base_adapter,
+        **_entry_session_payload(entry),
         "description": entry.description,
         "resolved": {
             field: {
@@ -2131,8 +2219,8 @@ def agents_list_command(
     _run_agents_list(selected_format, limit, plain)
 
 
-def _emit_agent_models(registry: AgentRegistry, entry: ResolvedEntry, selected_format: str) -> None:
-    _warn_unlisted_effort_model(registry.resolve_call(entry.entry))
+def _emit_agent_models(entry: ResolvedEntry, selected_format: str) -> None:
+    _warn_unlisted_effort_model(entry.without_session_keys().resolve_call())
     record = _ensure_cache(entry)
     text, payload = _render_models(entry, record)
     if selected_format == "json":
@@ -2204,7 +2292,7 @@ def agents_get_command(
         registry = AgentRegistry()
         entry = registry.resolve(name)
         if models:
-            _emit_agent_models(registry, entry, selected_format)
+            _emit_agent_models(entry, selected_format)
             return
         if commands:
             _emit_agent_commands(entry, selected_format)
@@ -2222,9 +2310,9 @@ def _check_entries(registry: AgentRegistry, name: str | None) -> list[ResolvedEn
     return [registry.resolve(name)]
 
 
-def _check_one(registry: AgentRegistry, entry: ResolvedEntry, timeout: float) -> dict[str, Any]:
+def _check_one(entry: ResolvedEntry, timeout: float) -> dict[str, Any]:
     try:
-        resolution = registry.resolve_call(entry.entry)
+        resolution = entry.without_session_keys().resolve_call()
         _warn_unlisted_effort_model(resolution)
         advertised = runner.run_with_sigint_deferred(
             lambda: asyncio.wait_for(cache.probe_advertised(resolution), timeout=timeout)
@@ -2246,7 +2334,7 @@ def _agents_check(
     entries = _check_entries(registry, name)[:limit]
     results: list[dict[str, Any]] = []
     for entry in entries:
-        results.append(_check_one(registry, entry, timeout))
+        results.append(_check_one(entry, timeout))
     if name is None:
         payload: dict[str, Any] = output.collection_envelope(
             results, has_more=len(results) < len(_check_entries(registry, None))
@@ -2504,9 +2592,9 @@ def agents_create_command(
     permissions = _normalize_permission(permissions)
     try:
         registry = AgentRegistry()
-        registry.resolve(parent)
+        parent_entry = registry.resolve(parent)
         if effort is not None:
-            registry.resolve_call(parent, model=model, effort=effort)
+            parent_entry.without_session_keys().resolve_call(model=model, effort=effort)
     except RegistryError as error:
         raise _registry_problem(error) from None
     target = _agent_entry_path(name)
@@ -4180,6 +4268,7 @@ def _resolve_run_call(
     mode: str | None,
     permissions: str | None,
     home: str | None,
+    system_prompt_file: str | None = None,
 ) -> CallResolution:
     try:
         registry = AgentRegistry()
@@ -4190,6 +4279,9 @@ def _resolve_run_call(
             mode=mode,
             permissions=permissions,
             home=_resolve_caller_path(home) if home is not None else None,
+            system_prompt_file=(
+                _resolve_caller_path(system_prompt_file) if system_prompt_file is not None else None
+            ),
         )
         if permissions is None:
             _warn_permission_alias(registry.permission_alias(agent))
@@ -4293,6 +4385,7 @@ def resolve_command(
         permissions=permissions,
         home=home,
     )
+    resolution, _ = _load_system_prompt(resolution)
     _run_preview(
         resolution,
         permissions=permissions,
@@ -4320,6 +4413,7 @@ def _create_run_session(
     cwd: str,
     alias: str | None,
     permissions_source: str | None,
+    system_prompt: str | None = None,
 ) -> sessions.SessionMeta:
     settings = config.load_config()
     runner.auto_prune(settings.retention_seconds)
@@ -4328,6 +4422,7 @@ def _create_run_session(
             entry=resolution.entry.entry,
             base_adapter=resolution.entry.base_adapter,
             prompt=prompt,
+            system_prompt=system_prompt,
             resolution=runner.session_resolution(
                 resolution,
                 cwd=cwd,
@@ -4414,6 +4509,12 @@ def _run_foreground(
         "prompt sources with the argument and `-`, exactly one of which must be given."
     ),
 )
+@click.option(
+    "--system-prompt-file",
+    "system_prompt_file",
+    metavar="FILE",
+    help="Replace the system prompt for this call; overrides the entry's system_prompt_file.",
+)
 @click.option("--output-file", "output_file", metavar="FILE", help=_OUTPUT_FILE_HELP)
 @click.option(
     "--format",
@@ -4468,6 +4569,7 @@ def run_command(
     agent: str,
     prompt_text: str | None,
     prompt_file: str | None,
+    system_prompt_file: str | None,
     cwd: str | None,
     model: str | None,
     effort: str | None,
@@ -4505,6 +4607,7 @@ def run_command(
         mode=mode,
         permissions=permissions,
         home=home,
+        system_prompt_file=system_prompt_file,
     )
     defaulted_permissions = permissions is None and resolution.permissions is None
     prompt = _read_prompt(
@@ -4513,6 +4616,7 @@ def run_command(
         operation="run",
         hint="Run: acpc run AGENT PROMPT",
     )
+    resolution, system_prompt = _load_system_prompt(resolution)
     try:
         runner.adapter_command(resolution)
     except runner.RunnerError as error:
@@ -4530,6 +4634,7 @@ def run_command(
         cwd=resolved_cwd,
         alias=alias,
         permissions_source=permissions_source or ("default" if defaulted_permissions else None),
+        system_prompt=system_prompt,
     )
     request = runner.TurnRequest(
         resolution=resolution,
@@ -4831,6 +4936,12 @@ def _continuation_prompt(meta: sessions.SessionMeta) -> str:
     help="Must equal the session's stored name; continue reuses the session's settings.",
 )
 @click.option(
+    "--system-prompt-file",
+    "system_prompt_file",
+    metavar="FILE",
+    help="Must name the session's stored system prompt file; see --model.",
+)
+@click.option(
     "--permissions",
     type=click.Choice(_PERMISSION_CHOICES),
     metavar="P",
@@ -4898,11 +5009,12 @@ def continue_command(
     cwd: str | None,
     home: str | None,
     name: str | None,
+    system_prompt_file: str | None,
     permissions: str | None,
 ) -> None:
     """Continue a finished session and print an observed result, even on failure.
 
-    Model, effort, mode, cwd, home and name come from the session, not from
+    Model, effort, mode, cwd, home, name and system prompt come from the session, not from
     re-resolving the agent entry; editing an entry never changes a session
     mid-conversation. Matching resolution flags verify those stored values
     without changing them. ``--permissions`` is the one resolution flag that
@@ -4931,6 +5043,7 @@ def continue_command(
         cwd=resolved_cwd,
         home=home,
         name=name,
+        system_prompt=system_prompt_file,
     )
     if meta.is_active:
         raise AcpcError(
@@ -4964,6 +5077,9 @@ def continue_command(
     )
 
 
+_CONTINUE_PATH_FIELDS = frozenset({"cwd", "home", "system_prompt"})
+
+
 def _continue_stored_value(meta: sessions.SessionMeta, field: str) -> Any:
     """Read one setting from the session snapshot for a continue flag check."""
     if field == "name":
@@ -4984,7 +5100,7 @@ def _continue_model_value(meta: sessions.SessionMeta, value: str) -> str:
     if value not in MODEL_TIERS:
         return value
     try:
-        entry = AgentRegistry().resolve(meta.entry)
+        entry = AgentRegistry().resolve(meta.entry).without_session_keys()
         model = entry.resolve_call(model=value).model
     except RegistryError as error:
         raise _registry_problem(error) from None
@@ -4994,7 +5110,7 @@ def _continue_model_value(meta: sessions.SessionMeta, value: str) -> str:
 def _continue_flag_value(meta: sessions.SessionMeta, field: str, value: str) -> str:
     if field == "model":
         return _continue_model_value(meta, value)
-    if field in {"cwd", "home"}:
+    if field in _CONTINUE_PATH_FIELDS:
         return _resolve_caller_path(value)
     return value
 
@@ -5012,28 +5128,32 @@ def _validate_continue_flags(
     cwd: str | None,
     home: str | None,
     name: str | None,
+    system_prompt: str | None = None,
 ) -> None:
     """Reject a continue flag unless it names the stored setting unchanged."""
-    for field, given in (
-        ("model", model),
-        ("effort", effort),
-        ("mode", mode),
-        ("cwd", cwd),
-        ("home", home),
-        ("name", name),
+    # (stored field, flag spelling, label in the message, given value): the
+    # stored field and the flag differ for the system prompt file.
+    for field, flag, label, given in (
+        ("model", "--model", "model", model),
+        ("effort", "--effort", "effort", effort),
+        ("mode", "--mode", "mode", mode),
+        ("cwd", "--cwd", "cwd", cwd),
+        ("home", "--home", "home", home),
+        ("name", "--name", "name", name),
+        ("system_prompt", "--system-prompt-file", "system prompt file", system_prompt),
     ):
         if given is None:
             continue
         normalized_given = _continue_flag_value(meta, field, given)
         stored = _continue_stored_value(meta, field)
-        if field in {"cwd", "home"} and isinstance(stored, str):
+        if field in _CONTINUE_PATH_FIELDS and isinstance(stored, str):
             stored = _resolve_caller_path(stored)
         if stored == normalized_given:
             continue
         raise UsageProblem(
-            f"--{field}: continue reuses the session's stored {field} "
+            f"{flag}: continue reuses the session's stored {label} "
             f"{_continue_value_text(stored)}; given {_continue_value_text(normalized_given)}",
-            hint=f"Drop --{field}, or start a new session: acpc run {meta.entry} ...",
+            hint=f"Drop {flag}, or start a new session: acpc run {meta.entry} ...",
         )
 
 

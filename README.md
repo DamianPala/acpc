@@ -167,6 +167,19 @@ The `home` field is the provider switch: OpenAI vs OpenRouter vs a local endpoin
 
 `--model fast|standard|max` resolves through the adapter's preset table (overridable per adapter in `agents/`). When the vendor advertises new model ids, upgrade that adapter's binary first, then `acpc skills get refresh-adapter-models` — it writes only the operator overlay, after a confirm. The adapter's environment is **constructed, not inherited**: a base system set, capability variables (ssh agent, proxies, CA bundles), and the entry's declared env — the rest of your ambient environment never reaches the adapter.
 
+### Judge entries
+
+An eval runner can use one entry as a stateless judge: its own system prompt, no tools, the model and effort it asks for, on the subscription.
+
+```toml
+# ~/.acpc/agents/judge.toml
+extends = "bare"
+permissions = "read"
+tools = []
+```
+
+`acpc run judge --model claude-sonnet-5-5 --effort low --system-prompt-file judge-v2.md --prompt-file case.md --cancel-after 120 --json` answers with the judge prompt in place of Claude Code's own and no tool available; the prompt in force is kept as `system.md` in the session directory, and `system_prompt_file` on the entry pins one prompt for every call instead. Killing the client does not cancel the turn, `--cancel-after` does. The keys need an adapter with a route (`system_prompt_via`, `tools_via` in `agents get`); on one without, the call fails `not_supported` before any session exists, and acpc never falls back to the vendor's prompt.
+
 ## Teaching agents about acpc
 
 acpc documents itself: the root `--help` is a complete cheat sheet, and every command's `--help` names its own defaults. Don't copy usage documentation into your agent instructions — it goes stale the first time a flag moves, and the copy is what the agent will believe.
@@ -206,6 +219,7 @@ Keep it to purpose only. Models, efforts and flags belong to the tool — `acpc 
   sessions/<id>/
     meta.json                # full resolved invocation + state, timing, context occupancy, exit code
     prompt.md                # the prompt as sent (earlier turns: prompt.<n>.md)
+    system.md                # the system prompt in force, when the session has one
     transcript.ndjson        # full event stream, versioned public format
     answer.md                # final answer (earlier turns: answer.<n>.md)
 ```

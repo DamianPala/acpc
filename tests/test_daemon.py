@@ -2097,3 +2097,195 @@ def test_steering_a_turn_still_preparing_is_a_conflict(state_root: Path) -> None
 
     assert reply["ok"] is False
     assert reply["kind"] == "conflict"
+
+
+# --- system prompt and tool list through the daemon --------------------------
+
+JUDGE_TEXT = "You are a daemon judge. " * 40
+
+
+def write_judge_entry(state_root: Path, extra: str = "") -> None:
+    facts = 'system_prompt_via = "acp_meta"\ntools_via = "acp_meta"\n'
+    text = MOCK_ENTRY.replace("\n[modes]", f"\n{facts}{extra}\n[modes]", 1)
+    (state_root / "agents" / "judge.toml").write_text(text, encoding="utf-8")
+
+
+def judge_resolution(*, system_prompt: str | None = None):
+    """The `judge` entry resolved as `run` does, with its prompt size recorded."""
+    resolution = AgentRegistry().resolve_call(
+        "judge", permissions="read", system_prompt_file=system_prompt
+    )
+    mode, spec = select_mode(resolution.entry.modes, "read", resolution.mode)
+    resolution = replace(resolution, mode=mode, mode_spec=spec)
+    if resolution.system_prompt is not None:
+        size = len(JUDGE_TEXT.encode("utf-8"))
+        resolution = replace(resolution, system_prompt=replace(resolution.system_prompt, size=size))
+    return resolution
+
+
+def new_judge_session(resolution, prompt: str) -> str:
+    meta = sessions.create_session(
+        entry="judge",
+        base_adapter="judge",
+        prompt=prompt,
+        system_prompt=JUDGE_TEXT if resolution.system_prompt is not None else None,
+        resolution=runner.session_resolution(resolution, cwd=None),
+        target=runner.call_target(resolution),
+    )
+    return meta.session_id
+
+
+async def _stop_judge_target(resolution) -> None:
+    connection = await daemon_client.connect(runner.call_target(resolution))
+    assert connection is not None
+    try:
+        await connection.stop()
+    finally:
+        await connection.close()
+
+
+def test_the_dispatch_payload_carries_tools_and_the_prompt_source_but_not_its_text(
+    state_root: Path,
+) -> None:
+    (state_root / "agents" / "p.md").write_text(JUDGE_TEXT, encoding="utf-8")
+    write_judge_entry(state_root, 'system_prompt_file = "p.md"\ntools = ["Read", "Grep"]\n')
+    resolution = judge_resolution()
+
+    payload = runner.daemon_payload(runner.TurnRequest(resolution=resolution, prompt="x"))
+
+    assert payload["tools"] == ["Read", "Grep"]
+    assert payload["system_prompt"] == {
+        "value": str(state_root / "agents" / "p.md"),
+        "source": "entry",
+        "bytes": len(JUDGE_TEXT.encode("utf-8")),
+    }
+    assert (payload["system_prompt_via"], payload["tools_via"]) == ("acp_meta", "acp_meta")
+    assert JUDGE_TEXT not in json.dumps(payload)
+
+
+def test_the_daemon_rebuilds_prompt_and_tools_from_the_payload_not_the_live_entry(
+    state_root: Path,
+) -> None:
+    (state_root / "agents" / "p.md").write_text(JUDGE_TEXT, encoding="utf-8")
+    write_judge_entry(state_root, 'system_prompt_file = "p.md"\ntools = ["Read"]\n')
+    payload = runner.daemon_payload(runner.TurnRequest(resolution=judge_resolution(), prompt="x"))
+    # Entry edited after dispatch: different tools, no prompt, and then an
+    # entry whose adapter has no route at all.
+    write_judge_entry(state_root, 'tools = ["Bash"]\n')
+    edited = daemon.Daemon("judge")._rebuild_request(payload)
+    (state_root / "agents" / "judge.toml").write_text(
+        MOCK_ENTRY.replace("\n[modes]", "\ntools = []\n\n[modes]", 1), encoding="utf-8"
+    )
+    unroutable = daemon.Daemon("judge")._rebuild_request(payload)
+
+    for request in (edited, unroutable):
+        assert request.resolution.tools == ("Read",)
+        assert request.resolution.system_prompt is not None
+        assert request.resolution.system_prompt.source == "entry"
+        assert request.resolution.entry.system_prompt_via == "acp_meta"
+        assert request.resolution.entry.tools_via == "acp_meta"
+
+
+def test_a_key_the_live_entry_gained_without_a_route_does_not_refuse_a_running_session(
+    state_root: Path,
+) -> None:
+    (state_root / "agents" / "judge.toml").write_text(MOCK_ENTRY, encoding="utf-8")
+    payload = runner.daemon_payload(runner.TurnRequest(resolution=judge_resolution(), prompt="x"))
+    # The session began with no tool list; the entry now sets one on an adapter
+    # whose tools_via is none. The payload's facts win and nothing is refused.
+    (state_root / "agents" / "judge.toml").write_text(
+        MOCK_ENTRY.replace("\n[modes]", "\ntools = []\n\n[modes]", 1), encoding="utf-8"
+    )
+
+    request = daemon.Daemon("judge")._rebuild_request(payload)
+
+    assert request.resolution.tools is None
+    assert request.resolution.system_prompt is None
+
+
+def test_a_payload_without_prompt_or_tools_rebuilds_without_them(state_root: Path) -> None:
+    write_judge_entry(state_root)
+    payload = runner.daemon_payload(runner.TurnRequest(resolution=judge_resolution(), prompt="x"))
+
+    request = daemon.Daemon("judge")._rebuild_request(payload)
+
+    assert payload["tools"] is None
+    assert payload["system_prompt"] is None
+    assert request.resolution.tools is None
+    assert request.resolution.system_prompt is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("tools", "Read"),
+        ("tools", [1]),
+        ("system_prompt", {"value": 3, "source": "entry", "bytes": 1}),
+        ("system_prompt", {"value": "/x", "source": "other", "bytes": 1}),
+        ("system_prompt", {"value": "/x", "source": "entry"}),
+        ("system_prompt_via", "bogus"),
+        ("tools_via", "codex_config"),
+    ],
+)
+def test_a_malformed_prompt_or_tool_payload_is_rejected(
+    state_root: Path, field: str, value: object
+) -> None:
+    write_judge_entry(state_root)
+    payload = runner.daemon_payload(runner.TurnRequest(resolution=judge_resolution(), prompt="x"))
+    payload[field] = value
+
+    with pytest.raises(daemon.DaemonError):
+        daemon.Daemon("judge")._rebuild_request(payload)
+
+
+def test_a_live_daemon_run_sends_the_prompt_and_tools_as_meta(
+    state_root: Path, live_daemon: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wire_file = tmp_path / "wire.jsonl"
+    monkeypatch.setenv("ACPC_MOCK_WIRE_FILE", str(wire_file))
+    (state_root / "agents" / "p.md").write_text(JUDGE_TEXT, encoding="utf-8")
+    write_judge_entry(state_root, 'system_prompt_file = "p.md"\ntools = []\n')
+    resolution = judge_resolution()
+    session_id = new_judge_session(resolution, "judge this")
+
+    outcome = runner.execute_turn(
+        session_id, runner.TurnRequest(resolution=resolution, prompt="judge this")
+    )
+
+    assert outcome.state == "succeeded"
+    events = [json.loads(line) for line in wire_file.read_text(encoding="utf-8").splitlines()]
+    assert [event["params"]["meta"] for event in events if event["method"] == "session/new"] == [
+        {"systemPrompt": JUDGE_TEXT, "claudeCode": {"options": {"tools": []}}}
+    ]
+    assert sessions.system_path(session_id).read_text(encoding="utf-8") == JUDGE_TEXT
+    asyncio.run(_stop_judge_target(resolution))
+
+
+def test_a_daemon_cold_resume_sends_the_stored_prompt_and_tools_again(
+    state_root: Path, live_daemon: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wire_file = tmp_path / "wire.jsonl"
+    monkeypatch.setenv("ACPC_MOCK_WIRE_FILE", str(wire_file))
+    write_judge_entry(state_root, "tools = []\n")
+    resolution = judge_resolution(system_prompt=str(state_root / "agents" / "p.md"))
+    (state_root / "agents" / "p.md").write_text(JUDGE_TEXT, encoding="utf-8")
+    session_id = new_judge_session(resolution, "turn one")
+    runner.execute_turn(session_id, runner.TurnRequest(resolution=resolution, prompt="turn one"))
+    asyncio.run(_stop_judge_target(resolution))
+
+    sessions.rotate_turn(session_id)
+    sessions.write_prompt(session_id, "turn two")
+    resumed = sessions.read_meta(session_id).adapter_session_id
+    outcome = runner.execute_turn(
+        session_id,
+        runner.TurnRequest(
+            resolution=resolution, prompt="turn two", resume_adapter_session=resumed
+        ),
+    )
+
+    assert outcome.state == "succeeded"
+    events = [json.loads(line) for line in wire_file.read_text(encoding="utf-8").splitlines()]
+    expected = {"systemPrompt": JUDGE_TEXT, "claudeCode": {"options": {"tools": []}}}
+    assert [e["params"]["meta"] for e in events if e["method"] == "session/new"] == [expected]
+    assert [e["params"]["meta"] for e in events if e["method"] == "session/load"] == [expected]
+    asyncio.run(_stop_judge_target(resolution))

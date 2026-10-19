@@ -101,7 +101,7 @@ _CANCEL_STATUS = {
 }
 
 _PATHS = _object(
-    {name: _STRING for name in ("dir", "prompt", "transcript", "answer")},
+    {name: _STRING for name in ("dir", "prompt", "transcript", "answer", "system")},
     ("dir", "prompt", "transcript", "answer"),
 )
 _DENIAL = _object(
@@ -261,18 +261,29 @@ _RESOLUTION_FIELD = _object(
     },
     ("value", "source"),
 )
+# Present only when the entry or the call sets them.
+_RESOLUTION_SYSTEM_PROMPT = _object(
+    {"value": _STRING, "source": _STRING, "bytes": _INTEGER}, ("value", "source", "bytes")
+)
+_RESOLUTION_TOOLS = _object({"value": _array(_STRING), "source": _STRING}, ("value", "source"))
 _RESOLUTION = _object(
     {
         "entry": _STRING,
         "base_adapter": _STRING,
+        "system_prompt_via": _STRING,
+        "tools_via": _STRING,
         "command": _STRING,
         "cwd": _STRING,
         "env": {},
         "env_passthrough": _array(_STRING),
         "resolved": _object(
             {
-                name: _RESOLUTION_FIELD
-                for name in ("model", "effort", "mode", "permissions", "home")
+                **{
+                    name: _RESOLUTION_FIELD
+                    for name in ("model", "effort", "mode", "permissions", "home")
+                },
+                "system_prompt": _RESOLUTION_SYSTEM_PROMPT,
+                "tools": _RESOLUTION_TOOLS,
             },
             ("model", "effort", "mode", "permissions", "home"),
         ),
@@ -379,6 +390,11 @@ _AGENTS_GET = _object(
     {
         "agent": _STRING,
         "base_adapter": _STRING,
+        "system_prompt_file": _NULLABLE_STRING,
+        "tools": {"type": ["array", "null"], "items": _STRING},
+        "system_prompt_via": _STRING,
+        "tools_via": _STRING,
+        "refused": _NULLABLE_STRING,
         "description": _NULLABLE_STRING,
         "resolved": _object(
             {name: _RESOLVED_FIELD for name in ("model", "effort", "mode", "permissions", "home")},

@@ -16,8 +16,8 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
+from acpc import cache, interaction, paths, sessions, vocab
 from acpc import cli as cli_module
-from acpc import interaction, sessions, vocab
 from acpc.cli import main
 from acpc.permissions import ModeSelectionError
 from acpc.registry import ModeSpec
@@ -2037,3 +2037,417 @@ def test_listed_model_does_not_warn_on_resolve(cli: CliRunner) -> None:
 
     assert result.exit_code == vocab.EXIT_OK
     assert "has no [effort_by_model] row" not in result.stderr
+
+
+# --- system prompt and tool list (judge entries) ------------------------------
+
+JUDGE_FACTS = 'system_prompt_via = "acp_meta"\ntools_via = "acp_meta"\n'
+
+
+def write_judge_entry(state_root: Path, extra: str = "", *, name: str = "judge") -> None:
+    """A mock-adapter entry whose adapter declares the acp_meta routes."""
+    text = MOCK_ENTRY.replace("\n[modes]", f"\n{JUDGE_FACTS}{extra}\n[modes]", 1)
+    (state_root / "agents" / f"{name}.toml").write_text(text, encoding="utf-8")
+
+
+def session_new_meta(wire_file: Path) -> list[dict]:
+    return [
+        event["params"]["meta"]
+        for event in wire_events(wire_file)
+        if event["method"] == "session/new"
+    ]
+
+
+def sessions_on_disk() -> list[str]:
+    root = paths.sessions_dir()
+    return sorted(item.name for item in root.iterdir()) if root.exists() else []
+
+
+def test_run_sends_the_entry_prompt_and_tool_list_as_session_new_meta(
+    cli: CliRunner, state_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wire_file = state_root / "wire.jsonl"
+    monkeypatch.setenv("ACPC_MOCK_WIRE_FILE", str(wire_file))
+    (state_root / "agents" / "judge-prompt.md").write_text("You are a judge.\n", encoding="utf-8")
+    write_judge_entry(
+        state_root, 'system_prompt_file = "judge-prompt.md"\ntools = ["Read", "Grep"]\n'
+    )
+
+    result = invoke(cli, "run", "judge", "case one", "--quiet", "--json")
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    assert session_new_meta(wire_file) == [
+        {
+            "systemPrompt": "You are a judge.\n",
+            "claudeCode": {"options": {"tools": ["Read", "Grep"]}},
+        }
+    ]
+    advertised = json.loads(result.stdout)["paths"]
+    assert Path(advertised["system"]).read_text(encoding="utf-8") == "You are a judge.\n"
+    assert Path(advertised["system"]).name == "system.md"
+
+
+def test_an_empty_tool_list_arrives_as_an_empty_list_and_no_prompt_adds_no_system_path(
+    cli: CliRunner, state_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wire_file = state_root / "wire.jsonl"
+    monkeypatch.setenv("ACPC_MOCK_WIRE_FILE", str(wire_file))
+    write_judge_entry(state_root, "tools = []\n")
+
+    result = invoke(cli, "run", "judge", "case", "--quiet", "--json")
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    assert session_new_meta(wire_file) == [{"claudeCode": {"options": {"tools": []}}}]
+    assert "system" not in json.loads(result.stdout)["paths"]
+
+
+def test_a_session_without_prompt_or_tools_sends_no_meta(
+    cli: CliRunner, state_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wire_file = state_root / "wire.jsonl"
+    monkeypatch.setenv("ACPC_MOCK_WIRE_FILE", str(wire_file))
+    write_judge_entry(state_root)
+
+    result = invoke(cli, "run", "judge", "case", "--quiet", "--json")
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    assert session_new_meta(wire_file) == [{}]
+    assert "system" not in json.loads(result.stdout)["paths"]
+    session_dir = paths.session_dir(json.loads(result.stdout)["session_id"])
+    assert not (session_dir / "system.md").exists()
+
+
+def test_the_call_flag_wins_over_the_entry_key_and_is_recorded_as_call(
+    cli: CliRunner, state_root: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    wire_file = state_root / "wire.jsonl"
+    monkeypatch.setenv("ACPC_MOCK_WIRE_FILE", str(wire_file))
+    (state_root / "agents" / "entry.md").write_text("entry prompt", encoding="utf-8")
+    call_file = tmp_path / "call.md"
+    call_file.write_text("call prompt", encoding="utf-8")
+    write_judge_entry(state_root, 'system_prompt_file = "entry.md"\n')
+
+    result = invoke(
+        cli, "run", "judge", "case", "--system-prompt-file", str(call_file), "--quiet", "--json"
+    )
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    assert session_new_meta(wire_file) == [{"systemPrompt": "call prompt"}]
+    document = json.loads(result.stdout)
+    assert Path(document["paths"]["system"]).read_text(encoding="utf-8") == "call prompt"
+    stored = sessions.read_meta(document["session_id"]).resolution["resolved"]["system_prompt"]
+    assert stored == {"value": str(call_file.resolve()), "source": "call", "bytes": 11}
+
+
+def test_a_relative_call_flag_resolves_against_the_callers_directory(
+    cli: CliRunner, state_root: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    wire_file = state_root / "wire.jsonl"
+    monkeypatch.setenv("ACPC_MOCK_WIRE_FILE", str(wire_file))
+    (tmp_path / "rel.md").write_text("relative prompt", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    write_judge_entry(state_root)
+
+    result = invoke(cli, "run", "judge", "case", "--system-prompt-file", "rel.md", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    assert session_new_meta(wire_file) == [{"systemPrompt": "relative prompt"}]
+
+
+def test_resolve_shows_the_prompt_tools_and_route_facts(cli: CliRunner, state_root: Path) -> None:
+    (state_root / "agents" / "entry.md").write_text("héllo", encoding="utf-8")
+    write_judge_entry(state_root, 'system_prompt_file = "entry.md"\ntools = []\n')
+
+    result = invoke(cli, "resolve", "judge", "--json")
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    payload = json.loads(result.stdout)
+    assert (payload["system_prompt_via"], payload["tools_via"]) == ("acp_meta", "acp_meta")
+    assert payload["resolved"]["system_prompt"] == {
+        "value": str(state_root / "agents" / "entry.md"),
+        "source": "entry",
+        "bytes": 6,
+    }
+    assert payload["resolved"]["tools"]["value"] == []
+    assert payload["resolved"]["tools"]["source"].startswith("entry")
+    text = invoke(cli, "resolve", "judge")
+    assert f"prompt file  {state_root / 'agents' / 'entry.md'} (6 bytes, entry)" in text.stdout
+    assert "6 bytes" in text.stdout
+    assert "tools        none" in text.stdout
+    assert sessions_on_disk() == []
+
+
+def test_resolve_omits_prompt_and_tools_when_unset(cli: CliRunner, state_root: Path) -> None:
+    write_judge_entry(state_root)
+
+    payload = json.loads(invoke(cli, "resolve", "judge", "--json").stdout)
+
+    assert "system_prompt" not in payload["resolved"]
+    assert "tools" not in payload["resolved"]
+
+
+def test_agents_get_shows_the_prompt_file_and_tools(cli: CliRunner, state_root: Path) -> None:
+    (state_root / "agents" / "entry.md").write_text("12345", encoding="utf-8")
+    write_judge_entry(state_root, 'system_prompt_file = "entry.md"\ntools = ["Read"]\n')
+
+    result = invoke(cli, "agents", "get", "judge", "--json")
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["system_prompt_file"] == str(state_root / "agents" / "entry.md")
+    assert payload["tools"] == ["Read"]
+    assert (payload["system_prompt_via"], payload["tools_via"]) == ("acp_meta", "acp_meta")
+    text = invoke(cli, "agents", "get", "judge", "--format", "text").stdout
+    assert f"prompt file  {state_root / 'agents' / 'entry.md'} · 5 bytes" in text
+    assert "tools        Read" in text
+    assert payload["refused"] is None
+    assert "refused" not in text
+
+
+def test_agents_get_shows_an_empty_tool_list_as_none(cli: CliRunner, state_root: Path) -> None:
+    write_judge_entry(state_root, "tools = []\n")
+
+    text = invoke(cli, "agents", "get", "judge", "--format", "text").stdout
+
+    assert "tools        none" in text
+
+
+def test_agents_get_json_reports_null_for_unset_keys(cli: CliRunner, state_root: Path) -> None:
+    write_judge_entry(state_root)
+
+    payload = json.loads(invoke(cli, "agents", "get", "judge", "--json").stdout)
+
+    assert payload["system_prompt_file"] is None
+    assert payload["tools"] is None
+
+
+@pytest.mark.parametrize(
+    ("entry_extra", "args", "key"),
+    [
+        ('system_prompt_file = "p.md"\n', (), "system_prompt_file"),
+        ("tools = []\n", (), "tools"),
+        ("", ("--system-prompt-file", "p.md"), "--system-prompt-file"),
+    ],
+)
+def test_a_key_on_an_adapter_without_a_route_is_refused_before_any_session(
+    cli: CliRunner,
+    state_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    entry_extra: str,
+    args: tuple[str, ...],
+    key: str,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "p.md").write_text("prompt", encoding="utf-8")
+    (state_root / "agents" / "p.md").write_text("prompt", encoding="utf-8")
+    text = MOCK_ENTRY.replace("\n[modes]", f"\n{entry_extra}\n[modes]", 1)
+    (state_root / "agents" / "bare.toml").write_text(text, encoding="utf-8")
+
+    result = invoke(cli, "run", "bare", "case", *args, "--name", "claimed", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    error = error_envelope(result)
+    assert error["kind"] == "not_supported"
+    assert "bare" in error["message"]
+    assert key in error["message"]
+    assert error["hint"]
+    assert sessions_on_disk() == []
+    if not args:  # resolve has no --system-prompt-file; only the entry keys apply to it
+        assert error_envelope(invoke(cli, "resolve", "bare"))["kind"] == "not_supported"
+
+
+def write_unroutable_entry(state_root: Path) -> None:
+    """An entry that sets `tools` on an adapter with no tool route."""
+    text = MOCK_ENTRY.replace("\n[modes]", "\ntools = []\n\n[modes]", 1)
+    (state_root / "agents" / "bare.toml").write_text(text, encoding="utf-8")
+
+
+def test_agents_get_shows_an_entry_whose_keys_have_no_route_and_says_why(
+    cli: CliRunner, state_root: Path
+) -> None:
+    write_unroutable_entry(state_root)
+
+    as_json = invoke(cli, "agents", "get", "bare", "--json")
+    as_text = invoke(cli, "agents", "get", "bare", "--format", "text")
+
+    assert as_json.exit_code == vocab.EXIT_OK, as_json.stderr
+    assert as_text.exit_code == vocab.EXIT_OK, as_text.stderr
+    payload = json.loads(as_json.stdout)
+    assert payload["tools"] == []
+    assert payload["tools_via"] == "none"
+    assert payload["refused"] == (
+        "entry bare sets tools, but adapter bare has no tool list route (tools_via = none)"
+    )
+    assert "tools        none" in as_text.stdout
+    assert "refused      entry bare sets tools" in as_text.stdout
+
+
+def test_agents_get_models_and_commands_work_on_an_entry_whose_keys_have_no_route(
+    cli: CliRunner, state_root: Path
+) -> None:
+    write_unroutable_entry(state_root)
+
+    models = invoke(cli, "agents", "get", "bare", "--models", "--json")
+    commands = invoke(cli, "agents", "get", "bare", "--commands", "--json")
+
+    assert models.exit_code == vocab.EXIT_OK, models.stderr
+    assert commands.exit_code == vocab.EXIT_OK, commands.stderr
+    assert json.loads(models.stdout)["agent"] == "bare"
+
+
+def test_agents_check_reports_an_entry_whose_keys_have_no_route_as_one_more_row(
+    cli: CliRunner, state_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def advertised(_resolution: object) -> dict[str, list[object]]:
+        return {"models": []}
+
+    monkeypatch.setattr(cache, "probe_advertised", advertised)
+    write_unroutable_entry(state_root)
+
+    sweep = invoke(cli, "agents", "check", "--json")
+    single = invoke(cli, "agents", "check", "bare", "--json")
+
+    assert sweep.exit_code == vocab.EXIT_OK, sweep.stderr
+    rows = {item["agent"]: item for item in json.loads(sweep.stdout)["items"]}
+    assert {"bare", "mock", "claude"} <= set(rows)
+    assert all(row["ok"] for row in rows.values())
+    assert single.exit_code == vocab.EXIT_OK, single.stderr
+    assert [item["agent"] for item in json.loads(single.stdout)["items"]] == ["bare"]
+
+
+def test_agents_create_extends_an_entry_whose_keys_have_no_route(
+    cli: CliRunner, state_root: Path
+) -> None:
+    write_unroutable_entry(state_root)
+
+    result = invoke(cli, "agents", "create", "variant", "--extends", "bare", "--effort", "high")
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    assert (state_root / "agents" / "variant.toml").exists()
+
+
+def test_probe_connects_to_an_entry_whose_keys_have_no_route(
+    cli: CliRunner, state_root: Path
+) -> None:
+    write_unroutable_entry(state_root)
+
+    result = invoke(cli, "probe", "bare", "--discover", "--json")
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    assert json.loads(result.stdout)["discover_only"] is True
+
+
+def test_the_hint_names_the_flag_for_a_flag_refusal_and_the_key_for_an_entry_refusal(
+    cli: CliRunner, state_root: Path, tmp_path: Path
+) -> None:
+    (tmp_path / "p.md").write_text("prompt", encoding="utf-8")
+    (state_root / "agents" / "bare.toml").write_text(MOCK_ENTRY, encoding="utf-8")
+    (state_root / "agents" / "keyed.toml").write_text(
+        MOCK_ENTRY.replace("\n[modes]", "\ntools = []\n\n[modes]", 1), encoding="utf-8"
+    )
+
+    flag = invoke(cli, "run", "bare", "case", "--system-prompt-file", str(tmp_path / "p.md"))
+    key = invoke(cli, "run", "keyed", "case")
+
+    assert error_envelope(flag)["hint"].startswith("Drop the flag, or ")
+    assert error_envelope(key)["hint"].startswith("Drop the key, or ")
+
+
+def test_the_call_flag_on_a_codex_config_adapter_names_the_entry_key_as_the_route(
+    cli: CliRunner, state_root: Path, tmp_path: Path
+) -> None:
+    (tmp_path / "p.md").write_text("prompt", encoding="utf-8")
+    text = MOCK_ENTRY.replace("\n[modes]", '\nsystem_prompt_via = "codex_config"\n\n[modes]', 1)
+    (state_root / "agents" / "cx.toml").write_text(text, encoding="utf-8")
+
+    result = invoke(
+        cli, "run", "cx", "case", "--system-prompt-file", str(tmp_path / "p.md"), "--quiet"
+    )
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    error = error_envelope(result)
+    assert error["kind"] == "not_supported"
+    assert "system_prompt_file on the entry" in error["message"]
+    assert sessions_on_disk() == []
+
+
+def test_a_missing_system_prompt_file_is_a_usage_error_naming_the_flag(
+    cli: CliRunner, state_root: Path, tmp_path: Path
+) -> None:
+    write_judge_entry(state_root)
+
+    result = invoke(
+        cli, "run", "judge", "case", "--system-prompt-file", str(tmp_path / "nope.md"), "--quiet"
+    )
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    error = error_envelope(result)
+    assert error["kind"] == "invalid_input"
+    assert "--system-prompt-file" in error["message"]
+    assert sessions_on_disk() == []
+
+
+def test_a_missing_entry_prompt_file_names_the_entry_key(cli: CliRunner, state_root: Path) -> None:
+    write_judge_entry(state_root, 'system_prompt_file = "gone.md"\n')
+
+    result = invoke(cli, "run", "judge", "case", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    assert "system_prompt_file" in error_envelope(result)["message"]
+    assert sessions_on_disk() == []
+
+
+def test_an_unreadable_system_prompt_file_is_permission_denied(
+    cli: CliRunner, state_root: Path, tmp_path: Path
+) -> None:
+    write_judge_entry(state_root)
+    locked = tmp_path / "locked.md"
+    locked.write_text("secret", encoding="utf-8")
+    locked.chmod(0)
+    try:
+        if os.access(locked, os.R_OK):
+            pytest.skip("permission bits are not enforced for this user")
+        result = invoke(cli, "run", "judge", "case", "--system-prompt-file", str(locked), "--quiet")
+    finally:
+        locked.chmod(0o600)
+
+    assert error_envelope(result)["kind"] == "permission_denied"
+    assert sessions_on_disk() == []
+
+
+def test_an_oversized_or_empty_system_prompt_file_is_refused(
+    cli: CliRunner, state_root: Path, tmp_path: Path
+) -> None:
+    write_judge_entry(state_root)
+    big = tmp_path / "big.md"
+    big.write_text("x" * (vocab.MAX_PROMPT_BYTES + 1), encoding="utf-8")
+    empty = tmp_path / "empty.md"
+    empty.write_text("  \n", encoding="utf-8")
+
+    oversized = invoke(cli, "run", "judge", "case", "--system-prompt-file", str(big), "--quiet")
+    blank = invoke(cli, "run", "judge", "case", "--system-prompt-file", str(empty), "--quiet")
+
+    assert oversized.exit_code == vocab.EXIT_USAGE
+    assert "--system-prompt-file" in error_envelope(oversized)["message"]
+    assert blank.exit_code == vocab.EXIT_USAGE
+    assert "empty" in error_envelope(blank)["message"]
+    assert sessions_on_disk() == []
+
+
+def test_the_system_prompt_file_survives_delete_listing_and_status(
+    cli: CliRunner, state_root: Path, tmp_path: Path
+) -> None:
+    write_judge_entry(state_root)
+    prompt = tmp_path / "p.md"
+    prompt.write_text("keep me", encoding="utf-8")
+    run = invoke(
+        cli, "run", "judge", "case", "--system-prompt-file", str(prompt), "--quiet", "--json"
+    )
+    session_id = json.loads(run.stdout)["session_id"]
+
+    status = json.loads(invoke(cli, "status", session_id, "--json").stdout)
+
+    assert status["paths"]["system"].endswith("/system.md")
+    deleted = json.loads(invoke(cli, "delete", session_id, "--yes", "--json").stdout)
+    assert deleted["paths"]["system"] == status["paths"]["system"]

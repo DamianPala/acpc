@@ -427,7 +427,8 @@ _SESSION_OUTPUT_PROPERTIES = frozenset(
         "changed",
     }
 )
-_PATHS_PROPERTIES = frozenset({"dir", "prompt", "transcript", "answer"})
+_PATHS_REQUIRED = frozenset({"dir", "prompt", "transcript", "answer"})
+_PATHS_PROPERTIES = _PATHS_REQUIRED | {"system"}
 _DENIAL_PROPERTIES = frozenset({"category", "count", "minimum_policy", "remedy", "target"})
 _PERMISSIONS_CLAMP_PROPERTIES = frozenset({"requested", "ceiling", "effective"})
 _LIMIT_PROPERTIES = frozenset({"reason", "resume_at", "auto_continue", "source"})
@@ -444,7 +445,8 @@ _USAGE_MODEL_PROPERTIES = frozenset(
 _COMPACTIONS_PROPERTIES = frozenset({"count", "unaccounted", "context_before", "context_after"})
 # R2d's inspection object `status` reports: policy, mode, source and clamp, all required.
 _STATUS_PERMISSIONS_PROPERTIES = frozenset({"policy", "mode", "source", "clamp"})
-_RESOLUTION_PROPERTIES = frozenset({"model", "effort", "mode", "permissions", "home"})
+_RESOLUTION_REQUIRED = frozenset({"model", "effort", "mode", "permissions", "home"})
+_RESOLUTION_PROPERTIES = _RESOLUTION_REQUIRED | {"system_prompt", "tools"}
 _RESOLUTION_FIELD_PROPERTIES = frozenset(
     {"value", "source", "grants", "delegates", "escalates", "selectable", "clamp"}
 )
@@ -477,7 +479,7 @@ def _session_output_oracle(
         "output.usage.models": (frozenset(), frozenset()),
         "output.usage.models.*": (_USAGE_MODEL_PROPERTIES, _USAGE_MODEL_PROPERTIES),
         "output.usage.compactions": (_COMPACTIONS_PROPERTIES, _COMPACTIONS_PROPERTIES),
-        "output.paths": (_PATHS_PROPERTIES, frozenset(_PATHS_PROPERTIES)),
+        "output.paths": (_PATHS_PROPERTIES, _PATHS_REQUIRED),
         "output.denied[]": (_DENIAL_PROPERTIES, frozenset(_DENIAL_PROPERTIES - {"target"})),
         "output.permissions_clamp": (
             _PERMISSIONS_CLAMP_PROPERTIES,
@@ -513,6 +515,11 @@ EXPECTED_OUTPUT_ORACLES: dict[str, dict[str, tuple[frozenset[str], frozenset[str
                 {
                     "agent",
                     "base_adapter",
+                    "system_prompt_file",
+                    "tools",
+                    "system_prompt_via",
+                    "tools_via",
+                    "refused",
                     "description",
                     "resolved",
                     "env",
@@ -628,7 +635,7 @@ EXPECTED_OUTPUT_ORACLES: dict[str, dict[str, tuple[frozenset[str], frozenset[str
             frozenset({"session_id", "removed", "changed", "paths"}),
             frozenset({"session_id", "removed", "changed", "paths"}),
         ),
-        "output.paths": (_PATHS_PROPERTIES, _PATHS_PROPERTIES),
+        "output.paths": (_PATHS_PROPERTIES, _PATHS_REQUIRED),
     },
     "install": {
         "output": (
@@ -770,7 +777,17 @@ EXPECTED_OUTPUT_ORACLES: dict[str, dict[str, tuple[frozenset[str], frozenset[str
     "resolve": {
         "output": (
             frozenset(
-                {"entry", "base_adapter", "command", "cwd", "env", "env_passthrough", "resolved"}
+                {
+                    "entry",
+                    "base_adapter",
+                    "system_prompt_via",
+                    "tools_via",
+                    "command",
+                    "cwd",
+                    "env",
+                    "env_passthrough",
+                    "resolved",
+                }
             ),
             frozenset(
                 {"entry", "base_adapter", "command", "cwd", "env", "env_passthrough", "resolved"}
@@ -778,22 +795,30 @@ EXPECTED_OUTPUT_ORACLES: dict[str, dict[str, tuple[frozenset[str], frozenset[str
         ),
         "output.resolved": (
             _RESOLUTION_PROPERTIES,
-            _RESOLUTION_PROPERTIES,
+            _RESOLUTION_REQUIRED,
         ),
         **{
             f"output.resolved.{field}": (
                 _RESOLUTION_FIELD_PROPERTIES,
                 _RESOLUTION_FIELD_REQUIRED,
             )
-            for field in _RESOLUTION_PROPERTIES
+            for field in _RESOLUTION_REQUIRED
         },
         **{
             f"output.resolved.{field}.clamp": (
                 _PERMISSIONS_CLAMP_PROPERTIES,
                 _RESOLUTION_CLAMP_REQUIRED,
             )
-            for field in _RESOLUTION_PROPERTIES
+            for field in _RESOLUTION_REQUIRED
         },
+        "output.resolved.system_prompt": (
+            frozenset({"value", "source", "bytes"}),
+            frozenset({"value", "source", "bytes"}),
+        ),
+        "output.resolved.tools": (
+            frozenset({"value", "source"}),
+            frozenset({"value", "source"}),
+        ),
     },
     "skills get": {
         "output": (
@@ -849,7 +874,7 @@ EXPECTED_OUTPUT_ORACLES: dict[str, dict[str, tuple[frozenset[str], frozenset[str
         "output.limit": (_LIMIT_PROPERTIES, frozenset(_LIMIT_PROPERTIES)),
         "output.permissions": (_STATUS_PERMISSIONS_PROPERTIES, _STATUS_PERMISSIONS_PROPERTIES),
         "output.permissions.clamp": (_PERMISSIONS_CLAMP_PROPERTIES, _RESOLUTION_CLAMP_REQUIRED),
-        "output.paths": (_PATHS_PROPERTIES, _PATHS_PROPERTIES),
+        "output.paths": (_PATHS_PROPERTIES, _PATHS_REQUIRED),
     },
 }
 

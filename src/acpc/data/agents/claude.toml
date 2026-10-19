@@ -5,6 +5,10 @@ install_command = "npm install -g @agentclientprotocol/claude-agent-acp"
 home = "~/.claude"
 home_env = "CLAUDE_CONFIG_DIR"
 usage_profile = "claude_model_usage"
+# Verified on claude-agent-acp 0.89.1: `_meta.systemPrompt` as a string replaces
+# the system prompt whole; `_meta.claudeCode.options.tools` is the exact tool list, `[]` none.
+system_prompt_via = "acp_meta"
+tools_via = "acp_meta"
 env_passthrough = [
     "CLAUDE_CONFIG_DIR",
     "CLAUDE_CODE_EXECUTABLE",

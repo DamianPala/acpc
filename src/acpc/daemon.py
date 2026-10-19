@@ -46,7 +46,7 @@ from acpc.client import (
     ReplayTracker,
 )
 from acpc.permissions import PermissionLevel
-from acpc.registry import AgentRegistry, ModeSpec
+from acpc.registry import AgentRegistry, CallResolution, ModeSpec
 from acpc.spawn import spawn_adapter
 
 # How often the idle sweep runs. Short enough that a test can set a tiny TTL
@@ -465,6 +465,29 @@ def _endpoint_identity(path: Path | None) -> tuple[int, int] | None:
     except OSError:
         return None
     return (info.st_dev, info.st_ino)
+
+
+def _stored_call(payload: Mapping[str, Any]) -> CallResolution:
+    """Resolve the payload's entry with the session's own prompt, tools and routes.
+
+    They come from the payload, so an entry edited since the session began
+    cannot change a running session's facts, or refuse it.
+    """
+    context = "daemon dispatch"
+    try:
+        prompt_via, tools_via = runner.routes_from_payload(payload, context=context)
+        raw_prompt = payload.get("system_prompt")
+        system_prompt = (
+            None
+            if raw_prompt is None
+            else runner.system_prompt_from_payload(raw_prompt, context=context)
+        )
+        tools = runner.tools_from_payload(payload.get("tools"), context=context)
+    except runner.RunnerError as error:
+        raise DaemonError(str(error)) from None
+    entry = AgentRegistry().resolve(payload["entry"])
+    entry = entry.without_session_keys(system_prompt_via=prompt_via, tools_via=tools_via)
+    return replace(entry.resolve_call(), system_prompt=system_prompt, tools=tools)
 
 
 class Daemon:
@@ -1217,7 +1240,7 @@ class Daemon:
                 policy_level = PermissionLevel(policy)
             except ValueError:
                 raise DaemonError(f"mode {mode} has invalid permission policy {policy!r}") from None
-        resolved_call = AgentRegistry().resolve_call(payload["entry"])
+        resolved_call = _stored_call(payload)
         if "modes" in payload:
             try:
                 modes = runner.mode_catalog_from_payload(
@@ -1505,6 +1528,7 @@ class Daemon:
                         adapter_session_id,
                         self._request_cwd(request),
                         session_id,
+                        adapter_meta=runner.adapter_session_meta(session_id, request.resolution),
                     )
                     client.mark_cold_resume()
                 except runner.ResumePreparationError:
@@ -1519,7 +1543,11 @@ class Daemon:
             finally:
                 self.host.mux.release(adapter_session_id)
         else:
-            session = await conn.new_session(cwd=self._request_cwd(request), mcp_servers=[])
+            session = await conn.new_session(
+                cwd=self._request_cwd(request),
+                mcp_servers=[],
+                **runner.adapter_session_meta(session_id, request.resolution),
+            )
             adapter_session_id = session.session_id
             client.capture_advertised(session)
             # SPEC.md *State on disk*: recorded as soon as the adapter has

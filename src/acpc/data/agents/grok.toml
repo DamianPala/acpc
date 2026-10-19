@@ -16,6 +16,9 @@ install_docs = "https://docs.x.ai/build/overview"
 home = "~/.grok"
 home_env = "GROK_HOME"
 usage_profile = "grok_meta_usage"
+# No system prompt or tool list route.
+system_prompt_via = "none"
+tools_via = "none"
 env_passthrough = [
     "GROK_HOME",
     "XAI_API_KEY",

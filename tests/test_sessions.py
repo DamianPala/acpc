@@ -444,6 +444,36 @@ class TestSteerModeMetadata:
         assert loaded.steer_mode == vocab.STEER_CANCEL_THEN_START
 
 
+class TestSystemPromptFile:
+    def test_a_session_without_a_system_prompt_advertises_no_system_path(self) -> None:
+        meta = make_session()
+
+        assert "system" not in sessions.session_paths(meta.session_id)
+        assert not sessions.system_path(meta.session_id).exists()
+
+    def test_the_system_prompt_is_written_at_creation_and_advertised(self) -> None:
+        meta = sessions.create_session(
+            entry="builder", base_adapter="builder", prompt="p", system_prompt="be a judge"
+        )
+
+        assert sessions.system_path(meta.session_id).read_text(encoding="utf-8") == "be a judge"
+        assert sessions.session_paths(meta.session_id)["system"] == str(
+            sessions.system_path(meta.session_id)
+        )
+
+    def test_rotation_leaves_the_system_prompt_alone(self) -> None:
+        meta = sessions.create_session(
+            entry="builder", base_adapter="builder", prompt="p", system_prompt="be a judge"
+        )
+        sessions.mark_running(meta.session_id, pid=1, process_start_time="token", clock=at(1.0))
+        sessions.transition(meta.session_id, "succeeded", exit_code=0, clock=at(60.0))
+
+        sessions.rotate_turn(meta.session_id, clock=at(100.0))
+
+        assert sessions.system_path(meta.session_id).read_text(encoding="utf-8") == "be a judge"
+        assert "system" in sessions.session_paths(meta.session_id)
+
+
 class TestTurnRotation:
     def test_rotation_parks_both_artifacts_and_counts_the_turn(self) -> None:
         session_id = finished_session()

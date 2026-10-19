@@ -56,6 +56,7 @@ RESERVED_NAME = "last"
 META_NAME = "meta.json"
 TOMBSTONE_NAME = ".tombstone"
 PROMPT_NAME = "prompt.md"
+SYSTEM_NAME = "system.md"
 ANSWER_NAME = "answer.md"
 TRANSCRIPT_NAME = "transcript.ndjson"
 LOCK_NAME = "lock"
@@ -282,14 +283,24 @@ def tombstone_path(session_id: str) -> Path:
     return session_dir(session_id) / TOMBSTONE_NAME
 
 
+def system_path(session_id: str) -> Path:
+    return session_dir(session_id) / SYSTEM_NAME
+
+
 def session_paths(session_id: str) -> dict[str, str]:
-    """The four advertised paths, as the `--json` envelope's `paths` object."""
-    return {
+    """The advertised paths, as the `--json` envelope's `paths` object.
+
+    `system` appears only when the session has a system prompt file.
+    """
+    result = {
         "dir": str(session_dir(session_id)),
         "prompt": str(prompt_path(session_id)),
         "transcript": str(transcript_path(session_id)),
         "answer": str(answer_path(session_id)),
     }
+    if system_path(session_id).is_file():
+        result["system"] = str(system_path(session_id))
+    return result
 
 
 def turn_path(session_id: str, stem: str, turn: int, *, ext: str = "md") -> Path:
@@ -940,10 +951,11 @@ def create_session(
     resolution: Mapping[str, Any] | None = None,
     target: str | None = None,
     name: str | None = None,
+    system_prompt: str | None = None,
     clock: Clock | None = None,
     rng: random.Random | None = None,
 ) -> SessionMeta:
-    """Allocate a session dir, write `prompt.md`, publish `meta.json`."""
+    """Allocate a session dir, write `prompt.md` (and `system.md`), publish `meta.json`."""
     resolved_clock = _resolve_clock(clock)
     session_id = allocate_session_id(rng=rng)
     meta = SessionMeta(
@@ -959,6 +971,8 @@ def create_session(
     )
     with session_lock(session_id):
         paths.atomic_write(prompt_path(session_id), prompt)
+        if system_prompt is not None:
+            paths.atomic_write(system_path(session_id), system_prompt)
         write_meta(meta)
     return meta
 

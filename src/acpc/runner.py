@@ -53,7 +53,16 @@ from acpc import (
 from acpc.client import AcpcClient
 from acpc.permissions import PermissionLevel
 from acpc.proc import process_group_kwargs
-from acpc.registry import AgentRegistry, CallResolution, ModeSpec, RegistryError, ResolvedEntry
+from acpc.registry import (
+    SYSTEM_PROMPT_VIA_VALUES,
+    TOOLS_VIA_VALUES,
+    AgentRegistry,
+    CallResolution,
+    ModeSpec,
+    RegistryError,
+    ResolvedEntry,
+    SystemPrompt,
+)
 from acpc.spawn import spawn_adapter
 
 # SPEC.md `cancel`: graceful cancellation with a bounded wait for the ack (10s) — if
@@ -308,8 +317,35 @@ def _stored_prompt_items(session_id: str) -> list[tuple[Path, str]]:
     return items
 
 
+def adapter_session_meta(session_id: str, resolution: CallResolution) -> dict[str, Any]:
+    """The `_meta` keys a session's system prompt and tool list travel in.
+
+    Empty when the session has neither, so a plain session stays byte-identical
+    on the wire. The prompt text is read from the session's `system.md` here,
+    at the call that sends it, so no payload or snapshot carries it. Only the
+    `acp_meta` routes are served by this function; the adapter facts decide.
+    """
+    meta: dict[str, Any] = {}
+    if resolution.system_prompt is not None and resolution.entry.system_prompt_via == "acp_meta":
+        path = sessions.system_path(session_id)
+        try:
+            meta["systemPrompt"] = path.read_text(encoding="utf-8")
+        except OSError as error:
+            raise RunnerError(
+                f"session {session_id}: its system prompt {path} is unreadable ({error}); "
+                "acpc never falls back to the vendor's own prompt"
+            ) from None
+    if resolution.tools is not None and resolution.entry.tools_via == "acp_meta":
+        meta["claudeCode"] = {"options": {"tools": list(resolution.tools)}}
+    return meta
+
+
 async def _restore_adapter_session(
-    conn: Any, capabilities: Any, adapter_session_id: str, cwd: str
+    conn: Any,
+    capabilities: Any,
+    adapter_session_id: str,
+    cwd: str,
+    adapter_meta: Mapping[str, Any] | None = None,
 ) -> None:
     """Restore an adapter session, preferring ``session/resume`` when offered."""
     require_load_session_capability(capabilities)
@@ -317,6 +353,7 @@ async def _restore_adapter_session(
         "session_id": adapter_session_id,
         "cwd": cwd,
         "mcp_servers": [],
+        **(adapter_meta or {}),
     }
     if has_resume_session_capability(capabilities):
         await conn.resume_session(**request)
@@ -342,8 +379,13 @@ async def verify_adapter_resume(
     session_id: str,
     *,
     abandon_event: asyncio.Event | None = None,
+    adapter_meta: Mapping[str, Any] | None = None,
 ) -> str:
-    """Restore and independently run the adapter identity and replay checks."""
+    """Restore and independently run the adapter identity and replay checks.
+
+    `adapter_meta` is the session's stored system prompt and tool list; the
+    restore sends them again so a resumed session runs under the first turn's.
+    """
     try:
         meta = sessions.read_meta(session_id)
     except sessions.SessionNotFound:
@@ -369,7 +411,7 @@ async def verify_adapter_resume(
     restore_to_settle: asyncio.Task[None] | None = None
     async with client.replaying(adapter_session_id, conn) as sink:
         restore_task = asyncio.create_task(
-            _restore_adapter_session(conn, capabilities, adapter_session_id, cwd),
+            _restore_adapter_session(conn, capabilities, adapter_session_id, cwd, adapter_meta),
             name=f"acpc.restore.{adapter_session_id}",
         )
         restore_started = True
@@ -821,7 +863,11 @@ async def _prepare_direct_adapter_session(
     client.capture_adapter(initialize)
     record_usage_identity(session_id, client.adapter_identity)
     if request.resume_adapter_session is None:
-        session = await conn.new_session(cwd=request.cwd or os.getcwd(), mcp_servers=[])
+        session = await conn.new_session(
+            cwd=request.cwd or os.getcwd(),
+            mcp_servers=[],
+            **adapter_session_meta(session_id, request.resolution),
+        )
         adapter_session_id = session.session_id
         client.capture_advertised(session)
         sessions.update_meta(session_id, adapter_session_id=adapter_session_id)
@@ -837,6 +883,7 @@ async def _prepare_direct_adapter_session(
             adapter_session_id,
             request.cwd or os.getcwd(),
             session_id,
+            adapter_meta=adapter_session_meta(session_id, request.resolution),
         )
     except ResumePreparationError:
         raise
@@ -1403,6 +1450,16 @@ def daemon_payload(request: TurnRequest) -> dict[str, Any]:
         else None,
         "resume_prepared": request.resume_prepared,
         "turn_token": request.turn_token,
+        # The prompt's source and size, never its text: the daemon reads the
+        # text from the session's `system.md`.
+        "system_prompt": (
+            system_prompt_payload(resolution.system_prompt)
+            if resolution.system_prompt is not None
+            else None
+        ),
+        "tools": list(resolution.tools) if resolution.tools is not None else None,
+        "system_prompt_via": resolution.entry.system_prompt_via,
+        "tools_via": resolution.entry.tools_via,
     }
 
 
@@ -2233,6 +2290,13 @@ def resolution_payload(
         resolved["mode"]["delegates"] = resolution.mode_spec.delegates
         resolved["mode"]["escalates"] = resolution.mode_spec.escalates
         resolved["mode"]["selectable"] = resolution.mode_spec.selectable
+    if resolution.system_prompt is not None:
+        resolved["system_prompt"] = system_prompt_payload(resolution.system_prompt)
+    if resolution.tools is not None:
+        resolved["tools"] = {
+            "value": list(resolution.tools),
+            "source": _source_label(provenance.get("tools")),
+        }
     try:
         spawn_command = " ".join(resolution.command)
     except RegistryError:
@@ -2240,6 +2304,8 @@ def resolution_payload(
     return {
         "entry": entry.entry,
         "base_adapter": entry.base_adapter,
+        "system_prompt_via": entry.system_prompt_via,
+        "tools_via": entry.tools_via,
         "command": spawn_command,
         "cwd": cwd,
         "env": dict(resolution.declared_env),
@@ -2271,6 +2337,46 @@ def mode_catalog_from_payload(raw: object, *, context: str) -> dict[str, ModeSpe
     return modes
 
 
+def system_prompt_payload(prompt: SystemPrompt) -> dict[str, Any]:
+    """The one serialized shape of a system prompt: source and size, never its text."""
+    return {"value": prompt.path, "source": prompt.source, "bytes": prompt.size}
+
+
+def system_prompt_from_payload(raw: object, *, context: str) -> SystemPrompt:
+    """Rebuild a `SystemPrompt` from `system_prompt_payload`; refuse any other shape."""
+    path = raw.get("value") if isinstance(raw, Mapping) else None
+    source = raw.get("source") if isinstance(raw, Mapping) else None
+    size = raw.get("bytes") if isinstance(raw, Mapping) else None
+    if (
+        not isinstance(path, str)
+        or source not in {"entry", "call"}
+        or not isinstance(size, int)
+        or isinstance(size, bool)
+    ):
+        raise RunnerError(f"{context} has an invalid stored system prompt")
+    return SystemPrompt(path, source, size)
+
+
+def tools_from_payload(raw: object, *, context: str) -> tuple[str, ...] | None:
+    """Rebuild a tool list: None is "unset", an empty list is "no tools"."""
+    if raw is None:
+        return None
+    if not isinstance(raw, list) or any(not isinstance(item, str) for item in raw):
+        raise RunnerError(f"{context} has an invalid stored tool list")
+    return tuple(raw)
+
+
+def routes_from_payload(raw: Mapping[str, Any], *, context: str) -> tuple[str, str]:
+    """The stored `system_prompt_via` and `tools_via`; an absent route is `none`."""
+    prompt_via = raw.get("system_prompt_via", "none")
+    if prompt_via not in SYSTEM_PROMPT_VIA_VALUES:
+        raise RunnerError(f"{context} has an invalid stored system_prompt_via")
+    tools_via = raw.get("tools_via", "none")
+    if tools_via not in TOOLS_VIA_VALUES:
+        raise RunnerError(f"{context} has an invalid stored tools_via")
+    return prompt_via, tools_via
+
+
 def session_resolution(
     resolution: CallResolution,
     *,
@@ -2294,6 +2400,8 @@ def session_resolution(
         "effort_cli_flag": resolution.entry.effort_cli_flag,
         "usage_profile": resolution.entry.usage_profile,
         "billing": resolution.entry.billing,
+        "system_prompt_via": resolution.entry.system_prompt_via,
+        "tools_via": resolution.entry.tools_via,
         "modes": mode_catalog_payload(resolution.entry.modes),
     }
     if resolution.mode is not None and resolution.mode_spec is not None:
@@ -2390,28 +2498,11 @@ def resolution_from_session(meta: sessions.SessionMeta) -> CallResolution:
     billing = adapter.get("billing")
     if billing not in {None, "subscription", "api"}:
         raise RunnerError(f"session {meta.session_id} has invalid stored billing")
+    context = f"session {meta.session_id}"
+    system_prompt_via, tools_via = routes_from_payload(adapter, context=context)
+    system_prompt, tools = _stored_prompt_and_tools(meta)
     env_passthrough = stored_strings("env_passthrough", payload)
-
-    stored_mode = adapter.get("mode", _stored_value(payload, "mode"))
-    if stored_mode is not None and not isinstance(stored_mode, str):
-        raise RunnerError(f"session {meta.session_id} has invalid stored mode")
-    grants = adapter.get("grants")
-    delegates = adapter.get("delegates")
-    mode_spec: ModeSpec | None = None
-    if stored_mode is not None and grants is not None and delegates is not None:
-        if not isinstance(grants, str) or grants not in vocab.PERMISSION_VALUES[:-1]:
-            raise RunnerError(f"session {meta.session_id} has invalid stored mode grants")
-        if not isinstance(delegates, bool):
-            raise RunnerError(f"session {meta.session_id} has invalid stored mode delegation")
-        mode_spec = ModeSpec(grants=grants, delegates=delegates)
-
-    raw_modes = adapter.get("modes")
-    if raw_modes is None:
-        modes = {stored_mode: mode_spec} if stored_mode is not None and mode_spec else {}
-    else:
-        modes = mode_catalog_from_payload(raw_modes, context=f"session {meta.session_id}")
-        if stored_mode is not None and mode_spec is not None:
-            modes[stored_mode] = mode_spec
+    stored_mode, mode_spec, modes = _stored_modes(meta)
 
     entry = ResolvedEntry(
         entry=meta.entry,
@@ -2441,6 +2532,10 @@ def resolution_from_session(meta: sessions.SessionMeta) -> CallResolution:
         presets={},
         extends=None,
         provenance={},
+        system_prompt_file=None,
+        tools=None,
+        system_prompt_via=system_prompt_via,
+        tools_via=tools_via,
     )
     return CallResolution(
         entry=entry,
@@ -2453,7 +2548,57 @@ def resolution_from_session(meta: sessions.SessionMeta) -> CallResolution:
         declared_env=dict(declared_env),
         env_passthrough=env_passthrough,
         provenance={},
+        system_prompt=system_prompt,
+        tools=tools,
     )
+
+
+def _stored_modes(
+    meta: sessions.SessionMeta,
+) -> tuple[str | None, ModeSpec | None, dict[str, ModeSpec]]:
+    """Read the stored mode, its facts and the measured catalog from the snapshot."""
+    payload = meta.resolution
+    adapter = payload.get("adapter", {})
+    stored_mode = adapter.get("mode", _stored_value(payload, "mode"))
+    if stored_mode is not None and not isinstance(stored_mode, str):
+        raise RunnerError(f"session {meta.session_id} has invalid stored mode")
+    grants = adapter.get("grants")
+    delegates = adapter.get("delegates")
+    mode_spec: ModeSpec | None = None
+    if stored_mode is not None and grants is not None and delegates is not None:
+        if not isinstance(grants, str) or grants not in vocab.PERMISSION_VALUES[:-1]:
+            raise RunnerError(f"session {meta.session_id} has invalid stored mode grants")
+        if not isinstance(delegates, bool):
+            raise RunnerError(f"session {meta.session_id} has invalid stored mode delegation")
+        mode_spec = ModeSpec(grants=grants, delegates=delegates)
+
+    raw_modes = adapter.get("modes")
+    if raw_modes is None:
+        modes = {stored_mode: mode_spec} if stored_mode is not None and mode_spec else {}
+    else:
+        modes = mode_catalog_from_payload(raw_modes, context=f"session {meta.session_id}")
+        if stored_mode is not None and mode_spec is not None:
+            modes[stored_mode] = mode_spec
+    return stored_mode, mode_spec, modes
+
+
+def _stored_prompt_and_tools(
+    meta: sessions.SessionMeta,
+) -> tuple[SystemPrompt | None, tuple[str, ...] | None]:
+    """Read the stored system prompt source and tool list; absent means unset."""
+    resolved = meta.resolution.get("resolved")
+    if not isinstance(resolved, Mapping):
+        return None, None
+    context = f"session {meta.session_id}"
+    raw_prompt = resolved.get("system_prompt")
+    prompt = None if raw_prompt is None else system_prompt_from_payload(raw_prompt, context=context)
+    raw_tools = resolved.get("tools")
+    if raw_tools is None:
+        return prompt, None
+    # A malformed entry must not read as "unset": that would lift a judge's tool limit.
+    if not isinstance(raw_tools, Mapping) or "value" not in raw_tools:
+        raise RunnerError(f"{context} has an invalid stored tool list")
+    return prompt, tools_from_payload(raw_tools["value"], context=context)
 
 
 def continue_request(
