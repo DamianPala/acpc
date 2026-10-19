@@ -912,7 +912,7 @@ def test_agents_create_validates_effort_against_the_requested_model(
         "xhigh",
     )
     assert rejected.exit_code == vocab.EXIT_USAGE
-    assert "supported levels: low, medium, high" in rejected.stderr
+    assert "allowed: low, medium, high" in rejected.stderr
     assert not (state_root / "agents" / "too-high.toml").exists()
 
     accepted = invoke(
@@ -1053,8 +1053,8 @@ def test_agents_models_warns_when_resolved_model_has_no_row(
     result = invoke(cli, "agents", "get", "mock", "--models", "--format", "text")
 
     assert result.exit_code == vocab.EXIT_OK
-    assert "mock-sonnet-5 has no [effort_by_model] row" in result.stderr
-    assert "using adapter efforts low, high" in result.stderr
+    assert "no effort row for mock-sonnet-5" in result.stderr
+    assert "sending high as given" in result.stderr
 
 
 def test_agents_check_warns_when_resolved_model_has_no_row(
@@ -1068,7 +1068,7 @@ def test_agents_check_warns_when_resolved_model_has_no_row(
     result = invoke(cli, "agents", "check", "mock", "--format", "text")
 
     assert result.exit_code == vocab.EXIT_OK
-    assert "mock-sonnet-5 has no [effort_by_model] row" in result.stderr
+    assert "no effort row for mock-sonnet-5" in result.stderr
 
 
 def test_agents_models_does_not_warn_when_resolved_model_has_a_row(
@@ -1082,4 +1082,4 @@ def test_agents_models_does_not_warn_when_resolved_model_has_a_row(
     result = invoke(cli, "agents", "get", "mock", "--models", "--format", "text")
 
     assert result.exit_code == vocab.EXIT_OK
-    assert "has no [effort_by_model] row" not in result.stderr
+    assert "no effort row" not in result.stderr

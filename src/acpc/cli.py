@@ -1321,21 +1321,18 @@ def _warn_permission_alias(alias: str | None) -> None:
 
 
 def _warn_unlisted_effort_model(resolution: CallResolution) -> None:
-    """Warn when the resolved model has no ``[effort_by_model]`` row."""
+    """Warn only when no observation or file row bounds a sent effort."""
     model = resolution.model
     entry = resolution.entry
-    if model is None or not entry.effort_by_model or model in entry.effort_by_model:
-        return
-    union = entry.derived_effort_union()
-    if union:
-        click.echo(
-            f"-- effort: {model} has no [effort_by_model] row; "
-            f"using adapter efforts {', '.join(union)}",
-            err=True,
-        )
+    if (
+        resolution.effort is None
+        or model is None
+        or model in entry.effort_by_model
+        or model in entry.advertised_efforts
+    ):
         return
     click.echo(
-        f"-- effort: {model} has no [effort_by_model] row; using the global effort scale",
+        f"-- effort: no effort row for {model}; sending {resolution.effort} as given",
         err=True,
     )
 
@@ -1375,7 +1372,8 @@ def _continue_selection(
         stored_mode = _stored_mode_item(meta)
         source = stored_mode.get("source") if stored_mode is not None else None
         explicit_mode = stored.mode if stored.mode is not None and source != "selected" else None
-        # Live [effort_by_model] must not reject a stored model/effort pair.
+        # Live static and advertised rows must not reject a stored model/effort pair.
+        # Drop live defaults too: a persisted None must keep the vendor default.
         # Mode/permissions re-read the current table; effort stays as persisted.
         # The session's prompt, tool list and routes are stored facts too: the
         # live entry's keys are dropped so an edit cannot change or refuse them.
@@ -1385,6 +1383,9 @@ def _continue_selection(
                 tools_via=stored.entry.tools_via,
             ),
             effort_by_model={},
+            advertised_efforts={},
+            effort=stored.effort,
+            presets={},
             usage_profile=stored.entry.usage_profile,
             billing=stored.entry.billing,
         )
@@ -1682,6 +1683,11 @@ def _tty_permission_prompt(kind: str, title: str) -> bool:
     return interaction.ask_yes_no(f"acpc: allow {kind}? {title} [y/N] ", default=False)
 
 
+def _effort_levels_text(levels: Mapping[str, Any]) -> str:
+    values = ", ".join(levels["values"]) or "none"
+    return f"  levels {values} ({' ∩ '.join(levels['bounded_by'])})"
+
+
 def _emit_resolution(payload: dict[str, Any], *, json_mode: bool) -> None:
     if json_mode:
         click.echo(json.dumps(payload, ensure_ascii=False))
@@ -1710,7 +1716,8 @@ def _emit_resolution(payload: dict[str, Any], *, json_mode: bool) -> None:
             if item["value"]:
                 lines.append(f"{'one-shot':<12} yes ({item['source']})")
         else:
-            lines.append(f"{name:<12} {value} ({item['source']})")
+            suffix = _effort_levels_text(item["levels"]) if name == "effort" else ""
+            lines.append(f"{name:<12} {value} ({item['source']}){suffix}")
     if payload["cwd"]:
         lines.append(f"cwd          {payload['cwd']}")
     if payload["env"]:
@@ -1804,6 +1811,8 @@ def _display_path(value: Path) -> str:
 def _source_text(source: FieldSource | None) -> str:
     if source is None:
         return "unset"
+    if source.kind == "vendor-default":
+        return "vendor default"
     if source.kind == "adapter-default":
         return "adapter default"
     if source.kind == "default":
@@ -2157,7 +2166,12 @@ def _render_entry_detail(
         else:
             rendered = "·" if value is None else str(value)
         rendered_source = _source_text(resolution.provenance.get(field))
-        lines.append(f"{field:<12} {rendered} ({rendered_source})")
+        suffix = (
+            _effort_levels_text(runner.effort_levels_payload(resolution))
+            if field == "effort"
+            else ""
+        )
+        lines.append(f"{field:<12} {rendered} ({rendered_source}){suffix}")
 
     lines.append(_entry_env_row(entry))
     lines.extend(_entry_session_rows(entry))
@@ -2180,6 +2194,7 @@ def _render_entry_detail(
         "env": dict(entry.env),
         "env_passthrough": list(entry.env_passthrough),
     }
+    payload["resolved"]["effort"]["levels"] = runner.effort_levels_payload(resolution)
     if entry.is_variant:
         lines.append(f"-- modes/models/commands: acpc agents get {entry.base_adapter}")
         return "\n".join(lines) + "\n", payload, None
@@ -2388,7 +2403,11 @@ def _emit_agent_commands(entry: ResolvedEntry, selected_format: str) -> None:
 def _emit_agent_detail(registry: AgentRegistry, entry: ResolvedEntry, selected_format: str) -> None:
     text, payload, _ = _render_entry_detail(registry, entry)
     if not entry.is_variant:
+        cold = cache.read_advertised(entry.base_adapter) is None
         record = _ensure_cache(entry)
+        if cold:
+            # The probe may have just observed effort rows; `levels` must agree with them.
+            text, payload, _ = _render_entry_detail(registry, registry.resolve(entry.entry))
         advertised_text, advertised_payload = _render_advertised_detail(entry, record)
         payload.update(advertised_payload)
         text += advertised_text

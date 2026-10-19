@@ -1049,7 +1049,7 @@ def test_continue_permissions_keeps_stored_effort_after_table_tightens(
         "high",
     )
     assert refused.exit_code == vocab.EXIT_USAGE
-    assert "supported levels: low" in refused.stderr
+    assert "allowed: low" in refused.stderr
 
     result = invoke(
         cli,

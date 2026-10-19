@@ -13,7 +13,7 @@ import shutil
 import subprocess
 import tomllib
 from collections.abc import Callable, Iterator, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from importlib.resources import files
 from pathlib import Path
 from typing import Any, Final, Literal
@@ -173,7 +173,9 @@ class RouteNotSupported(RegistryError):
 class FieldSource:
     """Where a resolved field value came from."""
 
-    kind: Literal["entry", "adapter-default", "call", "default", "unset", "selected"]
+    kind: Literal[
+        "entry", "adapter-default", "call", "default", "unset", "selected", "vendor-default"
+    ]
     path: Path | None = None
 
 
@@ -305,6 +307,8 @@ class ResolvedEntry:
     # Each session of the entry is consumed once; no adapter refuses it.
     one_shot: bool
     setting_sources: tuple[str, ...] | None = None
+    effort_row_origin: Mapping[str, Literal["shipped", "operator"]] = field(default_factory=dict)
+    advertised_efforts: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
     @property
     def is_variant(self) -> bool:
@@ -476,17 +480,10 @@ class ResolvedEntry:
                 sources["effort"] = self.provenance[f"presets.{model}.effort"]
         elif model is not None:
             resolved_model = model
-            resolved_effort = self.effort
+            resolved_effort = None
             sources["model"] = FieldSource("call")
-            if resolved_effort is not None:
-                sources["effort"] = self.source_for("effort")
         else:
-            # No --model: the entry's own value wins, and where it is silent the
-            # adapter's `standard` preset *is* the adapter default. SPEC's
-            # `agents claude` view shows exactly that pairing —
-            # `model claude-sonnet-5 (adapter default)` with claude's standard
-            # preset being claude-sonnet-5. Model and effort fall back
-            # independently: --effort is orthogonal to --model.
+            # A preset's effort travels only with that preset's model.
             default = self.presets.get("standard")
             resolved_model = self.model
             resolved_effort = self.effort
@@ -497,7 +494,7 @@ class ResolvedEntry:
                 sources["model"] = FieldSource("adapter-default", default.source)
             if resolved_effort is not None:
                 sources["effort"] = self.source_for("effort")
-            elif default is not None and default.effort is not None:
+            elif self.model is None and default is not None and default.effort is not None:
                 resolved_effort = default.effort
                 sources["effort"] = FieldSource("adapter-default", default.source)
 
@@ -505,7 +502,7 @@ class ResolvedEntry:
             resolved_effort = effort
             sources["effort"] = FieldSource("call")
         elif resolved_effort is None:
-            sources["effort"] = FieldSource("unset")
+            sources["effort"] = FieldSource("vendor-default")
 
         if resolved_model is None:
             sources["model"] = FieldSource("unset")
@@ -587,18 +584,21 @@ class ResolvedEntry:
             return str(error)
         return None
 
-    def derived_effort_union(self) -> tuple[str, ...]:
-        """Unique values from non-empty ``[effort_by_model]`` rows, in vocab order."""
-        seen: set[str] = set()
-        for levels in self.effort_by_model.values():
-            seen.update(levels)
-        return tuple(value for value in EFFORT_VALUES if value in seen)
-
-    def effective_efforts(self, model: str | None) -> tuple[str, ...]:
-        """Allowlist that applies to ``model`` (empty means no effort setting)."""
-        if model is not None and model in self.effort_by_model:
-            return self.effort_by_model[model]
-        return self.derived_effort_union() or EFFORT_VALUES
+    def allowed_efforts(self, model: str | None) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """Intersect the scale with observation and the applicable file row."""
+        values = EFFORT_VALUES
+        bounded_by = ["scale"]
+        if model is None:
+            return values, tuple(bounded_by)
+        if model in self.advertised_efforts:
+            values = tuple(value for value in values if value in self.advertised_efforts[model])
+            bounded_by.append("advertised")
+        if model in self.effort_by_model:
+            operator = self.effort_row_origin.get(model) == "operator"
+            if operator or model not in self.advertised_efforts:
+                values = tuple(value for value in values if value in self.effort_by_model[model])
+                bounded_by.append("entry" if operator else "shipped")
+        return values, tuple(bounded_by)
 
     def _validate_effort(self, value: str, model: str | None) -> None:
         if value not in EFFORT_VALUES:
@@ -606,14 +606,22 @@ class ResolvedEntry:
             raise RegistryError(
                 f"{self.entry}: unsupported effort '{value}'; supported levels: {supported}"
             )
-        if model is not None and model in self.effort_by_model and not self.effort_by_model[model]:
-            raise RegistryError(f"{self.entry}: {model} has no effort setting")
-        allowed = self.effective_efforts(model)
-        if value not in allowed:
-            supported = ", ".join(allowed)
+        values, bounded_by = self.allowed_efforts(model)
+        if value not in values:
+            excluded_by = self._effort_exclusion(value, model, bounded_by)
             raise RegistryError(
-                f"{self.entry}: effort '{value}' is not supported; supported levels: {supported}"
+                f"{self.entry}: effort '{value}' is not available for {model}; "
+                f"allowed: {', '.join(values) or 'none'} ({excluded_by})"
             )
+
+    def _effort_exclusion(self, value: str, model: str | None, bounded_by: tuple[str, ...]) -> str:
+        if model is None:
+            return "the effort scale"
+        if "advertised" in bounded_by and value not in self.advertised_efforts[model]:
+            return f"advertised by {self.base_adapter}"
+        path = self.provenance[f"effort_by_model.{model}"].path
+        prefix = "row" if "entry" in bounded_by else "shipped row"
+        return f"{prefix} in {path}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -903,6 +911,33 @@ def _effort_by_model_from_data(data: Mapping[str, Any], source: Path) -> dict[st
     return result
 
 
+def _effort_row_origins(entry: ResolvedEntry) -> dict[str, Literal["shipped", "operator"]]:
+    root = Path(str(files("acpc").joinpath("data", "agents"))).resolve()
+    origins: dict[str, Literal["shipped", "operator"]] = {}
+    for model in entry.effort_by_model:
+        path = entry.provenance[f"effort_by_model.{model}"].path
+        shipped = path is not None and path.resolve().is_relative_to(root)
+        origins[model] = "shipped" if shipped else "operator"
+    return origins
+
+
+def _advertised_efforts(adapter: str) -> dict[str, tuple[str, ...]]:
+    # cache -> client -> registry: import only after registry initialization.
+    from acpc.cache import read_advertised
+
+    record = read_advertised(adapter)
+    if record is None:
+        return {}
+    rows = record.advertised.get("efforts", {})
+    return {
+        model: tuple(row["levels"])
+        for model, row in rows.items()
+        if isinstance(row, dict)
+        and isinstance(row.get("levels"), list)
+        and all(isinstance(level, str) for level in row["levels"])
+    }
+
+
 def _to_resolved(
     name: str, parsed: _ParsedEntry, extends: str | None, base_adapter: str
 ) -> ResolvedEntry:
@@ -1132,8 +1167,14 @@ class AgentRegistry:
                 provenance=parent_provenance,
             )
             merged = _merge_parsed(parent_parsed, parsed)
-            return _to_resolved(name, merged, extends, parent.base_adapter)
-        return _to_resolved(name, parsed, None, name)
+            entry = _to_resolved(name, merged, extends, parent.base_adapter)
+        else:
+            entry = _to_resolved(name, parsed, None, name)
+        return replace(
+            entry,
+            effort_row_origin=_effort_row_origins(entry),
+            advertised_efforts=_advertised_efforts(entry.base_adapter),
+        )
 
     def resolve_call(
         self,

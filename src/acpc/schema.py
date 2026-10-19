@@ -275,6 +275,12 @@ _RESOLUTION_CLAMP = _object(
     {name: _STRING for name in ("requested", "ceiling", "effective")},
     ("requested", "ceiling", "effective"),
 )
+_EFFORT_LEVELS = _object(
+    {"values": _array(_STRING), "bounded_by": _array(_STRING)}, ("values", "bounded_by")
+)
+_RESOLVED_EFFORT = _object(
+    {"value": _NULLABLE_STRING, "source": _STRING, "levels": _EFFORT_LEVELS}, ("value", "source")
+)
 _RESOLUTION_FIELD = _object(
     {
         "value": _NULLABLE_STRING,
@@ -305,10 +311,8 @@ _RESOLUTION = _object(
         "env_passthrough": _array(_STRING),
         "resolved": _object(
             {
-                **{
-                    name: _RESOLUTION_FIELD
-                    for name in ("model", "effort", "mode", "permissions", "home")
-                },
+                **{name: _RESOLUTION_FIELD for name in ("model", "mode", "permissions", "home")},
+                "effort": _RESOLVED_EFFORT,
                 "system_prompt": _RESOLUTION_SYSTEM_PROMPT,
                 "tools": _RESOLUTION_TOOLS,
                 "setting_sources": _RESOLUTION_TOOLS,
@@ -429,7 +433,10 @@ _AGENTS_GET = _object(
         "refused": _NULLABLE_STRING,
         "description": _NULLABLE_STRING,
         "resolved": _object(
-            {name: _RESOLVED_FIELD for name in ("model", "effort", "mode", "permissions", "home")},
+            {
+                **{name: _RESOLVED_FIELD for name in ("model", "mode", "permissions", "home")},
+                "effort": _RESOLVED_EFFORT,
+            },
             ("model", "effort", "mode", "permissions", "home"),
         ),
         "env": {},

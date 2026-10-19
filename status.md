@@ -41,17 +41,31 @@ timestamps excluded from the comparison; `agents get` shows the rows, `--models`
 the rows inform only, validation stays on `[effort_by_model]` until slice 6. Live: `agents check`
 on claude-agent-acp 0.89.1 (bare judge) records 7 rows in 1,8 s, on codex-acp 2.2.2 7 rows in
 4,6 s, the two `luna` models without `ultra`; claude advertises `default` as a level, which slice
-6 drops). Each slice: two builder rounds at most, Opus reviewer with mutation testing on a `git
+6 drops), 6 (this commit, BREAKING: the levels an entry may send for a model are the scale ∩ the
+adapter's observed row ∩ the operator's `[effort_by_model]` row, a shipped row only until the
+adapter has been observed, no union, `default` never selectable; an entry that names a model and
+no effort sends none and the vendor's default applies, provenance `vendor default`, which changes
+codex entries that inherited `xhigh` and claude/grok entries that inherited `high` (grok gets a new
+daemon target once); a preset's effort travels only with the preset's model; `continue` freezes a
+stored `None` like a stored level and the daemon no longer revalidates the stored pair against
+the live entry; `resolve` and `agents get` publish `levels {values, bounded_by}` under
+`resolved.effort`; a refused level names the factor that excluded it; the no-row warning fires
+only when a level is sent for a model without any row; the `refresh-adapter-models` skill tells
+the agent that claude and codex fill their rows through `agents check` and an overlay row there is
+an exclusion list. Ruled by a Fable arbiter on 2026-10-19 over the plan's "advertised > entry row
+> union"; Damian may still revert it. Live on claude: `judge --effort ultra` refused naming
+`advertised by claude`, an entry with a model and no effort runs and continues on the vendor
+default with no warning; on codex: `ultra` refused on `gpt-6-luna`, allowed on `gpt-6-sol`). Each slice: two builder rounds at most, Opus reviewer with mutation testing on a `git
 archive` copy with its own venv (a copied `.venv` runs the worktree's code), live on
 claude-agent-acp 0.89.1 with a bare judge (3c: daemon route, session dir = `meta.json` + `lock`,
 `~/.claude-bare` file listing unchanged after the run). Build contract since 2026-10-19 (local to
 this repo): builder and builder-light through the installed acpc (Codex), reviewer and explorer
-through the Agent tool. Next: slice 6, effort resolved against the advertised rows (BREAKING:
-allowed = advertised ∩ operator row ∩ scale, shipped row only until observed, no union, `default`
-never selectable, an entry that names a model and no effort sends none and gets the vendor
-default; Fable arbiter ruling 2026-10-19, Damian may still revert it to "advertised > entry row >
-union"), then 7 codex `codex_config` route, 8 `data_residency` + windows, 9 the import floor;
-plan and briefs in `docs/plans/1.2/`. Known flakes under `-n auto`:
+through the Agent tool. Next: slice 7, the codex `codex_config` system-prompt route (verified
+live 2026-10-20: `model_instructions_file` inside the `CODEX_CONFIG` JSON replaces the vendor
+prompt and is re-read at every thread start and resume), then 8 `data_residency` + subscription
+windows per vendor home (claude only; codex-acp 2.2.2 forwards no rate limits), then 9 the
+import floor (`import acpc.cli` 424–587 ms today, `acp.schema` alone 229 ms); SPEC deltas and
+briefs in `docs/plans/1.2/`. Known flakes under `-n auto`:
 `test_continue_rejects_an_adapter_without_load_session`, the steer `cancel_then_start` wait test,
 and `test_agents_check_reports_has_more_past_the_default_limit` hitting the 30 s timeout on a
 loaded desktop (21 mock spawns; passes alone in 11 s). `feat/1.2` is on origin through `1e7818f`

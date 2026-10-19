@@ -55,13 +55,19 @@ def test_shipped_adapter_facts_and_presets_are_available(tmp_path: Path) -> None
         if name not in {"auto", "read-only"}
     )
     assert claude.presets["max"].model == "claude-opus-5-5"
-    assert claude.effective_efforts("claude-opus-5-5") == ("low", "medium", "high", "xhigh", "max")
+    assert claude.allowed_efforts("claude-opus-5-5")[0] == ("low", "medium", "high", "xhigh", "max")
     assert codex.presets["standard"].effort == "xhigh"
     assert claude.presets["fast"].model == "claude-haiku-5-5"
     assert claude.presets["fast"].effort == "low"
-    assert claude.effective_efforts("claude-haiku-5-5") == ("low", "medium", "high", "xhigh", "max")
+    assert claude.allowed_efforts("claude-haiku-5-5")[0] == (
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+    )
     # claude CLI >=2.1.224 offers no effort option for haiku 4.5; see claude.toml.
-    assert claude.effective_efforts("claude-haiku-4-5") == ()
+    assert claude.allowed_efforts("claude-haiku-4-5")[0] == ()
     assert claude.usage_profile == "claude_model_usage"
     assert codex.usage_profile == "codex_usage_updates"
     assert grok.usage_profile == "grok_meta_usage"
@@ -400,7 +406,7 @@ def test_a_variant_inherits_the_parent_adapter_contract_lists(tmp_path: Path) ->
     worker = registry.resolve("worker")
 
     assert worker.effort_by_model == {"some-model": ("low", "high")}
-    assert worker.effective_efforts("some-model") == ("low", "high")
+    assert worker.allowed_efforts("some-model")[0] == ("low", "high")
     assert worker.effort_config_id == "effort"
     assert worker.env_passthrough == ("BASE_KEY",)
     with pytest.raises(RegistryError, match="low, high"):
@@ -480,7 +486,7 @@ def test_a_preset_may_pin_the_model_alone(tmp_path: Path) -> None:
     assert call.model == "local-fast"
     assert call.effort is None
     assert call.provenance["model"].kind == "entry"
-    assert call.provenance["effort"].kind == "unset"
+    assert call.provenance["effort"].kind == "vendor-default"
 
 
 def test_an_effortless_standard_preset_still_supplies_the_default_model(tmp_path: Path) -> None:
@@ -498,7 +504,7 @@ def test_an_effortless_standard_preset_still_supplies_the_default_model(tmp_path
     assert call.model == "local-standard"
     assert call.effort is None
     assert call.provenance["model"].kind == "adapter-default"
-    assert call.provenance["effort"].kind == "unset"
+    assert call.provenance["effort"].kind == "vendor-default"
 
 
 def test_an_explicit_effort_still_applies_over_an_effortless_preset(tmp_path: Path) -> None:
@@ -572,7 +578,7 @@ def test_effort_validation_lists_supported_levels(tmp_path: Path) -> None:
         'command = "python"\n[effort_by_model]\nsome-model = ["low", "medium"]\n',
     )
 
-    with pytest.raises(RegistryError, match=r"supported levels: low, medium"):
+    with pytest.raises(RegistryError, match=r"allowed: low, medium"):
         AgentRegistry(agents).resolve_call("limited", model="some-model", effort="xhigh")
 
     entry = AgentRegistry(agents).resolve("limited")
@@ -668,9 +674,8 @@ def test_an_entry_model_beats_the_adapter_default(tmp_path: Path) -> None:
 
     assert call.model == "claude-opus-5"
     assert call.provenance["model"].kind == "entry"
-    # effort was not set on the variant, so it still falls back independently
-    assert call.effort == "high"
-    assert call.provenance["effort"].kind == "adapter-default"
+    assert call.effort is None
+    assert call.provenance["effort"].kind == "vendor-default"
 
 
 def test_an_explicit_effort_overrides_the_adapter_default(tmp_path: Path) -> None:
@@ -706,7 +711,7 @@ def test_shipped_grok_uses_set_model_and_cli_effort(tmp_path: Path) -> None:
     assert "default" in grok.modes
     assert grok.presets["standard"].model == "grok-4.7"
     assert grok.presets["max"].model == "grok-4.7"
-    assert grok.effective_efforts("grok-4.7") == ("low", "medium", "high", "xhigh")
+    assert grok.allowed_efforts("grok-4.7")[0] == ("low", "medium", "high", "xhigh")
     call = grok.resolve_call(model="fast", permissions="execute")
     assert call.model == "grok-4.5"
     assert call.effort == "low"
@@ -766,8 +771,8 @@ def test_shipped_grok_4_5_rejects_xhigh_and_accepts_high(tmp_path: Path) -> None
     with pytest.raises(RegistryError) as error:
         registry.resolve_call("grok", model="grok-4.5", effort="xhigh")
     message = str(error.value)
-    assert "supported levels: low, medium, high" in message
-    assert "supported levels: low, medium, high, xhigh" not in message
+    assert "allowed: low, medium, high" in message
+    assert "allowed: low, medium, high, xhigh" not in message
 
     call = registry.resolve_call("grok", model="grok-4.5", effort="high")
     assert call.model == "grok-4.5"
@@ -780,13 +785,13 @@ def test_shipped_grok_4_6_accepts_xhigh(tmp_path: Path) -> None:
     assert call.effort == "xhigh"
 
 
-def test_unlisted_model_uses_derived_union(tmp_path: Path) -> None:
+def test_listed_grok_model_uses_its_shipped_row(tmp_path: Path) -> None:
     registry = AgentRegistry(tmp_path / "agents")
     allowed = registry.resolve_call("grok", model="grok-4.7", effort="xhigh")
     assert allowed.effort == "xhigh"
     assert allowed.model == "grok-4.7"
 
-    with pytest.raises(RegistryError, match="supported levels: low, medium, high, xhigh"):
+    with pytest.raises(RegistryError, match="allowed: low, medium, high, xhigh"):
         registry.resolve_call("grok", model="grok-4.7", effort="ultra")
 
 
@@ -798,13 +803,13 @@ def test_empty_effort_row_rejects_any_effort(tmp_path: Path) -> None:
         'command = "python"\n[effort_by_model]\nhaiku = []\nsonnet = ["low", "high"]\n',
     )
 
-    with pytest.raises(RegistryError, match="haiku has no effort setting"):
+    with pytest.raises(RegistryError, match="is not available for haiku; allowed: none"):
         AgentRegistry(agents).resolve_call("limited", model="haiku", effort="high")
     call = AgentRegistry(agents).resolve_call("limited", model="sonnet", effort="high")
     assert call.effort == "high"
 
 
-def test_empty_union_falls_back_to_global_vocab(tmp_path: Path) -> None:
+def test_other_models_ignore_an_empty_row(tmp_path: Path) -> None:
     agents = tmp_path / "agents"
     write_entry(
         agents,
@@ -815,7 +820,7 @@ def test_empty_union_falls_back_to_global_vocab(tmp_path: Path) -> None:
 
     call = registry.resolve_call("onlyempty", model="other", effort="ultra")
     assert call.effort == "ultra"
-    with pytest.raises(RegistryError, match="haiku has no effort setting"):
+    with pytest.raises(RegistryError, match="is not available for haiku; allowed: none"):
         registry.resolve_call("onlyempty", model="haiku", effort="low")
 
 
@@ -848,8 +853,8 @@ def test_variant_inherits_grok_effort_by_model(tmp_path: Path) -> None:
     grok = registry.resolve("grok")
 
     assert worker.effort_by_model == grok.effort_by_model
-    assert worker.effective_efforts("grok-4.5") == ("low", "medium", "high")
-    assert worker.effective_efforts("grok-4.6") == ("low", "medium", "high", "xhigh")
+    assert worker.allowed_efforts("grok-4.5")[0] == ("low", "medium", "high")
+    assert worker.allowed_efforts("grok-4.6")[0] == ("low", "medium", "high", "xhigh")
 
 
 def test_shipped_claude_haiku_rejects_effort_and_sonnet_accepts_high(
@@ -857,7 +862,7 @@ def test_shipped_claude_haiku_rejects_effort_and_sonnet_accepts_high(
 ) -> None:
     registry = AgentRegistry(tmp_path / "agents")
 
-    with pytest.raises(RegistryError, match="claude-haiku-4-5 has no effort setting"):
+    with pytest.raises(RegistryError, match="is not available for claude-haiku-4-5; allowed: none"):
         registry.resolve_call("claude", model="claude-haiku-4-5", effort="high")
     call = registry.resolve_call("claude", model="claude-sonnet-5", effort="high")
     assert call.effort == "high"
@@ -877,15 +882,14 @@ def test_shipped_codex_preset_rows_reject_unsupported_efforts(tmp_path: Path) ->
     assert registry.resolve_call("codex", effort="xhigh").effort == "xhigh"
     for model in codex.preset_models:
         for effort in ("none", "minimal", "max", "ultra"):
-            with pytest.raises(RegistryError, match=r"supported levels: low, medium, high, xhigh$"):
+            with pytest.raises(RegistryError, match=r"allowed: low, medium, high, xhigh \("):
                 registry.resolve_call("codex", model=model, effort=effort)
 
-    # Models without a row retain the derived-union fallback and its warning.
+    # Models without a row use the scale alone.
     assert (
         registry.resolve_call("codex", model="gpt-5.6-unlisted", effort="xhigh").effort == "xhigh"
     )
-    # The union spans every listed row, so an unlisted model reaches a level no
-    # preset model takes.
+    # Unlisted models are not constrained by another model's static row.
     assert registry.resolve_call("codex", model="gpt-5.6-unlisted", effort="max").effort == "max"
 
 
@@ -893,7 +897,7 @@ def test_shipped_codex_astra_row_allows_max_but_not_ultra(tmp_path: Path) -> Non
     registry = AgentRegistry(tmp_path / "agents")
 
     assert registry.resolve_call("codex", model="gpt-6-astra", effort="max").effort == "max"
-    with pytest.raises(RegistryError, match="supported levels: low, medium, high, xhigh, max"):
+    with pytest.raises(RegistryError, match="allowed: low, medium, high, xhigh, max"):
         registry.resolve_call("codex", model="gpt-6-astra", effort="ultra")
 
 
@@ -914,7 +918,7 @@ def test_preset_effort_rejected_when_model_row_disallows_it(tmp_path: Path) -> N
         'fast = { model = "small", effort = "high" }\n',
     )
 
-    with pytest.raises(RegistryError, match="supported levels: low"):
+    with pytest.raises(RegistryError, match="allowed: low"):
         AgentRegistry(agents).resolve_call("local", model="fast")
 
 

@@ -26,8 +26,9 @@ env_passthrough = [
 # denied by the sandbox. Treat `edit` as the measured floor, not a guarantee:
 # read-only is the mode with the least predictable ceiling, not the safe one.
 # Verified live 2026-08-06: codex-acp rejects minimal/ultra ("Invalid params").
-# Preset models are guarded to the vendor's supported effort levels; unlisted
-# models use the derived union as a fallback.
+# The rows below are shipped measurements: they bound a model only until acpc
+# has observed the adapter's own effort list for it (`agents check`), and an
+# operator row in $ACPC_HOME/agents/codex.toml narrows that list further.
 
 # `escalates = true` on read-only records exactly that: the in-vendor reviewer can
 # raise the effective ceiling with nothing reaching acpc, so `grants` there is a

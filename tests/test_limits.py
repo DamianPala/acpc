@@ -46,7 +46,10 @@ def state_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     root = tmp_path / "state"
     agents = root / "agents"
     agents.mkdir(parents=True)
-    (agents / "mock.toml").write_text(MOCK_ENTRY, encoding="utf-8")
+    (agents / "mock.toml").write_text(
+        MOCK_ENTRY + '\n[effort_by_model]\nmock-sonnet-5 = ["low", "medium", "high", "xhigh"]\n',
+        encoding="utf-8",
+    )
     monkeypatch.setenv("ACPC_HOME", str(root))
     return root
 

@@ -665,3 +665,15 @@ def wait_until_running(session_id: str) -> None:
             return
         time.sleep(0.02)
     pytest.fail(f"session {session_id} never became active")
+
+
+def test_effort_levels_match_the_published_schemas(cli: CliRunner, state_root: Path) -> None:
+    (state_root / "agents/mock.toml").write_text('model = "mock-sonnet-5"\n' + MOCK_ENTRY)
+    assert_json_payload(cli, "agents check", "mock")
+    detail = assert_json_payload(cli, "agents get", "mock")
+    assert detail["resolved"]["effort"]["levels"] == {
+        "values": ["low", "medium", "high", "xhigh"],
+        "bounded_by": ["scale", "advertised"],
+    }
+    resolved = assert_json_payload(cli, "resolve", "mock")
+    assert resolved["resolved"]["effort"]["levels"] == detail["resolved"]["effort"]["levels"]

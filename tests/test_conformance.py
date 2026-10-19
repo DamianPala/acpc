@@ -572,8 +572,12 @@ EXPECTED_OUTPUT_ORACLES: dict[str, dict[str, tuple[frozenset[str], frozenset[str
             frozenset({"value", "source"}),
         ),
         "output.resolved.effort": (
+            frozenset({"value", "source", "levels"}),
             frozenset({"value", "source"}),
-            frozenset({"value", "source"}),
+        ),
+        "output.resolved.effort.levels": (
+            frozenset({"values", "bounded_by"}),
+            frozenset({"values", "bounded_by"}),
         ),
         "output.resolved.mode": (
             frozenset({"value", "source"}),
@@ -836,14 +840,22 @@ EXPECTED_OUTPUT_ORACLES: dict[str, dict[str, tuple[frozenset[str], frozenset[str
                 _RESOLUTION_FIELD_PROPERTIES,
                 _RESOLUTION_FIELD_REQUIRED,
             )
-            for field in _RESOLUTION_REQUIRED
+            for field in _RESOLUTION_REQUIRED - {"effort"}
         },
+        "output.resolved.effort": (
+            frozenset({"value", "source", "levels"}),
+            _RESOLUTION_FIELD_REQUIRED,
+        ),
+        "output.resolved.effort.levels": (
+            frozenset({"values", "bounded_by"}),
+            frozenset({"values", "bounded_by"}),
+        ),
         **{
             f"output.resolved.{field}.clamp": (
                 _PERMISSIONS_CLAMP_PROPERTIES,
                 _RESOLUTION_CLAMP_REQUIRED,
             )
-            for field in _RESOLUTION_REQUIRED
+            for field in _RESOLUTION_REQUIRED - {"effort"}
         },
         "output.resolved.system_prompt": (
             frozenset({"value", "source", "bytes"}),

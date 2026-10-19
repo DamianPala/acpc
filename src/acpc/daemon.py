@@ -516,7 +516,7 @@ def _stored_call(payload: Mapping[str, Any]) -> CallResolution:
     entry = AgentRegistry().resolve(payload["entry"])
     entry = entry.without_session_keys(system_prompt_via=prompt_via, tools_via=tools_via)
     return replace(
-        entry.resolve_call(),
+        replace(entry, model=None, effort=None, presets={}).resolve_call(),
         system_prompt=system_prompt,
         tools=tools,
         one_shot=one_shot,
@@ -1226,12 +1226,9 @@ class Daemon:
         The lookup is still trusted for everything the payload does not carry,
         and that list is wider than the resolved values: the command, the env
         and passthrough behind `adapter_environment`, `home_env`,
-        `effort_config_id`, and the effort validation that runs on the entry's
-        own value. So an entry edit can still redirect a live session's provider
-        mid-conversation, and an entry that grows an unsupported effort makes
-        `continue` fail here rather than run on its stored one. Both are the
-        cost of shipping the entry as a name; the selected mode facts are pinned
-        in the payload.
+        `effort_config_id`. An entry edit can still redirect a live session's
+        provider mid-conversation. Model and effort are not revalidated against
+        the live entry: they are pinned in the payload, like the mode facts.
 
         Provenance is deliberately left as the lookup produced it: nothing on
         this path reads it, `session_resolution` runs client-side at dispatch.

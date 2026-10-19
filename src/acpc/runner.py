@@ -2409,6 +2409,12 @@ def auto_prune(retention_seconds: float) -> None:
         sessions.prune_sessions(older_than=retention_seconds)
 
 
+def effort_levels_payload(resolution: CallResolution) -> dict[str, list[str]]:
+    """The selectable effort values and the factors that bounded them."""
+    values, bounded_by = resolution.entry.allowed_efforts(resolution.model)
+    return {"values": list(values), "bounded_by": list(bounded_by)}
+
+
 def resolution_payload(
     resolution: CallResolution, *, cwd: str | None, permissions_source: str | None = None
 ) -> dict[str, Any]:
@@ -2434,6 +2440,7 @@ def resolution_payload(
         }
         for name, value in fields.items()
     }
+    resolved["effort"]["levels"] = effort_levels_payload(resolution)
     if permissions_source is not None:
         resolved["permissions"]["source"] = permissions_source
     if resolution.permissions_clamp is not None:
@@ -2581,6 +2588,7 @@ def session_resolution(
     effort_via=cli can re-inject on continue without doubling flags.
     """
     payload = resolution_payload(resolution, cwd=cwd)
+    payload["resolved"]["effort"].pop("levels", None)
     payload["command"] = resolution.entry.command
     if permissions_source is not None:
         payload["permissions_source"] = permissions_source
@@ -2872,6 +2880,7 @@ def _source_label(source: Any) -> str:
     labels = {
         "entry": "entry",
         "adapter-default": "adapter default",
+        "vendor-default": "vendor default",
         "call": "call flag",
         "default": "default",
         "unset": "unset",

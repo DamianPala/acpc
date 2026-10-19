@@ -87,6 +87,12 @@ per level — wait for yes on that grid, or omit those rows.
 
 ## 4. Measure each new model
 
+An adapter that advertises effort options (claude, codex) fills its rows
+itself: `acpc agents check "$NAME"` records the levels per model under
+`advertised.efforts`, and an overlay row for such an adapter is an
+exclusion list, not a measurement. Measure rows by hand only for an
+adapter that advertises nothing (grok).
+
 A new id does not inherit a sibling's effort list. Advertised is not
 runnable: if this account / plan rejects the model itself, omit the row.
 
@@ -115,15 +121,12 @@ of docs and a live apply that did not reject:
    it (`unsupported` / `unknown option` / `Invalid params`). If you cannot
    tell whether the vendor stuck that level, omit it and say so.
 
-User refuses the turn cost → **omit the row** (unlisted → warning + union
-is legal). Do not invent a row from docs alone or from a silent 0-exit.
+User refuses the turn cost → **omit the row** (a model without a row is
+checked against acpc's scale alone and the adapter's answer decides; `run`
+warns once that it sends the level as given). Do not invent a row from
+docs alone or from a silent 0-exit.
 
 Leave **still there** / **gone** rows unless the user asked to re-measure.
-
-If the live table is **empty** (global vocab), adding the first row changes
-every unlisted model from the global scale to that row's union — and they
-start warning. Do not propose a lone new row on an empty map. Either
-measure the **still there** preset targets too, or write nothing.
 
 ## 5. Propose, confirm, write
 
@@ -153,9 +156,6 @@ The proposal names:
   reject-or-accept (or "omitted — fallback / unclear")
 - preset lines you will change, old → new
 - what you will not write (deletions, unmeasured levels)
-- if the table is empty today: that the first row changes the unlisted
-  fallback (global scale → this union) and will warn on preset models
-  that still have no row
 
 No or a different default → revise and ask again. Write only after yes.
 
@@ -198,4 +198,4 @@ Report `$OVERLAY` and the diff.
 | `agents get --models` without `agents check` | Yesterday's catalogue. |
 | Edit `src/acpc/data/agents/` | Wrong tree. Overlay only. |
 | Live turn exit 0, docs omit the level | Silent fallback. Do not write that level. |
-| First row on an empty map | Unlisted models leave the global scale. Name it. |
+| Overlay row on claude or codex | An exclusion list over the advertised levels, not a measurement. |
