@@ -17,10 +17,10 @@
 
 ## Build contract
 
-Roles and loop per `~/ai/lab/knowledge/build-contract.md` (main session briefs, builder implements, reviewer verifies on a fresh context, max 2 rounds). Local mapping, every role inside Claude Code since 2026-10-18 (acpc is the product under test, never the dispatch path):
+Roles and loop per `~/ai/lab/knowledge/build-contract.md` (main session briefs, builder implements, reviewer verifies on a fresh context, max 2 rounds). Local mapping since 2026-10-19:
 
-- builder-light = Agent tool `builder-light` (Haiku, high); builder = Agent tool `builder` (Sonnet, high); explorer = Agent tool `explorer` (Sonnet, high, read-only work); reviewer = Agent tool `reviewer` (Opus, high, adversarial with mutation testing on a `git archive` copy, never in the worktree). Hard design or diagnosis questions: Agent tool on Fable 5.1, one question per dispatch.
-- An agent gets the brief's path and the slice worktree's path in its prompt and works there; acpc itself runs only in the orchestrator's live checks of the feature being built.
+- builder-light = acpc entry `builder-light` (Codex Luna, max); builder = acpc entry `builder` (Codex Sol, medium); both through the installed `acpc` (the frozen snapshot, never `uv run acpc` from this repo): `acpc run <entry> --prompt-file <brief> --bg` plus `acpc wait <id>` in the background in the same turn. explorer = Agent tool `explorer` (Sonnet, high, read-only work); reviewer = Agent tool `reviewer` (Opus, high, adversarial with mutation testing on a `git archive` copy, never in the worktree). Hard design or diagnosis questions: Agent tool on Fable 5.1, one question per dispatch.
+- An agent gets the brief's path and the slice worktree's path in its prompt and works there; the orchestrator runs the repo's own acpc (`uv run --frozen acpc`) only in live checks of the feature being built.
 - Brief, builder report, reviewer verdicts and SPEC delta live as files under `docs/plans/<version>/` (`slice-N.md`, `slice-N-report.md`, `slice-N-review-<round>.md`, `slice-N-spec-delta.md`). Agents return a few lines; the file is the record.
 - SPEC/README/help wording is authored by the orchestrator before dispatch and pasted verbatim into the brief; builders never edit `SPEC.md`.
 - One commit per slice. After `approve` plus green gate (`pytest` with `ACPC_STANDARD_CHECKOUT` set, ruff, pyright, `smoke.sh`) and the orchestrator's own diff read, commit without asking; pushing stays Damian's act.
