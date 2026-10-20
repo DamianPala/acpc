@@ -1,5 +1,26 @@
 # Changelog
 
+## [1.2.0] - 2026-10-20
+
+### Added
+
+- Judge-style entries: `system_prompt_file`, `tools` and `setting_sources` entry keys and `run --system-prompt-file`. claude carries them in the session `_meta`; codex carries the prompt as `model_instructions_file` inside `CODEX_CONFIG`; a key the adapter has no route for is refused instead of running under the vendor prompt. The prompt in force is stored in the session's `system.md` and sent again on a cold resume; `continue` refuses with `conflict` when a codex entry's prompt file no longer matches it
+- `one_shot` entry key: when the turn ends, the session is reduced to `meta.json`, `answer.md` and `transcript.ndjson`, delivered once by the foreground `run` or the first `wait`; later `wait`, `continue`, `log` and `steer` fail with `conflict`; results carry `retained`
+- `--transcript-file FILE` on `run` and `wait` copies the finished transcript as NDJSON; the result reports `transcript_file`
+- `served_model` in results and `status`: the model that actually answered, with one stderr note per turn when it differs from the requested one
+- `--limit-wait DURATION` on `run` and `continue`, and the `limit_wait_max` entry key, cap how long a call waits out a usage limit; `0s` fails fast with `failure.class` `rate_limit` and the resume time in `next_step`
+- Observed effort levels: `agents check` probes every model the entry can reach and records the levels the adapter advertises under `advertised.efforts`; `agents get` shows them per model
+- Subscription windows: claude's 5-hour and 7-day utilization is kept per vendor home in `cache/claude/limits.json` and shown by `agents get` (`windows` row) and `agents check`
+- `data_residency` entry key (`eu` or `global`), inherited through `extends`, shown by `resolve` and `agents get`; declarative only, nothing enforces it
+
+### Changed
+
+- **BREAKING:** effort is resolved against what the adapter advertises: the allowed levels are the effort scale ∩ the adapter's observed row for the model ∩ the entry's `[effort_by_model]` row, and an entry that names a model without an `effort` sends none (`vendor default`) instead of inheriting the adapter's default. Migration: codex entries lose the inherited `xhigh`, claude and grok entries the inherited `high`; set `effort` where a level is wanted, pass `--effort` with an explicit `--model`, and drop levels the adapter does not advertise (claude's `default` among them)
+- **BREAKING:** `failure` in results and `status` is an object `{class, message, next_step}` with `class` one of `auth`, `rate_limit`, `adapter_limit`, `connection`, `adapter_error`, `acpc`, and `schema_version` is `2`. Migration: read `failure.message` for the old text and accept schema version 2
+- `--permissions edit` on claude selects the default mode instead of `plan`, so the agent can edit and answers on the entry's model; the mode fact `selectable = false` marks modes a policy never lands on (`--mode` still reaches them)
+- `agents list`, `agents check` and `skills list` show up to 100 entries by default and fit the text roster to the terminal width (long models and homes cut in the middle, descriptions truncated with one footer); machine formats keep every field
+- Read-only commands start faster: the ACP library is imported only by commands that talk to an adapter; `import acpc.cli` drops from about 500 ms to under 80 ms and `--version` answers in under 0.1 s
+
 ## [1.1.1] - 2026-10-19
 
 ### Changed
@@ -89,6 +110,7 @@
 - `log --max-output` truncation is reported on stderr instead of as a fake event inside the stream
 - Shipped `claude` and `codex` adapter facts refreshed to what the vendors currently support
 
+[1.2.0]: https://github.com/DamianPala/acpc/compare/v1.1.1...v1.2.0
 [1.1.1]: https://github.com/DamianPala/acpc/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/DamianPala/acpc/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/DamianPala/acpc/compare/v0.7.1...v1.0.1
