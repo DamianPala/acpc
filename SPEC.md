@@ -305,7 +305,7 @@ wait SELECTOR [--timeout S] [--output-file FILE] [--transcript-file FILE]
 
 The output field is a JSON Schema subset using only `type`, `enum`, `properties`, `required` and `items`. It describes one result document shared by the success and failure results, or one record for `log`. The generator walks the Click tree that actually parses the command. A group is indexed only when explicitly marked as dispatching useful work without a subcommand. An unknown schema path is an exit-2 usage error naming the nearest valid paths. Path segments are separate arguments.
 
-The installed binary currently publishes schema version `1`, tool version `1.2.0`, format defaults `{"tty": "text", "non_tty": "json"}`, and conformance name `cli-design-standard` at `0.2.0-draft.11` with extensions `["managed", "conversational"]`; `conversational` covers `run`, `continue`, `steer`, `wait` and the capability object. `tests/test_conformance.py` verifies the claim against the standard header and the behavior of every indexed command.
+The installed binary currently publishes schema version `2`, tool version `1.2.0`, format defaults `{"tty": "text", "non_tty": "json"}`, and conformance name `cli-design-standard` at `0.2.0-draft.11` with extensions `["managed", "conversational"]`; `conversational` covers `run`, `continue`, `steer`, `wait` and the capability object. `tests/test_conformance.py` verifies the claim against the standard header and the behavior of every indexed command.
 
 ## Output contract
 
