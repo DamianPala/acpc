@@ -311,14 +311,17 @@ _RESOLUTION = _object(
         "env_passthrough": _array(_STRING),
         "resolved": _object(
             {
-                **{name: _RESOLUTION_FIELD for name in ("model", "mode", "permissions", "home")},
+                **{
+                    name: _RESOLUTION_FIELD
+                    for name in ("model", "mode", "permissions", "home", "data_residency")
+                },
                 "effort": _RESOLVED_EFFORT,
                 "system_prompt": _RESOLUTION_SYSTEM_PROMPT,
                 "tools": _RESOLUTION_TOOLS,
                 "setting_sources": _RESOLUTION_TOOLS,
                 "one_shot": _RESOLUTION_ONE_SHOT,
             },
-            ("model", "effort", "mode", "permissions", "home"),
+            ("model", "effort", "mode", "permissions", "home", "data_residency"),
         ),
     },
     (
@@ -405,12 +408,32 @@ _AGENTS_LIST = _object(
     {"items": _array(_AGENT_ITEM), "has_more": _BOOLEAN},
     ("items", "has_more"),
 )
+_WINDOW = {
+    **_object(
+        {"utilization": {"type": "number"}, "resets_at": _INTEGER}, ("utilization", "resets_at")
+    ),
+    "type": ["object", "null"],
+}
+_WINDOWS = {
+    **_object(
+        {
+            "five_hour": _WINDOW,
+            "seven_day": _WINDOW,
+            "observed_at": {"type": "number"},
+            "session_id": _STRING,
+        },
+        ("five_hour", "seven_day", "observed_at", "session_id"),
+    ),
+    "type": ["object", "null"],
+}
+
 _CHECK_ITEM = _object(
     {
         "agent": _STRING,
         "ok": _BOOLEAN,
         "models": _INTEGER,
         "efforts": _INTEGER,
+        "windows": _WINDOWS,
         "error": _STRING,
     },
     ("agent", "ok"),
@@ -423,6 +446,7 @@ _RESOLVED_FIELD = _object({"value": _NULLABLE_STRING, "source": _STRING}, ("valu
 _AGENTS_GET = _object(
     {
         "agent": _STRING,
+        "windows": _WINDOWS,
         "base_adapter": _STRING,
         "system_prompt_file": _NULLABLE_STRING,
         "tools": {"type": ["array", "null"], "items": _STRING},
@@ -434,10 +458,13 @@ _AGENTS_GET = _object(
         "description": _NULLABLE_STRING,
         "resolved": _object(
             {
-                **{name: _RESOLVED_FIELD for name in ("model", "mode", "permissions", "home")},
+                **{
+                    name: _RESOLVED_FIELD
+                    for name in ("model", "mode", "permissions", "home", "data_residency")
+                },
                 "effort": _RESOLVED_EFFORT,
             },
-            ("model", "effort", "mode", "permissions", "home"),
+            ("model", "effort", "mode", "permissions", "home", "data_residency"),
         ),
         "env": {},
         "env_passthrough": _array(_STRING),

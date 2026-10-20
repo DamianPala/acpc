@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import re
 import shutil
 import tempfile
@@ -179,6 +180,91 @@ def _effort_rows(value: Any) -> dict[str, Any]:
         and (row.get("current", 0) is None or isinstance(row.get("current"), str))
         and type(row.get("observed_at")) in (int, float)
     }
+
+
+# 9999-12-30 UTC: any local zone can still render it.
+_LAST_RESET = 253_402_128_000
+
+
+def _home_key(home: str | None) -> str:
+    return "" if home is None else str(Path(home).expanduser())
+
+
+def _finite(value: Any) -> bool:
+    return type(value) in (int, float) and math.isfinite(value)
+
+
+def _valid_window(value: Any) -> bool:
+    # JSON admits NaN, Infinity and any integer; renderers must never raise on a stored row.
+    return value is None or (
+        isinstance(value, Mapping)
+        and _finite(value.get("utilization"))
+        and type(value.get("resets_at")) is int
+        and 0 <= value["resets_at"] < _LAST_RESET
+    )
+
+
+def _windows_row(value: Any) -> dict[str, Any] | None:
+    if (
+        not isinstance(value, Mapping)
+        or not _finite(value.get("observed_at"))
+        or not isinstance(value.get("session_id"), str)
+    ):
+        return None
+    for name in ("five_hour", "seven_day"):
+        if name not in value:
+            return None
+        window = value[name]
+        if not _valid_window(window):
+            return None
+    return dict(value)
+
+
+def _read_window_homes(agent: str) -> dict[str, Any]:
+    try:
+        payload = json.loads((_cache_path(agent) / "limits.json").read_text(encoding="utf-8"))
+        homes = payload.get("homes") if isinstance(payload, Mapping) else None
+        return dict(homes) if isinstance(homes, Mapping) else {}
+    except (OSError, TypeError, ValueError):
+        return {}
+
+
+def refresh_windows(
+    agent: str,
+    home: str | None,
+    windows: Mapping[str, Any] | None,
+    *,
+    session_id: str,
+    clock: Clock | None = None,
+) -> None:
+    """Publish a whole observation without letting auxiliary state fail a turn.
+
+    The client's observed_at is authoritative; publication never restamps it.
+    """
+    try:
+        if windows is None:
+            return
+        row = _windows_row({**windows, "session_id": session_id})
+        if row is None:
+            return
+        homes = _read_window_homes(agent)
+        key = _home_key(home)
+        previous = _windows_row(homes.get(key))
+        if previous is not None and previous["observed_at"] > row["observed_at"]:
+            return
+        homes[key] = row
+        root = paths.ensure_private_dir(_cache_path(agent))
+        paths.atomic_write(root / "limits.json", {"homes": homes})
+    except Exception:  # noqa: BLE001
+        return
+
+
+def read_windows(agent: str, home: str | None) -> dict[str, Any] | None:
+    """Read only this vendor home's observation; damaged rows are cache misses."""
+    try:
+        return _windows_row(_read_window_homes(agent).get(_home_key(home)))
+    except (OSError, TypeError, ValueError):
+        return None
 
 
 def cache_age(cached_at: float, *, clock: Clock | None = None) -> str:

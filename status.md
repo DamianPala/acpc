@@ -68,18 +68,33 @@ Live on codex-acp 2.2.2 / codex 0.160.1, `gpt-5.6-luna`: the entry prompt replac
 warm and cold; `continue` with a malformed caller value refused before daemon contact. Backlog from
 the review: a non-UTF-8 prompt file is `operation_failed (UnicodeDecodeError)` on every route
 (pre-existing), the `continue` byte read of the entry file has no size cap, `acp_meta` still stores
-newline-translated text in `system.md`). Each slice: two builder rounds at most, Opus reviewer with mutation testing on a `git
+newline-translated text in `system.md`), 8 (this commit: the subscription windows claude reports
+in `_meta["_claude/rateLimit"]["unifiedWindows"]` are kept per base adapter and vendor home in
+`cache/<adapter>/limits.json` as `{five_hour, seven_day, observed_at, session_id}`, whole-row
+replacement, never an older observation over a newer, published after finalization without ever
+failing the turn; `agents get` shows the entry home's row with reset times and age for adapters
+and variants, `agents check` carries it on the `ok` item and reads only, `resolve` shows none;
+codex-acp 2.2.2 forwards no rate limits, so codex and grok stay `null`; `data_residency = "eu" |
+"global"` is an entry declaration shown by `resolve` and `agents get` with provenance, inherited,
+enforced by nothing; the mock gains `ACPC_MOCK_RATE_WINDOWS` and the two window knobs. Live on
+the bare claude judge: the first turn published the `/home/haz/.claude-bare` row (5h 3 %, 7d 26 %),
+`agents get judge` renders `windows 5h 3% resets 06:30 · 7d 26% resets Mon 26 Oct 01:00 ·
+observed 1m ago`, `agents check judge` the same suffix, `cx` stays `null`. Review fixes: a stored
+row with NaN, Infinity or an unrenderable `resets_at` crashed `agents get`/`agents check`; the
+validator now requires finite numbers and a reset the clock can render, so such a row reads as
+"none observed" and is never written. Known: the read-modify-write on `limits.json` is unlocked
+like `advertised.json`; `unifiedWindows` is an `@internal` CLI field, so a CLI update can silence
+the rows without an error). Each slice: two builder rounds at most, Opus reviewer with mutation testing on a `git
 archive` copy with its own venv (a copied `.venv` runs the worktree's code), live on
 claude-agent-acp 0.89.1 with a bare judge (3c: daemon route, session dir = `meta.json` + `lock`,
 `~/.claude-bare` file listing unchanged after the run). Build contract since 2026-10-19 (local to
 this repo): builder and builder-light through the installed acpc (Codex), reviewer and explorer
-through the Agent tool. Next: slice 8, `data_residency` + subscription windows per vendor home
-(claude's `unifiedWindows` only; codex-acp 2.2.2 forwards no rate limits), then 9 the
+through the Agent tool. Next: slice 9, the
 import floor (`import acpc.cli` 424–587 ms today, `acp.schema` alone 229 ms); SPEC deltas and
 briefs in `docs/plans/1.2/`. Known flakes under `-n auto`:
 `test_continue_rejects_an_adapter_without_load_session`, the steer `cancel_then_start` wait test,
 and `test_agents_check_reports_has_more_past_the_default_limit` hitting the 30 s timeout on a
-loaded desktop (21 mock spawns; passes alone in 11 s). `feat/1.2` is on origin through `23e926f`
+loaded desktop (21 mock spawns; passes alone in 11 s). `feat/1.2` is on origin through `5cecf2b`
 (fast-forward pushes and `gate.yml` laps under Damian's standing grant, both green on ubuntu and
 macos); main, merge, tags and the release wait for his go.
 

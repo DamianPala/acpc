@@ -596,6 +596,7 @@ class TurnOutcome:
     denial_details: dict[str, dict[str, Any]] = field(default_factory=dict)
     adapter_session_id: str | None = None
     advertised: dict[str, Any] = field(default_factory=dict)
+    rate_windows: dict[str, Any] | None = None
     route_note: str | None = None
     # The adapter's own failure, when the turn died in `session/prompt`. Carried
     # on the outcome rather than raised so the prose streamed before it survives.
@@ -878,6 +879,7 @@ async def _drive_turn(
         denial_details=client.denial_details,
         adapter_session_id=adapter_session_id,
         advertised=client.advertised,
+        rate_windows=client.rate_windows,
         error=turn_error,
         delivery_record_incomplete=bool(delivery and delivery.delivery_record_incomplete),
         turn_token=request.turn_token,
@@ -970,7 +972,12 @@ async def _prompt_direct_turn(
             # No delivery: the caller finalizes no usage for a prompt never started.
             return "error", error, None, None
         _finalize_claimed_setup_failure(
-            session_id, request.turn_token, error, adapter_session_id, advertised=client.advertised
+            session_id,
+            request.turn_token,
+            error,
+            adapter_session_id,
+            advertised=client.advertised,
+            rate_windows=client.rate_windows,
         )
         if isinstance(error, asyncio.CancelledError):
             raise
@@ -1056,6 +1063,7 @@ def _finalize_claimed_setup_failure(
     adapter_session_id: str | None = None,
     *,
     advertised: dict[str, Any] | None = None,
+    rate_windows: dict[str, Any] | None = None,
 ) -> None:
     """Close a claimed turn when setup failed before an owner was installed."""
     _finalize(
@@ -1067,6 +1075,7 @@ def _finalize_claimed_setup_failure(
             adapter_session_id=adapter_session_id,
             error=error,
             advertised=advertised or {},
+            rate_windows=rate_windows,
             turn_token=turn_token,
         ),
         error=error,
@@ -2155,6 +2164,11 @@ def _after_finalize(finalized: sessions.SessionMeta, outcome: TurnOutcome) -> No
     if outcome.advertised:
         with contextlib.suppress(Exception):
             cache.refresh_advertised(_agent_of(finalized.session_id), outcome.advertised)
+    with contextlib.suppress(Exception):
+        home = _stored_value(finalized.resolution, "home")
+        cache.refresh_windows(
+            finalized.base_adapter, home, outcome.rate_windows, session_id=finalized.session_id
+        )
 
 
 def _reduces_at_end(current: sessions.SessionMeta | None) -> bool:
@@ -2437,6 +2451,7 @@ def resolution_payload(
         "mode": resolution.mode,
         "permissions": resolution.permissions,
         "home": resolution.home,
+        "data_residency": resolution.entry.data_residency,
     }
     resolved: dict[str, dict[str, Any]] = {
         name: {

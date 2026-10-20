@@ -677,3 +677,16 @@ def test_effort_levels_match_the_published_schemas(cli: CliRunner, state_root: P
     }
     resolved = assert_json_payload(cli, "resolve", "mock")
     assert resolved["resolved"]["effort"]["levels"] == detail["resolved"]["effort"]["levels"]
+
+
+@pytest.mark.parametrize("observed", [False, True])
+def test_window_payloads_match_the_published_schemas(
+    cli: CliRunner, state_root: Path, monkeypatch: pytest.MonkeyPatch, observed: bool
+) -> None:
+    if observed:
+        monkeypatch.setenv("ACPC_MOCK_RATE_WINDOWS", "1")
+        assert_json_payload(cli, "run", "mock", "echo:windows")
+    detail = assert_json_payload(cli, "agents get", "mock")
+    checked = assert_json_payload(cli, "agents check", "mock")
+    assert (detail["windows"] is not None) is observed
+    assert checked["items"][0]["windows"] == detail["windows"]

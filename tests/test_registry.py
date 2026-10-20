@@ -97,7 +97,12 @@ def test_usage_profile_and_billing_default_and_inherit_through_extends(tmp_path:
 
 @pytest.mark.parametrize(
     ("key", "value"),
-    [("usage_profile", "bogus"), ("billing", "free")],
+    [
+        ("usage_profile", "bogus"),
+        ("billing", "free"),
+        ("data_residency", "us"),
+        ("data_residency", "EU"),
+    ],
 )
 def test_invalid_usage_registry_values_are_rejected(tmp_path: Path, key: str, value: str) -> None:
     agents = tmp_path / "agents"
@@ -1160,3 +1165,18 @@ def test_limit_wait_registry_rejects_invalid(tmp_path: Path, value: str) -> None
     write_entry(agents, "bad", f'command = "true"\nlimit_wait_max = {value}\n')
     with pytest.raises(RegistryError, match=r"bad.toml.*limit_wait_max"):
         AgentRegistry(agents)
+
+
+def test_data_residency_defaults_inherits_and_overrides(tmp_path: Path) -> None:
+    agents = tmp_path / "agents"
+    write_entry(agents, "base", 'command = "python -m base"\ndata_residency = "eu"\n')
+    write_entry(agents, "child", 'extends = "base"\n')
+    write_entry(agents, "override", 'extends = "child"\ndata_residency = "global"\n')
+    write_entry(agents, "defaulted", 'command = "python -m base"\n')
+    registry = AgentRegistry(agents)
+    assert registry.resolve("defaulted").data_residency is None
+    assert registry.resolve("child").data_residency == "eu"
+    assert registry.resolve("override").data_residency == "global"
+    source = registry.resolve("child").resolve_call().provenance["data_residency"]
+    assert source.kind == "entry"
+    assert source.path == agents / "base.toml"

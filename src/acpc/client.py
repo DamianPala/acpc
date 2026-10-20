@@ -590,6 +590,7 @@ class AcpcClient:
         self._served_model: str | None = None
         self._claude_model_seen = False
         self._rate_limit_info: dict[str, Any] | None = None
+        self._rate_windows: dict[str, Any] | None = None
         self._recorded_progress = False
         self._denied: dict[str, int] = {}
         self._denial_details: dict[str, dict[str, Any]] = {}
@@ -627,6 +628,11 @@ class AcpcClient:
     def adapter_identity(self) -> dict[str, str | None]:
         """Return the adapter's identity reported by ACP initialize."""
         return dict(self._adapter_info)
+
+    @property
+    def rate_windows(self) -> dict[str, Any] | None:
+        """The latest subscription observation, independent of per-send rejection state."""
+        return copy.deepcopy(self._rate_windows)
 
     def clear_rate_limit_info(self) -> None:
         """Drop the last-seen `_meta["_claude/rateLimit"]` before a resend.
@@ -1311,6 +1317,25 @@ class AcpcClient:
         current.finished = True
         self._recorded_progress = True
 
+    def _capture_rate_windows(self, rate_limit_info: Mapping[str, Any]) -> None:
+        windows = rate_limit_info.get("unifiedWindows")
+        if not isinstance(windows, Mapping):
+            return
+        row: dict[str, Any] = {"five_hour": None, "seven_day": None}
+        for name in row:
+            window = windows.get(name)
+            if (
+                isinstance(window, Mapping)
+                and type(window.get("utilization")) in (int, float)
+                and type(window.get("resetsAt")) is int
+            ):
+                row[name] = {
+                    "utilization": float(window["utilization"]),
+                    "resets_at": window["resetsAt"],
+                }
+        if any(row.values()):
+            self._rate_windows = {**row, "observed_at": time.time()}
+
     def _record_usage(self, update: UsageUpdate) -> None:
         self._usage_update_seen = True
         self._turn_used.append(update.used)
@@ -1339,6 +1364,7 @@ class AcpcClient:
         rate_limit_info = meta.get("_claude/rateLimit")
         if isinstance(rate_limit_info, Mapping):
             self._rate_limit_info = dict(rate_limit_info)
+            self._capture_rate_windows(rate_limit_info)
         # Last: a failed best-effort meta refresh must not skip the capture above.
         self._refresh_context_if_due(previous_context, context)
 

@@ -523,3 +523,79 @@ def test_model_dependent_config_responses_and_restore_payloads(tmp_path: Path, k
 
 def _config_updates(updates: list[Any]) -> list[Any]:
     return [u for u in updates if getattr(u, "session_update", None) == "config_option_update"]
+
+
+@pytest.mark.parametrize("knob", [None, "1", "bare", "skip"])
+def test_subscription_window_knobs_on_the_wire(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, knob: str | None
+) -> None:
+    from acp.schema import UsageUpdate
+
+    class WindowDriver(DriverClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.updates: list[Any] = []
+
+        async def session_update(self, session_id: str, update: Any, **kwargs: Any) -> None:
+            self.updates.append(update)
+            await super().session_update(session_id, update, **kwargs)
+
+    if knob is not None:
+        monkeypatch.setenv("ACPC_MOCK_RATE_WINDOWS", knob)
+    else:
+        monkeypatch.delenv("ACPC_MOCK_RATE_WINDOWS", raising=False)
+    monkeypatch.setenv("ACPC_MOCK_RATE_FIVE_HOUR", "0.42:7200")
+    monkeypatch.setenv("ACPC_MOCK_RATE_SEVEN_DAY", "none")
+
+    async def scenario() -> None:
+        client = WindowDriver()
+        async with spawn_adapter(
+            client,
+            sys.executable,
+            MOCK_AGENT_SCRIPT,
+            env={**os.environ, "HOME": str(tmp_path)},
+            cwd=str(tmp_path),
+        ) as (conn, _process):
+            await conn.initialize(protocol_version=PROTOCOL_VERSION)
+            session = await conn.new_session(cwd=str(tmp_path))
+            for turn in range(2):
+                client.updates.clear()
+                response = await conn.prompt(
+                    session_id=session.session_id, prompt=[text_block(f"echo:window {turn}")]
+                )
+                assert response.stop_reason == "end_turn"
+                # A barrier response lets the notification callbacks finish.
+                await conn.set_session_mode(session_id=session.session_id, mode_id="default")
+                updates = [
+                    update
+                    for update in client.updates
+                    if isinstance(update, UsageUpdate)
+                    and (update.field_meta or {}).get("_claude/rateLimit")
+                ]
+                if knob not in ("1", "bare"):
+                    assert updates == []
+                    continue
+                assert len(updates) == 1
+                update = updates[0]
+                assert update.used > 0 and update.size == 200000
+                assert update.field_meta is not None
+                assert update.field_meta["_claude/model"] == "mock-sonnet-5"
+                info = update.field_meta["_claude/rateLimit"]
+                assert type(info["resetsAt"]) is int
+                assert info["status"] == "allowed"
+                assert any(
+                    isinstance(item, AgentMessageChunk)
+                    for item in client.updates[: client.updates.index(update)]
+                )
+                if knob == "bare":
+                    assert "unifiedWindows" not in info
+                else:
+                    assert set(info["unifiedWindows"]) == {"five_hour"}
+                    window = info["unifiedWindows"]["five_hour"]
+                    assert window["utilization"] == 0.42
+                    assert type(window["resetsAt"]) is int
+                    import time
+
+                    assert 7100 < window["resetsAt"] - time.time() <= 7200
+
+    asyncio.run(scenario())

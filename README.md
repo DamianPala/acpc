@@ -165,7 +165,7 @@ MODEL_PROVIDER = "openrouter"
 
 The `home` field is the provider switch: OpenAI vs OpenRouter vs a local endpoint is just a different vendor home. Resolution stays fully inspectable — `acpc agents get builder` shows what the entry resolves to with per-field provenance, `acpc resolve builder` shows one concrete call.
 
-`--model fast|standard|max` resolves through the adapter's preset table (overridable per adapter in `agents/`). An entry that names a model and no `effort` sends none, so the vendor's default applies; `acpc resolve NAME` shows the levels it may send. When the vendor advertises new model ids, upgrade that adapter's binary first, then `acpc skills get refresh-adapter-models` — it writes only the operator overlay, after a confirm. The adapter's environment is **constructed, not inherited**: a base system set, capability variables (ssh agent, proxies, CA bundles), and the entry's declared env — the rest of your ambient environment never reaches the adapter.
+`--model fast|standard|max` resolves through the adapter's preset table (overridable per adapter in `agents/`). `data_residency = "eu" | "global"` on an entry records where its vendor processes data; `acpc agents get NAME` shows it, nothing in acpc enforces it. An entry that names a model and no `effort` sends none, so the vendor's default applies; `acpc resolve NAME` shows the levels it may send. When the vendor advertises new model ids, upgrade that adapter's binary first, then `acpc skills get refresh-adapter-models` — it writes only the operator overlay, after a confirm. The adapter's environment is **constructed, not inherited**: a base system set, capability variables (ssh agent, proxies, CA bundles), and the entry's declared env — the rest of your ambient environment never reaches the adapter.
 
 ### Judge entries
 
@@ -218,7 +218,7 @@ Keep it to purpose only. Models, efforts and flags belong to the tool — `acpc 
 ~/.acpc/                     # ACPC_HOME overrides it — the only env var acpc reads for itself
   config.toml                # retention, daemon_ttl, daemon_max_concurrent — the whole file
   agents/<name>.toml         # variants, adapter overrides, new adapters
-  cache/<agent>/             # advertised models, modes, commands, effort levels per model
+  cache/<agent>/             # advertised models, modes, commands, effort levels per model, subscription windows per home
   daemon/<target>.log        # adapter stderr per target
   sessions/<id>/
     meta.json                # full resolved invocation + state, timing, context occupancy, exit code

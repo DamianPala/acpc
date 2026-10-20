@@ -173,7 +173,7 @@ def test_probe_fills_all_rows_and_views_show_them(state_root: Path, command: str
     assert "unavailable" not in observed
     if command == "check":
         item = json.loads(result.stdout)["items"][0]
-        assert item == {"agent": "mock", "ok": True, "models": 3, "efforts": 3}
+        assert item == {"agent": "mock", "ok": True, "models": 3, "efforts": 3, "windows": None}
     detail = invoke("agents", "get", "mock", "--json")
     assert json.loads(detail.stdout)["advertised"]["efforts"] == observed
     text = invoke("agents", "get", "mock", "--format", "text").stdout

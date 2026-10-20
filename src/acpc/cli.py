@@ -18,6 +18,7 @@ import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -1738,7 +1739,8 @@ def _emit_resolution(payload: dict[str, Any], *, json_mode: bool) -> None:
                 lines.append(f"{'one-shot':<12} yes ({item['source']})")
         else:
             suffix = _effort_levels_text(item["levels"]) if name == "effort" else ""
-            lines.append(f"{name:<12} {value} ({item['source']}){suffix}")
+            label = "residency" if name == "data_residency" else name
+            lines.append(f"{label:<12} {value} ({item['source']}){suffix}")
     if payload["cwd"]:
         lines.append(f"cwd          {payload['cwd']}")
     if payload["env"]:
@@ -2050,7 +2052,10 @@ def _ensure_cache(entry: ResolvedEntry) -> cache.CachedAdvertised:
 
 
 def _render_advertised_detail(
-    entry: ResolvedEntry, record: cache.CachedAdvertised | None
+    entry: ResolvedEntry,
+    record: cache.CachedAdvertised | None,
+    *,
+    windows: Mapping[str, Any] | None,
 ) -> tuple[str, dict[str, Any]]:
     advertised = _advertised_payload(record)
     modes = [_mode_name(item) for item in advertised.get("modes", [])]
@@ -2074,6 +2079,7 @@ def _render_advertised_detail(
         f"models       {len(models)} · {' · '.join(visible_models) if visible_models else '·'}",
         f"commands     {len(commands)} · {' · '.join(visible_commands) if visible_commands else '·'}",
         f"efforts      {len(efforts)} · {' · '.join(visible_efforts) or '·'}",
+        f"windows      {_windows_text(windows, resets=True)}",
         _cache_footer(record),
     ]
     payload = {
@@ -2178,6 +2184,7 @@ def _render_entry_detail(
         "mode": resolution.mode,
         "permissions": resolution.permissions,
         "home": resolution.home,
+        "data_residency": entry.data_residency,
     }
     for field, value in resolved_values.items():
         if field == "home":
@@ -2192,8 +2199,12 @@ def _render_entry_detail(
             if field == "effort"
             else ""
         )
-        lines.append(f"{field:<12} {rendered} ({rendered_source}){suffix}")
+        label = "residency" if field == "data_residency" else field
+        lines.append(f"{label:<12} {rendered} ({rendered_source}){suffix}")
 
+    windows = cache.read_windows(entry.base_adapter, resolution.home)
+    if entry.is_variant:
+        lines.append(f"windows      {_windows_text(windows, resets=True)}")
     lines.append(_entry_env_row(entry))
     lines.extend(_entry_session_rows(entry))
     if not entry.is_variant:
@@ -2202,6 +2213,7 @@ def _render_entry_detail(
 
     payload = {
         "agent": entry.entry,
+        "windows": windows,
         "base_adapter": entry.base_adapter,
         **_entry_session_payload(entry),
         "description": entry.description,
@@ -2421,6 +2433,28 @@ def _emit_agent_commands(entry: ResolvedEntry, selected_format: str) -> None:
         _write_stdout(text)
 
 
+def _windows_text(row: Mapping[str, Any] | None, *, resets: bool = False) -> str:
+    if row is None:
+        return "· (none observed)"
+    parts = []
+    now = time.time()
+    for name, label in (("five_hour", "5h"), ("seven_day", "7d")):
+        window = row[name]
+        if window is None:
+            continue
+        if window["resets_at"] <= now:
+            parts.append(f"{label} reset")
+            continue
+        text = f"{label} {round(window['utilization'] * 100)}%"
+        if resets:
+            pattern = "%H:%M" if window["resets_at"] - now < 86400 else "%a %d %b %H:%M"
+            reset_time = datetime.fromtimestamp(window["resets_at"], UTC).astimezone()
+            text += f" resets {reset_time.strftime(pattern)}"
+        parts.append(text)
+    parts.append(f"observed {cache.cache_age(row['observed_at'])} ago")
+    return " · ".join(parts)
+
+
 def _emit_agent_detail(registry: AgentRegistry, entry: ResolvedEntry, selected_format: str) -> None:
     text, payload, _ = _render_entry_detail(registry, entry)
     if not entry.is_variant:
@@ -2429,7 +2463,9 @@ def _emit_agent_detail(registry: AgentRegistry, entry: ResolvedEntry, selected_f
         if cold:
             # The probe may have just observed effort rows; `levels` must agree with them.
             text, payload, _ = _render_entry_detail(registry, registry.resolve(entry.entry))
-        advertised_text, advertised_payload = _render_advertised_detail(entry, record)
+        advertised_text, advertised_payload = _render_advertised_detail(
+            entry, record, windows=payload["windows"]
+        )
         payload.update(advertised_payload)
         text += advertised_text
         if selected_format == "json":
@@ -2504,6 +2540,7 @@ def _check_one(entry: ResolvedEntry, timeout: float) -> dict[str, Any]:
             "ok": True,
             "models": len(advertised["models"]),
             "efforts": len(advertised.get("efforts", {})),
+            "windows": cache.read_windows(entry.base_adapter, resolution.home),
         }
     except (cache.ProbeError, TimeoutError) as error:
         message = "check timed out" if isinstance(error, TimeoutError) else str(error)
@@ -2535,7 +2572,8 @@ def _agents_check(
     else:
         for result in results:
             if result["ok"]:
-                _write_stdout(f"{result['agent']} ok\n")
+                suffix = f" · {_windows_text(result['windows'])}" if result["windows"] else ""
+                _write_stdout(f"{result['agent']} ok{suffix}\n")
             else:
                 _write_stdout(f"{result['agent']} failed: {result['error']}\n")
     failed = [str(result["agent"]) for result in results if not result["ok"]]

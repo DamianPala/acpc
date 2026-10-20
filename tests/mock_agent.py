@@ -108,6 +108,12 @@ restricted mode), models ``mock-opus-5``/``mock-sonnet-5``/``mock-haiku-4-5``,
 efforts ``low``/``medium``/``high``/``xhigh`` — any other effort value is
 rejected with a RequestError, giving the client a real "unsupported effort
 level" to surface. A small command list is advertised after session/new.
+Subscription windows (all off by default): ``ACPC_MOCK_RATE_WINDOWS=1`` sends
+one real-context usage update after the first assistant message of each prompt;
+``bare`` omits unifiedWindows, ``skip`` sends nothing. ``ACPC_MOCK_RATE_FIVE_HOUR``
+and ``ACPC_MOCK_RATE_SEVEN_DAY`` accept fraction:seconds (defaults 0.24:3600 and
+0.06:259200), or ``none`` to omit that window. Works with ACPC_MOCK_LIMIT_META=1.
+
 """
 
 import asyncio
@@ -382,6 +388,8 @@ class MockAgent(Agent):
         self._late_updates: list[asyncio.Task[None]] = []
         self._steered: dict[str, list[str]] = {}
         self._limit_prompt_counts: dict[str, int] = {}
+        self._windows_sent: set[str] = set()
+        self._last_usage: dict[str, tuple[int, int]] = {}
 
     def on_connect(self, conn: Client) -> None:
         self._conn = conn
@@ -773,6 +781,7 @@ class MockAgent(Agent):
             if hasattr(block, "text"):
                 prompt_text += block.text
 
+        self._windows_sent.discard(session_id)
         self._record_event(f"prompt:{session_id}:{prompt_text}")
         history = list(self._sessions.get(session_id, []))
         self._sessions.setdefault(session_id, []).append(prompt_text)
@@ -1270,7 +1279,9 @@ class MockAgent(Agent):
         if os.environ.get("ACPC_MOCK_LIMIT_VENDOR") == "codex":
             raise _codex_limit_error(reset_epoch, zone_name)
 
-        if os.environ.get("ACPC_MOCK_LIMIT_AFTER_TEXT") == "1":
+        if os.environ.get("ACPC_MOCK_LIMIT_AFTER_TEXT") == "1" or os.environ.get(
+            "ACPC_MOCK_RATE_WINDOWS"
+        ) in ("1", "bare"):
             await self._send_text(session_id, "working on it")
         if os.environ.get("ACPC_MOCK_LIMIT_META") == "1":
             await self._send_usage_meta(
@@ -1294,11 +1305,19 @@ class MockAgent(Agent):
         raise RequestError(-32603, f"Internal error: {text}", data)
 
     async def _send_usage_meta(self, session_id: str, *, rate_limit: dict[str, Any]) -> None:
+        window_info = self._rate_window_info()
+        info = {**window_info, **rate_limit}
+        meta: dict[str, Any] = {"_claude/rateLimit": info}
+        used, size = 0, 200_000
+        if window_info:
+            info["resetsAt"] = int(info["resetsAt"])
+            used, size = self._last_usage.get(session_id, (1200, 200_000))
+            meta["_claude/model"] = self._models.get(session_id, DEFAULT_MODEL)
         update = UsageUpdate(
             session_update="usage_update",
-            used=0,
-            size=200_000,
-            field_meta={"_claude/rateLimit": rate_limit},
+            used=used,
+            size=size,
+            field_meta=meta,
         )
         try:
             await self._conn.session_update(session_id=session_id, update=update)
@@ -1479,6 +1498,47 @@ class MockAgent(Agent):
     async def _send_text(self, session_id: str, text: str) -> None:
         chunk = update_agent_message(text_block(text))
         await self._conn.session_update(session_id=session_id, update=chunk)
+        if session_id in self._prompt_active and session_id not in self._windows_sent:
+            self._windows_sent.add(session_id)
+            await self._send_rate_windows(session_id)
+
+    def _rate_window_info(self) -> dict[str, Any]:
+        if os.environ.get("ACPC_MOCK_RATE_WINDOWS") not in ("1", "bare"):
+            return {}
+        windows = {}
+        now = int(time.time())
+        for name, knob, default in (
+            ("five_hour", "ACPC_MOCK_RATE_FIVE_HOUR", "0.24:3600"),
+            ("seven_day", "ACPC_MOCK_RATE_SEVEN_DAY", "0.06:259200"),
+        ):
+            raw = os.environ.get(knob, default)
+            if raw == "none":
+                continue
+            fraction, seconds = raw.split(":")
+            windows[name] = {"utilization": float(fraction), "resetsAt": now + int(seconds)}
+        info: dict[str, Any] = {
+            "status": "allowed",
+            "rateLimitType": "five_hour",
+            "resetsAt": windows.get("five_hour", {}).get("resetsAt", now),
+        }
+        if os.environ.get("ACPC_MOCK_RATE_WINDOWS") == "1":
+            info["unifiedWindows"] = windows
+        return info
+
+    async def _send_rate_windows(self, session_id: str) -> None:
+        info = self._rate_window_info()
+        if not info:
+            return
+        used, size = self._last_usage.get(session_id, (1200, 200_000))
+        await self._send_usage(
+            session_id,
+            used=used,
+            size=size,
+            field_meta={
+                "_claude/rateLimit": info,
+                "_claude/model": self._models.get(session_id, DEFAULT_MODEL),
+            },
+        )
 
     async def _send_steered(self, session_id: str) -> None:
         """Acknowledge accepted corrections inside the turn that took them.
@@ -1496,12 +1556,18 @@ class MockAgent(Agent):
         used: int,
         cost: float | None = None,
         size: int = 200_000,
+        *,
+        field_meta: dict[str, Any] | None = None,
     ) -> None:
+        self._last_usage[session_id] = (used, size)
         update = UsageUpdate(
             session_update="usage_update",
-            field_meta={"_claude/model": os.environ["ACPC_MOCK_SERVED_MODEL"]}
-            if os.environ.get("ACPC_MOCK_SERVED_MODEL")
-            else None,
+            field_meta=field_meta
+            or (
+                {"_claude/model": os.environ["ACPC_MOCK_SERVED_MODEL"]}
+                if os.environ.get("ACPC_MOCK_SERVED_MODEL")
+                else None
+            ),
             used=used,
             size=size,
             cost=Cost(amount=cost, currency="USD") if cost is not None else None,

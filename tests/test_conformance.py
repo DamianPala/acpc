@@ -465,7 +465,9 @@ _USAGE_MODEL_PROPERTIES = frozenset(
 _COMPACTIONS_PROPERTIES = frozenset({"count", "unaccounted", "context_before", "context_after"})
 # R2d's inspection object `status` reports: policy, mode, source and clamp, all required.
 _STATUS_PERMISSIONS_PROPERTIES = frozenset({"policy", "mode", "source", "clamp"})
-_RESOLUTION_REQUIRED = frozenset({"model", "effort", "mode", "permissions", "home"})
+_RESOLUTION_REQUIRED = frozenset(
+    {"model", "effort", "mode", "permissions", "home", "data_residency"}
+)
 _RESOLUTION_PROPERTIES = _RESOLUTION_REQUIRED | {
     "system_prompt",
     "tools",
@@ -522,9 +524,20 @@ EXPECTED_OUTPUT_ORACLES: dict[str, dict[str, tuple[frozenset[str], frozenset[str
     "agents check": {
         "output": (frozenset({"items", "has_more"}), frozenset({"items", "has_more"})),
         "output.items[]": (
-            frozenset({"agent", "ok", "models", "efforts", "error"}),
+            frozenset({"agent", "ok", "models", "efforts", "error", "windows"}),
             frozenset({"agent", "ok"}),
         ),
+        "output.items[].windows": (
+            frozenset({"five_hour", "seven_day", "observed_at", "session_id"}),
+            frozenset({"five_hour", "seven_day", "observed_at", "session_id"}),
+        ),
+        **{
+            f"output.items[].windows.{name}": (
+                frozenset({"utilization", "resets_at"}),
+                frozenset({"utilization", "resets_at"}),
+            )
+            for name in ("five_hour", "seven_day")
+        },
     },
     "agents create": {
         "output": (
@@ -542,6 +555,7 @@ EXPECTED_OUTPUT_ORACLES: dict[str, dict[str, tuple[frozenset[str], frozenset[str
         "output": (
             frozenset(
                 {
+                    "windows",
                     "agent",
                     "base_adapter",
                     "system_prompt_file",
@@ -564,8 +578,8 @@ EXPECTED_OUTPUT_ORACLES: dict[str, dict[str, tuple[frozenset[str], frozenset[str
             frozenset({"agent"}),
         ),
         "output.resolved": (
-            frozenset({"model", "effort", "mode", "permissions", "home"}),
-            frozenset({"model", "effort", "mode", "permissions", "home"}),
+            frozenset({"model", "effort", "mode", "permissions", "home", "data_residency"}),
+            frozenset({"model", "effort", "mode", "permissions", "home", "data_residency"}),
         ),
         "output.resolved.model": (
             frozenset({"value", "source"}),
@@ -586,6 +600,22 @@ EXPECTED_OUTPUT_ORACLES: dict[str, dict[str, tuple[frozenset[str], frozenset[str
         "output.resolved.permissions": (
             frozenset({"value", "source"}),
             frozenset({"value", "source"}),
+        ),
+        "output.resolved.data_residency": (
+            frozenset({"value", "source"}),
+            frozenset({"value", "source"}),
+        ),
+        "output.windows": (
+            frozenset({"five_hour", "seven_day", "observed_at", "session_id"}),
+            frozenset({"five_hour", "seven_day", "observed_at", "session_id"}),
+        ),
+        "output.windows.five_hour": (
+            frozenset({"utilization", "resets_at"}),
+            frozenset({"utilization", "resets_at"}),
+        ),
+        "output.windows.seven_day": (
+            frozenset({"utilization", "resets_at"}),
+            frozenset({"utilization", "resets_at"}),
         ),
         "output.resolved.home": (
             frozenset({"value", "source"}),

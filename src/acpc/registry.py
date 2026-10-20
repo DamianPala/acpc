@@ -32,6 +32,7 @@ _USAGE_PROFILES: Final = frozenset(
     {"claude_model_usage", "codex_usage_updates", "grok_meta_usage", "none"}
 )
 _BILLING_VALUES: Final = frozenset({"subscription", "api"})
+_DATA_RESIDENCY_VALUES: Final = frozenset({"eu", "global"})
 SYSTEM_PROMPT_VIA_VALUES: Final = frozenset({"acp_meta", "codex_config", "none"})
 TOOLS_VIA_VALUES: Final = frozenset({"acp_meta", "none"})
 # Provenance defaults to `default` (not `unset`) for these fields.
@@ -72,6 +73,7 @@ _ENTRY_KEYS: Final = frozenset(
         "model_via",
         "usage_profile",
         "billing",
+        "data_residency",
         "limit_wait_max",
         "env_passthrough",
         "extends",
@@ -107,6 +109,7 @@ _FIELD_NAMES: Final = (
     "model_via",
     "usage_profile",
     "billing",
+    "data_residency",
     "limit_wait_max",
     "env_passthrough",
     "description",
@@ -312,6 +315,7 @@ class ResolvedEntry:
     setting_sources: tuple[str, ...] | None = None
     effort_row_origin: Mapping[str, Literal["shipped", "operator"]] = field(default_factory=dict)
     advertised_efforts: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    data_residency: str | None = None
 
     @property
     def is_variant(self) -> bool:
@@ -430,6 +434,7 @@ class ResolvedEntry:
             sources["home"] = self.source_for("home") if home is None else FieldSource("call")
         else:
             sources["home"] = FieldSource("unset")
+        sources["data_residency"] = self.source_for("data_residency")
         sources["env"] = self.source_for("env")
         if system_prompt is None:
             sources["system_prompt"] = FieldSource("unset")
@@ -724,6 +729,15 @@ def _validate_judge_keys(path: Path, raw: dict[str, Any]) -> None:
                 )
 
 
+def _validate_declarations(path: Path, raw: dict[str, Any]) -> None:
+    for key, allowed in (("billing", _BILLING_VALUES), ("data_residency", _DATA_RESIDENCY_VALUES)):
+        if key in raw:
+            value = _expect_string(path, key, raw[key])
+            if value not in allowed:
+                supported = ", ".join(sorted(allowed))
+                raise RegistryError(f"{path}: key '{key}' must be one of: {supported}")
+
+
 def _parse_entry(
     path: Path,
     *,
@@ -783,11 +797,7 @@ def _parse_entry(
             parse_duration(value, allow_zero=True)
         except ValueError as error:
             raise RegistryError(f"{path}: key 'limit_wait_max': {error}") from None
-    if "billing" in raw:
-        value = _expect_string(path, "billing", raw["billing"])
-        if value not in _BILLING_VALUES:
-            supported = ", ".join(sorted(_BILLING_VALUES))
-            raise RegistryError(f"{path}: key 'billing' must be one of: {supported}")
+    _validate_declarations(path, raw)
     if "effort_cli_flag" in raw:
         _expect_string(path, "effort_cli_flag", raw["effort_cli_flag"])
     _validate_judge_keys(path, raw)
@@ -1012,6 +1022,7 @@ def _to_resolved(
         effort_cli_flag=string_or_none("effort_cli_flag"),
         usage_profile=string_or_none("usage_profile") or "none",
         billing=string_or_none("billing"),
+        data_residency=string_or_none("data_residency"),
         limit_wait_max=string_or_none("limit_wait_max"),
         env_passthrough=strings("env_passthrough"),
         description=string_or_none("description"),

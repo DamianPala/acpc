@@ -1556,6 +1556,7 @@ class Daemon:
             usage_finalized=usage_finalized,
             turn_token=request.turn_token,
             advertised=client.advertised if client is not None else {},
+            rate_windows=client.rate_windows if client is not None else None,
         )
 
     async def _prepare_drive(
@@ -1715,6 +1716,7 @@ class Daemon:
             denial_details=client.denial_details,
             adapter_session_id=adapter_session_id,
             advertised=client.advertised,
+            rate_windows=client.rate_windows,
             error=turn_error,
             delivery_record_incomplete=delivery.delivery_record_incomplete,
             turn_token=request.turn_token,
