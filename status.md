@@ -84,17 +84,28 @@ row with NaN, Infinity or an unrenderable `resets_at` crashed `agents get`/`agen
 validator now requires finite numbers and a reset the clock can render, so such a row reads as
 "none observed" and is never written. Known: the read-modify-write on `limits.json` is unlocked
 like `advertised.json`; `unifiedWindows` is an `@internal` CLI field, so a CLI update can silence
-the rows without an error). Each slice: two builder rounds at most, Opus reviewer with mutation testing on a `git
+the rows without an error), 9 (this commit, refactor only: the ACP library and pydantic are
+imported where a turn, a probe or an adapter spawn needs them, never at `acpc.cli` import;
+`cache`, `permissions`, `environment`, `runner` are ACP-free at module load, `cli` reaches
+`runner`, `daemon_client`, `interaction`, `probe` and `asyncio` through a lazy module proxy,
+`acpc.__version__` resolves on first access; `import acpc.cli` 47–80 ms from 424–587, plain
+`python -m acpc --version` 0,08–0,10 s from 0,36; `tests/test_import_floor.py` pins the structure,
+no module named `acp` or `pydantic` after `--version`, `list`, `status`, `agents list`, `resolve`,
+`schema` and a warm `agents get`, and a cold `agents get` must load them; `acpc schema` byte-identical;
+behaviour, exit codes and files unchanged. Live: the real claude run and the codex probe still
+work through the lazy paths). Each slice: two builder rounds at most, Opus reviewer with mutation testing on a `git
 archive` copy with its own venv (a copied `.venv` runs the worktree's code), live on
 claude-agent-acp 0.89.1 with a bare judge (3c: daemon route, session dir = `meta.json` + `lock`,
 `~/.claude-bare` file listing unchanged after the run). Build contract since 2026-10-19 (local to
 this repo): builder and builder-light through the installed acpc (Codex), reviewer and explorer
-through the Agent tool. Next: slice 9, the
-import floor (`import acpc.cli` 424–587 ms today, `acp.schema` alone 229 ms); SPEC deltas and
-briefs in `docs/plans/1.2/`. Known flakes under `-n auto`:
+through the Agent tool. Next: 1.2 close-out, Damian's morning: the slice 6 effort-precedence
+ruling (`docs/plans/1.2/handoff.md`, "Owner rulings for the morning"), then merge `feat/1.2` into
+`main` (fast-forward), bump to 1.2.0 in the 7 version spots, `release-create`, reinstall the host
+tool and update the `ai-lab` container; SPEC deltas, briefs, reports and verdicts in
+`docs/plans/1.2/`. Known flakes under `-n auto`:
 `test_continue_rejects_an_adapter_without_load_session`, the steer `cancel_then_start` wait test,
 and `test_agents_check_reports_has_more_past_the_default_limit` hitting the 30 s timeout on a
-loaded desktop (21 mock spawns; passes alone in 11 s). `feat/1.2` is on origin through `5cecf2b`
+loaded desktop (21 mock spawns; passes alone in 11 s). `feat/1.2` is on origin through `19bf908`
 (fast-forward pushes and `gate.yml` laps under Damian's standing grant, both green on ubuntu and
 macos); main, merge, tags and the release wait for his go.
 

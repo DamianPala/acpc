@@ -5,7 +5,8 @@ parsing, usage errors (exit 2), the TTY rules and the fixed exit codes, and
 delegates everything else to the layer that owns it.
 """
 
-import asyncio
+from __future__ import annotations
+
 import contextlib
 import json
 import os
@@ -19,31 +20,27 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from importlib import import_module
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import TYPE_CHECKING, Any, NoReturn
 
 import click
 
 from acpc import (
-    __version__,
     cache,
     config,
-    daemon_client,
     effects,
     errors,
-    interaction,
     output,
     paths,
     proc,
     render,
-    runner,
     schema,
     sessions,
     skills,
     transcript,
     vocab,
 )
-from acpc import probe as probe_engine
 from acpc.errors import AcpcError, AgentProblem, UsageProblem
 from acpc.permissions import ModeSelectionError, PermissionLevel, select_mode
 from acpc.registry import (
@@ -59,6 +56,32 @@ from acpc.registry import (
     ResolvedEntry,
     RouteNotSupported,
 )
+
+
+class _LazyModule:
+    # Writes go to the module, so a patch through `cli.runner` reaches every importer.
+    def __init__(self, module_name: str) -> None:
+        object.__setattr__(self, "_module_name", module_name)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(import_module(self._module_name), name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(import_module(self._module_name), name, value)
+
+
+if TYPE_CHECKING:
+    import asyncio
+
+    from acpc import daemon_client, interaction, runner
+    from acpc import probe as probe_engine
+else:
+    asyncio = _LazyModule("asyncio")
+    daemon_client = _LazyModule("acpc.daemon_client")
+    interaction = _LazyModule("acpc.interaction")
+    probe_engine = _LazyModule("acpc.probe")
+    runner = _LazyModule("acpc.runner")
+
 
 # How every command that addresses one session names it.  One sentence,
 # published on each of them, because a caller reading one command's schema
@@ -1116,7 +1139,7 @@ def _friendly_usage_problem(message: str, command_path: str | None, exit_code: i
     invoke_without_command=True,
     context_settings={"show_default": True},
 )
-@click.version_option(__version__, "-V", "--version", message="%(version)s")
+@click.version_option(None, "-V", "--version", package_name="acpc", message="%(version)s")
 @click.help_option("-h", "--help")
 @click.pass_context
 def main(ctx: click.Context) -> None:

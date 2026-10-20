@@ -8,7 +8,6 @@ result of a turn that already completed.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import math
 import re
@@ -20,15 +19,10 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from acp import PROTOCOL_VERSION, RequestError
-
 from acpc import paths
-from acpc.client import AcpcClient
-from acpc.permissions import ModeSelectionError, PermissionLevel, select_mode
-from acpc.spawn import spawn_adapter
-from acpc.transcript import Transcript
 
 if TYPE_CHECKING:
+    from acpc.client import AcpcClient
     from acpc.registry import CallResolution
 
 
@@ -289,7 +283,19 @@ def first_sentence(description: str) -> str:
 
 async def probe_advertised(resolution: CallResolution) -> dict[str, Any]:
     """Launch an adapter, initialize it, and create a session for a live probe."""
+    import asyncio  # import floor
+
+    from acp import PROTOCOL_VERSION  # import floor
+
     from acpc import runner as runner_module
+    from acpc.client import AcpcClient  # import floor
+    from acpc.permissions import (
+        ModeSelectionError,
+        PermissionLevel,
+        select_mode,
+    )  # import floor
+    from acpc.spawn import spawn_adapter  # import floor
+    from acpc.transcript import Transcript  # import floor
 
     try:
         command, args = runner_module.adapter_command(resolution)
@@ -360,6 +366,8 @@ async def probe_advertised(resolution: CallResolution) -> dict[str, Any]:
 async def _probe_models(
     connection: Any, session_id: str, resolution: CallResolution, client: AcpcClient
 ) -> None:
+    from acp import RequestError  # import floor
+
     from acpc import runner
 
     if resolution.entry.model_via == "set_model":

@@ -24,7 +24,7 @@ from typing import Any
 
 import click
 
-from acpc import __version__, effects, transcript, vocab
+from acpc import effects, transcript, vocab
 
 # Introspection format version.  It changes when a required field is added, a
 # field is removed, or a field's type or meaning changes — not when an
@@ -1154,6 +1154,8 @@ def detail(name: str, command: click.Command) -> dict[str, Any]:
 
 def index(root: click.Group) -> dict[str, Any]:
     """The D7 index: everything a caller needs to choose a command."""
+    from acpc import __version__  # import floor
+
     return {
         "schema_version": SCHEMA_VERSION,
         "tool_version": __version__,

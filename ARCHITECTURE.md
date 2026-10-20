@@ -45,6 +45,8 @@ permissions.py (frozen)         kind classification + approval policy
 vocab.py (frozen)               efforts, permission values, session states, exit codes
 ```
 
+`cli`, `registry`, `permissions`, `cache`, `environment` and `runner` import no ACP or pydantic at module load (`cli` reaches `runner`, `probe`, `daemon_client`, `interaction` and `asyncio` through a lazy proxy), so the read-only commands start without building the ACP schema models; the probe, cache-miss, turn and adapter-spawn paths import ACP inside the functions that use it. `tests/test_import_floor.py` pins this.
+
 "(frozen)" = harvested from 0.2 verbatim with their tests; the marker records provenance, not an edit restriction (build history in status.md).
 
 ## Module ownership

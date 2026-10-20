@@ -12,8 +12,10 @@ from __future__ import annotations
 from collections.abc import Mapping
 from enum import Enum
 from functools import total_ordering
+from typing import TYPE_CHECKING
 
-from acp.schema import PermissionOption
+if TYPE_CHECKING:
+    from acp.schema import PermissionOption
 
 from acpc.registry import ModeSpec
 from acpc.vocab import PERMISSION_ALIASES

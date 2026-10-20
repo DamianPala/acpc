@@ -15,8 +15,6 @@ import json
 import os
 from collections.abc import Mapping, Sequence
 
-from acp.transports import default_environment
-
 from acpc.paths import acpc_home
 
 _PINNED_TERM = "dumb"
@@ -52,6 +50,8 @@ def base_environment(
     ceiling: str | None = None,
 ) -> dict[str, str]:
     """Build the allowlisted environment inherited by an adapter or daemon."""
+    from acp.transports import default_environment  # import floor
+
     ambient = os.environ if ambient is None else ambient
     environment = dict(default_environment())
     for name, value in ambient.items():

@@ -19,6 +19,8 @@ resolved call and a finished session:
   written before the process exits: a partial answer is still an answer.
 """
 
+from __future__ import annotations
+
 import asyncio
 import contextlib
 import json
@@ -34,9 +36,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, cast
-
-from acp import PROTOCOL_VERSION, RequestError, text_block
+from typing import TYPE_CHECKING, Any, cast
 
 from acpc import (
     cache,
@@ -50,7 +50,6 @@ from acpc import (
     transcript,
     vocab,
 )
-from acpc.client import AcpcClient
 from acpc.permissions import PermissionLevel
 from acpc.proc import process_group_kwargs
 from acpc.registry import (
@@ -63,7 +62,18 @@ from acpc.registry import (
     ResolvedEntry,
     SystemPrompt,
 )
-from acpc.spawn import spawn_adapter
+
+if TYPE_CHECKING:
+    from acpc.client import AcpcClient
+
+
+def __getattr__(name: str) -> Any:
+    if name != "spawn_adapter":
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    from acpc.spawn import spawn_adapter  # import floor
+
+    return spawn_adapter
+
 
 # SPEC.md `cancel`: graceful cancellation with a bounded wait for the ack (10s) — if
 # the callee does not wind down in time, the connection is torn down anyway.
@@ -184,6 +194,8 @@ def describe_error(error: BaseException) -> str:
     A JSON-RPC error's fixed message ("Internal error") often hides the
     vendor's real diagnosis, which rides in the optional `data` member.
     """
+    from acp import RequestError  # import floor
+
     if not isinstance(error, RequestError):
         return str(error)
     message = str(error) or "adapter error"
@@ -774,9 +786,33 @@ def preparation_cancelled_answer(session_id: str) -> str:
     return f"Session {session_id} was canceled during preparation; no prompt was sent.\n"
 
 
+def _spawn_adapter(*args: Any, **kwargs: Any) -> Any:
+    spawn = globals().get("spawn_adapter")
+    if spawn is None:
+        from acpc.spawn import spawn_adapter as spawn  # import floor
+
+    return spawn(*args, **kwargs)
+
+
+def _prompt_block(text: str) -> Any:
+    from acp import text_block  # import floor
+
+    return text_block(text)
+
+
+def _is_request_error(error: BaseException | None) -> bool:
+    if error is None:
+        return False
+    from acp import RequestError  # import floor
+
+    return isinstance(error, RequestError)
+
+
 def _direct_turn_client(
     session_id: str, request: TurnRequest, events: transcript.Transcript, cancel: _CancelSignal
 ) -> AcpcClient:
+    from acpc.client import AcpcClient  # import floor
+
     resolution = request.resolution
     stored = sessions.read_meta(session_id)
     return AcpcClient(
@@ -830,7 +866,7 @@ async def _drive_turn(
 
     try:
         try:
-            async with spawn_adapter(
+            async with _spawn_adapter(
                 client,
                 command,
                 *args,
@@ -895,6 +931,8 @@ async def _prepare_direct_adapter_session(
     client: AcpcClient,
 ) -> tuple[str, TurnRequest]:
     """Initialize or restore the adapter session before applying call options."""
+    from acp import PROTOCOL_VERSION  # import floor
+
     initialize = await conn.initialize(protocol_version=PROTOCOL_VERSION)
     client.capture_adapter(initialize)
     record_usage_identity(session_id, client.adapter_identity)
@@ -1141,6 +1179,8 @@ def observe_config_options(
     model_key: str | None,
 ) -> None:
     """Forward options only when the response actually carries them."""
+    from acpc.client import AcpcClient  # import floor
+
     options = getattr(response, "config_options", None)
     if options is None or observer is None:
         return
@@ -1188,6 +1228,8 @@ async def _configure(call: Any, what: str, *, unknown_option_hint: str | None = 
     option is missing rather than the value wrong. When it says so, the hint
     names what the caller can actually change.
     """
+    from acp import RequestError  # import floor
+
     try:
         return await call
     except RequestError as error:
@@ -1201,7 +1243,7 @@ async def _configure(call: Any, what: str, *, unknown_option_hint: str | None = 
 async def _await_prompt(
     conn: Any,
     adapter_session_id: str,
-    prompt_task: "asyncio.Task[Any]",
+    prompt_task: asyncio.Task[Any],
     request: TurnRequest,
     cancel: _CancelSignal,
     *,
@@ -1244,7 +1286,7 @@ async def _await_prompt(
 
 
 def _stop_reason_of(
-    prompt_task: "asyncio.Task[Any]",
+    prompt_task: asyncio.Task[Any],
     *,
     usage_client: Any | None = None,
 ) -> str | None:
@@ -1345,7 +1387,7 @@ def _limit_action(observation: Any, *, limit_waited_seconds: float, limit_wait_m
     return "wait"
 
 
-async def _sleep_through_limit(seconds: float, cancel: "_CancelSignal") -> bool:
+async def _sleep_through_limit(seconds: float, cancel: _CancelSignal) -> bool:
     """Sleep, interruptible by `cancel`. Returns True when canceled first."""
     sleeper = asyncio.ensure_future(asyncio.sleep(max(0.0, seconds)))
     waiter = asyncio.ensure_future(cancel.requested.wait())
@@ -1365,8 +1407,8 @@ async def run_prompt_with_limits(
     session_id: str,
     adapter_session_id: str,
     request: TurnRequest,
-    cancel: "_CancelSignal",
-    client: "AcpcClient",
+    cancel: _CancelSignal,
+    client: AcpcClient,
     *,
     on_delivered: Callable[[], None] | None = None,
 ) -> tuple[str | None, BaseException | None, PromptDelivery, dict[str, Any] | None]:
@@ -1401,7 +1443,7 @@ async def run_prompt_with_limits(
         # phase callback; a resend after a limit is still the same turn.
         delivered_on_first_send = None
         prompt_task = asyncio.create_task(
-            conn.prompt(session_id=adapter_session_id, prompt=[text_block(prompt_text)])
+            conn.prompt(session_id=adapter_session_id, prompt=[_prompt_block(prompt_text)])
         )
         turn_error: BaseException | None = None
         try:
@@ -1419,7 +1461,7 @@ async def run_prompt_with_limits(
 
         # SPEC.md `run`: a limit is recognized on a failed `session/prompt`; a
         # prompt the adapter completed is never reclassified from metadata.
-        if cancel.requested.is_set() or not isinstance(turn_error, RequestError):
+        if cancel.requested.is_set() or not _is_request_error(turn_error):
             return stop_reason, turn_error, delivery, limit_record
 
         observation = limits.classify_limit(turn_error, client.rate_limit_info, datetime.now(UTC))
@@ -2343,6 +2385,8 @@ def _failure_observation(
 
 def _is_authentication_failure(error: BaseException | None) -> bool:
     """Recognize the narrow ACP auth refusal shape used by vendor adapters."""
+    from acp import RequestError  # import floor
+
     if isinstance(error, AdapterRejection):
         return _is_authentication_failure(error.__cause__)
     if not isinstance(error, RequestError) or error.code != -32000:
