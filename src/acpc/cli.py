@@ -1222,7 +1222,9 @@ def _prompt_file_problem(
     return UsageProblem(message)
 
 
-def _read_prompt_file(prompt_file: str, flag: str = "--prompt-file") -> str:
+def _read_prompt_file(
+    prompt_file: str, flag: str = "--prompt-file", *, newline: str | None = None
+) -> str:
     """Read the prompt file without buffering more than the limit.
 
     `stat` stays as the cheap refusal that never opens the file, but it can
@@ -1240,7 +1242,7 @@ def _read_prompt_file(prompt_file: str, flag: str = "--prompt-file") -> str:
     if size > vocab.MAX_PROMPT_BYTES:
         raise _oversized_prompt(flag, size)
     try:
-        with path.open(encoding="utf-8") as stream:
+        with path.open(encoding="utf-8", newline=newline) as stream:
             text = stream.read(vocab.MAX_PROMPT_BYTES + 1)
     except OSError as error:
         raise _prompt_file_problem(prompt_file, error, flag) from None
@@ -1257,8 +1259,12 @@ def _load_system_prompt(resolution: CallResolution) -> tuple[CallResolution, str
     system_prompt = resolution.system_prompt
     if system_prompt is None:
         return resolution, None
+    _check_codex_config(resolution)
     flag = "--system-prompt-file" if system_prompt.source == "call" else "system_prompt_file"
-    text = _read_prompt_file(system_prompt.path, flag)
+    # codex_config: the core reads the file itself and `continue` compares its
+    # bytes with `system.md`, so the stored copy keeps the file's own newlines.
+    newline = "" if resolution.entry.system_prompt_via == "codex_config" else None
+    text = _read_prompt_file(system_prompt.path, flag, newline=newline)
     if not text.strip():
         raise UsageProblem(
             f"{flag} {system_prompt.path}: the file is empty",
@@ -1266,6 +1272,21 @@ def _load_system_prompt(resolution: CallResolution) -> tuple[CallResolution, str
         )
     sized = replace(system_prompt, size=len(text.encode("utf-8")))
     return replace(resolution, system_prompt=sized), text
+
+
+def _check_codex_config(resolution: CallResolution) -> None:
+    """Refuse a `CODEX_CONFIG` the codex_config merge cannot use, before any adapter contact."""
+    if resolution.entry.system_prompt_via != "codex_config" or resolution.system_prompt is None:
+        return
+    try:
+        resolution.adapter_environment  # noqa: B018 -- evaluated only for its ValueError
+    except ValueError as error:
+        origin = (
+            "the entry's [env]"
+            if "CODEX_CONFIG" in resolution.declared_env
+            else "the caller's environment"
+        )
+        raise UsageProblem(f"{error} from {origin}") from None
 
 
 def _read_prompt(
@@ -5478,6 +5499,8 @@ def _follow_up_request(
         stored_resolution = runner.resolution_from_session(current)
     except runner.RunnerError as error:
         raise _follow_up_problem(error, session_id) from None
+    _verify_codex_system_prompt(current, stored_resolution)
+    _check_codex_config(stored_resolution)
     selection: CallResolution | None = None
     if (
         permissions is not None
@@ -5524,6 +5547,25 @@ def _follow_up_request(
     if request.cwd is None:
         request = replace(request, cwd=_resolve_existing_cwd(None))
     return current, request
+
+
+def _verify_codex_system_prompt(meta: sessions.SessionMeta, resolution: CallResolution) -> None:
+    """Keep Codex's resumed instructions file equal to the saved system prompt."""
+    prompt = resolution.system_prompt
+    if resolution.entry.system_prompt_via != "codex_config" or prompt is None:
+        return
+    system_path = sessions.system_path(meta.session_id)
+    try:
+        matches = Path(prompt.path).read_bytes() == system_path.read_bytes()
+    except OSError:
+        matches = False
+    if not matches:
+        raise AcpcError(
+            f"system_prompt_file {prompt.path} no longer matches the session's {system_path}",
+            kind=errors.CONFLICT,
+            hint="Start a new session for the new prompt, or restore the file.",
+            context={"session_id": meta.session_id},
+        )
 
 
 def _dispatch_follow_up(

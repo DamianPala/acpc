@@ -16,11 +16,11 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 
-from acpc import cache, interaction, paths, sessions, vocab
+from acpc import cache, interaction, paths, proc, runner, sessions, targets, vocab
 from acpc import cli as cli_module
 from acpc.cli import main
 from acpc.permissions import ModeSelectionError
-from acpc.registry import ModeSpec
+from acpc.registry import AgentRegistry, ModeSpec
 
 MOCK_AGENT_SCRIPT = str(Path(__file__).with_name("mock_agent.py"))
 
@@ -2373,6 +2373,289 @@ def test_the_call_flag_on_a_codex_config_adapter_names_the_entry_key_as_the_rout
     assert error["kind"] == "not_supported"
     assert "system_prompt_file on the entry" in error["message"]
     assert sessions_on_disk() == []
+
+
+def write_codex_entry(
+    state_root: Path,
+    name: str,
+    prompt_file: str | None,
+    *,
+    env_value: str | None = None,
+    extends: str | None = None,
+    tools: str | None = None,
+) -> None:
+    if extends is None:
+        fields = ['system_prompt_via = "codex_config"', 'env_passthrough = ["CODEX_CONFIG"]']
+        if prompt_file is not None:
+            fields.append(f"system_prompt_file = {json.dumps(prompt_file)}")
+        if tools is not None:
+            fields.append(tools)
+        if env_value is not None:
+            fields.extend(("[env]", f"CODEX_CONFIG = {json.dumps(env_value)}"))
+        text = MOCK_ENTRY.replace("\n[modes]", "\n" + "\n".join(fields) + "\n\n[modes]", 1)
+    else:
+        text = f"extends = {json.dumps(extends)}\nsystem_prompt_file = {json.dumps(prompt_file)}\n"
+    (state_root / "agents" / f"{name}.toml").write_text(text, encoding="utf-8")
+
+
+def test_codex_config_route_resolution_keeps_the_existing_payload_shape(
+    cli: CliRunner, state_root: Path, tmp_path: Path
+) -> None:
+    prompt = tmp_path / "judge.md"
+    prompt.write_text("judge prompt", encoding="utf-8")
+    write_codex_entry(state_root, "cx", str(prompt))
+
+    resolved = invoke(cli, "resolve", "cx", "--json")
+    agent = invoke(cli, "agents", "get", "cx", "--json")
+
+    assert resolved.exit_code == vocab.EXIT_OK, resolved.stderr
+    resolution = json.loads(resolved.stdout)
+    assert resolution["system_prompt_via"] == "codex_config"
+    assert resolution["resolved"]["system_prompt"] == {
+        "value": str(prompt),
+        "source": "entry",
+        "bytes": len(b"judge prompt"),
+    }
+    assert json.loads(agent.stdout)["refused"] is None
+    assert sessions_on_disk() == []
+
+
+@pytest.mark.parametrize(
+    ("origin", "raw", "declared", "message_origin"),
+    [
+        ("entry", "[]", True, "the entry's [env]"),
+        ("entry", "not json", True, "the entry's [env]"),
+        ("entry", '{"setting":NaN}', True, "the entry's [env]"),
+        ("caller", "[]", False, "the caller's environment"),
+        ("caller", "not json", False, "the caller's environment"),
+        ("caller", '{"setting":Infinity}', False, "the caller's environment"),
+    ],
+)
+def test_malformed_codex_config_is_invalid_input_before_session_creation(
+    cli: CliRunner,
+    state_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    origin: str,
+    raw: str,
+    declared: bool,
+    message_origin: str,
+) -> None:
+    prompt = tmp_path / "judge.md"
+    prompt.write_text("judge prompt", encoding="utf-8")
+    monkeypatch.delenv("CODEX_CONFIG", raising=False)
+    write_codex_entry(state_root, f"cx-{origin}", str(prompt), env_value=raw if declared else None)
+    if not declared:
+        monkeypatch.setenv("CODEX_CONFIG", raw)
+
+    result = invoke(cli, "run", f"cx-{origin}", "case", "--quiet", "--json")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    error = error_envelope(result)
+    assert error["kind"] == "invalid_input"
+    assert "CODEX_CONFIG" in error["message"]
+    assert message_origin in error["message"]
+    shape = "array" if raw == "[]" else "invalid JSON"
+    assert shape in error["message"]
+    assert raw not in error["message"]
+    assert sessions_on_disk() == []
+
+
+def test_codex_config_merges_declared_and_caller_values_into_the_spawned_mock(
+    cli: CliRunner,
+    state_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env_file = state_root / "mock-env.jsonl"
+    monkeypatch.setenv("ACPC_MOCK_ENV_FILE", str(env_file))
+    prompt = tmp_path / "judge.md"
+    prompt.write_text("private prompt text", encoding="utf-8")
+    cases = [
+        ("bare", None, None, {"model_instructions_file": str(prompt)}),
+        (
+            "declared",
+            '{"declared":1}',
+            None,
+            {"declared": 1, "model_instructions_file": str(prompt)},
+        ),
+        (
+            "ambient",
+            None,
+            '{"caller":true}',
+            {"caller": True, "model_instructions_file": str(prompt)},
+        ),
+        (
+            "precedence",
+            '{"entry":true,"model_instructions_file":"entry-old.md"}',
+            '{"caller":true,"model_instructions_file":"caller-old.md"}',
+            {"entry": True, "model_instructions_file": str(prompt)},
+        ),
+    ]
+
+    for name, declared, ambient, expected in cases:
+        if ambient is None:
+            monkeypatch.delenv("CODEX_CONFIG", raising=False)
+        else:
+            monkeypatch.setenv("CODEX_CONFIG", ambient)
+        write_codex_entry(state_root, name, str(prompt), env_value=declared)
+        result = invoke(cli, "run", name, "case", "--quiet", "--json")
+        assert result.exit_code == vocab.EXIT_OK, result.stderr
+        session_id = json.loads(result.stdout)["session_id"]
+        argv = sessions.read_meta(session_id).resolution["command"]
+        assert "private prompt text" not in argv
+        assert "CODEX_CONFIG" not in argv
+
+    records = [json.loads(line) for line in env_file.read_text(encoding="utf-8").splitlines()]
+    assert [json.loads(record["CODEX_CONFIG"]) for record in records] == [
+        expected for _name, _declared, _ambient, expected in cases
+    ]
+
+
+def test_codex_config_merge_reaches_a_daemon_spawn(
+    cli: CliRunner,
+    live_daemon: None,
+    state_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env_file = state_root / "mock-env.jsonl"
+    monkeypatch.setenv("ACPC_MOCK_ENV_FILE", str(env_file))
+    monkeypatch.setenv("CODEX_CONFIG", '{"caller":true}')
+    prompt = tmp_path / "judge.md"
+    prompt.write_text("private prompt text", encoding="utf-8")
+    write_codex_entry(
+        state_root,
+        "cx-daemon",
+        str(prompt),
+        env_value='{"entry":true,"model_instructions_file":"old.md"}',
+    )
+
+    result = invoke(cli, "run", "cx-daemon", "case", "--quiet", "--json")
+
+    assert result.exit_code == vocab.EXIT_OK, result.stderr
+    records = [json.loads(line) for line in env_file.read_text(encoding="utf-8").splitlines()]
+    assert len(records) == 1
+    assert json.loads(records[0]["CODEX_CONFIG"]) == {
+        "entry": True,
+        "model_instructions_file": str(prompt),
+    }
+
+
+def test_codex_prompt_and_config_values_do_not_appear_in_adapter_argv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state_root = tmp_path / ("x" * 150)
+    agents = state_root / "agents"
+    agents.mkdir(parents=True)
+    monkeypatch.setenv("ACPC_HOME", str(state_root))
+    prompt = tmp_path / "judge.md"
+    prompt.write_text("private prompt text", encoding="utf-8")
+    write_codex_entry(
+        state_root,
+        "cx",
+        str(prompt),
+        env_value='{"secret":"private config value"}',
+    )
+    release = tmp_path / "release-before-prompt"
+    ready = tmp_path / "before-prompt-ready"
+    monkeypatch.setenv("ACPC_MOCK_BLOCK_BEFORE_PROMPT", str(release))
+    monkeypatch.setenv("ACPC_MOCK_BLOCK_BEFORE_PROMPT_READY", str(ready))
+    command = [
+        sys.executable,
+        "-c",
+        "from acpc.cli import main; raise SystemExit(main())",
+        "run",
+        "cx",
+        "case",
+        "--name",
+        "ps-hygiene",
+        "--quiet",
+        "--json",
+    ]
+    process = subprocess.Popen(
+        command,
+        env=os.environ.copy(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not ready.exists():
+            time.sleep(0.02)
+        assert ready.exists()
+        session_id = sessions.resolve_selector("ps-hygiene")
+        running = sessions.read_meta(session_id)
+        assert running.pid is not None
+        stored_command = running.resolution["command"]
+        assert "private prompt text" not in stored_command
+        assert "private config value" not in stored_command
+        assert "CODEX_CONFIG" not in stored_command
+        if sys.platform == "linux":
+            children_path = Path(f"/proc/{process.pid}/task/{process.pid}/children")
+            child_pids = [int(value) for value in children_path.read_text().split()]
+            adapter_argv = None
+            for child_pid in child_pids:
+                candidate = proc.process_cmdline(child_pid)
+                if candidate is not None and MOCK_AGENT_SCRIPT in candidate:
+                    adapter_argv = candidate
+                    break
+            assert adapter_argv is not None
+            assert "private prompt text" not in " ".join(adapter_argv)
+            assert "private config value" not in " ".join(adapter_argv)
+            assert "CODEX_CONFIG" not in adapter_argv
+    finally:
+        release.touch()
+        try:
+            process.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate(timeout=10)
+    assert process.returncode == 0
+
+
+def test_codex_config_route_preserves_tool_list_refusal(
+    cli: CliRunner, state_root: Path, tmp_path: Path
+) -> None:
+    prompt = tmp_path / "judge.md"
+    prompt.write_text("judge prompt", encoding="utf-8")
+    write_codex_entry(state_root, "cx-tools", str(prompt), tools="tools = []")
+
+    result = invoke(cli, "run", "cx-tools", "case", "--quiet", "--json")
+
+    assert result.exit_code == vocab.EXIT_USAGE
+    error = error_envelope(result)
+    assert error["kind"] == "not_supported"
+    assert "tools" in error["message"]
+    assert sessions_on_disk() == []
+
+
+def test_codex_prompt_path_partitions_targets_and_is_absent_without_a_prompt(
+    state_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("CODEX_CONFIG", raising=False)
+    first = tmp_path / "first.md"
+    second = tmp_path / "second.md"
+    first.write_text("first", encoding="utf-8")
+    second.write_text("second", encoding="utf-8")
+    write_codex_entry(state_root, "cx", str(first))
+    first_resolution = AgentRegistry().resolve_call("cx", permissions="read")
+    same_resolution = AgentRegistry().resolve_call("cx", permissions="read")
+    write_codex_entry(state_root, "cx", str(second))
+    second_resolution = AgentRegistry().resolve_call("cx", permissions="read")
+    write_codex_entry(state_root, "cx-base", str(first))
+    write_codex_entry(state_root, "cx-variant", str(second), extends="cx-base")
+    variant_resolution = AgentRegistry().resolve_call("cx-variant", permissions="read")
+    write_codex_entry(state_root, "cx-bare", None)
+    bare = AgentRegistry().resolve_call("cx-bare", permissions="read")
+
+    assert runner.call_target(first_resolution) == runner.call_target(same_resolution)
+    assert runner.call_target(first_resolution) != runner.call_target(second_resolution)
+    assert runner.call_target(first_resolution) != runner.call_target(variant_resolution)
+    assert runner.call_target(bare) == targets.target_for_call(
+        "cx-bare", home=bare.home, declared_env=bare.declared_env, permissions="read"
+    )
 
 
 def test_a_missing_system_prompt_file_is_a_usage_error_naming_the_flag(

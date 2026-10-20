@@ -5,8 +5,11 @@ install_command = "npm install -g @agentclientprotocol/codex-acp"
 home = "~/.codex"
 home_env = "CODEX_HOME"
 usage_profile = "codex_usage_updates"
-# No system prompt or tool list route yet: codex-acp ignores `_meta.systemPrompt`.
-system_prompt_via = "none"
+# System prompt per entry: `system_prompt_file` travels as `model_instructions_file`
+# inside CODEX_CONFIG (verified live 2026-10-20 on codex-acp 2.2.2 / codex 0.160.1:
+# full replacement, re-read at every thread start and resume). No tool list route:
+# codex-acp takes none.
+system_prompt_via = "codex_config"
 tools_via = "none"
 env_passthrough = [
     "CODEX_HOME",

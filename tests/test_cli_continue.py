@@ -2919,6 +2919,248 @@ def wire_meta(wire_file: Path, method: str) -> list[dict[str, Any]]:
     return [event["params"]["meta"] for event in events if event["method"] == method]
 
 
+def write_codex_entry(state_root: Path, prompt_file: Path) -> None:
+    fields = (
+        'system_prompt_via = "codex_config"\n'
+        f"system_prompt_file = {json.dumps(str(prompt_file))}\n"
+        'env_passthrough = ["CODEX_CONFIG"]\n'
+    )
+    text = MOCK_ENTRY.replace("\n[modes]", f"\n{fields}\n[modes]", 1)
+    (state_root / "agents" / "mock.toml").write_text(text, encoding="utf-8")
+
+
+def continue_error(result) -> dict[str, Any]:
+    lines = [line for line in result.stderr.splitlines() if line.strip()]
+    return json.loads(lines[-1])["error"]
+
+
+def test_codex_config_continue_reuses_the_stored_file_on_the_direct_route(
+    cli: CliRunner,
+    state_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env_file = state_root / "mock-env.jsonl"
+    monkeypatch.setenv("ACPC_MOCK_ENV_FILE", str(env_file))
+    prompt = tmp_path / "judge.md"
+    prompt.write_text("stored prompt", encoding="utf-8")
+    write_codex_entry(state_root, prompt)
+    started = invoke(cli, "run", "mock", "case one", "--quiet", "--json")
+    session_id = json.loads(started.stdout)["session_id"]
+    other_prompt = tmp_path / "other.md"
+    other_prompt.write_text("new entry prompt", encoding="utf-8")
+    write_codex_entry(state_root, other_prompt)
+
+    continued = invoke(cli, "continue", session_id, "case two", "--quiet")
+
+    assert started.exit_code == vocab.EXIT_OK, started.stderr
+    assert continued.exit_code == vocab.EXIT_OK, continued.stderr
+    records = [json.loads(line) for line in env_file.read_text(encoding="utf-8").splitlines()]
+    assert [json.loads(record["CODEX_CONFIG"]) for record in records] == [
+        {"model_instructions_file": str(prompt)},
+        {"model_instructions_file": str(prompt)},
+    ]
+    assert sessions.system_path(session_id).read_bytes() == prompt.read_bytes()
+
+
+@pytest.mark.parametrize("change", ["edited", "removed"])
+def test_codex_config_continue_refuses_a_changed_or_missing_file_on_the_direct_route(
+    cli: CliRunner,
+    state_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+) -> None:
+    env_file = state_root / "mock-env.jsonl"
+    monkeypatch.setenv("ACPC_MOCK_ENV_FILE", str(env_file))
+    prompt = tmp_path / "judge.md"
+    prompt.write_text("stored prompt", encoding="utf-8")
+    write_codex_entry(state_root, prompt)
+    started = invoke(cli, "run", "mock", "case one", "--quiet", "--json")
+    session_id = json.loads(started.stdout)["session_id"]
+    if change == "edited":
+        prompt.write_text("edited prompt", encoding="utf-8")
+    else:
+        prompt.unlink()
+
+    result = invoke(cli, "continue", session_id, "case two", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    error = continue_error(result)
+    assert error["kind"] == "conflict"
+    assert str(prompt) in error["message"]
+    assert str(sessions.system_path(session_id)) in error["message"]
+    assert error["hint"] == "Start a new session for the new prompt, or restore the file."
+    assert sessions.read_meta(session_id).turns == 1
+    assert len(env_file.read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_codex_config_continue_reuses_the_stored_file_after_a_cold_daemon_restart(
+    cli: CliRunner,
+    live_daemon: None,
+    state_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env_file = state_root / "mock-env.jsonl"
+    monkeypatch.setenv("ACPC_MOCK_ENV_FILE", str(env_file))
+    prompt = tmp_path / "judge.md"
+    prompt.write_text("stored prompt", encoding="utf-8")
+    write_codex_entry(state_root, prompt)
+    started = invoke(cli, "run", "mock", "case one", "--quiet", "--json")
+    session_id = json.loads(started.stdout)["session_id"]
+    stored = runner.resolution_from_session(sessions.read_meta(session_id))
+    other_prompt = tmp_path / "other.md"
+    other_prompt.write_text("new entry prompt", encoding="utf-8")
+    write_codex_entry(state_root, other_prompt)
+    stop_session_daemon(session_id)
+    wait_for_daemon_stop(stored)
+
+    continued = invoke(cli, "continue", session_id, "case two", "--quiet")
+
+    assert started.exit_code == vocab.EXIT_OK, started.stderr
+    assert continued.exit_code == vocab.EXIT_OK, continued.stderr
+    records = [json.loads(line) for line in env_file.read_text(encoding="utf-8").splitlines()]
+    assert [json.loads(record["CODEX_CONFIG"]) for record in records] == [
+        {"model_instructions_file": str(prompt)},
+        {"model_instructions_file": str(prompt)},
+    ]
+
+
+@pytest.mark.parametrize("change", ["edited", "removed"])
+def test_codex_config_continue_refuses_a_changed_or_missing_file_before_daemon_contact(
+    cli: CliRunner,
+    live_daemon: None,
+    state_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+) -> None:
+    env_file = state_root / "mock-env.jsonl"
+    monkeypatch.setenv("ACPC_MOCK_ENV_FILE", str(env_file))
+    prompt = tmp_path / "judge.md"
+    prompt.write_text("stored prompt", encoding="utf-8")
+    write_codex_entry(state_root, prompt)
+    started = invoke(cli, "run", "mock", "case one", "--quiet", "--json")
+    session_id = json.loads(started.stdout)["session_id"]
+    stored = runner.resolution_from_session(sessions.read_meta(session_id))
+    stop_session_daemon(session_id)
+    wait_for_daemon_stop(stored)
+    if change == "edited":
+        prompt.write_text("edited prompt", encoding="utf-8")
+    else:
+        prompt.unlink()
+
+    result = invoke(cli, "continue", session_id, "case two", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    error = continue_error(result)
+    assert error["kind"] == "conflict"
+    assert str(prompt) in error["message"]
+    assert str(sessions.system_path(session_id)) in error["message"]
+    assert sessions.read_meta(session_id).turns == 1
+    assert len(env_file.read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_acp_meta_continue_keeps_the_saved_prompt_when_the_entry_file_changes(
+    cli: CliRunner,
+    state_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wire_file = tmp_path / "wire.jsonl"
+    monkeypatch.setenv("ACPC_MOCK_WIRE_FILE", str(wire_file))
+    prompt = tmp_path / "judge.md"
+    prompt.write_text("stored prompt", encoding="utf-8")
+    write_judge_entry(state_root, f"system_prompt_file = {json.dumps(str(prompt))}\n")
+    started = invoke(cli, "run", "judge", "case one", "--quiet", "--json")
+    session_id = json.loads(started.stdout)["session_id"]
+    prompt.write_text("edited prompt", encoding="utf-8")
+
+    continued = invoke(cli, "continue", session_id, "case two", "--quiet")
+
+    assert continued.exit_code == vocab.EXIT_OK, continued.stderr
+    assert wire_meta(wire_file, "session/load") == [{"systemPrompt": "stored prompt"}]
+
+
+def test_acp_meta_entry_passes_codex_config_through_unmerged(
+    cli: CliRunner, state_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env_file = state_root / "mock-env.jsonl"
+    monkeypatch.setenv("ACPC_MOCK_ENV_FILE", str(env_file))
+    monkeypatch.setenv("CODEX_CONFIG", '{"caller":1}')
+    prompt = tmp_path / "judge.md"
+    prompt.write_text("stored prompt", encoding="utf-8")
+    extra = f'system_prompt_file = {json.dumps(str(prompt))}\nenv_passthrough = ["CODEX_CONFIG"]\n'
+    write_judge_entry(state_root, extra)
+
+    started = invoke(cli, "run", "judge", "case one", "--quiet", "--json")
+
+    assert started.exit_code == vocab.EXIT_OK, started.stderr
+    records = [json.loads(line) for line in env_file.read_text(encoding="utf-8").splitlines()]
+    assert [record["CODEX_CONFIG"] for record in records] == ['{"caller":1}']
+
+
+def test_codex_config_continue_keeps_crlf_bytes_and_refuses_a_newline_rewrite(
+    cli: CliRunner, state_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("CODEX_CONFIG", raising=False)
+    prompt = tmp_path / "judge.md"
+    prompt.write_bytes(b"line one\r\nline two\r\n")
+    write_codex_entry(state_root, prompt)
+    started = invoke(cli, "run", "mock", "case one", "--quiet", "--json")
+    session_id = json.loads(started.stdout)["session_id"]
+
+    continued = invoke(cli, "continue", session_id, "case two", "--quiet")
+    prompt.write_bytes(b"line one\nline two\n")
+    refused = invoke(cli, "continue", session_id, "case three", "--quiet")
+
+    assert continued.exit_code == vocab.EXIT_OK, continued.stderr
+    assert sessions.system_path(session_id).read_bytes() == b"line one\r\nline two\r\n"
+    assert refused.exit_code == vocab.EXIT_AGENT_ERROR
+    assert continue_error(refused)["kind"] == "conflict"
+
+
+def continue_with_a_malformed_caller_value(
+    cli: CliRunner, state_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env_file = state_root / "mock-env.jsonl"
+    monkeypatch.setenv("ACPC_MOCK_ENV_FILE", str(env_file))
+    monkeypatch.delenv("CODEX_CONFIG", raising=False)
+    prompt = tmp_path / "judge.md"
+    prompt.write_text("stored prompt", encoding="utf-8")
+    write_codex_entry(state_root, prompt)
+    started = invoke(cli, "run", "mock", "case one", "--quiet", "--json")
+    session_id = json.loads(started.stdout)["session_id"]
+    monkeypatch.setenv("CODEX_CONFIG", "[]")
+
+    result = invoke(cli, "continue", session_id, "case two", "--quiet")
+
+    assert result.exit_code == vocab.EXIT_USAGE, result.stderr
+    error = continue_error(result)
+    assert error["kind"] == "invalid_input"
+    assert "CODEX_CONFIG" in error["message"]
+    assert "the caller's environment" in error["message"]
+    assert sessions.read_meta(session_id).turns == 1
+    assert len(env_file.read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_codex_config_continue_refuses_a_malformed_caller_value_on_the_direct_route(
+    cli: CliRunner, state_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    continue_with_a_malformed_caller_value(cli, state_root, tmp_path, monkeypatch)
+
+
+def test_codex_config_continue_refuses_a_malformed_caller_value_before_daemon_contact(
+    cli: CliRunner,
+    live_daemon: None,
+    state_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    continue_with_a_malformed_caller_value(cli, state_root, tmp_path, monkeypatch)
+
+
 @pytest.mark.parametrize(
     ("advertise_resume", "method"), [("0", "session/load"), ("1", "session/resume")]
 )

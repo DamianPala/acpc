@@ -687,6 +687,11 @@ def call_target(resolution: CallResolution) -> str:
         spawn_identity["effort"] = resolution.effort
         flag = resolution.entry.effort_cli_flag or "--reasoning-effort"
         spawn_identity["effort_cli_flag"] = flag
+    if (
+        resolution.entry.system_prompt_via == "codex_config"
+        and resolution.system_prompt is not None
+    ):
+        spawn_identity["system_prompt_file"] = resolution.system_prompt.path
     return targets.target_for_call(
         resolution.entry.entry,
         home=resolution.home,

@@ -1804,6 +1804,7 @@ async def main() -> None:
                     flush=True,
                 )
                 raise SystemExit(2)
+    _record_startup_environment()
     # The SDK logs every errored request ("Background task failed" plus a
     # traceback) to stderr, racing the JSON-RPC error into the daemon log; tests
     # that assert on the log tail need stderr to hold only what a scenario prints.
@@ -1813,6 +1814,13 @@ async def main() -> None:
         os.environ.get("ACPC_MOCK_ADVERTISE_CLOSE"),
     )
     await run_agent(MockAgent(), use_unstable_protocol=unstable)
+
+
+def _record_startup_environment() -> None:
+    env_file = os.environ.get("ACPC_MOCK_ENV_FILE")
+    if env_file:
+        with Path(env_file).open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(dict(os.environ)) + "\n")
 
 
 if __name__ == "__main__":

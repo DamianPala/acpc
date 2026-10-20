@@ -11,6 +11,7 @@ spawned daemon or adapter resolves the same state root as its caller —
 `ACPC_HOME` is the one that matters; the wildcard keeps test toggles working.
 """
 
+import json
 import os
 from collections.abc import Mapping, Sequence
 
@@ -101,3 +102,37 @@ def adapter_environment(
         environment["ACPC_CEILING"] = ceiling
     environment.pop("ACPC_PARENT_SESSION", None)
     return environment
+
+
+def with_codex_instructions(env: Mapping[str, str], path: str) -> dict[str, str]:
+    """Add Codex's per-thread instructions file to the constructed environment."""
+    result = dict(env)
+    raw = result.get("CODEX_CONFIG")
+    if raw is None:
+        config: object = {}
+    else:
+
+        def reject_non_json_constant(_constant: str) -> None:
+            raise ValueError
+
+        try:
+            config = json.loads(raw, parse_constant=reject_non_json_constant)
+        except ValueError:
+            raise ValueError("CODEX_CONFIG must be a JSON object (found invalid JSON)") from None
+    if not isinstance(config, dict):
+        if isinstance(config, list):
+            shape = "array"
+        elif config is None:
+            shape = "null"
+        elif isinstance(config, bool):
+            shape = "boolean"
+        elif isinstance(config, str):
+            shape = "string"
+        else:
+            shape = "number"
+        raise ValueError(  # noqa: TRY004 -- the caller maps malformed values to invalid_input.
+            f"CODEX_CONFIG must be a JSON object (found a JSON {shape})"
+        )
+    config["model_instructions_file"] = path
+    result["CODEX_CONFIG"] = json.dumps(config, separators=(",", ":"))
+    return result

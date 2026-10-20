@@ -55,20 +55,31 @@ the agent that claude and codex fill their rows through `agents check` and an ov
 an exclusion list. Ruled by a Fable arbiter on 2026-10-19 over the plan's "advertised > entry row
 > union"; Damian may still revert it. Live on claude: `judge --effort ultra` refused naming
 `advertised by claude`, an entry with a model and no effort runs and continues on the vendor
-default with no warning; on codex: `ultra` refused on `gpt-6-luna`, allowed on `gpt-6-sol`). Each slice: two builder rounds at most, Opus reviewer with mutation testing on a `git
+default with no warning; on codex: `ultra` refused on `gpt-6-luna`, allowed on `gpt-6-sol`), 7
+(this commit: codex carries the entry's `system_prompt_file` as `model_instructions_file` inside the
+`CODEX_CONFIG` JSON object of the adapter's environment, merged into any declared or ambient value,
+`system_prompt_via = "codex_config"` on the shipped adapter; a `CODEX_CONFIG` that is not a JSON
+object is `invalid_input` naming the variable's origin before any session, on `run` and on
+`continue`; the daemon spawn identity carries the prompt path; `continue` refuses `conflict` when
+the entry file no longer byte-matches the session's `system.md`, because the codex core re-reads
+the file at every thread start and resume; the `codex_config` copy keeps the file's own newlines.
+Live on codex-acp 2.2.2 / codex 0.160.1, `gpt-5.6-luna`: the entry prompt replaces the vendor's
+(`ACPC-S7-A`), `served_model` filled, edited or removed file → `conflict` with no turn consumed,
+warm and cold; `continue` with a malformed caller value refused before daemon contact. Backlog from
+the review: a non-UTF-8 prompt file is `operation_failed (UnicodeDecodeError)` on every route
+(pre-existing), the `continue` byte read of the entry file has no size cap, `acp_meta` still stores
+newline-translated text in `system.md`). Each slice: two builder rounds at most, Opus reviewer with mutation testing on a `git
 archive` copy with its own venv (a copied `.venv` runs the worktree's code), live on
 claude-agent-acp 0.89.1 with a bare judge (3c: daemon route, session dir = `meta.json` + `lock`,
 `~/.claude-bare` file listing unchanged after the run). Build contract since 2026-10-19 (local to
 this repo): builder and builder-light through the installed acpc (Codex), reviewer and explorer
-through the Agent tool. Next: slice 7, the codex `codex_config` system-prompt route (verified
-live 2026-10-20: `model_instructions_file` inside the `CODEX_CONFIG` JSON replaces the vendor
-prompt and is re-read at every thread start and resume), then 8 `data_residency` + subscription
-windows per vendor home (claude only; codex-acp 2.2.2 forwards no rate limits), then 9 the
+through the Agent tool. Next: slice 8, `data_residency` + subscription windows per vendor home
+(claude's `unifiedWindows` only; codex-acp 2.2.2 forwards no rate limits), then 9 the
 import floor (`import acpc.cli` 424–587 ms today, `acp.schema` alone 229 ms); SPEC deltas and
 briefs in `docs/plans/1.2/`. Known flakes under `-n auto`:
 `test_continue_rejects_an_adapter_without_load_session`, the steer `cancel_then_start` wait test,
 and `test_agents_check_reports_has_more_past_the_default_limit` hitting the 30 s timeout on a
-loaded desktop (21 mock spawns; passes alone in 11 s). `feat/1.2` is on origin through `1e7818f`
+loaded desktop (21 mock spawns; passes alone in 11 s). `feat/1.2` is on origin through `23e926f`
 (fast-forward pushes and `gate.yml` laps under Damian's standing grant, both green on ubuntu and
 macos); main, merge, tags and the release wait for his go.
 

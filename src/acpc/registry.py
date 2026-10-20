@@ -18,7 +18,7 @@ from importlib.resources import files
 from pathlib import Path
 from typing import Any, Final, Literal
 
-from acpc.environment import adapter_environment
+from acpc.environment import adapter_environment, with_codex_instructions
 from acpc.paths import agents_dir
 from acpc.vocab import EFFORT_VALUES, PERMISSION_ALIASES, PERMISSION_VALUES, normalize_permission
 
@@ -243,7 +243,10 @@ class CallResolution:
         if self.home is not None and self.entry.home_env is not None:
             declared[self.entry.home_env] = str(Path(self.home).expanduser())
         ceiling = "read" if self.permissions == "ask" else self.permissions
-        return adapter_environment(declared, self.env_passthrough, ceiling=ceiling)
+        result = adapter_environment(declared, self.env_passthrough, ceiling=ceiling)
+        if self.entry.system_prompt_via == "codex_config" and self.system_prompt is not None:
+            result = with_codex_instructions(result, self.system_prompt.path)
+        return result
 
     @property
     def command(self) -> tuple[str, ...]:
@@ -535,11 +538,7 @@ class ResolvedEntry:
         if route == "acp_meta":
             return SystemPrompt(self.system_prompt_file, "entry")
         if route == "codex_config":
-            raise RouteNotSupported(
-                f"entry {self.entry} sets system_prompt_file, but this acpc does not carry "
-                f"the codex_config route of adapter {self.base_adapter} yet",
-                hint=_DROP_KEY_HINT,
-            )
+            return SystemPrompt(self.system_prompt_file, "entry")
         raise RouteNotSupported(
             f"entry {self.entry} sets system_prompt_file, but adapter {self.base_adapter} "
             "has no system prompt route (system_prompt_via = none)",

@@ -929,9 +929,11 @@ def test_shipped_adapters_declare_the_system_prompt_and_tool_routes(tmp_path: Pa
 
     assert (claude.system_prompt_via, claude.tools_via) == ("acp_meta", "acp_meta")
     assert claude.provenance["system_prompt_via"].kind == "adapter-default"
-    for name in ("codex", "grok"):
-        entry = registry.resolve(name)
-        assert (entry.system_prompt_via, entry.tools_via) == ("none", "none")
+    codex = registry.resolve("codex")
+    assert (codex.system_prompt_via, codex.tools_via) == ("codex_config", "none")
+    grok = registry.resolve("grok")
+    assert (grok.system_prompt_via, grok.tools_via) == ("none", "none")
+    for entry in (codex, grok):
         assert entry.system_prompt_file is None
         assert entry.tools is None
 
@@ -1062,7 +1064,6 @@ def test_call_resolution_records_prompt_and_tool_sources(tmp_path: Path) -> None
             {"system_prompt_file": "/x/p.md"},
             "system_prompt_file on",
         ),
-        ('system_prompt_via = "codex_config"\nsystem_prompt_file = "p.md"\n', {}, "codex_config"),
     ],
 )
 def test_a_key_without_a_route_is_refused_naming_entry_and_adapter(

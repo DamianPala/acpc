@@ -170,6 +170,31 @@ def test_initialize_prompt_answer_round_trip(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
+def test_mock_records_its_startup_environment(tmp_path: Path) -> None:
+    env_file = tmp_path / "adapter-env.jsonl"
+
+    async def scenario() -> None:
+        async with spawn_adapter(
+            DriverClient(),
+            sys.executable,
+            MOCK_AGENT_SCRIPT,
+            env={
+                "PATH": "/usr/bin:/bin",
+                "HOME": str(tmp_path),
+                "ACPC_MOCK_ENV_FILE": str(env_file),
+                "CODEX_CONFIG": '{"model_instructions_file":"/tmp/prompt.md"}',
+            },
+            cwd=str(tmp_path),
+        ) as (conn, _process):
+            await conn.initialize(protocol_version=PROTOCOL_VERSION)
+
+    asyncio.run(scenario())
+
+    records = [json.loads(line) for line in env_file.read_text(encoding="utf-8").splitlines()]
+    assert len(records) == 1
+    assert records[0]["CODEX_CONFIG"] == '{"model_instructions_file":"/tmp/prompt.md"}'
+
+
 def test_durable_store_updates_are_process_safe(tmp_path: Path) -> None:
     store_path = tmp_path / "mock-sessions.json"
     context = multiprocessing.get_context("spawn")
