@@ -2,7 +2,21 @@
 
 ## Now
 
-**1.2 in progress on `feat/1.2` (worktree `acpc.feat-1.2`, from `main` `ded1479`, 2026-10-19).**
+**1.2.0 released 2026-10-20: `feat/1.2` fast-forwarded into `main` (`5933b29`: bump `fe5427e`, SPEC
+schema-version correction `5a6a47f` and the CHANGELOG on top of slice 9 `56494d1`), tag `v1.2.0`,
+release page https://github.com/DamianPala/acpc/releases/tag/v1.2.0, CI green on ubuntu and macos
+on the tagged commit (lap 39378830125; the bump lap hit the known `load_session` flake on ubuntu
+once), host reinstalled (`acpc -V` 1.2.0, daemons stopped), `ai-lab` container updated (acpc now
+installed from `git+https://github.com/DamianPala/acpc.git@main`, the old ssh receipt had no key in
+the container; codex-acp 1.13.0 → 2.2.2 under the `~/.local` npm prefix). The `feat/1.2` branch and
+worktree are deleted; the builders' gate and mutation logs are parked in `docs/plans/1.2/`. Damian
+accepted the slice 6 effort-precedence ruling (2026-10-20 morning). The BREAKING line names codex
+(`xhigh`) and claude/grok (`high`) entries that name a model without `effort`. Next: a backlog pass
+into this file before 1.3 (the list sits in `docs/plans/1.2/handoff.md`, "Then" item 3), the
+dictation-cleanup client-timeout note (SPEC sentence or reduce when no foreground reader), and the
+`load_session` flake.**
+
+**1.2 slices on `feat/1.2` (worktree `acpc.feat-1.2`, from `main` `ded1479`, 2026-10-19).**
 Landed, one commit per slice: 1 `6181dc4` (`selectable` mode fact, `edit` on claude lands on
 `default`), 2 `00736b7` (judge keys `system_prompt_file` and `tools`, `run --system-prompt-file`,
 adapter routes `system_prompt_via`/`tools_via`, `not_supported` before any session exists), 3
@@ -98,16 +112,13 @@ archive` copy with its own venv (a copied `.venv` runs the worktree's code), liv
 claude-agent-acp 0.89.1 with a bare judge (3c: daemon route, session dir = `meta.json` + `lock`,
 `~/.claude-bare` file listing unchanged after the run). Build contract since 2026-10-19 (local to
 this repo): builder and builder-light through the installed acpc (Codex), reviewer and explorer
-through the Agent tool. Next: 1.2 close-out, Damian's morning: the slice 6 effort-precedence
-ruling (`docs/plans/1.2/handoff.md`, "Owner rulings for the morning"), then merge `feat/1.2` into
-`main` (fast-forward), bump to 1.2.0 in the 7 version spots, `release-create`, reinstall the host
-tool and update the `ai-lab` container; SPEC deltas, briefs, reports and verdicts in
-`docs/plans/1.2/`. Known flakes under `-n auto`:
+through the Agent tool. SPEC deltas, briefs, reports and verdicts in `docs/plans/1.2/`. Known
+flakes under `-n auto`:
 `test_continue_rejects_an_adapter_without_load_session`, the steer `cancel_then_start` wait test,
 and `test_agents_check_reports_has_more_past_the_default_limit` hitting the 30 s timeout on a
-loaded desktop (21 mock spawns; passes alone in 11 s). `feat/1.2` is on origin through `19bf908`
-(fast-forward pushes and `gate.yml` laps under Damian's standing grant, both green on ubuntu and
-macos); main, merge, tags and the release wait for his go.
+loaded desktop (21 mock spawns; passes alone in 11 s). Every slice went to origin as a fast-forward
+push with a `gate.yml` lap under Damian's standing grant, green on ubuntu and macos (one rerun for
+the `load_session` flake on slice 7).
 
 **1.1.1 released 2026-10-19: `fix/1.1.1` fast-forwarded into `main` (`c9240a2`, bump `f9a4e7a`
 and the CHANGELOG on top of slice 1), tag `v1.1.1`, release page
