@@ -216,7 +216,7 @@ Keep it to purpose only. Models, efforts and flags belong to the tool — `acpc 
 
 ```
 ~/.acpc/                     # ACPC_HOME overrides it — the only env var acpc reads for itself
-  config.toml                # retention, daemon_ttl, daemon_max_concurrent — the whole file
+  config.toml                # retention, daemon_ttl, daemon_max_concurrent, session_hold, limit_wait_max — the whole file
   agents/<name>.toml         # variants, adapter overrides, new adapters
   cache/<agent>/             # advertised models, modes, commands, effort levels per model, subscription windows per home
   daemon/<target>.log        # adapter stderr per target
@@ -236,8 +236,11 @@ A cold `continue` reports whether the adapter session was verified: the summary 
 
 A performance cache, nothing more: it keeps adapters warm so the next turn starts in ~2 s instead of a cold start. Auto-managed — starts on first use, expires after 30 min idle, restarts itself on version skew, heals itself if its adapter dies. One daemon per *target* (agent entry + vendor home + literal declared env + named passthrough values + resolved permission policy + process-level spawn identity when `effort_via = "cli"`), so different providers, credentials or permission ceilings never share a process. Secret values affect the target hash but are never exposed. If a daemon cannot start at all, `run` falls back to a direct child and says so on stderr.
 
+A finished session stays warm in the adapter for five minutes (`session_hold`), at most eight at a time, and is then closed there, so a fan-out of short agents does not pile up idle vendor processes. `continue` works either way: on a closed session it restores from the vendor's record and starts about a second slower.
+
 ```bash
-acpc daemon status          # acpc version, pid, uptime, idle age, per-target log path
+acpc daemon status          # acpc version, pid, uptime, idle age, held sessions, process count and memory, log path
+acpc resolve codex          # ... and `daemon_target` names the daemon a run would use
 acpc daemon stop codex      # controlled nuke; beats pkill, which kills mid-task dispatches
 acpc daemon stop codex --force  # ... and take its running sessions down with it
 ```

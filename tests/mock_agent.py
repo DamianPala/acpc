@@ -77,6 +77,8 @@ acpc asked for and whether it cancelled the turn the adapter started on its own.
 ``ACPC_MOCK_LATE_UPDATE=1`` sends one ``usage_update`` 0.2 s after every prompt
 response; ``ACPC_MOCK_ADVERTISE_CLOSE=1`` advertises ``session/close`` and
 ``ACPC_MOCK_SESSION_METHOD_FILE`` then receives a ``close:<session>`` line.
+``ACPC_MOCK_CLOSE_DELAY`` delays close by that many seconds (logging
+``closing:<session>`` first); ``ACPC_MOCK_CLOSE_FAIL=1`` rejects close.
 
 ``ACPC_MOCK_IGNORE_CANCEL=1`` drops every ``session/cancel`` notification on
 the floor: the running scenario's own timer is the only thing that ends the
@@ -1639,7 +1641,12 @@ class MockAgent(Agent):
         self._cancel_events.setdefault(session_id, asyncio.Event()).set()
 
     async def close_session(self, session_id: str, **kwargs: Any) -> CloseSessionResponse:
+        if delay := os.environ.get("ACPC_MOCK_CLOSE_DELAY"):
+            self._record_session_method(f"closing:{session_id}")
+            await asyncio.sleep(float(delay))
         self._record_session_method(f"close:{session_id}")
+        if os.environ.get("ACPC_MOCK_CLOSE_FAIL") == "1":
+            raise ValueError("mock close refused")
         if session_id not in self._sessions:
             raise ValueError(f"unknown session id: {session_id}")
         self._session_history[session_id] = list(self._sessions[session_id])

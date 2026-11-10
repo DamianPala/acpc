@@ -75,7 +75,7 @@ class DaemonConnection(Protocol):
         """Ask the daemon to add an instruction to a session's running turn."""
         ...
 
-    async def status(self) -> dict[str, Any]:
+    async def status(self, *, processes: bool = False) -> dict[str, Any]:
         """Report pid, uptime, log path and the sessions this daemon holds."""
         ...
 
@@ -128,8 +128,11 @@ class _SocketDaemon:
     async def steer(self, session_id: str, text: str) -> dict[str, Any]:
         return await self.call({"op": "steer", "session_id": session_id, "text": text})
 
-    async def status(self) -> dict[str, Any]:
-        return await self.call({"op": "status"})
+    async def status(self, *, processes: bool = False) -> dict[str, Any]:
+        frame: dict[str, Any] = {"op": "status"}
+        if processes:
+            frame["processes"] = True
+        return await self.call(frame)
 
     async def stop(self) -> dict[str, Any]:
         return await self.call({"op": "stop"})

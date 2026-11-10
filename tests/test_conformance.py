@@ -166,7 +166,16 @@ EXPECTED_REQUIRED_FIELDS = {
         "diff",
     },
     "prune": {"targets", "changed", "requires_confirmation"},
-    "resolve": {"entry", "base_adapter", "command", "cwd", "env", "env_passthrough", "resolved"},
+    "resolve": {
+        "entry",
+        "base_adapter",
+        "command",
+        "cwd",
+        "env",
+        "env_passthrough",
+        "daemon_target",
+        "resolved",
+    },
     "run": {
         "status",
         "session_id",
@@ -667,6 +676,8 @@ EXPECTED_OUTPUT_ORACLES: dict[str, dict[str, tuple[frozenset[str], frozenset[str
                     "uptime_seconds",
                     "log",
                     "sessions",
+                    "held",
+                    "processes",
                     "preparing",
                     "restoring",
                     "max_concurrent",
@@ -681,12 +692,18 @@ EXPECTED_OUTPUT_ORACLES: dict[str, dict[str, tuple[frozenset[str], frozenset[str
                     "uptime_seconds",
                     "log",
                     "sessions",
+                    "held",
+                    "processes",
                     "preparing",
                     "restoring",
                     "max_concurrent",
                     "idle_seconds",
                 }
             ),
+        ),
+        "output.items[].processes": (
+            frozenset({"count", "rss_bytes"}),
+            frozenset({"count", "rss_bytes"}),
         ),
     },
     "daemon stop": {
@@ -848,6 +865,7 @@ EXPECTED_OUTPUT_ORACLES: dict[str, dict[str, tuple[frozenset[str], frozenset[str
                 {
                     "entry",
                     "base_adapter",
+                    "daemon_target",
                     "system_prompt_via",
                     "tools_via",
                     "command",
@@ -858,7 +876,16 @@ EXPECTED_OUTPUT_ORACLES: dict[str, dict[str, tuple[frozenset[str], frozenset[str
                 }
             ),
             frozenset(
-                {"entry", "base_adapter", "command", "cwd", "env", "env_passthrough", "resolved"}
+                {
+                    "entry",
+                    "base_adapter",
+                    "command",
+                    "cwd",
+                    "env",
+                    "env_passthrough",
+                    "daemon_target",
+                    "resolved",
+                }
             ),
         ),
         "output.resolved": (

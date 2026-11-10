@@ -119,6 +119,7 @@ Secret values affect the target hash but are never exposed.
 A daemon starts on demand, keeps one adapter warm, serves up to `daemon_max_concurrent` turns at once, queues further turns, and expires after `daemon_ttl` of idleness.
 The daemon and the adapter it keeps warm run in acpc's state directory, not in the directory of the call that started them. Each session's working directory reaches the adapter through ACP when the session is created or restored, so removing the directory a daemon was started from does not affect later calls.
 A detached session keeps its daemon alive.
+A daemon holds a finished session in the adapter for `session_hold` after its turn ends, so that a `continue` soon after meets a warm session, and it holds at most `daemon_max_concurrent` finished sessions at once: one more closes the session whose turn ended first. When the hold ends the daemon closes the session in the adapter (`session/close`), and the adapter frees whatever it kept for it. A later `continue` restores the session from the vendor's own record, exactly as it does after a daemon restart, and a `continue` that arrives while the close is in flight waits for it and then restores. Whatever the vendor still ran in the background for that session ends with the close. `session_hold = "0s"` closes each session as its turn ends. An adapter that does not advertise `session/close` keeps its sessions until the daemon exits. A one-shot session is closed as its turn ends, whatever `session_hold` says.
 A version-skewed daemon stands down before the next mutating request; read-only status observes the running version instead.
 A daemon socket path that exceeds the platform limit (108 bytes on Linux, 104 on macOS) even in its hashed form starts no daemon: the call reports `unavailable` naming the limit and a shorter `ACPC_HOME` as the remedy, and a blocking call takes the direct path as for any unavailable daemon.
 
@@ -127,7 +128,7 @@ daemon status [AGENT] [--limit N] [--plain] [--format text|json|plain]
 daemon stop [AGENT] [--force] [--dry-run] [--yes] [--format text|json]
 ```
 
-`daemon status` reports bounded items with `target`, `version`, `pid`, `uptime_seconds`, `log`, `sessions`, `preparing`, `restoring`, `max_concurrent` and `idle_seconds`. Entries are ordered by target name, ascending, and the default window is the first 20 of that order. It connects only to the addressed daemon and does not restart it.
+`daemon status` reports bounded items with `target`, `version`, `pid`, `uptime_seconds`, `log`, `sessions`, `held`, `preparing`, `restoring`, `processes`, `max_concurrent` and `idle_seconds`. `sessions` lists the sessions with a turn in flight; `held` lists the finished sessions the adapter still keeps for this daemon, ascending by session id. `processes` is an object with `count`, the number of processes below the daemon process, and `rss_bytes`, their resident memory summed; both are `null` when the platform's process table could not be read. Entries are ordered by target name, ascending, and the default window is the first 20 of that order. It connects only to the addressed daemon and does not restart it.
 
 Named `daemon stop AGENT` stops the targeted daemon without a confirmation gate. Bare `daemon stop` resolves every daemon before confirmation; an empty target set succeeds unchanged without confirmation, while a non-empty set requires `--yes`. `--dry-run` lists the targets and requires confirmation exactly when that set is non-empty. Active `starting` or `running` sessions refuse the stop with `precondition_failed` unless `--force` is supplied. The active-session precondition is checked again after confirmation before the stop is sent. `--yes` confirms the action and `--force` overrides that precondition; neither substitutes for the other. A forced stop finalizes affected sessions as `failed`.
 
@@ -207,7 +208,7 @@ resolve AGENT [--cwd DIR] [--model M] [--effort E] [--permissions P]
     [--mode MODE] [--home DIR] [--format text|json]
 ```
 
-`resolve` previews the same call resolution that a later `run` would use. It creates no session, starts no daemon, and asks no question. The result contains `entry`, `base_adapter`, `command`, `cwd`, `env`, `env_passthrough` and `resolved`; each resolved field contains its value and provenance, with mode facts `grants`, `delegates`, `escalates` and `selectable` where applicable; `effort` also carries `levels`, the values the entry may send for the resolved model and the factors that bounded them (`scale`, `advertised`, `entry`, `shipped`), and its value is `null` with provenance `vendor default` when the entry sends none. `resolved` also carries `system_prompt` (the file path and its size in bytes) and `tools` when the entry sets them, with their provenance; and `data_residency`, the entry's declaration with its provenance; the adapter facts `system_prompt_via` and `tools_via` appear beside `base_adapter`. A policy that cannot be served by a declared mode is `permission_denied` with exit 2.
+`resolve` previews the same call resolution that a later `run` would use. It creates no session, starts no daemon, and asks no question. The result contains `entry`, `base_adapter`, `command`, `cwd`, `env`, `env_passthrough`, `daemon_target` and `resolved`; `daemon_target` is the name of the daemon a `run` with the same arguments would use, spelled as `daemon status` reports it and `daemon stop` accepts it; each resolved field contains its value and provenance, with mode facts `grants`, `delegates`, `escalates` and `selectable` where applicable; `effort` also carries `levels`, the values the entry may send for the resolved model and the factors that bounded them (`scale`, `advertised`, `entry`, `shipped`), and its value is `null` with provenance `vendor default` when the entry sends none. `resolved` also carries `system_prompt` (the file path and its size in bytes) and `tools` when the entry sets them, with their provenance; and `data_residency`, the entry's declaration with its provenance; the adapter facts `system_prompt_via` and `tools_via` appear beside `base_adapter`. A policy that cannot be served by a declared mode is `permission_denied` with exit 2.
 
 ### `run`
 
@@ -482,9 +483,11 @@ The complete global config is:
 retention = "90d"
 daemon_ttl = "30m"
 daemon_max_concurrent = 8
+session_hold = "5m"
 limit_wait_max = "8h"
 ```
 
+`session_hold` is how long a daemon keeps a finished session in the adapter, a duration with the `--timeout` syntax; `"0s"` keeps none.
 `limit_wait_max` caps how long one turn may wait for usage limits in total; a duration with the `--timeout` syntax, and `"0s"` disables waiting so that every recognized limit ends the turn `failed` at once. An entry's `limit_wait_max` overrides it for that entry's sessions, and `--limit-wait` overrides both for one turn. Unknown config keys are hard errors. Relative paths in `--cwd`, `--prompt-file` and `--output-file`, and in `--home` on `run`, `resolve` and `continue`, resolve against the caller's working directory; a leading `~` is expanded.
 The resolved working directory, from `--cwd` or the caller's directory, must exist; otherwise the call fails with `invalid_input` before it creates anything. Directories are mode 0700 and files are mode 0600 where the platform supports those permissions. Metadata and cache writes are atomic, and transcript appends are whole lines.
 

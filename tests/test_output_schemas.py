@@ -104,6 +104,7 @@ EXPECTED_REQUIRED: dict[str, tuple[str, ...]] = {
         "command",
         "cwd",
         "env",
+        "daemon_target",
         "env_passthrough",
         "resolved",
     ),
@@ -565,6 +566,8 @@ def test_real_document_payloads_match_their_published_schemas(
             "sessions": [],
             "preparing": [],
             "restoring": [],
+            "held": [],
+            "processes": {"count": None, "rss_bytes": None},
             "max_concurrent": 1,
             "idle_seconds": 2.0,
         }

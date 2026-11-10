@@ -30,6 +30,7 @@ import functools
 import math
 import os
 import shlex
+import subprocess
 import sys
 import time
 from collections.abc import Mapping
@@ -63,8 +64,8 @@ STEER_REQUEST_TIMEOUT = 10.0
 # can lower this bound; a hung adapter must never hold a session in `starting`.
 HOST_START_TIMEOUT = 60.0
 
-# How long the adapter may take to close a consumed session. Past it the daemon
-# moves on: the mapping is already dropped, so nothing waits on the adapter.
+# How long the adapter may take to close a retired session. Past this bound
+# a continuation may attempt to restore it; the warm mapping is already dropped.
 CLOSE_SESSION_TIMEOUT = 5.0
 
 # Frames name their operation under this key.
@@ -318,6 +319,7 @@ class AdapterHost:
         # as this adapter process lives. Presence here *is* "warm".
         self.adapter_sessions: dict[str, str] = {}
         self._restore_tasks: dict[str, asyncio.Task[Any]] = {}
+        self._close_tasks: dict[str, asyncio.Task[Any]] = {}
 
     @property
     def started(self) -> bool:
@@ -411,7 +413,8 @@ class AdapterHost:
         return conn
 
     async def close(self) -> None:
-        restore_tasks = tuple(self._restore_tasks.values())
+        restore_tasks = (*self._restore_tasks.values(), *self._close_tasks.values())
+        self._close_tasks.clear()
         self._restore_tasks.clear()
         for task in restore_tasks:
             task.cancel()
@@ -431,7 +434,7 @@ class AdapterHost:
         self.adapter_sessions.clear()
 
     async def close_adapter_session(self, adapter_session_id: str) -> None:
-        """Let the adapter forget a session nothing can continue, when it can be told.
+        """Release adapter resources for a retired or evicted session.
 
         An adapter that does not advertise `session/close` keeps the session
         until it exits; the daemon has already dropped its own mapping.
@@ -444,6 +447,29 @@ class AdapterHost:
                 self._conn.close_session(session_id=adapter_session_id),
                 timeout=CLOSE_SESSION_TIMEOUT,
             )
+
+    def start_close(self, adapter_session_id: str) -> None:
+        """Publish a close flight before a continuation can attempt to restore."""
+        task = asyncio.create_task(self.close_adapter_session(adapter_session_id))
+        self._close_tasks[adapter_session_id] = task
+
+        def settled(completed: asyncio.Task[Any]) -> None:
+            if self._close_tasks.get(adapter_session_id) is completed:
+                self._close_tasks.pop(adapter_session_id, None)
+            if not completed.cancelled():
+                completed.exception()
+
+        task.add_done_callback(settled)
+
+    async def wait_for_close(self, adapter_session_id: str) -> None:
+        task = self._close_tasks.get(adapter_session_id)
+        if task is None:
+            return
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if not task.cancelled():
+                raise
 
     def start_restore(self, adapter_session_id: str, coroutine: Any) -> asyncio.Task[Any]:
         """Track one uncancellable adapter restore until its response settles."""
@@ -478,6 +504,49 @@ class AdapterHost:
             # The old restore's result belongs to the cancelled turn. A later
             # continuation only needs its remote work to have settled.
             pass
+
+
+def _descendant_processes() -> dict[str, int | None]:
+    """Read the platform process boundary without blocking the daemon loop."""
+    unavailable: dict[str, int | None] = {"count": None, "rss_bytes": None}
+    try:
+        with subprocess.Popen(
+            ["ps", "-A", "-o", "pid=,ppid=,rss="],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ) as reader:
+            try:
+                stdout, _ = reader.communicate(timeout=2)
+            finally:
+                reader.kill()
+        rows = [tuple(map(int, line.split())) for line in stdout.splitlines()]
+        if reader.returncode != 0 or not rows:
+            return unavailable
+        if any(len(row) != 3 or min(row) < 0 for row in rows):
+            return unavailable
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return unavailable
+    # `ps -A` lists itself, and it runs as a child of this daemon.
+    return _sum_descendants([row for row in rows if row[0] != reader.pid])
+
+
+def _sum_descendants(rows: list[tuple[int, ...]]) -> dict[str, int | None]:
+    children: dict[int, list[tuple[int, int]]] = {}
+    for pid, parent, rss in rows:
+        children.setdefault(parent, []).append((pid, rss))
+    seen = {os.getpid()}
+    pending = [os.getpid()]
+    count = memory = 0
+    while pending:
+        for pid, rss in children.get(pending.pop(), []):
+            if pid in seen:
+                continue
+            seen.add(pid)
+            pending.append(pid)
+            count += 1
+            memory += rss * 1024
+    return {"count": count, "rss_bytes": memory}
 
 
 def _endpoint_identity(path: Path | None) -> tuple[int, int] | None:
@@ -534,6 +603,8 @@ class Daemon:
         self.max_concurrent = (
             settings.daemon_max_concurrent if max_concurrent is None else max_concurrent
         )
+        self.session_hold = settings.session_hold_seconds
+        self._finished_at: dict[str, float] = {}
         self.started_at = time.time()
         self.host = AdapterHost(target)
         self.turns: dict[str, _Turn] = {}
@@ -620,6 +691,7 @@ class Daemon:
                     self._stop_reason = "the daemon's socket was removed"
                     self._shutdown.set()
                     return
+                self._release_held()
                 if self._busy():
                     self._last_busy = time.monotonic()
                     continue
@@ -716,7 +788,7 @@ class Daemon:
         if operation == "steer":
             return await self._steer(frame)
         if operation == "status":
-            return self._status()
+            return await self._status(processes=frame.get("processes") is True)
         if operation == "stop":
             self._stop_reason = "the daemon was stopped"
             self._shutdown.set()
@@ -742,8 +814,8 @@ class Daemon:
             "target": self.target,
         }
 
-    def _status(self) -> dict[str, Any]:
-        return {
+    async def _status(self, *, processes: bool = False) -> dict[str, Any]:
+        reply = {
             "ok": True,
             "version": __version__,
             "target": self.target,
@@ -751,12 +823,16 @@ class Daemon:
             "uptime_seconds": time.time() - self.started_at,
             "log": str(log_path_for_target(self.target)),
             "sessions": sorted(self.turns),
+            "held": sorted(set(self.host.adapter_sessions) - self.turns.keys()),
             "preparing": sorted(
                 session_id for session_id, turn in self.turns.items() if turn.phase == "preparing"
             ),
             "restoring": sorted(self.host._restore_tasks),
             "max_concurrent": self.max_concurrent,
         }
+        if processes:
+            reply["processes"] = await asyncio.to_thread(_descendant_processes)
+        return reply
 
     def _cancel(self, frame: dict[str, Any]) -> dict[str, Any]:
         """Cancel the turn this daemon holds for one session.
@@ -1339,6 +1415,7 @@ class Daemon:
         adapter_session_id = request.resume_adapter_session
         if adapter_session_id is None:
             raise runner.ResumePreparationError("continued turn has no adapter session id")
+        await self.host.wait_for_close(adapter_session_id)
         await self.host.wait_for_restore(adapter_session_id)
         conn = await self.host.ensure(request.resolution)
         warm = self.host.adapter_sessions.get(session_id)
@@ -1431,7 +1508,6 @@ class Daemon:
             events = transcript.Transcript(sessions.transcript_path(session_id))
             outcome = runner.TurnOutcome(state="failed", stop_reason="error", answer="")
             error: BaseException | None = None
-            consumed_adapter_session: str | None = None
             # Where this turn's own output starts in the shared per-target log:
             # the file is append-only across every session the target ever ran,
             # so without this mark a failure would quote a stranger's stderr.
@@ -1505,8 +1581,8 @@ class Daemon:
                     adapter_log_from=log_from,
                     expected_turn=outcome.turn_token,
                 )
-                consumed_adapter_session = self._retire_if_reduced(session_id)
             finally:
+                consumed_adapter_session = self._retire_if_reduced(session_id)
                 # Only a turn that could not be *started* travels back as an
                 # error: the client raises on it. A turn that ran and failed is
                 # already finalized on disk, and the client mirrors that result
@@ -1525,7 +1601,9 @@ class Daemon:
         """
         try:
             reduced = not sessions.read_meta(session_id).retained
-        except sessions.SessionError:
+        # ValueError covers a meta.json that is not UTF-8: this runs in the
+        # turn's `finally`, and an escape there would skip `_finish`.
+        except (sessions.SessionError, ValueError):
             return None
         if not reduced:
             return None
@@ -1601,6 +1679,7 @@ class Daemon:
             adapter_session_id = request.resume_adapter_session
         elif request.resume_adapter_session is not None:
             adapter_session_id = request.resume_adapter_session
+            await self.host.wait_for_close(adapter_session_id)
             self.host.mux.bind(adapter_session_id, client)
             try:
                 try:
@@ -1746,6 +1825,7 @@ class Daemon:
         self._last_busy = time.monotonic()
         if turn is None:
             return
+        self._hold_finished(session_id)
         state = outcome.state
         if state == "terminated":
             state = "canceled"
@@ -1758,6 +1838,37 @@ class Daemon:
             payload["error"] = runner.describe_error(error)
         turn.result = payload
         self._resolve_waiters(turn, payload)
+
+    def _hold_finished(self, session_id: str) -> None:
+        if session_id in self.host.adapter_sessions:
+            self._finished_at[session_id] = time.monotonic()
+        self._release_held()
+
+    def _held_candidates(self) -> list[tuple[float, str]]:
+        self._finished_at = {
+            session_id: ended
+            for session_id, ended in self._finished_at.items()
+            if session_id in self.host.adapter_sessions
+        }
+        return sorted(
+            (ended, session_id)
+            for session_id, ended in self._finished_at.items()
+            if session_id not in self.turns
+        )
+
+    def _release_held(self) -> None:
+        candidates = self._held_candidates()
+        if not runner.has_close_session_capability(self.host.agent_capabilities):
+            return
+        now = time.monotonic()
+        remaining = len(candidates)
+        for ended, session_id in candidates:
+            if now - ended < self.session_hold and remaining <= self.max_concurrent:
+                break
+            adapter_session_id = self.host.adapter_sessions.pop(session_id)
+            self._finished_at.pop(session_id)
+            self.host.start_close(adapter_session_id)
+            remaining -= 1
 
     @staticmethod
     def _resolve_waiters(turn: _Turn, payload: dict[str, Any]) -> None:

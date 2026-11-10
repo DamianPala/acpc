@@ -1764,6 +1764,8 @@ def _emit_resolution(payload: dict[str, Any], *, json_mode: bool) -> None:
             suffix = _effort_levels_text(item["levels"]) if name == "effort" else ""
             label = "residency" if name == "data_residency" else name
             lines.append(f"{label:<12} {value} ({item['source']}){suffix}")
+    if "daemon_target" in payload:
+        lines.append(f"daemon       {payload['daemon_target']}")
     if payload["cwd"]:
         lines.append(f"cwd          {payload['cwd']}")
     if payload["env"]:
@@ -4610,6 +4612,7 @@ def _run_preview(
     if policy is not None:
         previewed = _select_resolution(previewed)
     payload = runner.resolution_payload(previewed, cwd=cwd, permissions_source=permissions_source)
+    payload["daemon_target"] = runner.call_target(previewed)
     _emit_resolution(payload, json_mode=selected_format == "json")
 
 
@@ -6673,6 +6676,8 @@ def daemon_status_command(
             f"up {output.format_duration(item['uptime_seconds'])}",
             f"· {_daemon_idle_column(item['idle_seconds'])}",
             f"· {len(item['sessions'])} sessions",
+            f"· {len(item['held'])} held",
+            f"· {_daemon_process_column(item['processes'])}",
             f"· {item['log']}",
         )
         for item in entries
@@ -6681,6 +6686,12 @@ def daemon_status_command(
     _write_stdout("\n".join(lines) + "\n")
     if len(entries) < len(all_entries):
         _write_stdout(f"-- {len(entries)} of {len(all_entries)} — use --limit to change\n")
+
+
+def _daemon_process_column(processes: dict[str, int | None]) -> str:
+    count, rss = processes["count"], processes["rss_bytes"]
+    memory = "·" if rss is None else f"{rss / 1024**2:.1f}"
+    return f"{count if count is not None else '·'} processes {memory} MiB"
 
 
 async def _collect_daemon_status(
@@ -6696,11 +6707,14 @@ async def _collect_daemon_status(
         if daemon is None:
             continue
         try:
-            reply = await daemon.status()
+            reply = await daemon.status(processes=True)
         finally:
             await daemon.close()
         if reply.get("ok"):
             entry = {key: value for key, value in reply.items() if key != "ok"}
+            # A daemon of an older build reports neither field.
+            entry.setdefault("held", [])
+            entry.setdefault("processes", {"count": None, "rss_bytes": None})
             entry["idle_seconds"] = render.daemon_idle_seconds(session_metas, target, now=now)
             entries.append(entry)
     return entries

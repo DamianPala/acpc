@@ -33,7 +33,7 @@ cli.py                          argument parsing, verbs, help, exit codes, TTY d
   ├── output.py                 output contract: stdout modes, stderr summary, --json
   ├── probe.py                  direct ACP mode discovery and registry diff
   ├── cache.py                  advertised models/modes/commands and per-model effort cache under cache/<agent>/
-  └── config.py                 config.toml (retention, daemon_ttl, daemon_max_concurrent)
+  └── config.py                 config.toml (retention, daemon_ttl, daemon_max_concurrent, session_hold, limit_wait_max)
 
 errors.py                       failure envelope: kinds, emission rule, exit status
 interaction.py                  interactive context, /dev/tty question, confirmation gate

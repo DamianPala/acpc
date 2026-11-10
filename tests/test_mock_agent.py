@@ -599,3 +599,41 @@ def test_subscription_window_knobs_on_the_wire(
                     assert 7100 < window["resetsAt"] - time.time() <= 7200
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_mock_close_delay_records_start_then_completion_or_failure(
+    tmp_path: Path, fail: bool
+) -> None:
+    method_file = tmp_path / "methods"
+
+    async def scenario() -> None:
+        async with spawn_adapter(
+            DriverClient(),
+            sys.executable,
+            MOCK_AGENT_SCRIPT,
+            env={
+                "ACPC_MOCK_ADVERTISE_CLOSE": "1",
+                "ACPC_MOCK_SESSION_METHOD_FILE": str(method_file),
+                "ACPC_MOCK_CLOSE_DELAY": "1",
+                "ACPC_MOCK_CLOSE_FAIL": "1" if fail else "0",
+            },
+            cwd=str(tmp_path),
+        ) as (conn, _process):
+            await conn.initialize(protocol_version=PROTOCOL_VERSION)
+            session = await conn.new_session(cwd=str(tmp_path))
+            closing = asyncio.create_task(conn.close_session(session_id=session.session_id))
+            await eventually(lambda: method_file.exists())
+            assert method_file.read_text().splitlines() == [f"closing:{session.session_id}"]
+            assert not closing.done()
+            if fail:
+                with pytest.raises(RequestError):
+                    await closing
+            else:
+                await closing
+            assert method_file.read_text().splitlines() == [
+                f"closing:{session.session_id}",
+                f"close:{session.session_id}",
+            ]
+
+    asyncio.run(scenario())

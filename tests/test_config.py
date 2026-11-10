@@ -38,6 +38,8 @@ def test_config_exposes_duration_values_as_seconds(tmp_path: Path) -> None:
 
     assert config.retention_seconds == 5400.0
     assert config.daemon_ttl_seconds == 120.0
+    assert config.session_hold == "5m"
+    assert config.session_hold_seconds == 300.0
 
 
 def test_parse_duration_accepts_compound_values() -> None:
@@ -83,6 +85,8 @@ def test_limit_wait_max_accepts_zero_to_turn_waiting_off(tmp_path: Path) -> None
         ("daemon_max_concurrent", '"eight"', "positive integer"),
         ("limit_wait_max", '"-1s"', "limit_wait_max"),
         ("limit_wait_max", '"abc"', "limit_wait_max"),
+        ("session_hold", '"abc"', "session_hold"),
+        ("session_hold", "2", "session_hold"),
     ],
 )
 def test_invalid_config_value_names_key_and_expected_type(
@@ -93,3 +97,10 @@ def test_invalid_config_value_names_key_and_expected_type(
 
     with pytest.raises(ConfigError, match=message):
         load_config(path)
+
+
+@pytest.mark.parametrize(("value", "seconds"), [("0s", 0), ("1h30m", 5400)])
+def test_session_hold_override(tmp_path: Path, value: str, seconds: int) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(f'session_hold = "{value}"\n', encoding="utf-8")
+    assert load_config(path).session_hold_seconds == seconds

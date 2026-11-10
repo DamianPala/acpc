@@ -308,6 +308,7 @@ _RESOLUTION = _object(
         "command": _STRING,
         "cwd": _STRING,
         "env": {},
+        "daemon_target": _STRING,
         "env_passthrough": _array(_STRING),
         "resolved": _object(
             {
@@ -330,6 +331,7 @@ _RESOLUTION = _object(
         "command",
         "cwd",
         "env",
+        "daemon_target",
         "env_passthrough",
         "resolved",
     ),
@@ -496,6 +498,11 @@ _DAEMON_ITEM = _object(
         "pid": _INTEGER,
         "uptime_seconds": _NUMBER,
         "log": _STRING,
+        "held": _array(_STRING),
+        "processes": _object(
+            {"count": _NULLABLE_INTEGER, "rss_bytes": _NULLABLE_INTEGER},
+            ("count", "rss_bytes"),
+        ),
         "sessions": _array(_STRING),
         "preparing": _array(_STRING),
         "restoring": _array(_STRING),
@@ -508,6 +515,8 @@ _DAEMON_ITEM = _object(
         "pid",
         "uptime_seconds",
         "log",
+        "held",
+        "processes",
         "sessions",
         "preparing",
         "restoring",
