@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.2.1] - 2026-11-10
+
+### Added
+
+- `daemon status` reports `held`, the finished sessions the adapter still keeps, and `processes` with the count and resident memory of the processes below the daemon
+- `resolve` reports `daemon_target`, the daemon a `run` with the same arguments would use
+- `session_hold` config key (default `5m`): how long a daemon keeps a finished session warm; `0s` keeps none
+
+### Fixed
+
+- A daemon no longer keeps every finished session in the adapter until it exits, which left one idle vendor process per session (about 200 MB each on claude) and filled memory during a fan-out. A finished session is held for `session_hold`, at most `daemon_max_concurrent` at once, then closed; `continue` restores it and starts about a second slower
+- A failed or canceled turn of a `one_shot` session closes the adapter session as it ends
+
 ## [1.2.0] - 2026-10-20
 
 ### Added
@@ -110,6 +123,7 @@
 - `log --max-output` truncation is reported on stderr instead of as a fake event inside the stream
 - Shipped `claude` and `codex` adapter facts refreshed to what the vendors currently support
 
+[1.2.1]: https://github.com/DamianPala/acpc/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/DamianPala/acpc/compare/v1.1.1...v1.2.0
 [1.1.1]: https://github.com/DamianPala/acpc/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/DamianPala/acpc/compare/v1.0.1...v1.1.0
