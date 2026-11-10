@@ -2,7 +2,23 @@
 
 ## Now
 
-**1.2.0 released 2026-10-20: `feat/1.2` fast-forwarded into `main` (`5933b29`: bump `fe5427e`, SPEC
+**1.2.1 released 2026-11-10** (`main` = `be177d4` = `v1.2.1`, release page
+https://github.com/DamianPala/acpc/releases/tag/v1.2.1, CI green on ubuntu and macos on the tagged
+commit, lap 42811549622; host and the `ai-lab` container on 1.2.1). One fix slice, `fce8627`: a
+daemon holds a finished session in the adapter for `session_hold` (default `5m`), at most
+`daemon_max_concurrent` at once, then closes it with `session/close`; before, every finished session
+kept its vendor process until the daemon exited (197 idle `claude` processes, 25 GB, after one
+fan-out on `bare`). `daemon status` gained `held` and `processes`, `resolve` gained `daemon_target`.
+Measured on claude-agent-acp 0.89.1: the close frees the process in 0,2 s; a `continue` on a closed
+session takes 2,6 s against 1,5 to 2,1 s warm. Builder Sol two rounds, Opus reviewer two rounds;
+records in `docs/plans/1.2.1/`. Decisions by Damian (2026-11-10): hold 5 minutes, version 1.2.1,
+the conformance claim stays on CLI standard draft.11 (the checkout is draft.12, so the gate runs
+against the pinned snapshot `docs/plans/1.2.1/cli-design-standard-pinned.md` with
+`ACPC_STANDARD_SOURCE_REPOSITORY` set). Backlog from this slice: an adapter session that was created
+or restored but never prompted is never closed; smoke `S08-views` "--prose shows the long msg in
+full" failed once on ubuntu CI and passed on the two following laps (race, not investigated).
+
+Earlier: **1.2.0 released 2026-10-20: `feat/1.2` fast-forwarded into `main` (`5933b29`: bump `fe5427e`, SPEC
 schema-version correction `5a6a47f` and the CHANGELOG on top of slice 9 `56494d1`), tag `v1.2.0`,
 release page https://github.com/DamianPala/acpc/releases/tag/v1.2.0, CI green on ubuntu and macos
 on the tagged commit (lap 39378830125; the bump lap hit the known `load_session` flake on ubuntu
