@@ -177,6 +177,11 @@ def test_status_reports_descendant_processes_and_text(state_root: Path, live_dae
     assert status()["held"] == [session_id]
 
 
+# The macOS liveness helpers read one pid through `ps`; only the daemon's
+# whole-table read (`ps -A`) gets the fake answer.
+_REAL_PS_UNLESS_TABLE = 'if [ "${1-}" != -A ]; then exec /bin/ps "$@"; fi\n'
+
+
 @pytest.mark.parametrize("ps_result", ["missing", "error", "invalid", "timeout"])
 def test_status_survives_unavailable_process_table(
     state_root: Path, live_daemon: None, monkeypatch: pytest.MonkeyPatch, ps_result: str
@@ -190,7 +195,7 @@ def test_status_survives_unavailable_process_table(
             "timeout": "exec /bin/sleep 3",
         }
         script = bin_dir / "ps"
-        script.write_text(f"#!/bin/sh\n{commands[ps_result]}\n")
+        script.write_text(f"#!/bin/sh\n{_REAL_PS_UNLESS_TABLE}{commands[ps_result]}\n")
         script.chmod(0o700)
     monkeypatch.setenv("PATH", str(bin_dir))
     finished()
@@ -223,6 +228,7 @@ def test_status_sums_all_descendants_and_excludes_daemon_and_unrelated_processes
     script = bin_dir / "ps"
     script.write_text(
         "#!/bin/sh\n"
+        f"{_REAL_PS_UNLESS_TABLE}"
         "printf '900003 900002 16\\n900004 1 9999\\n'\n"
         "printf '%s 1 100000\\n' \"$PPID\"\n"
         "printf '900001 %s 4\\n900002 900001 8\\n' \"$PPID\"\n"
