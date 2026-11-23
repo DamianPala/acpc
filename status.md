@@ -2,8 +2,11 @@
 
 ## Now
 
-**agy adapter built 2026-11-23, not released** (branch `feat/agy-adapter`, worktree
-`acpc.feat-agy`, slice commit `38808e9` on top of `main` `886d0e1`; nothing pushed). acpc ships a
+**1.3.0 released 2026-11-23** (`v1.3.0` = `695eda3`: slice `38808e9`, bump `da19246`, CHANGELOG
+`695eda3`; release page up; gate green on ubuntu and macos on the bump commit; host and the
+`ai-lab` container run 1.3.0; branch `feat/agy-adapter` and its worktree are gone; Damian said
+"jak przejdą testy na github to rób wydanie"). The host's local `~/.acpc/agents/agy.toml` now
+holds only the local description and `billing = "subscription"`. acpc ships a
 fourth base adapter, `agy` (Google Antigravity CLI, `agy acp`, measured on agy 1.5.15 with a
 personal Google AI Pro sign-in): modes `default` (read, delegates), `accept-edits` (edit, delegates,
 not confined to the working directory) and `plan` (kept out of policy selection); model and effort
@@ -15,9 +18,7 @@ prompt response's ACP `usage` object and checks that the total equals its parts
 patch, 13 mutants killed); gate 2 046 tests, smoke 609/609; records, the measurements and the
 research on Google's consumer terms in `docs/plans/agy/`. Decision by Damian (2026-11-23): integrate
 agy, but no fleets of agy agents dispatched from a coding agent while the terms question is open;
-he asks Google about acpc. Open for him: push, version number (a new adapter is a minor: 1.3.0) and
-release. After the release the host's local `~/.acpc/agents/agy.toml` goes away, or shrinks to the
-local description and `billing`.
+he asks Google about acpc.
 
 Earlier: **1.2.1 released 2026-11-10** (`main` = `be177d4` = `v1.2.1`, release page
 https://github.com/DamianPala/acpc/releases/tag/v1.2.1, CI green on ubuntu and macos on the tagged
