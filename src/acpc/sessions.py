@@ -924,6 +924,7 @@ def _unknown_usage(meta: SessionMeta) -> dict[str, Any] | None:
         "claude_model_usage",
         "codex_usage_updates",
         "grok_meta_usage",
+        "agy_response_usage",
         "none",
     ):
         return meta.usage

@@ -1180,3 +1180,37 @@ def test_data_residency_defaults_inherits_and_overrides(tmp_path: Path) -> None:
     source = registry.resolve("child").resolve_call().provenance["data_residency"]
     assert source.kind == "entry"
     assert source.path == agents / "base.toml"
+
+
+def test_agy_shipped_contract(tmp_path: Path) -> None:
+    registry = AgentRegistry(tmp_path / "agents")
+    entry = registry.resolve("agy")
+    assert entry.command_args == ("agy", "acp")
+    assert entry.install_command is None
+    assert entry.install_docs == "https://antigravity.google/docs/install/"
+    assert entry.home == "~/.gemini"
+    assert entry.home_env is entry.billing is None
+    assert entry.usage_profile == "agy_response_usage"
+    assert entry.model_via == entry.effort_via == "config_option"
+    assert entry.effort_config_id == "thought_level"
+    for policy, mode in [
+        ("read", "default"),
+        ("edit", "accept-edits"),
+        ("execute", "accept-edits"),
+        ("all", "accept-edits"),
+    ]:
+        assert select_mode(entry.modes, policy)[0] == mode
+    with pytest.raises(ModeSelectionError):
+        select_mode(entry.modes, "none")
+    assert select_mode(entry.modes, "read", "plan")[0] == "plan"
+    for preset, model, effort in [
+        ("fast", "gemini-3.8-flash", "medium"),
+        ("standard", "gemini-4-neon", "high"),
+        ("max", "gemini-4-neon", "xhigh"),
+    ]:
+        call = registry.resolve_call("agy", model=preset)
+        assert (call.model, call.effort) == (model, effort)
+    call = registry.resolve_call("agy")
+    assert (call.model, call.effort) == ("gemini-4-neon", "high")
+    assert call.home is not None
+    assert Path(call.home).expanduser() == Path("~/.gemini").expanduser()

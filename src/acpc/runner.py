@@ -2756,6 +2756,7 @@ def resolution_from_session(meta: sessions.SessionMeta) -> CallResolution:
         "claude_model_usage",
         "codex_usage_updates",
         "grok_meta_usage",
+        "agy_response_usage",
         "none",
     }:
         raise RunnerError(f"session {meta.session_id} has invalid stored usage_profile")
@@ -2769,7 +2770,6 @@ def resolution_from_session(meta: sessions.SessionMeta) -> CallResolution:
     setting_sources = _stored_setting_sources(meta)
     env_passthrough = stored_strings("env_passthrough", payload)
     stored_mode, mode_spec, modes = _stored_modes(meta)
-
     entry = ResolvedEntry(
         entry=meta.entry,
         base_adapter=meta.base_adapter,

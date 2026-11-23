@@ -668,9 +668,13 @@ class AcpcClient:
         self._cold_resume = True
 
     def record_limit_rejection(self, activity_before: int) -> None:
-        """Record one active, unanswered limit send for Claude or Grok."""
+        """Record one active, unanswered limit send for response-based profiles."""
         active = self._usage_activity_count > activity_before
-        if active and self._usage_profile in {"claude_model_usage", "grok_meta_usage"}:
+        if active and self._usage_profile in {
+            "claude_model_usage",
+            "grok_meta_usage",
+            "agy_response_usage",
+        }:
             self._limit_usage_gaps += 1
         self._known_limit_rejection = True
 

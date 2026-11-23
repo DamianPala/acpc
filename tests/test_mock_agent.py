@@ -637,3 +637,23 @@ def test_mock_close_delay_records_start_then_completion_or_failure(
             ]
 
     asyncio.run(scenario())
+
+
+def test_mock_agy_response_usage(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        async with _spawn_mock(DriverClient(), tmp_path) as (conn, _process):
+            await conn.initialize(protocol_version=PROTOCOL_VERSION)
+            session = await conn.new_session(cwd=str(tmp_path))
+            response = await conn.prompt(
+                session_id=session.session_id, prompt=[text_block("rawusage:agy")]
+            )
+            assert response.model_dump(by_alias=True, exclude_none=True)["usage"] == {
+                "totalTokens": 20872,
+                "inputTokens": 12523,
+                "outputTokens": 42,
+                "thoughtTokens": 0,
+                "cachedReadTokens": 8307,
+                "cachedWriteTokens": 0,
+            }
+
+    asyncio.run(scenario())

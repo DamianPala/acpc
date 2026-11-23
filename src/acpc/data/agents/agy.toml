@@ -1,0 +1,66 @@
+name = "Antigravity CLI"
+author = "Google"
+description = "Google Antigravity CLI ACP agent (stdio)."
+# Multi-word: the TUI is bare `agy`; the ACP server is `agy acp` (ACP v1,
+# stdio). Measured 2026-11-23 against agy 1.5.15 on a personal Google sign-in.
+#
+# Google's consumer terms restrict third-party coding agents that drive agy on
+# a personal sign-in (Antigravity Additional Terms and FAQ, as read
+# 2026-11-23). Read them before dispatching agy from another agent; an API key
+# or a Google Cloud sign-in is the route Google names for that.
+command = "agy acp"
+# No install_command: the vendor installer is curl | bash, not a trusted
+# one-liner for `acpc install`.
+install_docs = "https://antigravity.google/docs/install/"
+# No home_env: agy has no environment variable for its home, only the
+# --gemini-dir and --app-data-dir flags. Credentials sit in the OS keyring and
+# were found under acpc's constructed environment with no extra variable.
+home = "~/.gemini"
+# The prompt response carries the ACP `usage` object for the turn.
+usage_profile = "agy_response_usage"
+# No system prompt or tool list route wired. agy advertises a system prompt
+# append under `_meta.antigravity`; it is not measured.
+system_prompt_via = "none"
+tools_via = "none"
+# No env_passthrough: the API-key and Google Cloud sign-ins are not measured.
+
+# Model and effort: session/set_config_option, ids `model` and
+# `thought_level`, both advertised in the session/new response. The same
+# catalogue is also offered as set_model ids with the level as a suffix
+# (gemini-4-neon-high); the config-option route is the one used.
+effort_config_id = "thought_level"
+
+# Levels per model as the 2026-11-23 catalogue lists them (Google AI Pro).
+[effort_by_model]
+"gemini-4-neon" = ["low", "medium", "high", "xhigh"]
+"gemini-4-hydrogen" = ["low", "medium", "high", "xhigh"]
+"gemini-4-argon" = ["low", "medium", "high"]
+"gemini-3.8-flash" = ["low", "medium", "high"]
+
+# Ids from discovery (3 advertised). Measured 2026-11-23 on agy 1.5.15 with
+# gemini-3.8-flash, one turn per row, in a scratch git repository:
+#   default, read ceiling: a file write reached acpc as request_permission and
+#     was denied; nothing on disk.
+#   accept-edits, edit ceiling: file writes ran unasked, inside the working
+#     directory and outside it (a sibling directory and a directory under the
+#     home), so this mode is not confined to the workspace. A shell command
+#     reached acpc as an execute request and was denied.
+#   accept-edits, execute ceiling: the same shell command was approved by acpc
+#     and ran.
+#   plan, read ceiling: a workspace file write reached acpc and was denied. On
+#     a shell task agy ran nothing and wrote a plan file into its own home
+#     (~/.gemini/antigravity-cli/brain/) unasked. Kept out of policy selection.
+# Nothing escalated past a request in these runs. After a denied request agy
+# ends the turn with an empty answer. agy also applies the user's own rules
+# from ~/.gemini/antigravity-cli/settings.json beneath the mode.
+[modes]
+default = { grants = "read", delegates = true }
+accept-edits = { grants = "edit", delegates = true }
+plan = { grants = "read", delegates = true, selectable = false }
+
+[presets]
+# Live catalogue 2026-11-23: gemini-4-neon at high is the vendor's default.
+# A model pin was proven on the wire with gemini-3.8-flash at low.
+fast = { model = "gemini-3.8-flash", effort = "medium" }
+standard = { model = "gemini-4-neon", effort = "high" }
+max = { model = "gemini-4-neon", effort = "xhigh" }

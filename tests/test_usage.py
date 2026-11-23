@@ -529,11 +529,15 @@ def test_quiet_turn_suppresses_and_consumes_the_usage_drift_note(
     assert "reports usage as" not in second.stderr
 
 
+@pytest.mark.parametrize(
+    ("profile", "prompt"),
+    [("claude_model_usage", "rawusage:claude"), ("agy_response_usage", "rawusage:agy")],
+)
 def test_unknown_status_adds_one_usage_gap(
-    cli: CliRunner, monkeypatch: pytest.MonkeyPatch, state_root: Path
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch, state_root: Path, profile: str, prompt: str
 ) -> None:
-    _set_usage_profile(state_root, "claude_model_usage")
-    result = invoke(cli, "run", "mock", "rawusage:claude", "--json", "--quiet")
+    _set_usage_profile(state_root, profile)
+    result = invoke(cli, "run", "mock", prompt, "--json", "--quiet")
     assert result.exit_code == 0, result.stderr
     session_id = json.loads(result.stdout)["session_id"]
     meta = sessions.read_meta(session_id)
@@ -613,10 +617,11 @@ def test_resend_failing_after_a_quiet_limit_is_still_a_claude_gap(
     assert usage_value["quality"] == "estimate"
 
 
-def test_limit_after_activity_adds_one_claude_gap(
-    cli: CliRunner, monkeypatch: pytest.MonkeyPatch, state_root: Path
+@pytest.mark.parametrize("profile", ["claude_model_usage", "agy_response_usage"])
+def test_limit_after_activity_adds_one_response_usage_gap(
+    cli: CliRunner, monkeypatch: pytest.MonkeyPatch, state_root: Path, profile: str
 ) -> None:
-    _set_usage_profile(state_root, "claude_model_usage")
+    _set_usage_profile(state_root, profile)
     monkeypatch.setenv("ACPC_MOCK_LIMIT_PROMPTS", "1")
     monkeypatch.setenv("ACPC_MOCK_LIMIT_META", "1")
     monkeypatch.setenv("ACPC_MOCK_LIMIT_RESET_S", "0.01")
@@ -789,3 +794,31 @@ def test_claude_turn_failed_by_the_adapter_is_one_lasting_gap(
     assert usage_value["gaps"] == 1
     assert usage_value["quality"] == "estimate"
     assert usage_value["models"]["claude-opus-5[1m]"]["total_tokens"] == 270074
+
+
+def test_agy_cli_usage_survives_restart(
+    cli: CliRunner, live_daemon: None, state_root: Path
+) -> None:
+    _set_usage_profile(state_root, "agy_response_usage")
+    first = invoke(cli, "run", "mock", "rawusage:agy", "--json", "--quiet")
+    assert first.exit_code == 0, first.stderr
+    payload = json.loads(first.stdout)
+    session_id = payload["session_id"]
+    expected = {
+        "total_tokens": 20872,
+        "input_tokens": 12523,
+        "cache_read_tokens": 8307,
+        "cache_write_tokens": 0,
+        "output_tokens": 42,
+    }
+    assert payload["usage"]["models"] == {"mock-sonnet-5": expected}
+    status = invoke(cli, "status", session_id, "--json")
+    assert json.loads(status.stdout)["usage"] == payload["usage"]
+    for count in (2, 3):
+        if count == 3:
+            assert invoke(cli, "daemon", "stop", "mock", "--json").exit_code == 0
+        continued = invoke(cli, "continue", session_id, "rawusage:agy", "--json", "--quiet")
+        assert continued.exit_code == 0, continued.stderr
+        assert json.loads(continued.stdout)["usage"]["models"] == {
+            "mock-sonnet-5": {key: value * count for key, value in expected.items()}
+        }

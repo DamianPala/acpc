@@ -29,7 +29,7 @@ _MODE_GRANTS: Final = frozenset(PERMISSION_VALUES[:-1])
 _MODEL_VIA_VALUES: Final = frozenset({"config_option", "set_model"})
 _EFFORT_VIA_VALUES: Final = frozenset({"config_option", "cli"})
 _USAGE_PROFILES: Final = frozenset(
-    {"claude_model_usage", "codex_usage_updates", "grok_meta_usage", "none"}
+    {"claude_model_usage", "codex_usage_updates", "grok_meta_usage", "agy_response_usage", "none"}
 )
 _BILLING_VALUES: Final = frozenset({"subscription", "api"})
 _DATA_RESIDENCY_VALUES: Final = frozenset({"eu", "global"})

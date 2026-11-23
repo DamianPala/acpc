@@ -195,6 +195,7 @@ def test_agents_list_uses_stable_adapter_then_variant_order(cli: CliRunner) -> N
     assert first == second
     items = first["items"]
     assert [item["name"] for item in items] == [
+        "agy",
         "claude",
         "codex",
         "grok",
@@ -216,7 +217,7 @@ def test_agents_check_uses_name_order_for_its_collection(
 
     first_names = [item["agent"] for item in first["items"]]
     assert first == second
-    assert first_names == ["builder", "claude", "codex", "grok", "mock", "phantom"]
+    assert first_names == ["agy", "builder", "claude", "codex", "grok", "mock", "phantom"]
 
 
 def test_agents_list_labels_variant_columns_and_adapts_to_long_values(
@@ -1083,3 +1084,10 @@ def test_agents_models_does_not_warn_when_resolved_model_has_a_row(
 
     assert result.exit_code == vocab.EXIT_OK
     assert "no effort row" not in result.stderr
+
+
+def test_agy_install_hint_uses_vendor_docs(cli: CliRunner) -> None:
+    result = invoke(cli, "install", "agy")
+    assert result.exit_code == vocab.EXIT_AGENT_ERROR
+    assert "https://antigravity.google/docs/install/" in result.stderr
+    assert "acpc install agy" not in result.stderr

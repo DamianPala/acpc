@@ -548,7 +548,8 @@ def test_restore_and_size_checks_do_not_drift_at_their_boundaries() -> None:
 
 
 @pytest.mark.parametrize(
-    "profile", ["claude_model_usage", "codex_usage_updates", "grok_meta_usage"]
+    "profile",
+    ["claude_model_usage", "codex_usage_updates", "grok_meta_usage", "agy_response_usage"],
 )
 def test_usage_update_cannot_report_more_than_its_context_size(profile: str) -> None:
     observation = usage.check_turn_invariants(
@@ -565,6 +566,7 @@ def test_usage_update_cannot_report_more_than_its_context_size(profile: str) -> 
             "claude_model_usage": "turn",
             "codex_usage_updates": "last",
             "grok_meta_usage": "turn",
+            "agy_response_usage": "turn",
         }[profile],
         "observed": "cumulative",
     }
@@ -674,3 +676,150 @@ def test_first_drift_survives_later_drift_and_clean_turns() -> None:
     }
     assert second_drift["drift"] == drifted["drift"] == clean["drift"]
     assert clean["quality"] == "estimate"
+
+
+AGY_SAMPLES = [
+    {
+        "totalTokens": 10311,
+        "inputTokens": 10288,
+        "outputTokens": 23,
+        "thoughtTokens": 21,
+        "cachedReadTokens": 0,
+        "cachedWriteTokens": 0,
+    },
+    {
+        "totalTokens": 20872,
+        "inputTokens": 12523,
+        "outputTokens": 42,
+        "thoughtTokens": 0,
+        "cachedReadTokens": 8307,
+        "cachedWriteTokens": 0,
+    },
+    {
+        "totalTokens": 10764,
+        "inputTokens": 2249,
+        "outputTokens": 74,
+        "thoughtTokens": 0,
+        "cachedReadTokens": 8441,
+        "cachedWriteTokens": 0,
+    },
+]
+
+
+@pytest.mark.parametrize("sample", AGY_SAMPLES)
+def test_agy_measured_turn(sample: dict[str, int]) -> None:
+    result = update("agy_response_usage", response={"usage": sample})
+    assert result is not None
+    assert result["models"] == {
+        "resolved-model": {
+            "total_tokens": sample["totalTokens"],
+            "input_tokens": sample["inputTokens"],
+            "cache_read_tokens": sample["cachedReadTokens"],
+            "cache_write_tokens": sample["cachedWriteTokens"],
+            "output_tokens": sample["outputTokens"],
+        }
+    }
+    assert result["calls"] is None
+    assert result["quality"] == "exact"
+    assert result["gaps"] == 0
+    assert result["source"] == "mock-acp 1.2.3 usage"
+    assert result["drift"] is None
+
+
+def test_agy_accumulates_turns() -> None:
+    first = update("agy_response_usage", response={"usage": AGY_SAMPLES[1]})
+    result = update("agy_response_usage", previous=first, response={"usage": AGY_SAMPLES[2]})
+    assert result is not None
+    assert result["models"]["resolved-model"] == {
+        "total_tokens": 31636,
+        "input_tokens": 14772,
+        "cache_read_tokens": 16748,
+        "cache_write_tokens": 0,
+        "output_tokens": 116,
+    }
+
+
+@pytest.mark.parametrize("response", [None, {}, {"usage": {}}, {"usage": {"totalTokens": True}}])
+def test_agy_missing_usage_is_gap(response: Any) -> None:
+    result = update("agy_response_usage", response=response, used=(100,))
+    assert result is not None
+    assert result["gaps"] == 1
+    assert result["quality"] == "estimate"
+    assert result["models"] == {}
+
+
+def test_agy_partial_usage() -> None:
+    result = update("agy_response_usage", response={"usage": {"totalTokens": 10}})
+    assert result is not None
+    assert result["gaps"] == 0
+    assert result["quality"] == "estimate"
+    assert result["drift"] is None
+    assert result["models"]["resolved-model"] == {
+        "total_tokens": 10,
+        "input_tokens": None,
+        "cache_read_tokens": None,
+        "cache_write_tokens": None,
+        "output_tokens": None,
+    }
+
+
+@pytest.mark.parametrize(
+    "missing", ["totalTokens", "inputTokens", "cachedReadTokens", "cachedWriteTokens"]
+)
+def test_agy_incomplete_object_is_observed_and_not_sum_checked(missing: str) -> None:
+    sent = {**AGY_SAMPLES[1], "totalTokens": 1}
+    del sent[missing]
+    result = update("agy_response_usage", response={"usage": sent})
+    assert result is not None
+    assert result["gaps"] == 0
+    assert result["drift"] is None
+    row = result["models"]["resolved-model"]
+    assert row["output_tokens"] == 42
+    assert None in row.values()
+
+
+def test_agy_drift_keeps_declared_figures() -> None:
+    result = update("agy_response_usage", response={"usage": {**AGY_SAMPLES[1], "totalTokens": 1}})
+    assert result is not None
+    assert result["drift"] == {
+        "check": "response_parts_sum",
+        "declared": "turn",
+        "observed": "unknown",
+        "adapter": "mock-acp",
+        "version": "1.2.3",
+        "turn": 1,
+    }
+    assert result["models"]["resolved-model"]["total_tokens"] == 1
+    assert result["quality"] == "estimate"
+
+
+def test_agy_compaction_is_unaccounted() -> None:
+    result = update("agy_response_usage", response={"usage": AGY_SAMPLES[0]}, used=(100, 50))
+    assert result is not None
+    assert result["compactions"]["count"] == 1
+    assert result["compactions"]["unaccounted"] == 1
+
+
+def test_agy_unknown_model_and_sources() -> None:
+    result = usage.accumulate_turn(
+        None,
+        used=(),
+        prompt_response={"usage": AGY_SAMPLES[0]},
+        prompt="work",
+        previous_context=None,
+        profile="agy_response_usage",
+        adapter_name="Antigravity ACP Server",
+        adapter_version="1.5.15",
+        resolved_model=None,
+        billing=None,
+    )
+    assert result is not None
+    assert list(result["models"]) == ["unknown"]
+    assert result["source"] == "Antigravity ACP Server 1.5.15 usage"
+    for profile, field in [
+        ("agy_response_usage", "usage"),
+        ("grok_meta_usage", "_meta.usage"),
+        ("codex_usage_updates", "usage_update.used"),
+        ("claude_model_usage", "_meta.quota.model_usage"),
+    ]:
+        assert usage.profile_for_source(f"server 1.5.15 {field}") == profile

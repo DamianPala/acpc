@@ -243,7 +243,13 @@ acpc agents check "$NAME"      # live apply of resolved options; zero turns
 | `description` | Roster purpose. |
 
 Shape references (not values to copy): package `data/agents/claude.toml`,
-`data/agents/codex.toml`, `data/agents/grok.toml`.
+`data/agents/codex.toml`, `data/agents/grok.toml`, `data/agents/agy.toml`.
+
+`usage_profile` names how acpc reads the adapter's token reports:
+`claude_model_usage`, `codex_usage_updates`, `grok_meta_usage`,
+`agy_response_usage`, or `none` (the default). Leave it unset until you have
+seen what this adapter sends. `agy_response_usage` fits an adapter whose
+prompt response carries the turn's ACP `usage` object with uncached input.
 
 ## Traps
 

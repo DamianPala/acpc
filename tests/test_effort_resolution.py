@@ -393,3 +393,10 @@ def test_cli_effort_route_spawns_without_an_effort_flag(state_root: Path) -> Non
     result = invoke("run", "mock", "settings", "--json")
     assert result.exit_code == 0, result.output
     assert json.loads(result.stdout)["answer"].split("/")[-1] == "0"
+
+
+def test_agy_refuses_unavailable_shipped_effort() -> None:
+    result = invoke("resolve", "agy", "--model", "gemini-4-argon", "--effort", "xhigh", "--json")
+    assert result.exit_code == 2
+    assert json.loads(result.stderr.splitlines()[-1])["error"]["kind"] == "invalid_input"
+    assert "gemini-4-argon" in result.stderr

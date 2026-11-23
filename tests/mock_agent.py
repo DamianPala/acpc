@@ -44,6 +44,7 @@ Exact-prefix triggers (donor design, for precise timing control in tests):
 - ``meta:TOKENS:TICKS:TEXT`` -> prose plus per-turn PromptResponse ``_meta`` usage
 - ``both:TOKENS:TICKS:TEXT`` -> streamed usage plus deliberately stale ``_meta``
 - ``rawusage:claude|codex|grok[:USED,...]`` -> vendor-shaped PromptResponse usage, ``_meta`` and usage updates
+- ``rawusage:agy`` -> one measured Antigravity PromptResponse ``usage`` object, no usage updates
 - ``drift:used-size`` -> a context usage update above its size
 - ``drift:claude-restore`` -> model usage shaped like a restore delta
 - ``drift:codex:hold:PATH`` -> drifting codex usage held until PATH exists
@@ -881,20 +882,7 @@ class MockAgent(Agent):
         if prompt_text.startswith("drift:claude-restore"):
             return await self._drift_claude_restore(session_id)
         if prompt_text.startswith("drift:codex"):
-            await self._send_text(session_id, "drifting codex usage")
-            for used in (100, 200, 300, 400):
-                await self._send_usage(session_id, used=used)
-            return PromptResponse.model_validate(
-                {
-                    "stopReason": "end_turn",
-                    "usage": {
-                        "totalTokens": 1000,
-                        "inputTokens": 900,
-                        "cachedReadTokens": 0,
-                        "outputTokens": 100,
-                    },
-                }
-            )
+            return await self._drift_codex_response(session_id)
 
         if prompt_text.startswith("rawusage:"):
             raw_parts = prompt_text.split(":", 2)
@@ -905,6 +893,8 @@ class MockAgent(Agent):
                 else None
             )
             await self._send_text(session_id, f"raw {profile} usage")
+            if profile == "agy":
+                return self._agy_response()
             if profile == "claude":
                 usage = {
                     "totalTokens": 135037,
@@ -1161,6 +1151,38 @@ class MockAgent(Agent):
             raise RequestError(-32603, "Internal error", {"details": "upstream connection reset"})
 
         return None
+
+    @staticmethod
+    def _agy_response() -> PromptResponse:
+        return PromptResponse.model_validate(
+            {
+                "stopReason": "end_turn",
+                "usage": {
+                    "totalTokens": 20872,
+                    "inputTokens": 12523,
+                    "outputTokens": 42,
+                    "thoughtTokens": 0,
+                    "cachedReadTokens": 8307,
+                    "cachedWriteTokens": 0,
+                },
+            }
+        )
+
+    async def _drift_codex_response(self, session_id: str) -> PromptResponse:
+        await self._send_text(session_id, "drifting codex usage")
+        for used in (100, 200, 300, 400):
+            await self._send_usage(session_id, used=used)
+        return PromptResponse.model_validate(
+            {
+                "stopReason": "end_turn",
+                "usage": {
+                    "totalTokens": 1000,
+                    "inputTokens": 900,
+                    "cachedReadTokens": 0,
+                    "outputTokens": 100,
+                },
+            }
+        )
 
     async def _drift_codex_hold(
         self, session_id: str, prompt_text: str, cancel_event: asyncio.Event

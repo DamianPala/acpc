@@ -7,6 +7,7 @@ _PROFILES: Final = {
     "claude_model_usage": "_meta.quota.model_usage",
     "codex_usage_updates": "usage_update.used",
     "grok_meta_usage": "_meta.usage",
+    "agy_response_usage": "usage",
 }
 _MODEL_FIELDS: Final = (
     "total_tokens",
@@ -25,6 +26,7 @@ _DECLARED: Final = {
     "claude_model_usage": "turn",
     "codex_usage_updates": "last",
     "grok_meta_usage": "turn",
+    "agy_response_usage": "turn",
 }
 
 
@@ -146,6 +148,16 @@ def check_turn_invariants(
             and (observation := _claude_restore_drift(used, prompt_response))
         ):
             return observation
+    if profile == "agy_response_usage":
+        fields = _agy_fields(prompt_response)
+        total = fields["total_tokens"]
+        parts = [fields[field] for field in _SPLIT_FIELDS]
+        if (
+            total is not None
+            and all(part is not None for part in parts)
+            and total != sum(part for part in parts if part is not None)
+        ):
+            return _observation("response_parts_sum", profile, "unknown")
     previous_size = previous_context.get("size") if previous_context is not None else None
     if _usage_exceeds_size(used, sizes, previous_size):
         return _observation("used_le_size", profile, "cumulative")
@@ -308,7 +320,7 @@ def _add_compactions(
 ) -> None:
     compactions = result["compactions"]
     compactions["count"] += len(drops)
-    if profile in {"codex_usage_updates", "grok_meta_usage"} or (
+    if profile in {"codex_usage_updates", "grok_meta_usage", "agy_response_usage"} or (
         profile == "claude_model_usage" and gap
     ):
         compactions["unaccounted"] += len(drops)
@@ -328,6 +340,12 @@ def _apply_profile(
         return _apply_claude(result, response)
     if profile == "codex_usage_updates":
         return _apply_codex(result, used, response, drops, resolved_model)
+    if profile == "agy_response_usage":
+        fields = _agy_fields(response)
+        if not any(value is not None for value in fields.values()):
+            return False
+        _add_model(result, resolved_model or "unknown", fields)
+        return True
     if profile == "grok_meta_usage":
         return _apply_grok(result, response, resolved_model)
     return False
@@ -402,6 +420,17 @@ def _codex_zero_category_total(response: Mapping[str, Any] | None) -> int | None
     return None
 
 
+def _agy_fields(response: Mapping[str, Any] | None) -> dict[str, int | None]:
+    raw = _nested_mapping(response, "usage")
+    return _empty_fields(
+        total_tokens=_integer(raw.get("totalTokens")),
+        input_tokens=_integer(raw.get("inputTokens")),
+        cache_read_tokens=_integer(raw.get("cachedReadTokens")),
+        cache_write_tokens=_integer(raw.get("cachedWriteTokens")),
+        output_tokens=_integer(raw.get("outputTokens")),
+    )
+
+
 def _apply_grok(
     result: dict[str, Any], response: Mapping[str, Any] | None, resolved_model: str | None
 ) -> bool:
@@ -422,7 +451,7 @@ def _apply_grok(
 
 
 def _turn_has_gap(profile: str, used: Sequence[int], observed: bool) -> bool:
-    if profile in {"claude_model_usage", "grok_meta_usage"}:
+    if profile in {"claude_model_usage", "grok_meta_usage", "agy_response_usage"}:
         return not observed
     return not used and not observed
 
