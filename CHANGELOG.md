@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.0] - 2026-11-23
+
+### Added
+
+- `agy` adapter: Google's Antigravity CLI (`agy acp`) ships beside claude, codex and grok. Model and effort go through its `model` and `thought_level` config options; presets are `fast` (`gemini-3.8-flash`), `standard` and `max` (`gemini-4-neon`). `--permissions read` selects the mode `default`; `edit` and above select `accept-edits`, which does not confine file writes to the working directory. Measured on agy 1.5.15. Google's consumer terms, as read on 2026-11-23, restrict third-party coding agents driving `agy` on a personal sign-in; read them before dispatching it from another agent
+- Token usage for agy turns: the `agy_response_usage` usage profile reads uncached input, cache read, cache write and output per model from the prompt response; a total that differs from the sum of its parts is recorded as drift
+
 ## [1.2.1] - 2026-11-10
 
 ### Added
@@ -123,6 +130,7 @@
 - `log --max-output` truncation is reported on stderr instead of as a fake event inside the stream
 - Shipped `claude` and `codex` adapter facts refreshed to what the vendors currently support
 
+[1.3.0]: https://github.com/DamianPala/acpc/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/DamianPala/acpc/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/DamianPala/acpc/compare/v1.1.1...v1.2.0
 [1.1.1]: https://github.com/DamianPala/acpc/compare/v1.1.0...v1.1.1
