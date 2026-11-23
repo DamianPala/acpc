@@ -2,7 +2,24 @@
 
 ## Now
 
-**1.2.1 released 2026-11-10** (`main` = `be177d4` = `v1.2.1`, release page
+**agy adapter built 2026-11-23, not released** (branch `feat/agy-adapter`, worktree
+`acpc.feat-agy`, slice commit `38808e9` on top of `main` `886d0e1`; nothing pushed). acpc ships a
+fourth base adapter, `agy` (Google Antigravity CLI, `agy acp`, measured on agy 1.5.15 with a
+personal Google AI Pro sign-in): modes `default` (read, delegates), `accept-edits` (edit, delegates,
+not confined to the working directory) and `plan` (kept out of policy selection); model and effort
+through config options `model` and `thought_level`; presets on `gemini-3.8-flash` and
+`gemini-4-neon`. New usage profile `agy_response_usage` reads the turn's token classes from the
+prompt response's ACP `usage` object and checks that the total equals its parts
+(`response_parts_sum`). Live check from the worktree: a run and a continue reported `usage` with
+`quality: exact` and no drift. Builder Sol one round, Opus reviewer one round (approve with a test
+patch, 13 mutants killed); gate 2 046 tests, smoke 609/609; records, the measurements and the
+research on Google's consumer terms in `docs/plans/agy/`. Decision by Damian (2026-11-23): integrate
+agy, but no fleets of agy agents dispatched from a coding agent while the terms question is open;
+he asks Google about acpc. Open for him: push, version number (a new adapter is a minor: 1.3.0) and
+release. After the release the host's local `~/.acpc/agents/agy.toml` goes away, or shrinks to the
+local description and `billing`.
+
+Earlier: **1.2.1 released 2026-11-10** (`main` = `be177d4` = `v1.2.1`, release page
 https://github.com/DamianPala/acpc/releases/tag/v1.2.1, CI green on ubuntu and macos on the tagged
 commit, lap 42811549622; host and the `ai-lab` container on 1.2.1). One fix slice, `fce8627`: a
 daemon holds a finished session in the adapter for `session_hold` (default `5m`), at most
@@ -760,7 +777,9 @@ Release: bump `0.4.0` → `0.4.1` (the pending `uv.lock` version line rides here
 - **`available_commands_update`, `config_option_update` and `current_mode_update` set the message-boundary flag but write no transcript event**, so in theory S11 (separator) and S13 (continuation marker) could disagree about where a boundary is. Verified not reachable today — all three arrive at session setup, before any message chunk — but the two views derive the same fact from different sources, which is what makes the divergence possible at all.
 - **Daemon version-skew self-heal keys on the version string alone**, so during development a warm daemon serves stale client code until a manual `daemon stop`. Finer keying (source hash?) is a 0.5 design question.
 - **Vendor drift is now a live failure mode:** the haiku-effort break (see *Now*) came from a routine claude CLI auto-update. The candidate guard — consult the advertised config options after the model set instead of writing blind — would absorb this whole class.
-- Possible `agy` adapter, if it speaks ACP (Damian's mention at the gemini retirement).
+- **acpc does not introduce itself to the adapter** (2026-11-23, Damian: backlog): `initialize` carries only the protocol version, no `clientInfo`. Send `clientInfo` (`acpc` and its version) at every `initialize` (`cache.py`, `probe.py`, `daemon.py`, `runner.py`). agy answers the same either way today; a named client is what Damian's question to Google about acpc is about.
+- **An adapter without `home_env` accepts a home it cannot deliver** (agy slice review, 2026-11-23): `acpc resolve agy --home /tmp/x` shows the new home and changes the daemon target, but nothing reaches `agy`, which keeps `~/.gemini` and the personal sign-in. agy is the first shipped adapter without `home_env`. Reviewer's recommendation: `run` and `resolve` refuse a non-default home on such an adapter (`not_supported`), SPEC clause first. agy has `--gemini-dir` and `--app-data-dir` flags, so a flag route is the alternative.
+- **agy, not measured:** the API-key and Google Cloud sign-ins (`gemini-api-key`, `agent-platform`), the system prompt append agy advertises under `_meta.antigravity`, images, steering, client-passed MCP servers, `--process-per-session`.
 - SPEC examples say "Claude Code (Anthropic)" where adapters render "Claude Code" — pre-existing cosmetic gap, flagged during the wave-5 SPEC alignment check.
 
 ## Decisions
